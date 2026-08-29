@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from functools import partial
 from typing import Any, Self
 
 from mcp.server.fastmcp import FastMCP
@@ -11,28 +12,67 @@ from .contract import AdapterError
 from .gateway import HostBinding, MemoryGateway
 
 
-class _GatewayTool(tuple, metaclass=type(HostBinding)):
-    __slots__ = ()
-    __name__ = "memory_tool"
-    __doc__ = "Bound FactLane memory operation."
-
-    def __new__(cls, gateway: MemoryGateway, operation: str) -> Self:
-        return tuple.__new__(cls, (gateway, operation))
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        raise TypeError("_GatewayTool cannot be subclassed")
-
-    def __setattr__(self, name: str, value: object) -> None:
-        raise AttributeError("tool state is immutable")
-
-    def __delattr__(self, name: str) -> None:
-        raise AttributeError("tool state is immutable")
-
-    async def __call__(self, request: dict[str, Any]) -> dict[str, Any]:
-        gateway = tuple.__getitem__(self, 0)
-        if type(gateway) is not MemoryGateway:
-            raise AdapterError("UNBOUND_GATEWAY", "server gateway is not valid")
-        return await MemoryGateway.dispatch(gateway, tuple.__getitem__(self, 1), request)
+def _server_dispatch(server: Any, operation: str, *args: Any, **kwargs: Any) -> Any:
+    gateway = tuple.__getitem__(server, 0)
+    if type(gateway) is not MemoryGateway:
+        raise AdapterError("UNBOUND_GATEWAY", "server gateway is not valid")
+    gateway_transport = tuple.__getitem__(gateway, 3)
+    if operation == "_gateway":
+        return gateway
+    if operation == "_tool_specs":
+        return tuple.__getitem__(server, 1)
+    if operation == "tool_names":
+        return sorted(name for name, _, _ in tuple.__getitem__(server, 1))
+    if operation == "_require_transport":
+        selected_transport = args[0] if args else kwargs.get("selected_transport")
+        return gateway_transport(gateway, selected_transport)
+    if operation == "settings":
+        gateway_transport(gateway, "sse")
+        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "SSE is not supported")
+    if operation == "_session_manager":
+        gateway_transport(gateway, "streamable-http")
+        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "streamable HTTP is not supported")
+    if operation == "_mcp_server":
+        raise AdapterError("UNBOUND_GATEWAY", "base FastMCP dispatch is not available")
+    if operation in {"sse_app", "_normalize_path", "run_sse_async"}:
+        gateway_transport(gateway, "sse")
+        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "SSE is not supported")
+    if operation in {"streamable_http_app", "run_streamable_http_async"}:
+        gateway_transport(gateway, "streamable-http")
+        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "streamable HTTP is not supported")
+    if operation == "run":
+        transport = args[0] if args else kwargs.get("transport", "stdio")
+        mount_path = args[1] if len(args) > 1 else kwargs.get("mount_path")
+        gateway_transport(gateway, transport)
+        inner = FastMCP(
+            "factlane",
+            instructions="Supporting memory only; never execution authority.",
+            host="127.0.0.1",
+            port=8000,
+        )
+        for name, description, operation_name in tuple.__getitem__(server, 1):
+            tool = partial(tuple.__getitem__(gateway, 2), gateway, operation_name)
+            tool_metadata = vars(tool)
+            tool_metadata["__name__"] = name
+            tool_metadata["__doc__"] = description
+            inner.tool(name=name, description=description)(tool)
+        return inner.run(transport, mount_path)
+    if operation == "run_stdio_async":
+        gateway_transport(gateway, "stdio")
+        inner = FastMCP(
+            "factlane",
+            instructions="Supporting memory only; never execution authority.",
+            host="127.0.0.1",
+            port=8000,
+        )
+        for name, description, operation_name in tuple.__getitem__(server, 1):
+            tool = partial(tuple.__getitem__(gateway, 2), gateway, operation_name)
+            tool_metadata = vars(tool)
+            tool_metadata["__name__"] = name
+            tool_metadata["__doc__"] = description
+            inner.tool(name=name, description=description)(tool)
+        return inner.run_stdio_async()
+    raise AdapterError("UNBOUND_GATEWAY", "server operation is not available")
 
 
 class _BoundFastMCP(tuple, metaclass=type(HostBinding)):
@@ -41,7 +81,7 @@ class _BoundFastMCP(tuple, metaclass=type(HostBinding)):
     __slots__ = ()
 
     def __new__(cls, gateway: MemoryGateway, tools: tuple[tuple[str, str, str], ...]) -> Self:
-        return tuple.__new__(cls, (gateway, tools))
+        return tuple.__new__(cls, (gateway, tools, _server_dispatch))
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         raise TypeError("_BoundFastMCP cannot be subclassed")
@@ -51,6 +91,26 @@ class _BoundFastMCP(tuple, metaclass=type(HostBinding)):
 
     def __delattr__(self, name: str) -> None:
         raise AttributeError("server state is immutable")
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "_gateway":
+            return tuple.__getitem__(self, 0)
+        if name == "settings" or name == "_session_manager" or name == "_mcp_server":
+            return tuple.__getitem__(self, 2)(self, name)
+        if (
+            name == "_require_transport"
+            or name == "_tool_specs"
+            or name == "tool_names"
+            or name == "sse_app"
+            or name == "streamable_http_app"
+            or name == "_normalize_path"
+            or name == "run"
+            or name == "run_stdio_async"
+            or name == "run_sse_async"
+            or name == "run_streamable_http_async"
+        ):
+            return partial(tuple.__getitem__(self, 2), self, name)
+        return tuple.__getattribute__(self, name)
 
     def __getitem__(self, key: object) -> Any:
         raise TypeError("server state is private")
@@ -63,84 +123,56 @@ class _BoundFastMCP(tuple, metaclass=type(HostBinding)):
 
     @property
     def _gateway(self) -> MemoryGateway:
-        return tuple.__getitem__(self, 0)
+        return tuple.__getitem__(self, 2)(self, "_gateway")
 
     def _require_transport(self, selected_transport: str) -> None:
-        gateway = self._gateway
-        if type(gateway) is not MemoryGateway:
-            raise AdapterError("UNBOUND_GATEWAY", "server gateway is not valid")
-        gateway.require_transport(selected_transport)
+        tuple.__getitem__(self, 2)(self, "_require_transport", selected_transport)
 
     def _tool_specs(self) -> tuple[tuple[str, str, str], ...]:
-        return tuple.__getitem__(self, 1)
+        return tuple.__getitem__(self, 2)(self, "_tool_specs")
 
     @property
     def settings(self) -> Any:
-        self._require_transport("sse")
-        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "SSE is not supported")
+        return tuple.__getitem__(self, 2)(self, "settings")
 
     @property
     def _session_manager(self) -> Any:
-        self._require_transport("streamable-http")
-        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "streamable HTTP is not supported")
+        return tuple.__getitem__(self, 2)(self, "_session_manager")
 
     @property
     def _mcp_server(self) -> Any:
-        raise AdapterError("UNBOUND_GATEWAY", "base FastMCP dispatch is not available")
+        return tuple.__getitem__(self, 2)(self, "_mcp_server")
 
     def tool_names(self) -> list[str]:
-        return sorted(name for name, _, _ in self._tool_specs())
+        return tuple.__getitem__(self, 2)(self, "tool_names")
 
     def sse_app(self, mount_path: str | None = None) -> Any:
-        self._require_transport("sse")
-        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "SSE is not supported")
+        return tuple.__getitem__(self, 2)(self, "sse_app", mount_path)
 
     def streamable_http_app(self) -> Any:
-        self._require_transport("streamable-http")
-        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "streamable HTTP is not supported")
+        return tuple.__getitem__(self, 2)(self, "streamable_http_app")
 
     def _normalize_path(self, mount_path: str, path: str) -> str:
-        self._require_transport("sse")
-        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "SSE is not supported")
+        return tuple.__getitem__(self, 2)(self, "_normalize_path", mount_path, path)
 
     def run(self, transport: str = "stdio", mount_path: str | None = None) -> None:
-        self._require_transport(transport)
-        inner = FastMCP(
-            "factlane",
-            instructions="Supporting memory only; never execution authority.",
-            host="127.0.0.1",
-            port=8000,
-        )
-        for name, description, operation in self._tool_specs():
-            inner.tool(name=name, description=description)(_GatewayTool(self._gateway, operation))
-        inner.run(transport, mount_path)
+        tuple.__getitem__(self, 2)(self, "run", transport, mount_path)
 
     async def run_stdio_async(self) -> None:
-        self._require_transport("stdio")
-        inner = FastMCP(
-            "factlane",
-            instructions="Supporting memory only; never execution authority.",
-            host="127.0.0.1",
-            port=8000,
-        )
-        for name, description, operation in self._tool_specs():
-            inner.tool(name=name, description=description)(_GatewayTool(self._gateway, operation))
-        await inner.run_stdio_async()
+        await tuple.__getitem__(self, 2)(self, "run_stdio_async")
 
     async def run_sse_async(self, mount_path: str | None = None) -> None:
-        self._require_transport("sse")
-        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "SSE is not supported")
+        await tuple.__getitem__(self, 2)(self, "run_sse_async", mount_path)
 
     async def run_streamable_http_async(self) -> None:
-        self._require_transport("streamable-http")
-        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "streamable HTTP is not supported")
+        await tuple.__getitem__(self, 2)(self, "run_streamable_http_async")
 
 
 def build_mcp_server(gateway: MemoryGateway) -> _BoundFastMCP:
     """Build only the five normal agent tools over a bound gateway."""
     if type(gateway) is not MemoryGateway:
         raise AdapterError("UNBOUND_GATEWAY", "gateway is not a valid memory gateway")
-    gateway.require_transport("stdio")
+    tuple.__getitem__(gateway, 3)(gateway, "stdio")
 
     return _BoundFastMCP(
         gateway,

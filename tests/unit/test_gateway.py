@@ -168,6 +168,66 @@ def test_host_binding_class_attributes_cannot_be_replaced() -> None:
         type.__setattr__(HostBinding, "transport_kind", descriptor)
 
 
+def test_type_level_dispatch_replacement_cannot_bypass_gateway() -> None:
+    bound = gateway()
+    original = MemoryGateway.__dict__["dispatch"]
+
+    async def evil_dispatch(self: MemoryGateway, operation: str, request: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "EVIL", "audit": {"host_binding": {"host_id": "spoofed"}}}
+
+    type.__setattr__(MemoryGateway, "dispatch", evil_dispatch)
+    try:
+        response = asyncio.run(bound.dispatch("memory_status", {"scope": "PROJECT", "project_id": "p"}))
+        class_response = asyncio.run(
+            MemoryGateway.dispatch(bound, "memory_status", {"scope": "PROJECT", "project_id": "p"})
+        )
+    finally:
+        type.__setattr__(MemoryGateway, "dispatch", original)
+
+    assert response["status"] == "OK"
+    assert response["audit"]["host_binding"]["host_id"] == "codex-disposable"
+    assert class_response["status"] == "OK"
+    assert class_response["audit"]["host_binding"]["host_id"] == "codex-disposable"
+
+
+def test_type_level_transport_replacement_cannot_bypass_gateway() -> None:
+    bound = gateway()
+    original = MemoryGateway.__dict__["require_transport"]
+
+    def evil_transport(self: MemoryGateway, selected_transport: str) -> HostBinding:
+        return HostBinding("spoofed", selected_transport, "spoofed")
+
+    type.__setattr__(MemoryGateway, "require_transport", evil_transport)
+    try:
+        with pytest.raises(AdapterError) as error:
+            bound.require_transport("sse")
+        with pytest.raises(AdapterError) as class_error:
+            MemoryGateway.require_transport(bound, "sse")
+    finally:
+        type.__setattr__(MemoryGateway, "require_transport", original)
+
+    assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
+    assert class_error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
+
+
+def test_type_level_server_transport_replacement_cannot_bypass_gateway() -> None:
+    server = build_mcp_server(gateway())
+    server_type = type(server)
+    original = server_type.__dict__["run_sse_async"]
+
+    async def evil_sse(self: Any, mount_path: str | None = None) -> None:
+        return None
+
+    type.__setattr__(server_type, "run_sse_async", evil_sse)
+    try:
+        with pytest.raises(AdapterError) as error:
+            FastMCP.run(server, "sse")
+    finally:
+        type.__setattr__(server_type, "run_sse_async", original)
+
+    assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
+
+
 def test_host_binding_subclass_cannot_replace_gateway_audit() -> None:
     class SpoofBinding(HostBinding):
         def audit_projection(self) -> dict[str, str]:
