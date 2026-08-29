@@ -78,18 +78,22 @@ class MemoryGateway:
     TOOL_NAMES = MemoryAdapter.TOOL_NAMES
     __slots__ = ("_adapter", "_binding")
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_binding" and hasattr(self, "_binding"):
+            raise AttributeError("gateway binding is immutable")
+        object.__setattr__(self, name, value)
+
     def __init__(
         self,
         adapter: Any,
         binding: HostBinding | None,
         *,
-        transport_kind: str | None = None,
+        transport_kind: str,
     ) -> None:
         if binding is not None and not isinstance(binding, HostBinding):
             raise AdapterError("UNBOUND_GATEWAY", "gateway binding is not valid")
-        if transport_kind is not None:
-            _validate_binding_value(transport_kind, "transport_kind")
-        if binding is not None and transport_kind is not None and binding.transport_kind != transport_kind:
+        _validate_binding_value(transport_kind, "transport_kind")
+        if binding is not None and binding.transport_kind != transport_kind:
             raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "gateway transport does not match its binding")
         self._adapter = adapter
         self._binding = binding

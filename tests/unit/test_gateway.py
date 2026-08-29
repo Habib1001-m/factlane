@@ -86,6 +86,29 @@ def test_binding_validation_and_immutability() -> None:
         bound.binding = binding  # type: ignore[misc]
 
 
+def test_gateway_backing_binding_cannot_be_reassigned() -> None:
+    bound = gateway()
+    original = bound.binding
+    replacement = HostBinding("hermes-disposable", "stdio", "trusted-launcher")
+
+    with pytest.raises(AttributeError):
+        bound._binding = replacement  # type: ignore[misc]
+
+    assert bound.binding is original
+
+
+def test_selected_transport_is_required() -> None:
+    binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
+
+    with pytest.raises(TypeError):
+        MemoryGateway(FakeAdapter(), binding)  # type: ignore[call-arg]
+
+    with pytest.raises(AdapterError) as error:
+        MemoryGateway(FakeAdapter(), binding, transport_kind=None)  # type: ignore[arg-type]
+
+    assert error.value.code == "INVALID_HOST_BINDING"
+
+
 @pytest.mark.parametrize(
     "bound_host_id",
     [None, "", " ", "codex\ndisposable", "codex\x00disposable", "\ud800", "x" * 129, "/private/path", "secret:" + "a" * 32],
@@ -145,7 +168,7 @@ def test_matching_request_side_identity_is_still_not_authoritative() -> None:
     assert adapter.calls == []
 
 
-def test_transport_mismatch_fails_closed() -> None:
+def test_selected_transport_must_match_bound_transport() -> None:
     binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
 
     with pytest.raises(AdapterError) as error:
