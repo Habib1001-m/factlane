@@ -132,6 +132,42 @@ def test_server_state_does_not_retain_inner_fastmcp() -> None:
         )
 
 
+def test_server_tool_callbacks_do_not_retain_mutable_dispatch_closures() -> None:
+    server = build_mcp_server(gateway())
+    state = tuple.__getitem__(server, 1)
+
+    assert all(not callable(operation) for _, _, operation in state)
+
+
+def test_transport_and_operation_authority_is_not_module_mutable() -> None:
+    import factlane.gateway as gateway_module
+    import factlane.server as server_module
+
+    assert getattr(gateway_module, "SUPPORTED_TRANSPORT_KIND", None) is None
+    assert getattr(server_module, "STDIO_TRANSPORT", None) is None
+    assert getattr(gateway_module, "_OPERATION_METHODS", None) is None
+    assert getattr(gateway_module, "_MAX_BINDING_BYTES", None) is None
+    assert getattr(gateway_module, "_BINDING_VALUE_RE", None) is None
+    assert getattr(gateway_module, "_RESERVED_IDENTITY_CLAIMS", None) is None
+
+
+def test_host_binding_class_attributes_cannot_be_replaced() -> None:
+    with pytest.raises(AttributeError):
+        HostBinding.transport_kind = property(lambda self: "sse")  # type: ignore[misc]
+
+    bound = gateway()
+    assert bound.require_transport("stdio").transport_kind == "stdio"
+
+    descriptor = HostBinding.__dict__["transport_kind"]
+    type.__setattr__(HostBinding, "transport_kind", property(lambda self: "sse"))
+    try:
+        assert bound.binding is not None
+        assert bound.binding.transport_kind == "stdio"
+        assert bound.require_transport("stdio").transport_kind == "stdio"
+    finally:
+        type.__setattr__(HostBinding, "transport_kind", descriptor)
+
+
 def test_host_binding_subclass_cannot_replace_gateway_audit() -> None:
     class SpoofBinding(HostBinding):
         def audit_projection(self) -> dict[str, str]:
@@ -429,13 +465,25 @@ def test_server_requires_explicit_host_id_before_adapter_start(monkeypatch, tmp_
     assert error.value.code == 2
 
 
-def test_registered_server_handler_dispatches_through_gateway() -> None:
+def test_registered_server_handler_dispatches_through_gateway(monkeypatch) -> None:
     adapter = FakeAdapter()
     server = build_mcp_server(gateway(adapter=adapter))
-    tool = server._tool_function("memory_status")
 
-    response = asyncio.run(tool({"scope": "PROJECT", "project_id": "p"}))
+    captured: dict[str, Any] = {}
 
+    def capture_run(inner: FastMCP, transport: str, mount_path: str | None = None) -> None:
+        captured["transport"] = transport
+        captured["response"] = asyncio.run(
+            inner._tool_manager._tools["memory_status"].fn(  # type: ignore[attr-defined]
+                {"scope": "PROJECT", "project_id": "p"}
+            )
+        )
+
+    monkeypatch.setattr(FastMCP, "run", capture_run)
+    server.run("stdio")
+    response = captured["response"]
+
+    assert captured["transport"] == "stdio"
     assert response["audit"]["host_binding"]["host_id"] == "codex-disposable"
     assert adapter.calls == [("memory_status", {"scope": "PROJECT", "project_id": "p"})]
 

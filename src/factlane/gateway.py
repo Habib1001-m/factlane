@@ -7,30 +7,15 @@ from dataclasses import FrozenInstanceError
 from typing import Any, Self, cast
 from uuid import uuid4
 
-from .adapter import MemoryAdapter
 from .contract import AdapterError, contains_sensitive
 
-_MAX_BINDING_BYTES = 128
-SUPPORTED_TRANSPORT_KIND = "stdio"
-_BINDING_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_RESERVED_IDENTITY_CLAIMS = frozenset(
-    {
-        "host_id",
-        "bound_host_id",
-        "host_identity",
-        "transport_identity",
-        "gateway_instance_id",
-        "runtime_agent_id",
-        "transport_kind",
-    }
-)
-_OPERATION_METHODS = {
-    "memory_search": "search",
-    "memory_get": "get",
-    "memory_store": "store",
-    "memory_update": "update",
-    "memory_status": "status",
-}
+
+class _ImmutableType(type):
+    def __setattr__(cls, name: str, value: object) -> None:
+        raise AttributeError(f"{cls.__name__} is immutable")
+
+    def __delattr__(cls, name: str) -> None:
+        raise AttributeError(f"{cls.__name__} is immutable")
 
 
 def _validate_binding_value(value: object, field: str) -> str:
@@ -40,16 +25,16 @@ def _validate_binding_value(value: object, field: str) -> str:
         encoded = value.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise AdapterError("INVALID_HOST_BINDING", f"{field} is not valid UTF-8") from exc
-    if len(encoded) > _MAX_BINDING_BYTES:
+    if len(encoded) > 128:
         raise AdapterError("INVALID_HOST_BINDING", f"{field} is oversized")
     if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
         raise AdapterError("INVALID_HOST_BINDING", f"{field} contains control characters")
-    if not _BINDING_VALUE_RE.fullmatch(value) or contains_sensitive(value):
+    if not re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", value) or contains_sensitive(value):
         raise AdapterError("INVALID_HOST_BINDING", f"{field} is not a safe non-secret value")
     return value
 
 
-class HostBinding(tuple):
+class HostBinding(tuple, metaclass=_ImmutableType):
     """Immutable, trusted transport binding for one gateway instance."""
 
     __slots__ = ()
@@ -70,6 +55,17 @@ class HostBinding(tuple):
 
     def __delattr__(self, name: str) -> None:
         raise FrozenInstanceError(f"cannot delete field {name!r}")
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "bound_host_id":
+            return tuple.__getitem__(self, 0)
+        if name == "transport_kind":
+            return tuple.__getitem__(self, 1)
+        if name == "binding_source":
+            return tuple.__getitem__(self, 2)
+        if name == "gateway_instance_id":
+            return tuple.__getitem__(self, 3)
+        return tuple.__getattribute__(self, name)
 
     @property
     def bound_host_id(self) -> str:
@@ -110,10 +106,9 @@ def _binding_from_values(values: tuple[object, ...]) -> HostBinding:
     )
 
 
-class MemoryGateway(tuple):
+class MemoryGateway(tuple, metaclass=_ImmutableType):
     """Project-neutral request gateway over the existing five-operation adapter."""
 
-    TOOL_NAMES = MemoryAdapter.TOOL_NAMES
     __slots__ = ()
 
     def __new__(
@@ -136,7 +131,7 @@ class MemoryGateway(tuple):
                 _validate_binding_value(binding_values[3], "gateway_instance_id"),
             )
         _validate_binding_value(transport_kind, "transport_kind")
-        if transport_kind != SUPPORTED_TRANSPORT_KIND:
+        if transport_kind != "stdio":
             raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "gateway transport is not supported")
         if binding_values is not None and binding_values[1] != transport_kind:
             raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "gateway transport does not match its binding")
@@ -182,7 +177,7 @@ class MemoryGateway(tuple):
 
     @classmethod
     def tool_names(cls) -> list[str]:
-        return list(cls.TOOL_NAMES)
+        return ["memory_search", "memory_get", "memory_store", "memory_update", "memory_status"]
 
     @staticmethod
     def _validate_request(request: object) -> dict[str, Any]:
@@ -190,14 +185,34 @@ class MemoryGateway(tuple):
             raise AdapterError("INVALID_ENVELOPE", "request must be an object")
         if any(not isinstance(key, str) for key in request):
             raise AdapterError("INVALID_ENVELOPE", "request keys must be strings")
-        if _RESERVED_IDENTITY_CLAIMS.intersection(request):
+        reserved_claims = frozenset(
+            {
+                "host_id",
+                "bound_host_id",
+                "host_identity",
+                "transport_identity",
+                "gateway_instance_id",
+                "runtime_agent_id",
+                "transport_kind",
+            }
+        )
+        if reserved_claims.intersection(request):
             raise AdapterError("HOST_IDENTITY_CLAIM_DENIED", "request cannot claim transport identity")
         return request
 
     async def dispatch(self, operation: str, request: dict[str, Any]) -> dict[str, Any]:
         binding_values = self._binding_values()
-        method_name = _OPERATION_METHODS.get(operation)
-        if method_name is None:
+        if operation == "memory_search":
+            method_name = "search"
+        elif operation == "memory_get":
+            method_name = "get"
+        elif operation == "memory_store":
+            method_name = "store"
+        elif operation == "memory_update":
+            method_name = "update"
+        elif operation == "memory_status":
+            method_name = "status"
+        else:
             raise AdapterError("INVALID_OPERATION", "operation is not part of the public gateway surface")
         safe_request = self._validate_request(request)
         handler = getattr(self._adapter, method_name, None)
