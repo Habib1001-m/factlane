@@ -108,6 +108,18 @@ def test_gateway_backing_binding_cannot_be_reassigned() -> None:
     assert bound.binding.gateway_instance_id == original.gateway_instance_id
 
 
+def test_gateway_authority_has_no_mutable_module_registry() -> None:
+    import factlane.gateway as gateway_module
+
+    assert getattr(gateway_module, "_GATEWAY_BINDINGS", None) is None
+
+
+def test_server_authority_has_no_mutable_module_registry() -> None:
+    import factlane.server as server_module
+
+    assert getattr(server_module, "_BOUND_SERVER_STATE", None) is None
+
+
 def test_host_binding_subclass_cannot_replace_gateway_audit() -> None:
     class SpoofBinding(HostBinding):
         def audit_projection(self) -> dict[str, str]:
@@ -376,7 +388,7 @@ def test_audit_binding_is_gateway_owned_bounded_and_immutable() -> None:
 
 def test_public_mcp_tool_set_remains_exactly_five() -> None:
     server = build_mcp_server(gateway())
-    names = sorted(server._tool_manager._tools)  # type: ignore[attr-defined]
+    names = server.tool_names()
 
     assert names == sorted(MemoryAdapter.tool_names())
     assert len(names) == 5
@@ -408,9 +420,9 @@ def test_server_requires_explicit_host_id_before_adapter_start(monkeypatch, tmp_
 def test_registered_server_handler_dispatches_through_gateway() -> None:
     adapter = FakeAdapter()
     server = build_mcp_server(gateway(adapter=adapter))
-    tool = server._tool_manager._tools["memory_status"]  # type: ignore[attr-defined]
+    tool = server._tool_function("memory_status")
 
-    response = asyncio.run(tool.fn({"scope": "PROJECT", "project_id": "p"}))
+    response = asyncio.run(tool({"scope": "PROJECT", "project_id": "p"}))
 
     assert response["audit"]["host_binding"]["host_id"] == "codex-disposable"
     assert adapter.calls == [("memory_status", {"scope": "PROJECT", "project_id": "p"})]
