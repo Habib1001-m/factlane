@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from mcp.server.fastmcp import FastMCP
 
@@ -11,60 +12,87 @@ from .contract import AdapterError
 from .gateway import SUPPORTED_TRANSPORT_KIND, HostBinding, MemoryGateway
 
 STDIO_TRANSPORT = SUPPORTED_TRANSPORT_KIND
+_BOUND_SERVER_STATE: WeakKeyDictionary[object, tuple[MemoryGateway, FastMCP]] = WeakKeyDictionary()
 
 
-class _BoundFastMCP(FastMCP):
-    __slots__ = ("__gateway",)
+class _BoundFastMCP:
+    """Small guarded facade that does not expose FastMCP base dispatch paths."""
+
+    __slots__ = ("__weakref__",)
 
     def __init__(self, gateway: MemoryGateway) -> None:
-        object.__setattr__(self, "_BoundFastMCP__gateway", gateway)
-        super().__init__(
-            "factlane",
-            instructions="Supporting memory only; never execution authority.",
-            host="127.0.0.1",
-            port=8000,
+        _BOUND_SERVER_STATE[self] = (
+            gateway,
+            FastMCP(
+                "factlane",
+                instructions="Supporting memory only; never execution authority.",
+                host="127.0.0.1",
+                port=8000,
+            ),
         )
 
-    def __setattr__(self, name: str, value: object) -> None:
-        if name == "_BoundFastMCP__gateway" and hasattr(self, "_BoundFastMCP__gateway"):
-            raise AttributeError("server gateway is immutable")
-        super().__setattr__(name, value)
-
-    def __delattr__(self, name: str) -> None:
-        if name == "_BoundFastMCP__gateway":
-            raise AttributeError("server gateway is immutable")
-        super().__delattr__(name)
+    def _state(self) -> tuple[MemoryGateway, FastMCP]:
+        try:
+            return _BOUND_SERVER_STATE[self]
+        except KeyError as exc:
+            raise AdapterError("UNBOUND_GATEWAY", "server gateway is not available") from exc
 
     @property
-    def _gateway(self) -> MemoryGateway:
-        return self.__gateway
+    def _tool_manager(self) -> Any:
+        return self._state()[1]._tool_manager
+
+    @property
+    def settings(self) -> Any:
+        gateway, server = self._state()
+        gateway.require_transport("sse")
+        return server.settings
+
+    @property
+    def _session_manager(self) -> Any:
+        gateway, server = self._state()
+        gateway.require_transport("streamable-http")
+        return server._session_manager
+
+    def tool(self, *args: Any, **kwargs: Any) -> Any:
+        return self._state()[1].tool(*args, **kwargs)
+
+    def sse_app(self, mount_path: str | None = None) -> Any:
+        gateway, server = self._state()
+        gateway.require_transport("sse")
+        return server.sse_app(mount_path)
+
+    def streamable_http_app(self) -> Any:
+        gateway, server = self._state()
+        gateway.require_transport("streamable-http")
+        return server.streamable_http_app()
+
+    def _normalize_path(self, mount_path: str, path: str) -> str:
+        gateway, server = self._state()
+        gateway.require_transport("sse")
+        return server._normalize_path(mount_path, path)
 
     def run(self, transport: str = STDIO_TRANSPORT, mount_path: str | None = None) -> None:
-        self._gateway.require_transport(transport)
-        super().run(transport, mount_path)  # type: ignore[arg-type]
+        gateway, server = self._state()
+        gateway.require_transport(transport)
+        server.run(transport, mount_path)  # type: ignore[arg-type]
 
     async def run_stdio_async(self) -> None:
-        self._gateway.require_transport(STDIO_TRANSPORT)
-        await super().run_stdio_async()
+        gateway, server = self._state()
+        gateway.require_transport(STDIO_TRANSPORT)
+        await server.run_stdio_async()
 
     async def run_sse_async(self, mount_path: str | None = None) -> None:
-        self._gateway.require_transport("sse")
-        await super().run_sse_async(mount_path)
+        gateway, server = self._state()
+        gateway.require_transport("sse")
+        await server.run_sse_async(mount_path)
 
     async def run_streamable_http_async(self) -> None:
-        self._gateway.require_transport("streamable-http")
-        await super().run_streamable_http_async()
-
-    def sse_app(self, mount_path: str | None = None):
-        self._gateway.require_transport("sse")
-        return super().sse_app(mount_path)
-
-    def streamable_http_app(self):
-        self._gateway.require_transport("streamable-http")
-        return super().streamable_http_app()
+        gateway, server = self._state()
+        gateway.require_transport("streamable-http")
+        await server.run_streamable_http_async()
 
 
-def build_mcp_server(gateway: MemoryGateway) -> FastMCP:
+def build_mcp_server(gateway: MemoryGateway) -> _BoundFastMCP:
     """Build only the five normal agent tools over a bound gateway."""
     if type(gateway) is not MemoryGateway:
         raise AdapterError("UNBOUND_GATEWAY", "gateway is not a valid memory gateway")

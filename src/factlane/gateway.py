@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, cast
 from uuid import uuid4
+from weakref import WeakKeyDictionary
 
 from .adapter import MemoryAdapter
 from .contract import AdapterError, contains_sensitive
@@ -73,21 +74,14 @@ class HostBinding:
         }
 
 
+_GATEWAY_BINDINGS: WeakKeyDictionary[object, HostBinding] = WeakKeyDictionary()
+
+
 class MemoryGateway:
     """Project-neutral request gateway over the existing five-operation adapter."""
 
     TOOL_NAMES = MemoryAdapter.TOOL_NAMES
-    __slots__ = ("_adapter", "_binding")
-
-    def __setattr__(self, name: str, value: object) -> None:
-        if name == "_binding" and hasattr(self, "_binding"):
-            raise AttributeError("gateway binding is immutable")
-        object.__setattr__(self, name, value)
-
-    def __delattr__(self, name: str) -> None:
-        if name == "_binding":
-            raise AttributeError("gateway binding is immutable")
-        object.__delattr__(self, name)
+    __slots__ = ("__weakref__", "_adapter")
 
     def __init__(
         self,
@@ -96,7 +90,7 @@ class MemoryGateway:
         *,
         transport_kind: str,
     ) -> None:
-        if binding is not None and not isinstance(binding, HostBinding):
+        if binding is not None and type(binding) is not HostBinding:
             raise AdapterError("UNBOUND_GATEWAY", "gateway binding is not valid")
         _validate_binding_value(transport_kind, "transport_kind")
         if transport_kind != SUPPORTED_TRANSPORT_KIND:
@@ -104,7 +98,12 @@ class MemoryGateway:
         if binding is not None and binding.transport_kind != transport_kind:
             raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "gateway transport does not match its binding")
         self._adapter = adapter
-        self._binding = binding
+        if binding is not None:
+            _GATEWAY_BINDINGS[self] = binding
+
+    @property
+    def _binding(self) -> HostBinding | None:
+        return _GATEWAY_BINDINGS.get(self)
 
     def require_transport(self, selected_transport: str) -> HostBinding:
         _validate_binding_value(selected_transport, "transport_kind")

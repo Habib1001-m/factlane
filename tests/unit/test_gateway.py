@@ -98,7 +98,30 @@ def test_gateway_backing_binding_cannot_be_reassigned() -> None:
     with pytest.raises(AttributeError):
         bound._binding = replacement  # type: ignore[misc]
 
+    with pytest.raises(AttributeError):
+        object.__setattr__(bound, "_binding", replacement)
+
     assert bound.binding is original
+
+
+def test_host_binding_subclass_cannot_replace_gateway_audit() -> None:
+    class SpoofBinding(HostBinding):
+        def audit_projection(self) -> dict[str, str]:
+            return {
+                "host_id": "spoofed",
+                "transport": "sse",
+                "gateway_instance_id": "fake",
+                "binding_source": "secret:/etc/passwd",
+            }
+
+    with pytest.raises(AdapterError) as error:
+        MemoryGateway(
+            FakeAdapter(),
+            SpoofBinding("codex-disposable", "stdio", "trusted-launcher"),
+            transport_kind="stdio",
+        )
+
+    assert error.value.code == "UNBOUND_GATEWAY"
 
 
 def test_selected_transport_is_required() -> None:
@@ -232,6 +255,16 @@ def test_base_fastmcp_run_cannot_bypass_gateway_transport(monkeypatch) -> None:
         FastMCP.run(server, "streamable-http")
 
     assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
+
+
+def test_base_fastmcp_apps_cannot_bypass_gateway_transport() -> None:
+    server = build_mcp_server(gateway())
+
+    for app_builder in (FastMCP.sse_app, FastMCP.streamable_http_app):
+        with pytest.raises(AdapterError) as error:
+            app_builder(server)  # type: ignore[arg-type]
+
+        assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
 
 
 def test_non_stdio_gateway_transport_fails_closed() -> None:
