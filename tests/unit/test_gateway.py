@@ -195,6 +195,17 @@ def test_server_rejects_duck_typed_gateway() -> None:
     assert error.value.code == "UNBOUND_GATEWAY"
 
 
+def test_server_gateway_cannot_be_reassigned() -> None:
+    server = build_mcp_server(gateway())
+    replacement = gateway(host_id="hermes-disposable")
+
+    with pytest.raises(AttributeError):
+        server._gateway = replacement  # type: ignore[misc]
+
+    with pytest.raises(AttributeError):
+        del server._gateway  # type: ignore[misc]
+
+
 def test_server_run_transport_must_match_gateway_binding(monkeypatch) -> None:
     server = build_mcp_server(gateway())
 
@@ -205,6 +216,20 @@ def test_server_run_transport_must_match_gateway_binding(monkeypatch) -> None:
 
     with pytest.raises(AdapterError) as error:
         server.run("streamable-http")
+
+    assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
+
+
+def test_base_fastmcp_run_cannot_bypass_gateway_transport(monkeypatch) -> None:
+    server = build_mcp_server(gateway())
+
+    async def unexpected_transport_run(self: FastMCP) -> None:
+        pytest.fail("base FastMCP.run must not bypass gateway transport validation")
+
+    monkeypatch.setattr(FastMCP, "run_streamable_http_async", unexpected_transport_run)
+
+    with pytest.raises(AdapterError) as error:
+        FastMCP.run(server, "streamable-http")
 
     assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
 

@@ -14,8 +14,10 @@ STDIO_TRANSPORT = SUPPORTED_TRANSPORT_KIND
 
 
 class _BoundFastMCP(FastMCP):
+    __slots__ = ("__gateway",)
+
     def __init__(self, gateway: MemoryGateway) -> None:
-        self._gateway = gateway
+        object.__setattr__(self, "_BoundFastMCP__gateway", gateway)
         super().__init__(
             "factlane",
             instructions="Supporting memory only; never execution authority.",
@@ -23,9 +25,43 @@ class _BoundFastMCP(FastMCP):
             port=8000,
         )
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_BoundFastMCP__gateway" and hasattr(self, "_BoundFastMCP__gateway"):
+            raise AttributeError("server gateway is immutable")
+        super().__setattr__(name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name == "_BoundFastMCP__gateway":
+            raise AttributeError("server gateway is immutable")
+        super().__delattr__(name)
+
+    @property
+    def _gateway(self) -> MemoryGateway:
+        return self.__gateway
+
     def run(self, transport: str = STDIO_TRANSPORT, mount_path: str | None = None) -> None:
         self._gateway.require_transport(transport)
         super().run(transport, mount_path)  # type: ignore[arg-type]
+
+    async def run_stdio_async(self) -> None:
+        self._gateway.require_transport(STDIO_TRANSPORT)
+        await super().run_stdio_async()
+
+    async def run_sse_async(self, mount_path: str | None = None) -> None:
+        self._gateway.require_transport("sse")
+        await super().run_sse_async(mount_path)
+
+    async def run_streamable_http_async(self) -> None:
+        self._gateway.require_transport("streamable-http")
+        await super().run_streamable_http_async()
+
+    def sse_app(self, mount_path: str | None = None):
+        self._gateway.require_transport("sse")
+        return super().sse_app(mount_path)
+
+    def streamable_http_app(self):
+        self._gateway.require_transport("streamable-http")
+        return super().streamable_http_app()
 
 
 def build_mcp_server(gateway: MemoryGateway) -> FastMCP:
