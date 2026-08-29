@@ -8,20 +8,30 @@ from mcp.server.fastmcp import FastMCP
 
 from .adapter import PROFILE_DEFINITIONS, MemoryAdapter
 from .contract import AdapterError
-from .gateway import HostBinding, MemoryGateway
+from .gateway import SUPPORTED_TRANSPORT_KIND, HostBinding, MemoryGateway
 
-STDIO_TRANSPORT = "stdio"
+STDIO_TRANSPORT = SUPPORTED_TRANSPORT_KIND
+
+
+class _BoundFastMCP(FastMCP):
+    def __init__(self, gateway: MemoryGateway) -> None:
+        self._gateway = gateway
+        super().__init__(
+            "factlane",
+            instructions="Supporting memory only; never execution authority.",
+            host="127.0.0.1",
+            port=8000,
+        )
+
+    def run(self, transport: str = STDIO_TRANSPORT, mount_path: str | None = None) -> None:
+        self._gateway.require_transport(transport)
+        super().run(transport, mount_path)  # type: ignore[arg-type]
 
 
 def build_mcp_server(gateway: MemoryGateway) -> FastMCP:
     """Build only the five normal agent tools over a bound gateway."""
-    gateway.require_binding()
-    server = FastMCP(
-        "factlane",
-        instructions="Supporting memory only; never execution authority.",
-        host="127.0.0.1",
-        port=8000,
-    )
+    gateway.require_transport(STDIO_TRANSPORT)
+    server = _BoundFastMCP(gateway)
 
     @server.tool(name="memory_search", description="Search validated memory in one exact scope.")
     async def memory_search(request: dict[str, Any]) -> dict[str, Any]:

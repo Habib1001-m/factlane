@@ -11,6 +11,7 @@ from .adapter import MemoryAdapter
 from .contract import AdapterError, contains_sensitive
 
 _MAX_BINDING_BYTES = 128
+SUPPORTED_TRANSPORT_KIND = "stdio"
 _BINDING_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _RESERVED_IDENTITY_CLAIMS = frozenset(
     {
@@ -98,10 +99,19 @@ class MemoryGateway:
         if binding is not None and not isinstance(binding, HostBinding):
             raise AdapterError("UNBOUND_GATEWAY", "gateway binding is not valid")
         _validate_binding_value(transport_kind, "transport_kind")
+        if transport_kind != SUPPORTED_TRANSPORT_KIND:
+            raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "gateway transport is not supported")
         if binding is not None and binding.transport_kind != transport_kind:
             raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "gateway transport does not match its binding")
         self._adapter = adapter
         self._binding = binding
+
+    def require_transport(self, selected_transport: str) -> HostBinding:
+        _validate_binding_value(selected_transport, "transport_kind")
+        binding = self.require_binding()
+        if selected_transport != binding.transport_kind:
+            raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "selected transport does not match its binding")
+        return binding
 
     @property
     def binding(self) -> HostBinding | None:

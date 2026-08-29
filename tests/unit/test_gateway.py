@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from mcp.server.fastmcp import FastMCP
 
 from factlane.adapter import MemoryAdapter
 from factlane.contract import AdapterError
@@ -173,6 +174,29 @@ def test_matching_request_side_identity_is_still_not_authoritative() -> None:
 
 def test_selected_transport_must_match_bound_transport() -> None:
     binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
+
+    with pytest.raises(AdapterError) as error:
+        MemoryGateway(FakeAdapter(), binding, transport_kind="http")
+
+    assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
+
+
+def test_server_run_transport_must_match_gateway_binding(monkeypatch) -> None:
+    server = build_mcp_server(gateway())
+
+    def unexpected_run(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("mismatched transport must be rejected before FastMCP runs")
+
+    monkeypatch.setattr(FastMCP, "run", unexpected_run)
+
+    with pytest.raises(AdapterError) as error:
+        server.run("streamable-http")
+
+    assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
+
+
+def test_non_stdio_gateway_transport_fails_closed() -> None:
+    binding = HostBinding("codex-disposable", "http", "trusted-launcher")
 
     with pytest.raises(AdapterError) as error:
         MemoryGateway(FakeAdapter(), binding, transport_kind="http")
