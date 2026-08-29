@@ -1,7 +1,7 @@
 # FactLane Canonical Taskboard
 
 ```text
-TASKBOARD_VERSION=16
+TASKBOARD_VERSION=19
 TASKBOARD_UPDATE_MODE=IN_PLACE_APPEND_AND_RECONCILE
 CANONICAL_FILENAME=TASKBOARD.md
 NUMBERED_TASKBOARD_FILES_FUTURE_AUTHORITY=NO
@@ -589,6 +589,70 @@ FINAL_HEAD_REVIEWER=HOLD
 FINAL_HEAD_REVIEW_FINDING=INNER_FASTMCP_CLOSURE_RECOVERY_TRANSPORT_BYPASS
 PR5_INNER_FASTMCP_STATE_REMEDIATION=7241c6fedde3a873084c6dad81bdb077ade331de
 BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_POST_REMEDIATION_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_REVIEW
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-30 — Fresh reviewer HOLD and mutable authority surface remediation
+
+The fresh bounded reviewer examined exact candidate
+`c0b95f7df33b9705ad33f33e1f77b552f2904043` and found three identity/transport
+bypasses: nested tool callback closure replacement could forge responses,
+transport constants were rebindable module globals, and the operation routing
+map plus `HostBinding` class properties were mutable import-reachable authority.
+The follow-up removes callback closures and mutable transport/operation policy
+names, locks the gateway-bound classes, and preserves the exact five-tool stdio
+path. A new fresh review must inspect the exact post-remediation head. It does
+not merge PR #5, close PR #4, start 4C-03, or authorize later runtime mutation.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=c0b95f7df33b9705ad33f33e1f77b552f2904043
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDINGS=CALLBACK_CLOSURE_REPLACEMENT_MUTABLE_TRANSPORT_CONSTANTS_OPERATION_MAP_HOSTBINDING_CLASS_ATTRIBUTES
+PR5_AUTHORITY_SURFACE_REMEDIATION=f112cf004ead6789bedf61ebe323d6e656444fe4
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_POST_REMEDIATION_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_REVIEW
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-30 — Authority surface hardening candidate
+
+After the HOLD on `c0b95f7df33b9705ad33f33e1f77b552f2904043`, the authority
+surface remediation was consolidated in `fbd2742942c9825f0d90809af3ce6837e8ab2a50`.
+The gateway now uses inline fixed operation routing and literal stdio checks;
+the server stores only immutable operation specifications, creates inner
+`FastMCP` state only inside the guarded stdio run path, and tool callbacks use
+tuple-backed gateway/operation state without nested dispatch closures. Binding
+field reads remain tuple-authoritative even after low-level class descriptor
+replacement. A new fresh bounded security review must inspect the exact pushed
+head. No merge, PR #4 closure, 4C-03 start, or later runtime mutation is
+authorized.
+
+```text
+PR_NUMBER=5
+PR5_AUTHORITY_SURFACE_REMEDIATION=fbd2742942c9825f0d90809af3ce6837e8ab2a50
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_FINAL_REVIEW
 BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_REVIEW
 FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
 S6B_4C=IN_PROGRESS
