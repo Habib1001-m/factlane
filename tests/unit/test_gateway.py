@@ -124,6 +124,25 @@ def test_host_binding_subclass_cannot_replace_gateway_audit() -> None:
     assert error.value.code == "UNBOUND_GATEWAY"
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("bound_host_id", "spoofed"),
+        ("transport_kind", "sse"),
+        ("gateway_instance_id", "forged"),
+        ("binding_source", "secret-path"),
+    ],
+)
+def test_binding_fields_cannot_be_reassigned_by_object_setattr(field: str, replacement: str) -> None:
+    binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
+    original = getattr(binding, field)
+
+    with pytest.raises(AttributeError):
+        object.__setattr__(binding, field, replacement)
+
+    assert getattr(binding, field) == original
+
+
 def test_selected_transport_is_required() -> None:
     binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
 

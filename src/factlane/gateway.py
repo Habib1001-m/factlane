@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
+from collections import namedtuple
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from dataclasses import dataclass, field
-from typing import Any, cast
+from dataclasses import FrozenInstanceError
+from typing import Any, Self, cast
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
@@ -50,20 +51,36 @@ def _validate_binding_value(value: object, field: str) -> str:
     return value
 
 
-@dataclass(frozen=True, slots=True)
-class HostBinding:
+_HostBindingTuple = namedtuple(
+    "_HostBindingTuple",
+    ("bound_host_id", "transport_kind", "binding_source", "gateway_instance_id"),
+)
+
+
+class HostBinding(_HostBindingTuple):
     """Immutable, trusted transport binding for one gateway instance."""
 
-    bound_host_id: str
-    transport_kind: str
-    binding_source: str
-    gateway_instance_id: str = field(init=False)
+    __slots__ = ()
 
-    def __post_init__(self) -> None:
-        _validate_binding_value(self.bound_host_id, "bound_host_id")
-        _validate_binding_value(self.transport_kind, "transport_kind")
-        _validate_binding_value(self.binding_source, "binding_source")
-        object.__setattr__(self, "gateway_instance_id", uuid4().hex)
+    def __new__(
+        cls,
+        bound_host_id: object,
+        transport_kind: object,
+        binding_source: object,
+    ) -> Self:
+        return super().__new__(
+            cls,
+            _validate_binding_value(bound_host_id, "bound_host_id"),
+            _validate_binding_value(transport_kind, "transport_kind"),
+            _validate_binding_value(binding_source, "binding_source"),
+            uuid4().hex,
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError(f"cannot delete field {name!r}")
 
     def audit_projection(self) -> dict[str, str]:
         return {
