@@ -18,12 +18,8 @@ class _BoundFastMCP(tuple):
 
     __slots__ = ()
 
-    def __new__(cls, gateway: MemoryGateway, inner: FastMCP) -> Self:
-        def invoke(method_name: str, *args: Any, **kwargs: Any) -> Any:
-            member = getattr(inner, method_name)
-            return member(*args, **kwargs) if callable(member) else member
-
-        return tuple.__new__(cls, (gateway, invoke))
+    def __new__(cls, gateway: MemoryGateway, tools: tuple[tuple[str, str, Any], ...]) -> Self:
+        return tuple.__new__(cls, (gateway, tools))
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         raise TypeError("_BoundFastMCP cannot be subclassed")
@@ -47,59 +43,81 @@ class _BoundFastMCP(tuple):
     def _gateway(self) -> MemoryGateway:
         return tuple.__getitem__(self, 0)
 
+    def _require_transport(self, selected_transport: str) -> None:
+        gateway = self._gateway
+        if type(gateway) is not MemoryGateway:
+            raise AdapterError("UNBOUND_GATEWAY", "server gateway is not valid")
+        gateway.require_transport(selected_transport)
+
+    def _tool_specs(self) -> tuple[tuple[str, str, Any], ...]:
+        return tuple.__getitem__(self, 1)
+
     @property
     def settings(self) -> Any:
-        self._gateway.require_transport("sse")
-        return _call_inner(self, "settings")
+        self._require_transport("sse")
+        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "SSE is not supported")
 
     @property
     def _session_manager(self) -> Any:
-        self._gateway.require_transport("streamable-http")
-        return _call_inner(self, "_session_manager")
+        self._require_transport("streamable-http")
+        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "streamable HTTP is not supported")
 
     @property
     def _mcp_server(self) -> Any:
-        self._gateway.require_transport(STDIO_TRANSPORT)
-        return _call_inner(self, "_mcp_server")
+        raise AdapterError("UNBOUND_GATEWAY", "base FastMCP dispatch is not available")
 
     def tool_names(self) -> list[str]:
-        return sorted(_call_inner(self, "_tool_manager")._tools)
+        return sorted(name for name, _, _ in self._tool_specs())
 
     def _tool_function(self, name: str) -> Any:
-        return _call_inner(self, "_tool_manager")._tools[name].fn
+        for tool_name, _, handler in self._tool_specs():
+            if tool_name == name:
+                return handler
+        raise KeyError(name)
 
     def sse_app(self, mount_path: str | None = None) -> Any:
-        self._gateway.require_transport("sse")
-        return _call_inner(self, "sse_app", mount_path)
+        self._require_transport("sse")
+        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "SSE is not supported")
 
     def streamable_http_app(self) -> Any:
-        self._gateway.require_transport("streamable-http")
-        return _call_inner(self, "streamable_http_app")
+        self._require_transport("streamable-http")
+        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "streamable HTTP is not supported")
 
     def _normalize_path(self, mount_path: str, path: str) -> str:
-        self._gateway.require_transport("sse")
-        return _call_inner(self, "_normalize_path", mount_path, path)
+        self._require_transport("sse")
+        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "SSE is not supported")
 
     def run(self, transport: str = STDIO_TRANSPORT, mount_path: str | None = None) -> None:
-        self._gateway.require_transport(transport)
-        _call_inner(self, "run", transport, mount_path)
+        self._require_transport(transport)
+        inner = FastMCP(
+            "factlane",
+            instructions="Supporting memory only; never execution authority.",
+            host="127.0.0.1",
+            port=8000,
+        )
+        for name, description, handler in self._tool_specs():
+            inner.tool(name=name, description=description)(handler)
+        inner.run(transport, mount_path)
 
     async def run_stdio_async(self) -> None:
-        self._gateway.require_transport(STDIO_TRANSPORT)
-        await _call_inner(self, "run_stdio_async")
+        self._require_transport(STDIO_TRANSPORT)
+        inner = FastMCP(
+            "factlane",
+            instructions="Supporting memory only; never execution authority.",
+            host="127.0.0.1",
+            port=8000,
+        )
+        for name, description, handler in self._tool_specs():
+            inner.tool(name=name, description=description)(handler)
+        await inner.run_stdio_async()
 
     async def run_sse_async(self, mount_path: str | None = None) -> None:
-        self._gateway.require_transport("sse")
-        await _call_inner(self, "run_sse_async", mount_path)
+        self._require_transport("sse")
+        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "SSE is not supported")
 
     async def run_streamable_http_async(self) -> None:
-        self._gateway.require_transport("streamable-http")
-        await _call_inner(self, "run_streamable_http_async")
-
-
-def _call_inner(server: _BoundFastMCP, method_name: str, *args: Any, **kwargs: Any) -> Any:
-    invoke = tuple.__getitem__(server, 1)
-    return invoke(method_name, *args, **kwargs)
+        self._require_transport("streamable-http")
+        raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "streamable HTTP is not supported")
 
 
 def build_mcp_server(gateway: MemoryGateway) -> _BoundFastMCP:
@@ -107,35 +125,36 @@ def build_mcp_server(gateway: MemoryGateway) -> _BoundFastMCP:
     if type(gateway) is not MemoryGateway:
         raise AdapterError("UNBOUND_GATEWAY", "gateway is not a valid memory gateway")
     gateway.require_transport(STDIO_TRANSPORT)
-    inner = FastMCP(
-        "factlane",
-        instructions="Supporting memory only; never execution authority.",
-        host="127.0.0.1",
-        port=8000,
-    )
-    server = _BoundFastMCP(gateway, inner)
+    async def dispatch(operation: str, request: dict[str, Any]) -> dict[str, Any]:
+        if type(gateway) is not MemoryGateway:
+            raise AdapterError("UNBOUND_GATEWAY", "server gateway is not valid")
+        return await gateway.dispatch(operation, request)
 
-    @inner.tool(name="memory_search", description="Search validated memory in one exact scope.")
     async def memory_search(request: dict[str, Any]) -> dict[str, Any]:
-        return await gateway.dispatch("memory_search", request)
+        return await dispatch("memory_search", request)
 
-    @inner.tool(name="memory_get", description="Get one logical memory record in one exact scope.")
     async def memory_get(request: dict[str, Any]) -> dict[str, Any]:
-        return await gateway.dispatch("memory_get", request)
+        return await dispatch("memory_get", request)
 
-    @inner.tool(name="memory_store", description="Admit one bounded, provenance-bearing memory candidate.")
     async def memory_store(request: dict[str, Any]) -> dict[str, Any]:
-        return await gateway.dispatch("memory_store", request)
+        return await dispatch("memory_store", request)
 
-    @inner.tool(name="memory_update", description="Reverify or explicitly replace one logical memory record.")
     async def memory_update(request: dict[str, Any]) -> dict[str, Any]:
-        return await gateway.dispatch("memory_update", request)
+        return await dispatch("memory_update", request)
 
-    @inner.tool(name="memory_status", description="Return bounded backend/profile status for one scope.")
     async def memory_status(request: dict[str, Any]) -> dict[str, Any]:
-        return await gateway.dispatch("memory_status", request)
+        return await dispatch("memory_status", request)
 
-    return server
+    return _BoundFastMCP(
+        gateway,
+        (
+            ("memory_search", "Search validated memory in one exact scope.", memory_search),
+            ("memory_get", "Get one logical memory record in one exact scope.", memory_get),
+            ("memory_store", "Admit one bounded, provenance-bearing memory candidate.", memory_store),
+            ("memory_update", "Reverify or explicitly replace one logical memory record.", memory_update),
+            ("memory_status", "Return bounded backend/profile status for one scope.", memory_status),
+        ),
+    )
 
 
 def main(argv: list[str] | None = None) -> None:

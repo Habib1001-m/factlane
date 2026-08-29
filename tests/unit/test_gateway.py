@@ -120,6 +120,18 @@ def test_server_authority_has_no_mutable_module_registry() -> None:
     assert getattr(server_module, "_BOUND_SERVER_STATE", None) is None
 
 
+def test_server_state_does_not_retain_inner_fastmcp() -> None:
+    server = build_mcp_server(gateway())
+    state = tuple.__getitem__(server, 1)
+
+    assert not isinstance(state, FastMCP)
+    if callable(state):
+        assert not any(
+            isinstance(cell.cell_contents, FastMCP)
+            for cell in state.__closure__ or ()
+        )
+
+
 def test_host_binding_subclass_cannot_replace_gateway_audit() -> None:
     class SpoofBinding(HostBinding):
         def audit_projection(self) -> dict[str, str]:
