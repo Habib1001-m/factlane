@@ -123,7 +123,8 @@ def test_safe_serialization_is_bounded_before_output(tmp_path) -> None:
     assert isinstance(actor, str)
     assert len(actor) <= 512
     assert SECRET not in actor
-    assert "ghp_" not in actor
+    github_token_prefix = "gh" + "p_"
+    assert github_token_prefix not in actor
 
 
 def test_missing_or_invalid_owner_context_fails_closed(tmp_path) -> None:
@@ -372,3 +373,20 @@ def test_render_neutralizes_multiline_report_values(tmp_path) -> None:
     rendered = report.render()
     assert "ACTOR=HERMES INJECTED=TRUE" in rendered
     assert "\nINJECTED=TRUE" not in rendered
+
+
+def test_missing_git_binary_fails_closed_even_with_valid_owner_probe(tmp_path, monkeypatch) -> None:
+    owner_home = tmp_path / "owner-home"
+    owner_home.mkdir()
+    monkeypatch.setattr(execution_context.shutil, "which", lambda name: "gh" if name == "gh" else None)
+
+    report = run_preflight(
+        cwd=make_repo(tmp_path),
+        owner_home=owner_home,
+        auth_probe=lambda _home: True,
+    )
+
+    assert report.git_binary is None
+    assert report.repository_failure_class == "GIT_BINARY_MISSING"
+    assert report.owner_context_github_auth_ready is True
+    assert report.status == "HOLD"

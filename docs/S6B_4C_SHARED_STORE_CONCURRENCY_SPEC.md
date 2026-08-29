@@ -5,7 +5,7 @@
 ```text
 SPEC_STATUS=OWNER_AUTHORIZED_IN_PROGRESS
 OWNER_AUTHORIZATION_DATE=2026-08-29
-CURRENT_SLICE=S6B_4C_01_ENTRY_PREFLIGHT_AND_HARNESS_FOUNDATION
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
 ```
 
 This specification defines the bounded S6B.4C campaign. It is not authorization to begin a later slice. Each slice has its own implementation and verification gate.
@@ -25,7 +25,17 @@ The campaign is limited to these slices, in order:
 5. **4C-05 — Async embedding concurrency and pinned-backend runtime proof**
 6. **4C-06 — Process/crash injection and final acceptance**
 
-The current implementation slice is 4C-01 only. In particular, 4C-01 must not implement concurrent writes, shared gateway transport, multi-client CAS, crash injection, or embedding concurrency.
+4C-01 is CLOSED_PASS. The current implementation slice is 4C-02 only. 4C-02 must not implement atomic multi-client CAS, lost-update prevention, concurrent writers, crash injection, or embedding concurrency; those remain later campaign slices.
+
+```text
+4C-01=CLOSED_PASS
+4C-02=CURRENT
+4C-03=NOT_STARTED
+4C-04=NOT_STARTED
+4C-05=NOT_STARTED
+4C-06=NOT_STARTED
+```
+
 
 ## Explicitly out of scope
 
@@ -146,3 +156,93 @@ GLOBAL_MCP_REGISTRATION=NONE
 ```
 
 A passing 4C-01 gate authorizes neither the next campaign slice nor any native-memory mutation.
+
+## 4C-02 contract: transport-bound host identity and shared gateway
+
+4C-02 establishes one project-neutral gateway boundary between a selected transport and
+the existing `MemoryAdapter`. It proves request/transport identity separation and an
+immutable per-gateway binding. It does not claim cryptographic principal authentication.
+
+The authoritative binding is created at trusted gateway/server construction, outside the
+MCP request payload:
+
+```text
+HostBinding (immutable)
+  BOUND_HOST_ID=<explicit trusted launcher value>
+  TRANSPORT_KIND=<selected transport implementation, currently stdio>
+  GATEWAY_INSTANCE_ID=<internally generated per gateway instance>
+  BINDING_SOURCE=<bounded non-secret construction source>
+```
+
+The binding rules are:
+
+- `BOUND_HOST_ID` is explicit trusted launcher configuration only; it is never derived
+  from `HOME`, hostname, cwd, username, credentials, or request data.
+- `TRANSPORT_KIND=stdio` comes from the server's selected transport path, not a request
+  field. A future transport must bind its own implementation kind.
+- `GATEWAY_INSTANCE_ID` is generated internally and remains immutable for that gateway.
+- Missing, empty, non-string, oversized, newline/control-bearing, or sensitive binding
+  values fail closed. No token, credential path, environment dump, or full config path
+  may enter a binding or audit envelope.
+- `BOUND_HOST_IDENTITY` and `MEMORY_SCOPE_AGENT_ID` are separate domains. The gateway
+  neither rewrites nor authorizes the adapter's `scope.agent_id`.
+
+The gateway rejects, rather than ignores, top-level request identity claims including
+`host_id`, `bound_host_id`, `host_identity`, `transport_identity`,
+`gateway_instance_id`, and `runtime_agent_id`. Stable bounded errors are
+`HOST_IDENTITY_CLAIM_DENIED`, `HOST_TRANSPORT_IDENTITY_MISMATCH`, or
+`UNBOUND_GATEWAY`; the implementation must use these names consistently.
+
+A gateway without a valid immutable binding cannot dispatch an operation. A successful
+adapter response receives an audit projection such as:
+
+```text
+audit.host_binding = {
+  host_id: <bounded non-secret bound value>,
+  transport: "stdio",
+  gateway_instance_id: <bounded opaque value>,
+  binding_source: <bounded non-secret value>
+}
+```
+
+The projection is gateway-owned, immutable per instance, and never copied from request
+metadata. The public MCP tool set remains exactly the five adapter operations:
+`memory_search`, `memory_get`, `memory_store`, `memory_update`, and `memory_status`.
+No identity/admin/login/registration tool is added. Existing disposable MCP acceptance probes must pass an explicit non-secret host id; they may not rely on a HOME, hostname, cwd, or request-derived fallback.
+
+### 4C-02 disposable proof and acceptance
+
+Use two separately bound gateway instances (`codex-disposable` and
+`hermes-disposable`) against one disposable FactLane store. Prove sequentially that A's
+committed record is read by B, B's response audit identifies B, A's response audit
+identifies A, and the requested memory scope including `scope.agent_id` remains unchanged.
+This is `POST_COMMIT_VISIBILITY=PASS_SEQUENTIAL_FOUNDATION` only.
+
+It must not be reported as `MULTI_CLIENT_CONCURRENCY`, `ATOMIC_CAS`, or
+`LOST_UPDATE_PREVENTION`; no simultaneous writers, locks, CAS rewrite, crash injection,
+or concurrent write campaign are permitted in 4C-02.
+
+Mandatory tests cover unbound startup/dispatch, request identity denial and mismatch,
+immutable bindings, distinct gateway IDs, host/scope-agent separation, audit provenance,
+sequential shared-store visibility, exactly five public tools, secret/config/environment
+exclusion, and the carried `MISSING_GIT_BINARY_EXPLICIT_REGRESSION_TEST` from 4C-01.
+
+### 4C-02 TDD and verification boundary
+
+Write the gateway tests before production implementation and observe the expected RED
+failures. Then implement the smallest gateway/server seam over the existing adapter.
+The required checks are:
+
+```bash
+git diff --check
+uv run ruff check .
+uv run pytest tests/unit/test_execution_context.py -q
+uv run pytest tests/unit/test_gateway.py -q
+uv run pytest -q
+uv run python -c "import factlane; print(factlane.__name__)"
+uv run factlane --help
+```
+
+The 4C-02 evidence root is `.factlane-local/evidence/s6b4c-02/` and remains ignored.
+No native memory, live Codex/Hermes configuration, global MCP registration, backend pin,
+embedding identity, schema, or `uv.lock` may change.

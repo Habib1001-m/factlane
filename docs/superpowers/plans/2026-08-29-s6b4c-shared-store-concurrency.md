@@ -2,31 +2,34 @@
 
 > **For Hermes:** Execute this plan task-by-task with strict TDD. Do not start a later slice until its predecessor is verified and the Owner/Advisor gate is clear.
 
-**Goal:** Establish a portable, fail-closed execution-context preflight and disposable harness before implementing any shared-store concurrency behavior.
+**Goal:** Establish a portable, immutable transport-bound host identity and one shared gateway over the existing five-operation `MemoryAdapter`, with a disposable sequential cross-gateway visibility proof. Do not implement atomic CAS, lost-update prevention, or concurrent writers in this slice.
 
-**Architecture:** Keep 4C-01 at the host edge. A small Python module reports exact repository, binary, HOME, and context-scoped auth facts without copying or exposing credentials. A read-only native-memory capacity gate is represented explicitly and remains closed when no trustworthy host primitive exists. Later concurrency slices consume this foundation; they are not implemented in this plan execution.
+**Architecture:** Keep identity at the trusted transport/server construction boundary. A small project-neutral `HostBinding` is created outside MCP request payloads, then an immutable `MemoryGateway` validates request identity claims, dispatches to the existing adapter, and adds a bounded non-secret host-binding audit projection. The stdio server supplies `TRANSPORT_KIND=stdio`; no host identity is derived from HOME, hostname, cwd, username, credentials, or `runtime_agent_id`.
 
-**Tech Stack:** Python 3.11+, stdlib subprocess/pathlib/shutil/argparse, pytest, existing FactLane package and lockfile.
+**Tech Stack:** Python 3.11+, stdlib dataclasses/uuid/argparse, existing FastMCP server, existing FactLane adapter/storage/contract, pytest, and the existing lockfile.
 
 ---
 
 ## Scope guard
 
-This execution covers 4C-01 only:
-
-```text
-4C-01 execution-context + entry harness
-```
-
-The campaign order is documented for future work but not executed here:
+This execution covers 4C-02 only:
 
 ```text
 4C-02 transport-bound host identity / shared gateway
-4C-03 atomic multi-client revision/CAS + lost-update prevention
-4C-04 Codex/Hermes disposable shared-store concurrency
-4C-05 async embedding concurrency + pinned-backend runtime proof
-4C-06 process/crash injection + final acceptance
 ```
+
+4C-01 is CLOSED_PASS. The campaign boundary remains:
+
+```text
+4C-01 CLOSED_PASS
+4C-02 CURRENT
+4C-03 NOT_STARTED
+4C-04 NOT_STARTED
+4C-05 NOT_STARTED
+4C-06 NOT_STARTED
+```
+
+4C-03 atomic multi-client revision/CAS, lost-update prevention, simultaneous writers, crash injection, and any new coordination mechanism are forbidden here.
 
 Do not implement retention/compaction/reclaim/recovery (S6B.4D), native-memory bootstrap or migration (S6B.5), live configuration, registration, backend-pin changes, embedding-model changes, or reopening accepted 4B results.
 
@@ -229,6 +232,132 @@ git commit -m "feat: add S6B.4C execution context preflight"
 ```
 
 Push only the task branch with the explicit Owner GitHub context. Open a PR with base `main`, report the exact head SHA and CI status, and stop for Owner/Advisor review. Do not self-approve or merge.
+
+## Current execution: S6B.4C-02 transport-bound host identity and shared gateway
+
+### Task 9: Write the 4C-02 RED contract tests
+
+**Objective:** Define the immutable binding, request-claim denial, host/scope separation, bounded audit, unbound fail-closed behavior, public five-tool surface, disposable sequential visibility, secret exclusion, and carried missing-Git regression before production code.
+
+**Files:**
+- Create: `tests/unit/test_gateway.py`
+- Modify: `tests/unit/test_execution_context.py` only for `MISSING_GIT_BINARY_EXPLICIT_REGRESSION_TEST`
+
+**Required cases:**
+
+- unbound gateway fails closed;
+- invalid/empty/oversized/control-bearing/sensitive binding fails closed;
+- request cannot override a bound host identity, including a matching fake claim;
+- transport/host mismatch fails closed;
+- binding and audit are immutable for the gateway lifetime;
+- separate gateway instances receive distinct internally generated IDs;
+- host identity never becomes `scope.agent_id`, and the scope remains unchanged;
+- audit host binding is gateway-owned and excludes request identity, secrets, config, and environment material;
+- one disposable store is sequentially visible across two differently bound gateways;
+- exactly five public tools remain and no identity/admin tool appears;
+- missing Git binary regression remains fail-closed.
+
+**RED verification:**
+
+```bash
+uv run pytest tests/unit/test_gateway.py -q
+```
+
+Expected: collection/import failure for the not-yet-created gateway contract, plus the explicit missing-Git regression failing if its production behavior is absent. Fix only test setup errors before implementation.
+
+### Task 10: Implement the immutable HostBinding
+
+**Objective:** Add the smallest validated frozen binding value object with bounded non-secret fields and an internal gateway instance identity.
+
+**Files:**
+- Create: `src/factlane/gateway.py`
+
+**Constraints:**
+
+- explicit trusted `bound_host_id` and `binding_source` only;
+- `transport_kind` is selected by the gateway/server implementation (`stdio` in this slice);
+- never derive identity from request payload, HOME, hostname, cwd, username, credentials, or `runtime_agent_id`;
+- reject non-string, empty, oversized, newline/control-bearing, or sensitive values;
+- generate `gateway_instance_id` internally and expose it read-only;
+- no cryptographic principal-authentication claim.
+
+**Verification:**
+
+```bash
+uv run pytest tests/unit/test_gateway.py::test_binding_validation_and_immutability -q
+```
+
+### Task 11: Implement the shared gateway dispatch boundary
+
+**Objective:** Wrap the existing `MemoryAdapter` without changing its scope semantics or adding tools.
+
+**Files:**
+- Modify: `src/factlane/gateway.py`
+
+**Constraints:**
+
+- reject reserved top-level identity claims with bounded `AdapterError` codes;
+- reject an unbound gateway before adapter dispatch;
+- dispatch only the existing five operation names;
+- copy the adapter response before adding `audit.host_binding` so the adapter remains transport-neutral;
+- add only bounded, non-secret, gateway-owned host-binding audit data;
+- do not mutate adapter scope or payload identity.
+
+**Verification:**
+
+```bash
+uv run pytest tests/unit/test_gateway.py -q
+```
+
+### Task 12: Wire the stdio server through the gateway
+
+**Objective:** Require explicit startup binding and use the shared gateway as the sole server dispatch layer while preserving exactly five MCP tools.
+
+**Files:**
+- Modify: `src/factlane/server.py`
+- Modify: `tests/acceptance/s6b4b_pilot.py`
+
+**Constraints:**
+
+- add a narrow required `--host-id` launcher argument and optional bounded `--binding-source`;
+- build `HostBinding(..., transport_kind="stdio", ...)` in server construction, not from request fields;
+- missing/invalid host binding fails closed before an operational server starts;
+- existing disposable MCP acceptance probes pass an explicit non-secret host id;
+- use the gateway for all five tool handlers;
+- do not add identity/admin/login/register tools or alter `MemoryAdapter.tool_names()`.
+
+**Verification:**
+
+```bash
+uv run factlane --help
+uv run pytest tests/unit/test_gateway.py -q
+```
+
+### Task 13: Prove disposable sequential visibility and final scope
+
+**Objective:** Run two separately bound gateway instances against one disposable FactLane adapter/store and prove only sequential post-commit visibility.
+
+**Files:**
+- Modify: `tests/unit/test_gateway.py`
+- Create locally only: `.factlane-local/evidence/s6b4c-02/`
+
+**Verification:**
+
+```text
+POST_COMMIT_VISIBILITY=PASS_SEQUENTIAL_FOUNDATION
+CONCURRENT_WRITE_TEST_RUN=NO
+ATOMIC_CAS_IMPLEMENTATION=NONE
+LOST_UPDATE_CAMPAIGN=NOT_STARTED
+NATIVE_MEMORY_MUTATION=NONE
+LIVE_CODEX_CONFIG_MUTATION=NONE
+LIVE_HERMES_CONFIG_MUTATION=NONE
+GLOBAL_MCP_REGISTRATION=NONE
+BACKEND_PIN_CHANGE=NONE
+EMBEDDING_CHANGE=NONE
+UV_LOCK_CHANGE=NONE
+```
+
+Then run the complete repository gate, record raw output only under the ignored evidence root, and leave the branch for one fresh bounded independent reviewer before commit.
 
 ## Later-slice handoff notes (not executed here)
 
