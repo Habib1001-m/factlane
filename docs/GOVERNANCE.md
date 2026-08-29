@@ -5,16 +5,40 @@
 ```text
 repo truth
 -> TASKBOARD.md
--> task branch / isolated worktree
--> implementation
--> tests and bounded evidence
--> review
+-> fresh/synchronized main
+-> hermes/<task>
+-> implementation/docs/tests
+-> bounded evidence
 -> commit
--> TASKBOARD/docs reconciliation
--> merge
+-> push task branch
+-> pull request
+-> CI
+-> Owner/Advisor review
+-> merge by Owner/Advisor
+-> TASKBOARD reconciliation
 ```
 
 `TASKBOARD.md` is the one live project board. Its version is an internal field. Never create a new numbered taskboard file per cycle.
+
+## Hermes change governance
+
+```text
+NO_DIRECT_PUSH_TO_MAIN_BY_EXECUTION_AGENTS=TRUE
+HERMES_DIRECT_PUSH_TO_ORIGIN_MAIN=FORBIDDEN
+HERMES_DIRECT_PUSH_TO_MAIN=FORBIDDEN
+HERMES_FORCE_PUSH=FORBIDDEN
+HERMES_MAIN_DEVELOPMENT=FORBIDDEN
+HERMES_WORK_BRANCH_PREFIX=hermes/
+TASK_BRANCH_REQUIRED=TRUE
+PR_REQUIRED=TRUE
+CI_BEFORE_MERGE=TRUE
+OWNER_OR_ADVISOR_MERGE_GATE=REQUIRED
+SAME_ACCOUNT_PR_DOES_NOT_EQUAL_INDEPENDENT_REVIEW=TRUE
+```
+
+Execution agents use a task branch and a pull request; they do not push directly to `main`, force-push, self-approve, invent a second reviewer identity, or bypass protection. A pull request from the single GitHub account currently in use is not an independent identity approval (`PR != independent identity approval`), but it remains the change boundary for scope, diff, CI, audit trail, and Owner/Advisor review. Independent decision review is performed outside the GitHub approval identity against the same PR head SHA. Hermes opens the PR, returns evidence, and stops; Owner/Advisor performs the merge.
+
+See [WORKFLOW_TEMPLATE.md](WORKFLOW_TEMPLATE.md) for an adaptable user-facing example. It is a template, not a prescription.
 
 ## Operating principles
 
