@@ -30,6 +30,8 @@ class _BoundFastMCP(FastMCP):
 
 def build_mcp_server(gateway: MemoryGateway) -> FastMCP:
     """Build only the five normal agent tools over a bound gateway."""
+    if type(gateway) is not MemoryGateway:
+        raise AdapterError("UNBOUND_GATEWAY", "gateway is not a valid memory gateway")
     gateway.require_transport(STDIO_TRANSPORT)
     server = _BoundFastMCP(gateway)
 

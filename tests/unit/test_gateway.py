@@ -181,6 +181,20 @@ def test_selected_transport_must_match_bound_transport() -> None:
     assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
 
 
+def test_server_rejects_duck_typed_gateway() -> None:
+    class DuckGateway:
+        def require_transport(self, selected_transport: str) -> None:
+            return None
+
+        async def dispatch(self, operation: str, request: dict[str, Any]) -> dict[str, Any]:
+            return {"status": "OK"}
+
+    with pytest.raises(AdapterError) as error:
+        build_mcp_server(DuckGateway())  # type: ignore[arg-type]
+
+    assert error.value.code == "UNBOUND_GATEWAY"
+
+
 def test_server_run_transport_must_match_gateway_binding(monkeypatch) -> None:
     server = build_mcp_server(gateway())
 
