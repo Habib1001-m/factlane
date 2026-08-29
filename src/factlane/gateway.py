@@ -83,6 +83,11 @@ class MemoryGateway:
             raise AttributeError("gateway binding is immutable")
         object.__setattr__(self, name, value)
 
+    def __delattr__(self, name: str) -> None:
+        if name == "_binding":
+            raise AttributeError("gateway binding is immutable")
+        object.__delattr__(self, name)
+
     def __init__(
         self,
         adapter: Any,

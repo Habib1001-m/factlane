@@ -92,6 +92,9 @@ def test_gateway_backing_binding_cannot_be_reassigned() -> None:
     replacement = HostBinding("hermes-disposable", "stdio", "trusted-launcher")
 
     with pytest.raises(AttributeError):
+        del bound._binding  # type: ignore[misc]
+
+    with pytest.raises(AttributeError):
         bound._binding = replacement  # type: ignore[misc]
 
     assert bound.binding is original
