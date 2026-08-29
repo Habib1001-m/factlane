@@ -101,7 +101,11 @@ def test_gateway_backing_binding_cannot_be_reassigned() -> None:
     with pytest.raises(AttributeError):
         object.__setattr__(bound, "_binding", replacement)
 
-    assert bound.binding is original
+    assert original is not None
+    assert bound.binding is not None
+    assert bound.binding.bound_host_id == original.bound_host_id
+    assert bound.binding.transport_kind == original.transport_kind
+    assert bound.binding.gateway_instance_id == original.gateway_instance_id
 
 
 def test_host_binding_subclass_cannot_replace_gateway_audit() -> None:
@@ -141,6 +145,41 @@ def test_binding_fields_cannot_be_reassigned_by_object_setattr(field: str, repla
         object.__setattr__(binding, field, replacement)
 
     assert getattr(binding, field) == original
+
+
+def test_gateway_binding_remains_authoritative_after_binding_class_mutation() -> None:
+    class SpoofBinding(HostBinding):
+        __slots__ = ()
+
+        @property
+        def transport_kind(self) -> str:
+            return "sse"
+
+        def audit_projection(self) -> dict[str, str]:
+            return {
+                "host_id": "spoofed",
+                "transport": "sse",
+                "gateway_instance_id": "forged",
+                "binding_source": "secret-path",
+            }
+
+    binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
+    bound = MemoryGateway(FakeAdapter(), binding, transport_kind="stdio")
+    object.__setattr__(binding, "__class__", SpoofBinding)
+
+    response = asyncio.run(bound.dispatch("memory_status", {"scope": "PROJECT", "project_id": "p"}))
+
+    assert response["audit"]["host_binding"] == {
+        "host_id": "codex-disposable",
+        "transport": "stdio",
+        "gateway_instance_id": bound.binding.gateway_instance_id if bound.binding else None,
+        "binding_source": "trusted-launcher",
+    }
+    assert bound.require_transport("stdio").transport_kind == "stdio"
+    with pytest.raises(AdapterError) as error:
+        bound.require_transport("sse")
+
+    assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
 
 
 def test_selected_transport_is_required() -> None:

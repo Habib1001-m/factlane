@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import re
-from collections import namedtuple
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
-from typing import Any, Self, cast
+from typing import Any, cast
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
@@ -51,25 +50,18 @@ def _validate_binding_value(value: object, field: str) -> str:
     return value
 
 
-_HostBindingTuple = namedtuple(
-    "_HostBindingTuple",
-    ("bound_host_id", "transport_kind", "binding_source", "gateway_instance_id"),
-)
+_BINDING_VALUES: WeakKeyDictionary[object, tuple[str, str, str, str]] = WeakKeyDictionary()
 
 
-class HostBinding(_HostBindingTuple):
+class HostBinding:
     """Immutable, trusted transport binding for one gateway instance."""
 
-    __slots__ = ()
+    __slots__ = ("__weakref__",)
 
-    def __new__(
-        cls,
-        bound_host_id: object,
-        transport_kind: object,
-        binding_source: object,
-    ) -> Self:
-        return super().__new__(
-            cls,
+    def __init__(self, bound_host_id: object, transport_kind: object, binding_source: object) -> None:
+        if self in _BINDING_VALUES:
+            raise FrozenInstanceError("host binding is already initialized")
+        _BINDING_VALUES[self] = (
             _validate_binding_value(bound_host_id, "bound_host_id"),
             _validate_binding_value(transport_kind, "transport_kind"),
             _validate_binding_value(binding_source, "binding_source"),
@@ -82,6 +74,28 @@ class HostBinding(_HostBindingTuple):
     def __delattr__(self, name: str) -> None:
         raise FrozenInstanceError(f"cannot delete field {name!r}")
 
+    def _values(self) -> tuple[str, str, str, str]:
+        try:
+            return _BINDING_VALUES[self]
+        except KeyError as exc:
+            raise AttributeError("host binding is not initialized") from exc
+
+    @property
+    def bound_host_id(self) -> str:
+        return self._values()[0]
+
+    @property
+    def transport_kind(self) -> str:
+        return self._values()[1]
+
+    @property
+    def binding_source(self) -> str:
+        return self._values()[2]
+
+    @property
+    def gateway_instance_id(self) -> str:
+        return self._values()[3]
+
     def audit_projection(self) -> dict[str, str]:
         return {
             "host_id": self.bound_host_id,
@@ -91,7 +105,13 @@ class HostBinding(_HostBindingTuple):
         }
 
 
-_GATEWAY_BINDINGS: WeakKeyDictionary[object, HostBinding] = WeakKeyDictionary()
+def _binding_from_values(values: tuple[str, str, str, str]) -> HostBinding:
+    binding = object.__new__(HostBinding)
+    _BINDING_VALUES[binding] = values
+    return binding
+
+
+_GATEWAY_BINDINGS: WeakKeyDictionary[object, tuple[str, str, str, str]] = WeakKeyDictionary()
 
 
 class MemoryGateway:
@@ -109,34 +129,42 @@ class MemoryGateway:
     ) -> None:
         if binding is not None and type(binding) is not HostBinding:
             raise AdapterError("UNBOUND_GATEWAY", "gateway binding is not valid")
+        binding_values = _BINDING_VALUES.get(binding) if binding is not None else None
+        if binding is not None and binding_values is None:
+            raise AdapterError("UNBOUND_GATEWAY", "gateway binding is not initialized")
         _validate_binding_value(transport_kind, "transport_kind")
         if transport_kind != SUPPORTED_TRANSPORT_KIND:
             raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "gateway transport is not supported")
-        if binding is not None and binding.transport_kind != transport_kind:
+        if binding_values is not None and binding_values[1] != transport_kind:
             raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "gateway transport does not match its binding")
         self._adapter = adapter
-        if binding is not None:
-            _GATEWAY_BINDINGS[self] = binding
+        if binding_values is not None:
+            _GATEWAY_BINDINGS[self] = binding_values
+
+    def _binding_values(self) -> tuple[str, str, str, str]:
+        values = _GATEWAY_BINDINGS.get(self)
+        if values is None:
+            raise AdapterError("UNBOUND_GATEWAY", "gateway has no trusted host binding")
+        return values
 
     @property
     def _binding(self) -> HostBinding | None:
-        return _GATEWAY_BINDINGS.get(self)
+        values = _GATEWAY_BINDINGS.get(self)
+        return _binding_from_values(values) if values is not None else None
 
     def require_transport(self, selected_transport: str) -> HostBinding:
         _validate_binding_value(selected_transport, "transport_kind")
-        binding = self.require_binding()
-        if selected_transport != binding.transport_kind:
+        values = self._binding_values()
+        if selected_transport != values[1]:
             raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "selected transport does not match its binding")
-        return binding
+        return _binding_from_values(values)
 
     @property
     def binding(self) -> HostBinding | None:
         return self._binding
 
     def require_binding(self) -> HostBinding:
-        if self._binding is None:
-            raise AdapterError("UNBOUND_GATEWAY", "gateway has no trusted host binding")
-        return self._binding
+        return _binding_from_values(self._binding_values())
 
     @classmethod
     def tool_names(cls) -> list[str]:
@@ -153,7 +181,7 @@ class MemoryGateway:
         return request
 
     async def dispatch(self, operation: str, request: dict[str, Any]) -> dict[str, Any]:
-        binding = self.require_binding()
+        binding_values = self._binding_values()
         method_name = _OPERATION_METHODS.get(operation)
         if method_name is None:
             raise AdapterError("INVALID_OPERATION", "operation is not part of the public gateway surface")
@@ -174,6 +202,11 @@ class MemoryGateway:
             audit = {}
         if not isinstance(audit, dict):
             raise AdapterError("INVALID_ADAPTER_RESPONSE", "adapter audit envelope is invalid")
-        audit["host_binding"] = binding.audit_projection()
+        audit["host_binding"] = {
+            "host_id": binding_values[0],
+            "transport": binding_values[1],
+            "gateway_instance_id": binding_values[3],
+            "binding_source": binding_values[2],
+        }
         envelope["audit"] = audit
         return envelope
