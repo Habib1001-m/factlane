@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "factlane"
+version = "0.1.0"
+description = "Local-first, multi-host governed memory plane for AI agents"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp-memory-service @ git+https://github.com/doobidoo/mcp-memory-service.git@e5155b937051db4fa99a384018c5ebd621d8c5ef",
+  "mcp==1.29.1",
+  "sqlite-vec==0.1.9",
+  "tokenizers==0.23.1",
+]
+
+[dependency-groups]
+dev = ["pytest==9.0.3"]
+
+[project.scripts]
+factlane = "factlane.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv]
+package = true

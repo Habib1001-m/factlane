@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "policy": "REUSE_FIRST_VERIFY_BEFORE_REUSE_PROVENANCE_ALWAYS",
+  "accepted_source": {
+    "phase": "S6B.4B",
+    "implementation_head": "6ac7f2a4a19c57e4e0e70c85dd055b5de9ad074c",
+    "dependency_lock_sha256": "6a0f38eef9de61277b524913d9aba9bb8b3ce5d6a80b2c1fa62c3aa08977df49"
+  },
+  "genesis_acceptance": {
+    "advisor_shell_network_egress": "UNAVAILABLE",
+    "frozen_sync_in_advisor_harness": "BLOCKED_BY_NETWORK",
+    "effective_nomic_context_window": 2048,
+    "truncate_policy": "FAIL_CLOSED_PROVIDER_REJECTION",
+    "bounded_fact_2000_bytes": "PASS",
+    "bounded_query_512_bytes": "PASS",
+    "owner_workstation_preacceptance": "PASS_R2",
+    "preacceptance_candidate_head": "8a768fa66d86451d5f2297979f508c416e035dbb",
+    "preacceptance_evidence_archive_sha256": "6311ff329deb7eda01d8b7e48eaf252c48ddae381de87b4ff765a640be8f2dd5",
+    "frozen_sync_owner_workstation": "PASS",
+    "full_pytest": "22_PASS",
+    "package_import": "PASS",
+    "cli_help": "PASS",
+    "hermes_runtime_dependencies": 0
+  },
+  "assets": [
+    {
+      "logical_name": "cpython",
+      "kind": "python-runtime",
+      "portable_requirement": "CPython >=3.11",
+      "resolved_source": "owner workstation uv-managed CPython installation; private absolute path withheld",
+      "runtime_owner": "Project Owner workstation",
+      "role": "RUNTIME",
+      "version_or_digest": "CPython 3.11.15; sha256=6ec402210289b1d16bf3440775d3595e93f92e1e0ec808d4607b85f528592159",
+      "verification": "accepted S6B.4B dependency provenance readback",
+      "reacquire_method": "uv python install 3.11.15",
+      "last_verified_at": "2026-08-28"
+    },
+    {
+      "logical_name": "uv",
+      "kind": "package-manager",
+      "portable_requirement": "uv compatible with lock version 1",
+      "resolved_source": "owner workstation user-local uv installation; private absolute path withheld",
+      "runtime_owner": "Project Owner workstation",
+      "role": "RUNTIME",
+      "version_or_digest": "uv 0.11.26 (x86_64-unknown-linux-gnu); sha256=29b90e884c384e1578ac37335521d807c192aa44d5a4a9b9f4690bb3850e179d",
+      "verification": "accepted S6B.4B dependency provenance readback",
+      "reacquire_method": "install a compatible uv release, then verify uv.lock without dependency drift",
+      "last_verified_at": "2026-08-28"
+    },
+    {
+      "logical_name": "ollama",
+      "kind": "local-model-runtime",
+      "portable_requirement": "local loopback embedding runtime compatible with Ollama /api/embed dimensions",
+      "resolved_source": "pre-existing owner workstation Ollama service",
+      "runtime_owner": "Project Owner workstation",
+      "role": "RUNTIME",
+      "version_or_digest": "ollama 0.22.1; binary sha256=26bd592d5c627cd2374c58d4a5ab5ccdf0b5a76a45609e7a15b66825e05bff54",
+      "verification": "accepted S6B.4B API/version and egress readback",
+      "reacquire_method": "install a compatible local Ollama runtime and verify loopback-only API behavior",
+      "last_verified_at": "2026-08-28"
+    },
+    {
+      "logical_name": "nomic-embed-text",
+      "kind": "embedding-model",
+      "portable_requirement": "exact approved Nomic artifact or explicitly requalified replacement",
+      "resolved_source": "pre-existing owner workstation Ollama model store",
+      "runtime_owner": "Ollama local model store",
+      "role": "RUNTIME",
+      "version_or_digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+      "verification": "S6B.4B exact digest/projection/prefix readback plus 2026-08-29 R2 live bounded-input acceptance with truncate=false",
+      "reacquire_method": "pull/pin the approved Nomic artifact, verify exact digest, then re-run provider acceptance",
+      "last_verified_at": "2026-08-29",
+      "effective_context_window": 2048,
+      "truncate_policy": "FAIL_CLOSED_PROVIDER_REJECTION",
+      "bounded_fact_2000_bytes": "PASS",
+      "bounded_query_512_bytes": "PASS"
+    },
+    {
+      "logical_name": "all-minilm-l6-v2",
+      "kind": "embedding-model-control",
+      "portable_requirement": "exact control artifact only while comparison/acceptance tests still reference it",
+      "resolved_source": "pre-existing owner workstation Ollama model store",
+      "runtime_owner": "Ollama local model store",
+      "role": "EVIDENCE_TOOL",
+      "version_or_digest": "1b226e2802dbb772b5fc32a58f103ca1804ef7501331012de126ab22f67475ef",
+      "verification": "S6B.4B exact digest and 384-dimension readback",
+      "reacquire_method": "ollama pull all-minilm:l6-v2 and verify the approved digest before reuse",
+      "last_verified_at": "2026-08-28"
+    },
+    {
+      "logical_name": "portable-token-measurement-profile",
+      "kind": "tokenizer-artifact",
+      "portable_requirement": "deterministic local tokenizer for measurement only; Codex-exact equivalence is not claimed",
+      "resolved_source": "Systran/faster-whisper-base tokenizer snapshot; private cache path withheld",
+      "runtime_owner": "Project Owner workstation cache used as evidence input",
+      "role": "EVIDENCE_TOOL",
+      "version_or_digest": "snapshot=ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66; sha256=fb7b63191e9bb045082c79fd742a3106a12c99513ab30df4a0d47fa6cb6fd0ab",
+      "verification": "accepted S6B.4B tokenizer artifact readback; CODEX_EXACT_TOKEN_EQUIVALENCE=UNVERIFIED",
+      "reacquire_method": "supply a deterministic local tokenizer artifact and record its digest; do not claim Codex equivalence without proof",
+      "last_verified_at": "2026-08-28"
+    }
+  ]
+}
