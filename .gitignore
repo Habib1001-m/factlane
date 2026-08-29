@@ -11,3 +11,6 @@ __pycache__/
 pilot-evidence/
 build/
 dist/
+
+# Private local custody / execution state. Never publish.
+.factlane-local/

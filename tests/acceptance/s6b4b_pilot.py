@@ -19,7 +19,10 @@ from factlane.contract import AdapterError, canonical_json, iso_now
 from factlane.embeddings import OllamaLocalProvider
 
 
-TOKENIZER_DEFAULT = "/home/habib1001/.cache/huggingface/hub/models--Systran--faster-whisper-base/snapshots/ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66/tokenizer.json"
+TOKENIZER_DEFAULT = str(
+    Path.home()
+    / ".cache/huggingface/hub/models--Systran--faster-whisper-base/snapshots/ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66/tokenizer.json"
+)
 
 
 def digest_id(value: str) -> str:

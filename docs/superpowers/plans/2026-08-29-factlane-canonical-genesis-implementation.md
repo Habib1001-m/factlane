@@ -928,7 +928,9 @@ Extend `tests/unit/test_repository_contract.py` to assert these files exist and 
 ```bash
 uv run pytest tests/unit -q
 git diff --check
-if grep -RIn --exclude-dir=.git -E '/home/habib1001|/mnt/c/Users/' README.md AGENTS.md SECURITY.md docs; then
+OWNER_HOME="${OWNER_HOME:-$HOME}"
+WINDOWS_OWNER_HOME="${WINDOWS_OWNER_HOME:-/mnt/c/Users}"
+if grep -RIn --exclude-dir=.git -E "${OWNER_HOME}|${WINDOWS_OWNER_HOME}/" README.md AGENTS.md SECURITY.md docs; then
   exit 1
 fi
 ```
