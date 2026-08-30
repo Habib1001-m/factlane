@@ -3,13 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from .contract import (
-    AUTHORITY_ROLES,
-    CONTRADICTION_STATES,
     CURRENT_LIFECYCLE,
     MEMORY_TYPES,
     AdapterError,
@@ -28,7 +25,7 @@ from .contract import (
     validate_provenance,
     validate_scope,
 )
-from .embeddings import EmbeddingProfile, OllamaLocalProvider
+from .embeddings import EmbeddingProvider, OllamaLocalProvider
 from .router import TruthRouter
 from .storage import SQLiteVecEngine
 
@@ -112,7 +109,7 @@ class MemoryAdapter:
     def __init__(
         self,
         engine: SQLiteVecEngine,
-        provider: OllamaLocalProvider,
+        provider: EmbeddingProvider,
         *,
         token_counter: TokenCounter | None = None,
         limits: AdapterLimits | None = None,
@@ -140,7 +137,7 @@ class MemoryAdapter:
         ollama_url: str = "http://127.0.0.1:11434",
         tokenizer_path: str | None = None,
         runtime_agent_id: str = "factlane-local",
-    ) -> "MemoryAdapter":
+    ) -> MemoryAdapter:
         try:
             definition = PROFILE_DEFINITIONS[profile_name]
         except KeyError as exc:

@@ -652,7 +652,7 @@ async def mcp_wire_probe(repo: Path, db: Path, tokenizer: str, ollama_url: str, 
     })
     params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "factlane.server", "--db", str(db), "--profile", "nomic-768", "--ollama-url", ollama_url, "--tokenizer-path", tokenizer],
+        args=["-m", "factlane.server", "--db", str(db), "--profile", "nomic-768", "--ollama-url", ollama_url, "--tokenizer-path", tokenizer, "--host-id", "acceptance-disposable"],
         env=env,
         cwd=repo,
     )

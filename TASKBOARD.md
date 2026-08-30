@@ -1,7 +1,7 @@
 # FactLane Canonical Taskboard
 
 ```text
-TASKBOARD_VERSION=5
+TASKBOARD_VERSION=25
 TASKBOARD_UPDATE_MODE=IN_PLACE_APPEND_AND_RECONCILE
 CANONICAL_FILENAME=TASKBOARD.md
 NUMBERED_TASKBOARD_FILES_FUTURE_AUTHORITY=NO
@@ -29,8 +29,8 @@ S6C_STARTED=NO
 ```text
 ACTIVE_SPEC=docs/S6B_4C_SHARED_STORE_CONCURRENCY_SPEC.md
 ACTIVE_PLAN=docs/superpowers/plans/2026-08-29-s6b4c-shared-store-concurrency.md
-CURRENT_SLICE=S6B_4C_01_ENTRY_PREFLIGHT_AND_HARNESS_FOUNDATION
-CURRENT_NEXT_ACTION=COMPLETE_S6B_4C_01_ENTRY_PREFLIGHT_AND_HARNESS_FOUNDATION
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=RETURN_TO_OWNER_ADVISOR_FOR_FINAL_4C_02_DECISION
 ```
 
 ## Accepted source gates carried forward
@@ -83,9 +83,10 @@ PREACCEPTANCE_EXACT_BACKEND_PIN_RUNTIME=PASS
 ## Pre-S6B.4C debts
 
 ```text
-P0 HOST_IDENTITY_BINDING=OPEN
-P0 EXECUTION_CONTEXT_IDENTITY_PREFLIGHT=OPEN
-P0 MULTI_CLIENT_WRITE_COORDINATION=OPEN
+P0 HOST_IDENTITY_BINDING=IN_PROGRESS_4C_02
+P0 EXECUTION_CONTEXT_IDENTITY_PREFLIGHT=CLOSED_PASS_4C_01
+P0 MULTI_CLIENT_WRITE_COORDINATION=OPEN_4C_03
+MISSING_GIT_BINARY_EXPLICIT_REGRESSION_TEST=REQUIRED_IN_4C_02
 P1 ASYNC_EMBEDDING_CONCURRENCY=OPEN
 P1 BACKEND_COMPATIBILITY_BOUNDARY=GENESIS_AUDIT_PASS_S6B4C_RUNTIME_PROOF_PENDING
 ```
@@ -257,11 +258,635 @@ S6B_4C=IN_PROGRESS
 S6B_4C_STARTED=YES
 ACTIVE_SPEC=docs/S6B_4C_SHARED_STORE_CONCURRENCY_SPEC.md
 ACTIVE_PLAN=docs/superpowers/plans/2026-08-29-s6b4c-shared-store-concurrency.md
-CURRENT_SLICE=S6B_4C_01_ENTRY_PREFLIGHT_AND_HARNESS_FOUNDATION
-CURRENT_NEXT_ACTION=COMPLETE_S6B_4C_01_ENTRY_PREFLIGHT_AND_HARNESS_FOUNDATION
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=COMPLETE_S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
 CHECK_NATIVE_MEMORY_CAPACITY_BEFORE_MEMORY_MUTATION=REQUIRED
 NATIVE_MEMORY_MUTATION=NONE
 S6B_4D=BLOCKED
 S6B_5=BLOCKED
 S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-29 — Owner start authorization for S6B.4C-02
+
+This reconciliation records the Owner-authorized 4C-02 slice. It does not authorize
+4C-03 atomic CAS/lost-update implementation, native-memory mutation, live runtime
+configuration changes, global registration, or production migration.
+
+```text
+TASKBOARD_VERSION=6
+S6B_4C=IN_PROGRESS
+S6B_4C_01_ENTRY_PREFLIGHT_AND_HARNESS_FOUNDATION=CLOSED_PASS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=COMPLETE_S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+
+MISSING_GIT_BINARY_EXPLICIT_REGRESSION_TEST=REQUIRED_IN_4C_02
+```
+
+---
+
+## Reconciliation 2026-08-29 — PR #5 remediation candidate
+
+This reconciliation records the Owner/Advisor-requested PR #5 remediation and the
+manual absorption of PR #4's neutral redaction-fixture intent. It does not close
+4C-02, merge PR #4, start 4C-03, or authorize any later slice or runtime mutation.
+
+```text
+PR_NUMBER=5
+PR5_OLD_HEAD=34a6a1a803847324e583df03bef7efd18a63ea29
+PR5_REMEDIATION_CODE_COMMIT=43e4f6e
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=IMPLEMENTED_PENDING_OWNER_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=IMPLEMENTED_PENDING_OWNER_REVIEW
+
+PR4_NEUTRAL_FIXTURE_SEMANTICS_ABSORBED=YES
+CREDENTIAL_SHAPED_TEST_FIXTURE_PRESENT=NO
+REDACTION_COVERAGE_PRESERVED=YES
+TOKEN_MARKER_COVERAGE_PRESERVED=YES
+MISSING_GIT_REGRESSION=PRESERVED
+PR4_SEPARATE_MERGE=NO
+PR4_CLOSE_NOW=NO
+
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=RETURN_TO_OWNER_ADVISOR_FOR_PR5_REREVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-29 — Fresh reviewer HOLD and follow-up
+
+The one fresh bounded reviewer independently held candidate `fc7e74a` after
+finding that ordinary deletion of `_binding` could be followed by replacement.
+The follow-up closes that ordinary deletion path with a narrow guard and direct
+regression coverage. The reviewer result remains HOLD for the superseded head;
+no second reviewer is invoked and no PASS is claimed here.
+
+```text
+PR_NUMBER=5
+FRESH_REVIEWER_INVOCATIONS=1
+FRESH_REVIEWED_HEAD=fc7e74a96111fdf2a390ebb2eab49ed42606dd5f
+FRESH_REVIEWER=HOLD
+FRESH_REVIEW_FINDING=DELETE_BINDING_THEN_REASSIGN_BYPASS
+PR5_REVIEW_FINDING_REMEDIATION_COMMIT=ef92cbe
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=FOLLOWUP_IMPLEMENTED_PENDING_OWNER_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_BY_TESTS_PENDING_OWNER_REVIEW
+
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=RETURN_TO_OWNER_ADVISOR_FOR_PR5_REREVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-29 — Final-head reviewer HOLD and transport-run remediation
+
+The required fresh reviewer examined the exact final head `c4a30bf` and found a
+material identity/transport bypass: a matching non-stdio gateway could be built,
+and the returned FastMCP server could be run under a different transport. This
+reconciliation records the finding and the follow-up candidate. It does not
+merge PR #5, close PR #4, start 4C-03, or authorize any later slice or runtime
+mutation. A fresh review of the post-remediation exact head is required.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=c4a30bf4beb740b52f783f4494b380d65d3d31e4
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDING=NON_STDIO_GATEWAY_AND_SERVER_RUN_TRANSPORT_BYPASS
+PR5_TRANSPORT_BYPASS_REMEDIATION_COMMIT=a06c430
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_FINAL_POST_REMEDIATION_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_POST_REMEDIATION_REVIEW
+
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=REMEDIATE_S6B_4C_02_TRANSPORT_RUN_BINDING_BYPASS
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-29 — Duck-typed gateway bypass remediation
+
+The fresh reviewer then identified that `build_mcp_server` accepted a duck-typed
+object with permissive `require_transport` and `dispatch` methods. The server
+construction boundary now requires the exact `MemoryGateway` implementation
+before transport validation and tool registration. No merge, PR #4 closure, or
+later slice is authorized; a new fresh review must inspect the post-remediation
+head.
+
+```text
+PR_NUMBER=5
+DUCK_TYPED_GATEWAY_BYPASS=FOUND_AND_REMEDIATED
+DUCK_TYPED_GATEWAY_REMEDIATION_COMMIT=a06c430
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_FINAL_POST_REMEDIATION_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_POST_REMEDIATION_REVIEW
+
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-29 — Final-head reviewer HOLD and server transport authority remediation
+
+The fresh reviewer examined exact candidate `d225787` and found two material
+bypasses: the returned FastMCP server's gateway reference was replaceable, and
+calling the base `FastMCP.run` could bypass the subclass transport check. The
+follow-up makes the server-held gateway set-once and guards the supported
+transport through FastMCP's dispatch hooks. It does not merge PR #5, close PR #4,
+start 4C-03, or authorize later runtime mutation. A new fresh review must inspect
+the post-remediation exact head.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=d22578745abb36bd6958b3f710c6a3e8d0bfc0cd
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDINGS=SERVER_GATEWAY_REBIND_AND_BASE_FASTMCP_RUN_TRANSPORT_BYPASS
+PR5_SERVER_TRANSPORT_AUTHORITY_REMEDIATION_COMMIT=UNCOMMITTED
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_POST_REMEDIATION_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=OPEN_PENDING_POST_REMEDIATION_REVIEW
+
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-29 — Final-head reviewer HOLD and gateway/server facade hardening
+
+The fresh reviewer examined exact candidate `d38acc8` and found two material
+identity-boundary bypasses: a `HostBinding` subclass could spoof the audit
+projection and `object.__setattr__` could replace the gateway binding; direct
+base FastMCP app methods also bypassed the subclass transport guard. The
+follow-up rejects binding subclasses, removes the writable binding slot, and uses
+a guarded composition facade for the returned server. A new fresh review must
+inspect the post-remediation exact head.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=d38acc8ecdb226768aba4e8ef96a53ab1bdd9e96
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDINGS=HOST_BINDING_SUBCLASS_AUDIT_SPOOF_OBJECT_SETATTR_AND_BASE_FASTMCP_APP_BYPASS
+PR5_GATEWAY_SERVER_HARDENING_COMMIT=4a850cc
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_FINAL_POST_REMEDIATION_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_POST_REMEDIATION_REVIEW
+
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-29 — Fresh reviewer HOLD and tuple-backed binding remediation
+
+The fresh reviewer examined exact candidate `80da79b` and found that frozen
+`HostBinding` fields remained mutable through `object.__setattr__`, allowing
+transport and audit provenance spoofing. The follow-up replaces the binding's
+mutable dataclass storage with immutable tuple-backed fields and adds direct
+regression coverage. It does not merge PR #5, close PR #4, start 4C-03, or
+authorize later runtime mutation. A new fresh review must inspect the exact
+post-remediation head.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=80da79b2babb0a228cff0e8696c82839b09c565c
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDING=OBJECT_SETATTR_HOST_BINDING_TRANSPORT_AND_AUDIT_SPOOF
+PR5_TUPLE_BINDING_REMEDIATION_COMMIT=e00bb0f
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_POST_REMEDIATION_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_POST_REMEDIATION_REVIEW
+
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-29 — HostBinding authority follow-up candidate
+
+The low-level binding mutation HOLD on `80da79b` is remediated in
+`e00bb0f`. `HostBinding` now has no mutable instance fields; validated binding
+values are held in private tuple state, and `MemoryGateway` snapshots those
+values for lifetime authority. The direct class-tampering regression confirms
+that subsequent audit and transport checks remain bound to the original values.
+A fresh bounded review of the final pushed head is required before any merge.
+
+```text
+PR_NUMBER=5
+PR5_BINDING_AUTHORITY_REMEDIATION=e00bb0f
+PR5_FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_FINAL_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_REVIEW
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-29 — Fresh reviewer HOLD and registry authority remediation
+
+The fresh bounded reviewer examined exact candidate
+`cca6ef86cfe8a00b391703ce6734794e339119f9` and found that the private
+`_GATEWAY_BINDINGS` and `_BOUND_SERVER_STATE` weak-key registries remained
+import-reachable and mutable. Replacing those entries changed authoritative
+gateway audit/transport values and server-held gateway identity. The follow-up
+removes both registries, stores gateway binding values in immutable tuple-backed
+state, and uses an immutable composition facade for server state. A new fresh
+review must inspect the exact post-remediation head. It does not merge PR #5,
+close PR #4, start 4C-03, or authorize later runtime mutation.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=cca6ef86cfe8a00b391703ce6734794e339119f9
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDING=IMPORT_REACHABLE_MUTABLE_GATEWAY_AND_SERVER_REGISTRIES
+PR5_REGISTRY_AUTHORITY_REMEDIATION=bf646bf10d5a2b53a1359ed6b4a1e396bc2dca13
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_FINAL_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_REVIEW
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-30 — Fresh reviewer HOLD and inner FastMCP exposure remediation
+
+The fresh bounded reviewer examined exact candidate
+`d2a7853178c62490c38d03ae9304e382fda049e7` and found that the
+`_BoundFastMCP` tuple held an `invoke` closure whose closure cell exposed the
+inner `FastMCP` instance. Recovering that instance allowed an unguarded SSE app
+to be built, bypassing the stdio transport binding. The follow-up removes the
+inner server from durable facade state, stores only immutable tool
+specifications, and constructs the inner FastMCP only during a guarded stdio
+run. A new fresh review must inspect the exact post-remediation head. It does
+not merge PR #5, close PR #4, start 4C-03, or authorize later runtime mutation.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=d2a7853178c62490c38d03ae9304e382fda049e7
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDING=INNER_FASTMCP_CLOSURE_RECOVERY_TRANSPORT_BYPASS
+PR5_INNER_FASTMCP_STATE_REMEDIATION=7241c6fedde3a873084c6dad81bdb077ade331de
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_POST_REMEDIATION_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_REVIEW
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-30 — Fresh reviewer HOLD and mutable authority surface remediation
+
+The fresh bounded reviewer examined exact candidate
+`c0b95f7df33b9705ad33f33e1f77b552f2904043` and found three identity/transport
+bypasses: nested tool callback closure replacement could forge responses,
+transport constants were rebindable module globals, and the operation routing
+map plus `HostBinding` class properties were mutable import-reachable authority.
+The follow-up removes callback closures and mutable transport/operation policy
+names, locks the gateway-bound classes, and preserves the exact five-tool stdio
+path. A new fresh review must inspect the exact post-remediation head. It does
+not merge PR #5, close PR #4, start 4C-03, or authorize later runtime mutation.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=c0b95f7df33b9705ad33f33e1f77b552f2904043
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDINGS=CALLBACK_CLOSURE_REPLACEMENT_MUTABLE_TRANSPORT_CONSTANTS_OPERATION_MAP_HOSTBINDING_CLASS_ATTRIBUTES
+PR5_AUTHORITY_SURFACE_REMEDIATION=f112cf004ead6789bedf61ebe323d6e656444fe4
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_POST_REMEDIATION_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_REVIEW
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-30 — Authority surface hardening candidate
+
+After the HOLD on `c0b95f7df33b9705ad33f33e1f77b552f2904043`, the authority
+surface remediation was consolidated in `fbd2742942c9825f0d90809af3ce6837e8ab2a50`.
+The gateway now uses inline fixed operation routing and literal stdio checks;
+the server stores only immutable operation specifications, creates inner
+`FastMCP` state only inside the guarded stdio run path, and tool callbacks use
+tuple-backed gateway/operation state without nested dispatch closures. Binding
+field reads remain tuple-authoritative even after low-level class descriptor
+replacement. A new fresh bounded security review must inspect the exact pushed
+head. No merge, PR #4 closure, 4C-03 start, or later runtime mutation is
+authorized.
+
+```text
+PR_NUMBER=5
+PR5_AUTHORITY_SURFACE_REMEDIATION=fbd2742942c9825f0d90809af3ce6837e8ab2a50
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_FINAL_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_REVIEW
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-30 — Fresh reviewer HOLD and class method authority remediation
+
+The fresh bounded reviewer examined exact candidate
+`4aab3d3014fd16c77b3f8bdfb55d08fced905f7a` and found an import-reachable class
+method replacement: `type.__setattr__(MemoryGateway, "dispatch", ...)` changed
+both direct gateway dispatch and the tool path, and equivalent replacement of
+`require_transport` bypassed transport matching. The follow-up adds canonical
+instance-state dispatch/transport references, class lookup guards, and guarded
+server transport callbacks; it also keeps tool callbacks free of mutable nested
+closures. A new fresh review must inspect the exact post-remediation head. It
+does not merge PR #5, close PR #4, start 4C-03, or authorize later runtime
+mutation.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=4aab3d3014fd16c77b3f8bdfb55d08fced905f7a
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDING=TYPE_SETATTR_MEMORYGATEWAY_DISPATCH_AND_TRANSPORT_BYPASS
+PR5_CLASS_METHOD_AUTHORITY_REMEDIATION=e1149b7f24bba01861c8c2fee312c3f400d5fd19
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_FINAL_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_REVIEW
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-30 — Fresh reviewer HOLD and public authority-boundary remediation
+
+The fresh bounded reviewer examined exact candidate
+`39b56f22428c7bcdeb894b1e27b4e208b2122f15` and found that low-level class
+method replacement remained able to bypass gateway dispatch and transport
+checks through `object.__getattribute__`; the mutable metaclass authority store
+also allowed audit and newly constructed gateway spoofing. The remediation
+keeps the public `HostBinding` and `MemoryGateway` construction boundaries
+stable while operational instances use private authoritative implementations,
+removes the metaclass authority store, and adds direct low-level regressions.
+A new fresh bounded security review must inspect the exact post-remediation
+head. No merge, PR #4 closure, 4C-03 start, or later runtime mutation is
+authorized.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=39b56f22428c7bcdeb894b1e27b4e208b2122f15
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDINGS=OBJECT_GETATTRIBUTE_CLASS_METHOD_BYPASS_MUTABLE_METACLASS_AUTHORITY_STORE
+PR5_PUBLIC_AUTHORITY_BOUNDARY_REMEDIATION=38e6a3034bbbafcaba5cb980da53318c6f831335
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_FINAL_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_REVIEW
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-30 — Fresh reviewer HOLD and in-process authority boundary
+
+The fresh bounded reviewer examined exact candidate
+`a4649ea5e2169de973b3ab11f73abe649c3712b3` and found that the current private
+runtime objects still expose mutable authority through their instance
+`__dict__`; replacing gateway `_state` changed audit and transport identity,
+and replacing server callbacks changed transport enforcement. The reviewer
+also confirmed that the private Python type remains mutable through
+`type.__setattr__`. The attempted remediation was not kept or pushed because
+it did not establish a verified security boundary. The work is returned to the
+Owner/Advisor for an architecture decision: either move the authority boundary
+outside the mutable Python process/object model, or explicitly narrow the
+accepted threat model before another implementation cycle. PR #5 remains
+unmerged; PR #4 remains open and unmerged; no later slice is authorized.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=a4649ea5e2169de973b3ab11f73abe649c3712b3
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDINGS=MUTABLE_GATEWAY_INSTANCE_DICT_MUTABLE_SERVER_INSTANCE_DICT_MUTABLE_PRIVATE_RUNTIME_TYPE
+PR5_UNVERIFIED_ATTEMPT_DISCARDED=YES
+PRODUCT_CODE_HEAD_UNCHANGED_AFTER_REVIEW=a4649ea5e2169de973b3ab11f73abe649c3712b3
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=OPEN_PENDING_ARCHITECTURE_DECISION
+BLOCKER_2_TRANSPORT_ENFORCEMENT=OPEN_PENDING_ARCHITECTURE_DECISION
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=OWNER_ADVISOR_ARCHITECTURE_DECISION_ON_IN_PROCESS_AUTHORITY_MODEL
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-30 — Owner/Advisor client-transport threat model and bounded simplification
+
+The Owner/Advisor accepted the prior architectural HOLD and explicitly narrowed
+the S6B.4C-02 authority boundary to the trusted FactLane process/MCP transport
+boundary. Arbitrary Python execution inside that trusted process is not a
+4C-02 security property and is not defended by this candidate. The accumulated
+anti-tamper machinery was therefore removed in one bounded pass; no new
+framework, process boundary, backend, schema, tool, or runtime configuration
+was introduced.
+
+```text
+S6B_4C_02_THREAT_MODEL=CLIENT_TRANSPORT_BOUNDARY
+UNTRUSTED_MCP_REQUEST=IN_SCOPE
+CALLER_SUPPLIED_IDENTITY_CLAIMS=IN_SCOPE
+MALFORMED_REQUEST=IN_SCOPE
+UNBOUND_TRUSTED_LAUNCH=IN_SCOPE
+HOST_TRANSPORT_MISMATCH=IN_SCOPE
+UNSUPPORTED_CLIENT_TRANSPORT=IN_SCOPE
+HOST_SCOPE_AGENT_CONFUSION=IN_SCOPE
+AUDIT_PROVENANCE_FROM_REQUEST=IN_SCOPE
+ARBITRARY_PYTHON_CODE_EXECUTION_INSIDE_FACTLANE_PROCESS=OUT_OF_SCOPE
+PYTHON_MONKEY_PATCHING_BY_IN_PROCESS_CODE=OUT_OF_SCOPE
+VARS_PRIVATE_STATE_REWRITE=OUT_OF_SCOPE
+OBJECT_SETATTR_LOW_LEVEL_TAMPERING=OUT_OF_SCOPE
+TYPE_SETATTR_RUNTIME_CLASS_TAMPERING=OUT_OF_SCOPE
+CLOSURE_CELL_MUTATION=OUT_OF_SCOPE
+DIRECT_PRIVATE_MODULE_STATE_REWRITE_BY_IN_PROCESS_CODE=OUT_OF_SCOPE
+
+PR_NUMBER=5
+PR5_SIMPLIFICATION_STARTING_HEAD=49a2209374ed76a03a5c3dc318386231ba5be338
+PR5_SIMPLIFICATION_COMMIT=fbe4563c038614bec52e6d86b27b04bc5c11537f
+KEEP_MAP=VALIDATED_HOST_BINDING_EXPLICIT_STDIO_GATEWAY_REQUEST_DENIAL_GATEWAY_AUDIT_FIVE_TOOLS_SCOPE_SEPARATION_SEQUENTIAL_PROOF
+REMOVE_MAP=PRIVATE_RUNTIME_TYPE_TUPLE_AUTHORITY_METACLASS_REGISTRIES_PARTIAL_CALLBACKS_FAKE_REJECTED_FASTMCP_SURFACES_IN_PROCESS_TAMPER_TESTS
+REMOVE_REASON=DEFENSE_ONLY_FOR_EXCLUDED_TRUSTED_PROCESS_PYTHON_ATTACKER
+PRODUCT_COMPLEXITY_REDUCED=YES
+GATEWAY_LINES_START=280
+GATEWAY_LINES_END=166
+GATEWAY_LINE_DELTA=-114
+SERVER_LINES_START=177
+SERVER_LINES_END=101
+SERVER_LINE_DELTA=-76
+REQUEST_IDENTITY_OVERRIDE=DENIED
+UNBOUND_GATEWAY=DENIED
+SUPPORTED_RUNTIME_TRANSPORT=stdio
+TRANSPORT_MATCH=PASS
+HOST_SCOPE_AGENT_ID_SEPARATION=PASS
+AUDIT_PROVENANCE=PASS
+PUBLIC_MCP_TOOL_COUNT=5
+SEQUENTIAL_CROSS_GATEWAY_VISIBILITY=PASS
+MISSING_GIT_BINARY_REGRESSION=PASS
+PR4_NEUTRAL_FIXTURE_SEMANTICS=PRESERVED
+LOCAL_ADVERSARIAL_CAMPAIGN=PASS
+GATEWAY_TESTS=37_PASS
+EXECUTION_CONTEXT_TESTS=22_PASS
+SEQUENTIAL_PROOF=1_PASS
+FULL_PYTEST=81_PASS
+FOCUSED_RUFF=PASS
+PY_COMPILE=PASS
+DIFF_CHECK=PASS
+RUFF_BASE_FINDINGS=19
+RUFF_HEAD_FINDINGS=13
+RUFF_NEW_FINDINGS=0
+HEAD_FINDINGS_MINUS_BASE_FINDINGS=EMPTY
+PACKAGE_IMPORT=PASS
+CLI_HELP=PASS
+WORKING_TREE=CLEAN
+MERGE_PERFORMED=NO
+PR4_STATE=OPEN_UNMERGED
+S6B_4C_03_STARTED=NO
+S6B_4D_STARTED=NO
+S6B_5_STARTED=NO
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-30 — Simplified candidate final bounded review PASS
+
+The single fresh bounded reviewer examined the exact simplified candidate after
+CI and found no client/request/transport-side identity, audit, scope, or
+unsupported-transport bypass. The reviewer explicitly applied the accepted
+`CLIENT_TRANSPORT_BOUNDARY` model and did not treat arbitrary Python execution
+or low-level mutation inside the trusted FactLane process as a 4C-02 blocker.
+The candidate remains unmerged pending final Owner/Advisor disposition.
+
+```text
+S6B_4C_02_ARCHITECTURE_DECISION_APPLIED=YES
+THREAT_MODEL=CLIENT_TRANSPORT_BOUNDARY
+ARBITRARY_IN_PROCESS_PYTHON_TAMPERING=OUT_OF_SCOPE
+CURRENT_PR=5
+SIMPLIFIED_HEAD=ec6382d6939b2a5b902c703da35c0394d7afb37d
+FRESH_REVIEWER=PASS
+FRESH_REVIEWER_REVIEWED_EXACT_HEAD=ec6382d6939b2a5b902c703da35c0394d7afb37d
+FRESH_REVIEWER_IN_SCOPE_FINDINGS=NONE
+FRESH_REVIEWER_OUT_OF_SCOPE_OBSERVATION=LOW_LEVEL_IN_PROCESS_TAMPERING_NOT_A_4C_02_BLOCKER
+CI_EXACT_HEAD=PASS
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=NO
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_WITHIN_CLIENT_TRANSPORT_BOUNDARY
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_WITHIN_CLIENT_TRANSPORT_BOUNDARY
+REQUEST_IDENTITY_OVERRIDE=DENIED
+UNBOUND_GATEWAY=DENIED
+SUPPORTED_RUNTIME_TRANSPORT=stdio
+TRANSPORT_MATCH=PASS
+HOST_SCOPE_AGENT_ID_SEPARATION=PASS
+AUDIT_PROVENANCE=PASS
+PUBLIC_MCP_TOOL_COUNT=5
+SEQUENTIAL_CROSS_GATEWAY_VISIBILITY=PASS
+MISSING_GIT_BINARY_REGRESSION=PASS
+PR4_NEUTRAL_FIXTURE_SEMANTICS=PRESERVED
+MERGE_PERFORMED=NO
+PR4_STATE=OPEN_UNMERGED
+S6B_4C_03_STARTED=NO
+S6B_4D_STARTED=NO
+S6B_5_STARTED=NO
+S6C_STARTED=NO
+CURRENT_NEXT_ACTION=RETURN_TO_OWNER_ADVISOR_FOR_FINAL_4C_02_DECISION
 ```
