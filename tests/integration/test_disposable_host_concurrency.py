@@ -31,6 +31,10 @@ def _actor_env(home: Path) -> dict[str, str]:
     return env
 
 
+def _read_json(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def test_disposable_process_clients_share_one_store_without_lost_update(tmp_path: Path) -> None:
     run_dir = tmp_path / "s6b4c04-run"
     codex_home = tmp_path / "codex-home"
@@ -77,6 +81,16 @@ def test_disposable_process_clients_share_one_store_without_lost_update(tmp_path
     finally:
         codex_home.chmod(0o755)
         hermes_home.chmod(0o755)
+
+    phase_payloads = {
+        actor: _read_json(run_dir / "phases" / f"{actor}.json")
+        for actor in ("codex-disposable", "hermes-disposable")
+    }
+    assert {payload["actor"] for payload in phase_payloads.values()} == {
+        "codex-disposable",
+        "hermes-disposable",
+    }
+    assert {payload["phase"] for payload in phase_payloads.values()} == {"RESULT_WRITTEN"}
 
     verified = _run("verify", "--run-dir", run_dir)
 
