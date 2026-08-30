@@ -42,12 +42,16 @@ class DeterministicProvider:
 
     def __init__(self, profile: EmbeddingProfile) -> None:
         self.profile = profile
+        self.document_calls = 0
+        self.query_calls = 0
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.document_calls += len(texts)
         vector = [0.0] * (self.profile.output_dimension - 1) + [1.0]
         return [list(vector) for _ in texts]
 
     def embed_query(self, text: str) -> list[float]:
+        self.query_calls += 1
         return [0.0] * (self.profile.output_dimension - 1) + [1.0]
 
 
