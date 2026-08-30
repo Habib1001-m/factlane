@@ -86,6 +86,7 @@ class SQLiteVecEngine:
             # the real provider before any memory operation.
             storage.embedding_dimension = self.profile.output_dimension
             storage.semantic_dedup_enabled = False
+
             async def defer_native_embedding() -> None:
                 # The adapter owns embedding calls; native startup must not create
                 # hash vectors or attempt a model download before provider binding.
@@ -327,6 +328,21 @@ class SQLiteVecEngine:
             now = time.time()
             self.conn.execute("BEGIN IMMEDIATE")
             try:
+                superseded_native_hash: str | None = None
+                if supersede_record_id:
+                    old = self.conn.execute(
+                        "SELECT native_content_hash, lifecycle_state FROM adapter_records WHERE record_id = ?",
+                        (supersede_record_id,),
+                    ).fetchone()
+                    if not old or old[1] != "VALIDATED_CURRENT":
+                        raise AdapterError(
+                            "VERSION_CONFLICT",
+                            "expected revision is no longer the current lineage parent",
+                        )
+                    if record.get("parent_record_id") != supersede_record_id:
+                        raise AdapterError("VERSION_CONFLICT", "update lineage parent does not match expected revision")
+                    superseded_native_hash = str(old[0])
+
                 values = [
                     record["record_id"],
                     record["memory_id"],
@@ -404,20 +420,15 @@ class SQLiteVecEngine:
                     (rowid, serialize_float32(embedding), self.profile.profile_id),
                 )
                 if supersede_record_id:
-                    old = self.conn.execute(
-                        "SELECT native_content_hash FROM adapter_records WHERE record_id = ?",
-                        (supersede_record_id,),
-                    ).fetchone()
-                    if not old:
-                        raise sqlite3.IntegrityError("lineage parent was not found")
                     self.conn.execute(
                         "UPDATE adapter_records SET lifecycle_state='SUPERSEDED' WHERE record_id = ?",
                         (supersede_record_id,),
                     )
                     if "superseded_by" in self.native_columns:
+                        assert superseded_native_hash is not None
                         self.conn.execute(
                             "UPDATE memories SET superseded_by = ? WHERE content_hash = ?",
-                            (record["native_content_hash"], old[0]),
+                            (record["native_content_hash"], superseded_native_hash),
                         )
                 self.conn.commit()
             except Exception:

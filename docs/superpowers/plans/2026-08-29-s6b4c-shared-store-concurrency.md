@@ -1,10 +1,10 @@
 # S6B.4C Shared-Store Concurrency Implementation Plan
 
-> **For Hermes:** Execute this plan task-by-task with strict TDD. Do not start a later slice until its predecessor is verified and the Owner/Advisor gate is clear.
+> **For execution agents:** Execute only the current Owner-authorized slice with strict TDD. Closed slices below are retained as implementation history and must not be replayed.
 
-**Goal:** Establish a portable, immutable transport-bound host identity and one shared gateway over the existing five-operation `MemoryAdapter`, with a disposable sequential cross-gateway visibility proof. Do not implement atomic CAS, lost-update prevention, or concurrent writers in this slice.
+**Goal:** Establish the S6B.4C shared-store concurrency campaign slice-by-slice. S6B.4C-01 and 4C-02 are closed; the current slice is S6B.4C-03 atomic multi-client revision/CAS and lost-update prevention.
 
-**Architecture:** Keep identity at the trusted transport/server construction boundary. A small project-neutral `HostBinding` is created outside MCP request payloads, then an immutable `MemoryGateway` validates request identity claims, dispatches to the existing adapter, and adds a bounded non-secret host-binding audit projection. The stdio server supplies `TRANSPORT_KIND=stdio`; no host identity is derived from HOME, hostname, cwd, username, credentials, or `runtime_agent_id`.
+**Architecture:** Preserve the accepted execution-context and immutable transport-bound gateway boundaries from 4C-01/02. For 4C-03, keep the adapter's early `expected_revision` validation but place the authoritative compare-and-swap decision inside the existing SQLite write transaction, before any successor row is inserted. Reuse the pinned backend's WAL and bounded lock/busy retry rather than adding a new coordinator or lock layer.
 
 **Tech Stack:** Python 3.11+, stdlib dataclasses/uuid/argparse, existing FastMCP server, existing FactLane adapter/storage/contract, pytest, and the existing lockfile.
 
@@ -12,26 +12,24 @@
 
 ## Scope guard
 
-This execution covers 4C-02 only:
-
-```text
-4C-02 transport-bound host identity / shared gateway
-```
-
-4C-01 is CLOSED_PASS. The campaign boundary remains:
+Current execution:
 
 ```text
 4C-01 CLOSED_PASS
-4C-02 CURRENT
-4C-03 NOT_STARTED
+4C-02 CLOSED_PASS
+4C-03 CURRENT
 4C-04 NOT_STARTED
 4C-05 NOT_STARTED
 4C-06 NOT_STARTED
 ```
 
-4C-03 atomic multi-client revision/CAS, lost-update prevention, simultaneous writers, crash injection, and any new coordination mechanism are forbidden here.
+The detailed Tasks 1–13 below are retained as closed 4C-01/02 implementation history only. Do not rerun them as gates for 4C-03.
+
+4C-04 real Codex/Hermes disposable concurrency, 4C-05 async embedding contention, and 4C-06 crash injection remain forbidden in the current slice.
 
 Do not implement retention/compaction/reclaim/recovery (S6B.4D), native-memory bootstrap or migration (S6B.5), live configuration, registration, backend-pin changes, embedding-model changes, or reopening accepted 4B results.
+
+## Closed implementation history — S6B.4C-01 and S6B.4C-02
 
 ## Task 1: Confirm the entry boundary
 
@@ -359,10 +357,53 @@ UV_LOCK_CHANGE=NONE
 
 Then run the complete repository gate, record raw output only under the ignored evidence root, and leave the branch for one fresh bounded independent reviewer before commit.
 
-## Later-slice handoff notes (not executed here)
+## Later-slice handoff notes
 
-- 4C-02 must bind host identity to transport/gateway context before any shared write-plane claim.
-- 4C-03 must prove single-winner atomic revision/CAS semantics across independent clients/processes.
+- 4C-01 and 4C-02 are CLOSED_PASS; their detailed tasks above are retained for provenance only.
+- 4C-03 is the current Owner-authorized slice and must prove single-winner atomic revision/CAS semantics across independent clients/connections.
 - 4C-04 must use disposable stores and separate Codex/Hermes execution contexts.
 - 4C-05 must preserve exact embedding/model/backend identities while testing async contention.
 - 4C-06 must inject process termination/crash boundaries and rerun final acceptance.
+
+## Current execution: S6B.4C-03 atomic multi-client revision/CAS and lost-update prevention
+
+### Task 14: Write the deterministic RED lost-update proof
+
+Use two independent `SQLiteVecEngine` instances and two independent `MemoryAdapter` instances against one disposable database. Seed one current record, allow both clients to finish reading the same revision, then release both writes through a test-only barrier.
+
+The pre-fix implementation must demonstrate the defect by allowing both writers to succeed. The intended RED contract is exactly one success and one `VERSION_CONFLICT`.
+
+### Task 15: Implement transaction-local parent-current CAS
+
+Modify only `src/factlane/storage.py` unless a failing test proves more production surface is required. After `BEGIN IMMEDIATE` and before any insert, require the supplied `supersede_record_id` to exist, remain `VALIDATED_CURRENT`, and equal the successor's `parent_record_id`. Failure raises `VERSION_CONFLICT` and rolls back. Success writes the successor/vector and supersedes that checked parent in the same transaction.
+
+No new lock, retry loop, coordinator, schema, public tool, backend pin, lockfile, or embedding identity is allowed.
+
+### Task 16: Prove REVERIFY and REPLACE invariants
+
+For both modes prove:
+
+```text
+SUCCESSFUL_WRITERS=1
+VERSION_CONFLICT_WRITERS=1
+CURRENT_LINEAGE_FORKS=0
+CURRENT_RECORD_COUNT=1
+PARTIAL_LOSER_ROWS=0
+```
+
+Additionally prove REVERIFY advances one linear revision and REPLACE creates exactly one new current logical memory while the old parent is superseded exactly once.
+
+### Task 17: Exact-head verification and PR handoff
+
+Run the exact final branch head through:
+
+```bash
+uv sync --frozen --dev
+uv run pytest -q
+uv run python -c "import factlane; print(factlane.__name__)"
+uv run factlane --help
+```
+
+Inspect the final diff and confirm no change to `uv.lock`, backend pin, schema, embedding identity, public five-tool surface, live configuration, native memory, global MCP registration, or 4C-04/05/06 implementation.
+
+Open a PR to `main`, report the exact head SHA and CI result, and stop for Owner/Advisor review. Do not self-merge and do not start 4C-04. Canonical merged-closure reconciliation follows the merge boundary.
