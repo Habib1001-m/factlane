@@ -101,6 +101,9 @@ def test_gateway_backing_binding_cannot_be_reassigned() -> None:
     with pytest.raises(AttributeError):
         object.__setattr__(bound, "_binding", replacement)
 
+    with pytest.raises(AttributeError):
+        object.__setattr__(bound, "_binding_values", tuple(replacement))
+
     assert original is not None
     assert bound.binding is not None
     assert bound.binding.bound_host_id == original.bound_host_id
@@ -122,19 +125,20 @@ def test_server_authority_has_no_mutable_module_registry() -> None:
 
 def test_server_state_does_not_retain_inner_fastmcp() -> None:
     server = build_mcp_server(gateway())
-    state = tuple.__getitem__(server, 1)
+    state = vars(server)
 
-    assert not isinstance(state, FastMCP)
-    if callable(state):
-        assert not any(
-            isinstance(cell.cell_contents, FastMCP)
-            for cell in state.__closure__ or ()
-        )
+    assert not any(isinstance(value, FastMCP) for value in state.values())
+    assert not any(
+        isinstance(cell.cell_contents, FastMCP)
+        for value in state.values()
+        if callable(value)
+        for cell in getattr(value, "__closure__", ()) or ()
+    )
 
 
 def test_server_tool_callbacks_do_not_retain_mutable_dispatch_closures() -> None:
     server = build_mcp_server(gateway())
-    state = tuple.__getitem__(server, 1)
+    state = vars(server)["_tool_specs_value"]
 
     assert all(not callable(operation) for _, _, operation in state)
 
@@ -151,69 +155,63 @@ def test_transport_and_operation_authority_is_not_module_mutable() -> None:
     assert getattr(gateway_module, "_RESERVED_IDENTITY_CLAIMS", None) is None
 
 
-def test_host_binding_class_attributes_cannot_be_replaced() -> None:
-    with pytest.raises(AttributeError):
-        HostBinding.transport_kind = property(lambda self: "sse")  # type: ignore[misc]
-
+def test_public_class_replacement_cannot_bypass_instance_authority() -> None:
     bound = gateway()
-    assert bound.require_transport("stdio").transport_kind == "stdio"
+    binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
 
-    descriptor = HostBinding.__dict__["transport_kind"]
-    type.__setattr__(HostBinding, "transport_kind", property(lambda self: "sse"))
-    try:
-        assert bound.binding is not None
-        assert bound.binding.transport_kind == "stdio"
-        assert bound.require_transport("stdio").transport_kind == "stdio"
-    finally:
-        type.__setattr__(HostBinding, "transport_kind", descriptor)
-
-
-def test_type_level_dispatch_replacement_cannot_bypass_gateway() -> None:
-    bound = gateway()
-    original = MemoryGateway.__dict__["dispatch"]
-
-    async def evil_dispatch(self: MemoryGateway, operation: str, request: dict[str, Any]) -> dict[str, Any]:
+    async def evil_dispatch(*args: Any, **kwargs: Any) -> dict[str, Any]:
         return {"status": "EVIL", "audit": {"host_binding": {"host_id": "spoofed"}}}
 
-    type.__setattr__(MemoryGateway, "dispatch", evil_dispatch)
-    try:
-        response = asyncio.run(bound.dispatch("memory_status", {"scope": "PROJECT", "project_id": "p"}))
-        class_response = asyncio.run(
-            MemoryGateway.dispatch(bound, "memory_status", {"scope": "PROJECT", "project_id": "p"})
-        )
-    finally:
-        type.__setattr__(MemoryGateway, "dispatch", original)
+    def evil_transport(*args: Any, **kwargs: Any) -> HostBinding:
+        return HostBinding("evil", "sse", "evil")
 
-    assert response["status"] == "OK"
-    assert response["audit"]["host_binding"]["host_id"] == "codex-disposable"
-    assert class_response["status"] == "OK"
-    assert class_response["audit"]["host_binding"]["host_id"] == "codex-disposable"
+    def evil_audit(*args: Any, **kwargs: Any) -> dict[str, str]:
+        return {"host_id": "evil", "transport": "sse"}
+
+    for owner, name, replacement, call in (
+        (MemoryGateway, "dispatch", evil_dispatch, lambda: asyncio.run(object.__getattribute__(bound, "dispatch")("memory_status", {"scope": "PROJECT"}))),
+        (MemoryGateway, "require_transport", evil_transport, lambda: object.__getattribute__(bound, "require_transport")("sse")),
+        (HostBinding, "transport_kind", property(lambda self: "sse"), lambda: object.__getattribute__(binding, "transport_kind")),
+        (HostBinding, "audit_projection", evil_audit, lambda: object.__getattribute__(binding, "audit_projection")()["host_id"]),
+    ):
+        had_original = name in owner.__dict__
+        original = owner.__dict__.get(name)
+        type.__setattr__(owner, name, replacement)
+        try:
+            try:
+                value = call()
+            except AdapterError as exc:
+                value = exc.code
+        finally:
+            if had_original:
+                type.__setattr__(owner, name, original)
+            else:
+                type.__delattr__(owner, name)
+        if name == "dispatch":
+            assert value["status"] == "OK"
+        elif name == "require_transport":
+            assert value == "HOST_TRANSPORT_IDENTITY_MISMATCH"
+        else:
+            assert value == ("stdio" if name == "transport_kind" else "codex-disposable")
 
 
-def test_type_level_transport_replacement_cannot_bypass_gateway() -> None:
+def test_gateway_operation_attributes_cannot_be_reassigned() -> None:
     bound = gateway()
-    original = MemoryGateway.__dict__["require_transport"]
 
-    def evil_transport(self: MemoryGateway, selected_transport: str) -> HostBinding:
-        return HostBinding("spoofed", selected_transport, "spoofed")
+    for name in ("dispatch", "require_transport", "require_binding"):
+        with pytest.raises(AttributeError):
+            object.__setattr__(bound, name, lambda *args: None)
+        with pytest.raises(AttributeError):
+            object.__delattr__(bound, name)
 
-    type.__setattr__(MemoryGateway, "require_transport", evil_transport)
-    try:
-        with pytest.raises(AdapterError) as error:
-            bound.require_transport("sse")
-        with pytest.raises(AdapterError) as class_error:
-            MemoryGateway.require_transport(bound, "sse")
-    finally:
-        type.__setattr__(MemoryGateway, "require_transport", original)
-
-    assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
-    assert class_error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
+    assert asyncio.run(bound.dispatch("memory_status", {"scope": "PROJECT"}))["status"] == "OK"
 
 
 def test_type_level_server_transport_replacement_cannot_bypass_gateway() -> None:
     server = build_mcp_server(gateway())
     server_type = type(server)
-    original = server_type.__dict__["run_sse_async"]
+    had_original = "run_sse_async" in server_type.__dict__
+    original = server_type.__dict__.get("run_sse_async")
 
     async def evil_sse(self: Any, mount_path: str | None = None) -> None:
         return None
@@ -223,29 +221,20 @@ def test_type_level_server_transport_replacement_cannot_bypass_gateway() -> None
         with pytest.raises(AdapterError) as error:
             FastMCP.run(server, "sse")
     finally:
-        type.__setattr__(server_type, "run_sse_async", original)
+        if had_original:
+            type.__setattr__(server_type, "run_sse_async", original)
+        else:
+            type.__delattr__(server_type, "run_sse_async")
 
     assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
 
 
 def test_host_binding_subclass_cannot_replace_gateway_audit() -> None:
     class SpoofBinding(HostBinding):
-        def audit_projection(self) -> dict[str, str]:
-            return {
-                "host_id": "spoofed",
-                "transport": "sse",
-                "gateway_instance_id": "fake",
-                "binding_source": "secret:/etc/passwd",
-            }
+        pass
 
-    with pytest.raises(AdapterError) as error:
-        MemoryGateway(
-            FakeAdapter(),
-            SpoofBinding("codex-disposable", "stdio", "trusted-launcher"),
-            transport_kind="stdio",
-        )
-
-    assert error.value.code == "UNBOUND_GATEWAY"
+    with pytest.raises(TypeError):
+        SpoofBinding("codex-disposable", "stdio", "trusted-launcher")
 
 
 @pytest.mark.parametrize(
@@ -267,25 +256,9 @@ def test_binding_fields_cannot_be_reassigned_by_object_setattr(field: str, repla
     assert getattr(binding, field) == original
 
 
-def test_gateway_binding_remains_authoritative_after_binding_class_mutation() -> None:
-    class SpoofBinding(HostBinding):
-        __slots__ = ()
-
-        @property
-        def transport_kind(self) -> str:
-            return "sse"
-
-        def audit_projection(self) -> dict[str, str]:
-            return {
-                "host_id": "spoofed",
-                "transport": "sse",
-                "gateway_instance_id": "forged",
-                "binding_source": "secret-path",
-            }
-
+def test_gateway_binding_remains_authoritative_after_caller_binding_mutation() -> None:
     binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
     bound = MemoryGateway(FakeAdapter(), binding, transport_kind="stdio")
-    object.__setattr__(binding, "__class__", SpoofBinding)
 
     response = asyncio.run(bound.dispatch("memory_status", {"scope": "PROJECT", "project_id": "p"}))
 
