@@ -1,7 +1,7 @@
 # FactLane Canonical Taskboard
 
 ```text
-TASKBOARD_VERSION=22
+TASKBOARD_VERSION=23
 TASKBOARD_UPDATE_MODE=IN_PLACE_APPEND_AND_RECONCILE
 CANONICAL_FILENAME=TASKBOARD.md
 NUMBERED_TASKBOARD_FILES_FUTURE_AUTHORITY=NO
@@ -30,7 +30,7 @@ S6C_STARTED=NO
 ACTIVE_SPEC=docs/S6B_4C_SHARED_STORE_CONCURRENCY_SPEC.md
 ACTIVE_PLAN=docs/superpowers/plans/2026-08-29-s6b4c-shared-store-concurrency.md
 CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
-CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+CURRENT_NEXT_ACTION=OWNER_ADVISOR_ARCHITECTURE_DECISION_ON_IN_PROCESS_AUTHORITY_MODEL
 ```
 
 ## Accepted source gates carried forward
@@ -728,6 +728,43 @@ S6B_4C=IN_PROGRESS
 S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
 CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
 CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-30 — Fresh reviewer HOLD and in-process authority boundary
+
+The fresh bounded reviewer examined exact candidate
+`a4649ea5e2169de973b3ab11f73abe649c3712b3` and found that the current private
+runtime objects still expose mutable authority through their instance
+`__dict__`; replacing gateway `_state` changed audit and transport identity,
+and replacing server callbacks changed transport enforcement. The reviewer
+also confirmed that the private Python type remains mutable through
+`type.__setattr__`. The attempted remediation was not kept or pushed because
+it did not establish a verified security boundary. The work is returned to the
+Owner/Advisor for an architecture decision: either move the authority boundary
+outside the mutable Python process/object model, or explicitly narrow the
+accepted threat model before another implementation cycle. PR #5 remains
+unmerged; PR #4 remains open and unmerged; no later slice is authorized.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=a4649ea5e2169de973b3ab11f73abe649c3712b3
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDINGS=MUTABLE_GATEWAY_INSTANCE_DICT_MUTABLE_SERVER_INSTANCE_DICT_MUTABLE_PRIVATE_RUNTIME_TYPE
+PR5_UNVERIFIED_ATTEMPT_DISCARDED=YES
+PRODUCT_CODE_HEAD_UNCHANGED_AFTER_REVIEW=a4649ea5e2169de973b3ab11f73abe649c3712b3
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=OPEN_PENDING_ARCHITECTURE_DECISION
+BLOCKER_2_TRANSPORT_ENFORCEMENT=OPEN_PENDING_ARCHITECTURE_DECISION
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=OWNER_ADVISOR_ARCHITECTURE_DECISION_ON_IN_PROCESS_AUTHORITY_MODEL
 S6B_4C_03=NOT_STARTED
 S6B_4D=BLOCKED
 S6B_5=BLOCKED
