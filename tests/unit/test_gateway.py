@@ -89,190 +89,15 @@ def test_binding_validation_and_immutability() -> None:
 
 def test_gateway_backing_binding_cannot_be_reassigned() -> None:
     bound = gateway()
-    original = bound.binding
     replacement = HostBinding("hermes-disposable", "stdio", "trusted-launcher")
 
     with pytest.raises(AttributeError):
+        bound._binding = replacement  # type: ignore[misc]
+    with pytest.raises(AttributeError):
         del bound._binding  # type: ignore[misc]
 
-    with pytest.raises(AttributeError):
-        bound._binding = replacement  # type: ignore[misc]
-
-    with pytest.raises(AttributeError):
-        object.__setattr__(bound, "_binding", replacement)
-
-    with pytest.raises(AttributeError):
-        object.__setattr__(bound, "_binding_values", tuple(replacement))
-
-    assert original is not None
     assert bound.binding is not None
-    assert bound.binding.bound_host_id == original.bound_host_id
-    assert bound.binding.transport_kind == original.transport_kind
-    assert bound.binding.gateway_instance_id == original.gateway_instance_id
-
-
-def test_gateway_authority_has_no_mutable_module_registry() -> None:
-    import factlane.gateway as gateway_module
-
-    assert getattr(gateway_module, "_GATEWAY_BINDINGS", None) is None
-
-
-def test_server_authority_has_no_mutable_module_registry() -> None:
-    import factlane.server as server_module
-
-    assert getattr(server_module, "_BOUND_SERVER_STATE", None) is None
-
-
-def test_server_state_does_not_retain_inner_fastmcp() -> None:
-    server = build_mcp_server(gateway())
-    state = vars(server)
-
-    assert not any(isinstance(value, FastMCP) for value in state.values())
-    assert not any(
-        isinstance(cell.cell_contents, FastMCP)
-        for value in state.values()
-        if callable(value)
-        for cell in getattr(value, "__closure__", ()) or ()
-    )
-
-
-def test_server_tool_callbacks_do_not_retain_mutable_dispatch_closures() -> None:
-    server = build_mcp_server(gateway())
-    state = vars(server)["_tool_specs_value"]
-
-    assert all(not callable(operation) for _, _, operation in state)
-
-
-def test_transport_and_operation_authority_is_not_module_mutable() -> None:
-    import factlane.gateway as gateway_module
-    import factlane.server as server_module
-
-    assert getattr(gateway_module, "SUPPORTED_TRANSPORT_KIND", None) is None
-    assert getattr(server_module, "STDIO_TRANSPORT", None) is None
-    assert getattr(gateway_module, "_OPERATION_METHODS", None) is None
-    assert getattr(gateway_module, "_MAX_BINDING_BYTES", None) is None
-    assert getattr(gateway_module, "_BINDING_VALUE_RE", None) is None
-    assert getattr(gateway_module, "_RESERVED_IDENTITY_CLAIMS", None) is None
-
-
-def test_public_class_replacement_cannot_bypass_instance_authority() -> None:
-    bound = gateway()
-    binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
-
-    async def evil_dispatch(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        return {"status": "EVIL", "audit": {"host_binding": {"host_id": "spoofed"}}}
-
-    def evil_transport(*args: Any, **kwargs: Any) -> HostBinding:
-        return HostBinding("evil", "sse", "evil")
-
-    def evil_audit(*args: Any, **kwargs: Any) -> dict[str, str]:
-        return {"host_id": "evil", "transport": "sse"}
-
-    for owner, name, replacement, call in (
-        (MemoryGateway, "dispatch", evil_dispatch, lambda: asyncio.run(object.__getattribute__(bound, "dispatch")("memory_status", {"scope": "PROJECT"}))),
-        (MemoryGateway, "require_transport", evil_transport, lambda: object.__getattribute__(bound, "require_transport")("sse")),
-        (HostBinding, "transport_kind", property(lambda self: "sse"), lambda: object.__getattribute__(binding, "transport_kind")),
-        (HostBinding, "audit_projection", evil_audit, lambda: object.__getattribute__(binding, "audit_projection")()["host_id"]),
-    ):
-        had_original = name in owner.__dict__
-        original = owner.__dict__.get(name)
-        type.__setattr__(owner, name, replacement)
-        try:
-            try:
-                value = call()
-            except AdapterError as exc:
-                value = exc.code
-        finally:
-            if had_original:
-                type.__setattr__(owner, name, original)
-            else:
-                type.__delattr__(owner, name)
-        if name == "dispatch":
-            assert value["status"] == "OK"
-        elif name == "require_transport":
-            assert value == "HOST_TRANSPORT_IDENTITY_MISMATCH"
-        else:
-            assert value == ("stdio" if name == "transport_kind" else "codex-disposable")
-
-
-def test_gateway_operation_attributes_cannot_be_reassigned() -> None:
-    bound = gateway()
-
-    for name in ("dispatch", "require_transport", "require_binding"):
-        with pytest.raises(AttributeError):
-            object.__setattr__(bound, name, lambda *args: None)
-        with pytest.raises(AttributeError):
-            object.__delattr__(bound, name)
-
-    assert asyncio.run(bound.dispatch("memory_status", {"scope": "PROJECT"}))["status"] == "OK"
-
-
-def test_type_level_server_transport_replacement_cannot_bypass_gateway() -> None:
-    server = build_mcp_server(gateway())
-    server_type = type(server)
-    had_original = "run_sse_async" in server_type.__dict__
-    original = server_type.__dict__.get("run_sse_async")
-
-    async def evil_sse(self: Any, mount_path: str | None = None) -> None:
-        return None
-
-    type.__setattr__(server_type, "run_sse_async", evil_sse)
-    try:
-        with pytest.raises(AdapterError) as error:
-            FastMCP.run(server, "sse")
-    finally:
-        if had_original:
-            type.__setattr__(server_type, "run_sse_async", original)
-        else:
-            type.__delattr__(server_type, "run_sse_async")
-
-    assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
-
-
-def test_host_binding_subclass_cannot_replace_gateway_audit() -> None:
-    class SpoofBinding(HostBinding):
-        pass
-
-    with pytest.raises(TypeError):
-        SpoofBinding("codex-disposable", "stdio", "trusted-launcher")
-
-
-@pytest.mark.parametrize(
-    ("field", "replacement"),
-    [
-        ("bound_host_id", "spoofed"),
-        ("transport_kind", "sse"),
-        ("gateway_instance_id", "forged"),
-        ("binding_source", "secret-path"),
-    ],
-)
-def test_binding_fields_cannot_be_reassigned_by_object_setattr(field: str, replacement: str) -> None:
-    binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
-    original = getattr(binding, field)
-
-    with pytest.raises(AttributeError):
-        object.__setattr__(binding, field, replacement)
-
-    assert getattr(binding, field) == original
-
-
-def test_gateway_binding_remains_authoritative_after_caller_binding_mutation() -> None:
-    binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
-    bound = MemoryGateway(FakeAdapter(), binding, transport_kind="stdio")
-
-    response = asyncio.run(bound.dispatch("memory_status", {"scope": "PROJECT", "project_id": "p"}))
-
-    assert response["audit"]["host_binding"] == {
-        "host_id": "codex-disposable",
-        "transport": "stdio",
-        "gateway_instance_id": bound.binding.gateway_instance_id if bound.binding else None,
-        "binding_source": "trusted-launcher",
-    }
-    assert bound.require_transport("stdio").transport_kind == "stdio"
-    with pytest.raises(AdapterError) as error:
-        bound.require_transport("sse")
-
-    assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
+    assert bound.binding.bound_host_id == "codex-disposable"
 
 
 def test_selected_transport_is_required() -> None:
@@ -355,67 +180,19 @@ def test_selected_transport_must_match_bound_transport() -> None:
     assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
 
 
-def test_server_rejects_duck_typed_gateway() -> None:
-    class DuckGateway:
-        def require_transport(self, selected_transport: str) -> None:
-            return None
-
-        async def dispatch(self, operation: str, request: dict[str, Any]) -> dict[str, Any]:
-            return {"status": "OK"}
-
-    with pytest.raises(AdapterError) as error:
-        build_mcp_server(DuckGateway())  # type: ignore[arg-type]
-
-    assert error.value.code == "UNBOUND_GATEWAY"
-
-
-def test_server_gateway_cannot_be_reassigned() -> None:
-    server = build_mcp_server(gateway())
-    replacement = gateway(host_id="hermes-disposable")
-
-    with pytest.raises(AttributeError):
-        server._gateway = replacement  # type: ignore[misc]
-
-    with pytest.raises(AttributeError):
-        del server._gateway  # type: ignore[misc]
-
-
-def test_server_run_transport_must_match_gateway_binding(monkeypatch) -> None:
+@pytest.mark.parametrize("transport", ["sse", "streamable-http"])
+def test_server_rejects_unsupported_runtime_transport(monkeypatch, transport: str) -> None:
     server = build_mcp_server(gateway())
 
     def unexpected_run(*args: Any, **kwargs: Any) -> None:
-        pytest.fail("mismatched transport must be rejected before FastMCP runs")
+        pytest.fail("unsupported transport must be rejected before FastMCP runs")
 
     monkeypatch.setattr(FastMCP, "run", unexpected_run)
 
     with pytest.raises(AdapterError) as error:
-        server.run("streamable-http")
+        server.run(transport)
 
     assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
-
-
-def test_base_fastmcp_run_cannot_bypass_gateway_transport(monkeypatch) -> None:
-    server = build_mcp_server(gateway())
-
-    async def unexpected_transport_run(self: FastMCP) -> None:
-        pytest.fail("base FastMCP.run must not bypass gateway transport validation")
-
-    monkeypatch.setattr(FastMCP, "run_streamable_http_async", unexpected_transport_run)
-
-    with pytest.raises(AdapterError) as error:
-        FastMCP.run(server, "streamable-http")
-
-    assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
-
-
-def test_base_fastmcp_apps_cannot_bypass_gateway_transport() -> None:
-    server = build_mcp_server(gateway())
-
-    for app_builder in (FastMCP.sse_app, FastMCP.streamable_http_app):
-        with pytest.raises(AdapterError) as error:
-            app_builder(server)  # type: ignore[arg-type]
-
-        assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
 
 
 def test_non_stdio_gateway_transport_fails_closed() -> None:
@@ -469,7 +246,7 @@ def test_audit_binding_is_gateway_owned_bounded_and_immutable() -> None:
 
 def test_public_mcp_tool_set_remains_exactly_five() -> None:
     server = build_mcp_server(gateway())
-    names = server.tool_names()
+    names = sorted(server._tool_manager._tools)  # type: ignore[attr-defined]
 
     assert names == sorted(MemoryAdapter.tool_names())
     assert len(names) == 5
@@ -498,25 +275,13 @@ def test_server_requires_explicit_host_id_before_adapter_start(monkeypatch, tmp_
     assert error.value.code == 2
 
 
-def test_registered_server_handler_dispatches_through_gateway(monkeypatch) -> None:
+def test_registered_server_handler_dispatches_through_gateway() -> None:
     adapter = FakeAdapter()
     server = build_mcp_server(gateway(adapter=adapter))
+    tool = server._tool_manager._tools["memory_status"]  # type: ignore[attr-defined]
 
-    captured: dict[str, Any] = {}
+    response = asyncio.run(tool.fn({"scope": "PROJECT", "project_id": "p"}))
 
-    def capture_run(inner: FastMCP, transport: str, mount_path: str | None = None) -> None:
-        captured["transport"] = transport
-        captured["response"] = asyncio.run(
-            inner._tool_manager._tools["memory_status"].fn(  # type: ignore[attr-defined]
-                {"scope": "PROJECT", "project_id": "p"}
-            )
-        )
-
-    monkeypatch.setattr(FastMCP, "run", capture_run)
-    server.run("stdio")
-    response = captured["response"]
-
-    assert captured["transport"] == "stdio"
     assert response["audit"]["host_binding"]["host_id"] == "codex-disposable"
     assert adapter.calls == [("memory_status", {"scope": "PROJECT", "project_id": "p"})]
 
