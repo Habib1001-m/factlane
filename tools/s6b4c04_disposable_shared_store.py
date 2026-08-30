@@ -10,28 +10,47 @@ import time
 from typing import Any
 
 
-def _bootstrap_actor_upstream_base() -> None:
+def _write_bootstrap_phase(run_dir: Path, actor: str, phase: str) -> None:
+    phase_path = run_dir / "phases" / f"{actor}.json"
+    phase_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "actor": actor,
+        "phase": phase,
+        "pid": os.getpid(),
+        "effective_home": os.environ.get("HOME", ""),
+    }
+    temporary = phase_path.with_name(f".{phase_path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, phase_path)
+
+
+def _bootstrap_actor_upstream_base() -> tuple[Path, str] | None:
     """Keep pinned-backend import-time state inside the disposable 4C-04 run."""
     args = sys.argv[1:]
     if not args or args[0] != "actor":
-        return
+        return None
     try:
         run_dir_index = args.index("--run-dir")
         actor_index = args.index("--actor")
         run_dir = Path(args[run_dir_index + 1]).resolve()
         actor = args[actor_index + 1]
     except (ValueError, IndexError):
-        return
+        return None
     os.environ["MCP_MEMORY_BASE_DIR"] = str(run_dir / "upstream-runtime" / actor)
+    _write_bootstrap_phase(run_dir, actor, "BOOTSTRAP_PRE_IMPORT")
+    return run_dir, actor
 
 
-_bootstrap_actor_upstream_base()
+_BOOTSTRAP_ACTOR = _bootstrap_actor_upstream_base()
 
 from factlane.adapter import MemoryAdapter
 from factlane.contract import AdapterError
 from factlane.embeddings import EmbeddingProfile
 from factlane.gateway import HostBinding, MemoryGateway
 from factlane.storage import SQLiteVecEngine
+
+if _BOOTSTRAP_ACTOR is not None:
+    _write_bootstrap_phase(*_BOOTSTRAP_ACTOR, "IMPORT_COMPLETE")
 
 
 ACTORS = ("codex-disposable", "hermes-disposable")
@@ -81,6 +100,7 @@ def _paths(run_dir: Path) -> dict[str, Path]:
         "manifest": root / "manifest.json",
         "ready": root / "ready",
         "results": root / "results",
+        "phases": root / "phases",
     }
 
 
@@ -89,6 +109,18 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _write_phase(paths: dict[str, Path], actor: str, phase: str) -> None:
+    _atomic_write_json(
+        paths["phases"] / f"{actor}.json",
+        {
+            "actor": actor,
+            "phase": phase,
+            "pid": os.getpid(),
+            "effective_home": os.environ.get("HOME", ""),
+        },
+    )
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -115,6 +147,7 @@ async def _prepare(run_dir: Path) -> dict[str, Any]:
     paths["root"].mkdir(parents=True, exist_ok=False)
     paths["ready"].mkdir()
     paths["results"].mkdir()
+    paths["phases"].mkdir()
 
     _engine, adapter = await _open_adapter(paths["db"])
     try:
@@ -191,12 +224,14 @@ def _install_file_barrier(
                 "pre_read_complete": True,
             },
         )
+        _write_phase(paths, actor, "BARRIER_READY")
         deadline = time.monotonic() + timeout_seconds
         peer_paths = [paths["ready"] / f"{name}.json" for name in ACTORS]
         while not all(path.exists() for path in peer_paths):
             if time.monotonic() >= deadline:
                 raise AdapterError("BARRIER_TIMEOUT", "peer execution context did not reach the shared write barrier")
             await asyncio.sleep(0.02)
+        _write_phase(paths, actor, "BARRIER_RELEASED")
         await original_write(*args, **kwargs)
 
     engine.write_record = gated_write  # type: ignore[method-assign]
@@ -206,11 +241,15 @@ async def _actor(run_dir: Path, actor: str, timeout_seconds: float) -> dict[str,
     if actor not in ACTORS:
         raise ValueError(f"actor must be one of: {', '.join(ACTORS)}")
     paths = _paths(run_dir)
+    _write_phase(paths, actor, "ACTOR_ENTER")
     manifest = _read_json(paths["manifest"])
+    _write_phase(paths, actor, "MANIFEST_LOADED")
     if manifest.get("actors") != list(ACTORS):
         raise ValueError("manifest actor set does not match the 4C-04 contract")
 
+    _write_phase(paths, actor, "OPEN_ADAPTER_START")
     engine, adapter = await _open_adapter(paths["db"])
+    _write_phase(paths, actor, "OPEN_ADAPTER_COMPLETE")
     binding = HostBinding(actor, "stdio", BINDING_SOURCE)
     gateway = MemoryGateway(adapter, binding, transport_kind="stdio")
     _install_file_barrier(
@@ -221,6 +260,7 @@ async def _actor(run_dir: Path, actor: str, timeout_seconds: float) -> dict[str,
         binding=binding,
         timeout_seconds=timeout_seconds,
     )
+    _write_phase(paths, actor, "GATEWAY_READY")
 
     marker = "b" if actor == ACTORS[0] else "c"
     request = {
@@ -250,7 +290,9 @@ async def _actor(run_dir: Path, actor: str, timeout_seconds: float) -> dict[str,
     audit_host_id: str | None = None
     audit_gateway_instance_id: str | None = None
     try:
+        _write_phase(paths, actor, "DISPATCH_START")
         response = await gateway.dispatch("memory_update", request)
+        _write_phase(paths, actor, "DISPATCH_COMPLETE")
         result = response["results"][0]
         audit = response["audit"]["host_binding"]
         outcome = "SUCCESS"
@@ -261,6 +303,7 @@ async def _actor(run_dir: Path, actor: str, timeout_seconds: float) -> dict[str,
     except AdapterError as exc:
         if exc.code != "VERSION_CONFLICT":
             raise
+        _write_phase(paths, actor, "VERSION_CONFLICT")
         outcome = "VERSION_CONFLICT"
         error_code = exc.code
     finally:
@@ -280,6 +323,7 @@ async def _actor(run_dir: Path, actor: str, timeout_seconds: float) -> dict[str,
         "audit_gateway_instance_id": audit_gateway_instance_id,
     }
     _atomic_write_json(paths["results"] / f"{actor}.json", payload)
+    _write_phase(paths, actor, "RESULT_WRITTEN")
     return payload
 
 
