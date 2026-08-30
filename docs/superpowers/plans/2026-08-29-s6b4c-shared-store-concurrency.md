@@ -2,11 +2,11 @@
 
 > **For execution agents:** Execute only the current Owner-authorized slice with strict TDD. Closed slices below are retained as implementation history and must not be replayed.
 
-**Goal:** Establish the S6B.4C shared-store concurrency campaign slice-by-slice. S6B.4C-01, 4C-02, and 4C-03 are closed; the current slice is S6B.4C-04 Codex/Hermes disposable shared-store concurrency.
+**Goal:** Establish the S6B.4C shared-store concurrency campaign slice-by-slice. S6B.4C-01 through 4C-04 are closed; the current slice is S6B.4C-05 async embedding concurrency and pinned-backend runtime proof.
 
-**Architecture:** Preserve the accepted execution-context, transport-bound gateway, and transaction-local CAS boundaries from 4C-01/02/03. For 4C-04, vary only the execution-context/process boundary: two separately launched actors use independent FactLane gateway/adapter/storage instances over one disposable database and synchronize only at a test acceptance barrier after reading the same current revision. The accepted SQLite transaction remains the sole CAS authority; no coordinator or new lock/retry layer is introduced.
+**Architecture:** Preserve the accepted execution-context, transport-bound gateway, transaction-local CAS, and disposable Codex/Hermes boundaries from 4C-01/02/03/04. For 4C-05, vary only the async scheduling boundary: synchronous local embedding-provider work is offloaded at the async adapter edge while the synchronous provider protocol, pinned SQLite-vec backend, and accepted CAS authority remain unchanged. No embedding coordinator, worker service, queue, custom retry layer, or storage executor is introduced.
 
-**Tech Stack:** Python 3.11+, stdlib asyncio/subprocess/pathlib/json, existing FactLane gateway/adapter/storage/contract, pytest, and the existing lockfile.
+**Tech Stack:** Python 3.11+, stdlib asyncio/threading/subprocess/pathlib/json, existing FactLane gateway/adapter/storage/contract, pytest, and the existing lockfile.
 
 ---
 
@@ -18,14 +18,14 @@ Current execution:
 4C-01 CLOSED_PASS
 4C-02 CLOSED_PASS
 4C-03 CLOSED_PASS
-4C-04 CURRENT
-4C-05 NOT_STARTED
+4C-04 CLOSED_PASS
+4C-05 CURRENT
 4C-06 NOT_STARTED
 ```
 
-The detailed Tasks 1–17 below are retained as closed 4C-01/02/03 implementation history only. Do not rerun them as gates for 4C-04.
+The detailed Tasks 1–21 below are retained as closed 4C-01/02/03/04 implementation history only. Do not rerun them as gates for the current slice.
 
-4C-05 async embedding contention and 4C-06 crash injection remain forbidden in the current slice.
+4C-06 process/crash injection remains forbidden in the current slice. Cancellation cleanup and interrupted worker-thread semantics are also deferred unless a concrete correctness defect prevents the 4C-05 proof.
 
 Do not implement retention/compaction/reclaim/recovery (S6B.4D), native-memory bootstrap or migration (S6B.5), live configuration, registration, backend-pin changes, embedding-model changes, or reopening accepted 4B results.
 
@@ -360,8 +360,8 @@ Then run the complete repository gate, record raw output only under the ignored 
 ## Later-slice handoff notes
 
 - 4C-01, 4C-02, and 4C-03 are CLOSED_PASS; their detailed tasks are retained for provenance only.
-- 4C-04 is the current Owner-authorized slice and must use one disposable store plus actual separate Codex/Hermes execution contexts.
-- 4C-05 must preserve exact embedding/model/backend identities while testing async contention.
+- 4C-04 is CLOSED_PASS after the disposable shared-store concurrency proof and accepted Codex/Hermes launcher provenance.
+- 4C-05 is the current Owner-authorized slice and must preserve exact embedding/model/backend identities while testing async contention.
 - 4C-06 must inject process termination/crash boundaries and rerun final acceptance.
 
 ## Closed implementation history — S6B.4C-03 atomic multi-client revision/CAS and lost-update prevention
@@ -407,7 +407,7 @@ Inspect the final diff and confirm no change to `uv.lock`, backend pin, schema, 
 
 The 4C-03 implementation and canonical merged closure are complete. Do not replay this task as a gate for 4C-04.
 
-## Current execution — S6B.4C-04 Codex/Hermes disposable shared-store concurrency
+## Closed execution history — S6B.4C-04 Codex/Hermes disposable shared-store concurrency
 
 ### Task 18: Add the deterministic process-boundary RED proof
 
@@ -501,3 +501,57 @@ S6B_4C_06_STARTED=NO
 ```
 
 Open a PR to `main`, record the exact candidate head and CI evidence, and stop for Owner/Advisor merge disposition. Do not self-merge. Canonical merged-closure reconciliation follows the merge boundary.
+
+## Current execution — S6B.4C-05 async embedding concurrency and pinned-backend runtime proof
+
+The Owner authorized this cycle for design and RED only. The current production paths
+call synchronous `embed_documents`, `embed_query`, and `provider_status` directly from
+async adapter methods. The synchronous `EmbeddingProvider` protocol remains unchanged.
+
+### Task 22: Define the async provider boundary
+
+The required boundary is adapter-side offload of potentially blocking provider work so it
+does not execute on the event-loop thread. The smallest intended candidate is the
+standard-library `asyncio.to_thread(...)` path using the default asyncio executor.
+Provider worker threads perform provider work only and never own or manipulate SQLite
+connections.
+
+Preserve local-only HTTP, exact model digest, prefixes, `truncate=false`, requested
+dimensions, finite normalized vectors, stable `AdapterError` codes, and no remote
+fallback. Preserve the accepted 4C-03 transaction-local CAS, adapter-local write lock,
+pinned backend retry ownership, schema, backend pin, lockfile, public tools, and gateway.
+Do not add a coordinator, worker service, queue, custom retry/backpressure subsystem,
+network dependency, async provider rewrite, or storage executor change.
+
+### Task 23: Write the deterministic RED coverage
+
+Create `tests/integration/test_async_embedding_concurrency.py` with a synchronous test
+provider that uses valid normalized vectors, a bounded `threading.Barrier`, thread IDs,
+and active-call tracking. Tests must not require Ollama or network access.
+
+Cover:
+
+- two concurrent semantic searches and observable query-embedding overlap;
+- heartbeat progress while a slow provider query is pending;
+- document embedding through genuinely independent adapter instances, without expecting
+  one adapter-local write lock to overlap;
+- provider-status responsiveness while its synchronous readiness call is pending.
+
+Required future invariants:
+
+```text
+EVENT_LOOP_BLOCKED_BY_QUERY_EMBEDDING=NO
+CONCURRENT_QUERY_EMBEDDING_OVERLAP=YES
+EVENT_LOOP_PROGRESS_DURING_EMBEDDING=YES
+EVENT_LOOP_BLOCKED_BY_DOCUMENT_EMBEDDING=NO
+EVENT_LOOP_BLOCKED_BY_PROVIDER_STATUS=NO
+```
+
+### Task 24: DESIGN_AND_RED verification boundary
+
+Commit the three authority-file contract update first, then commit only the RED test
+file. Run the focused test and prove it fails deterministically against the unchanged
+production implementation for the intended event-loop blocking/serial provider-call
+reason. Run the full suite only to show existing unrelated tests remain green and the
+intentional RED coverage is the only failure. Do not implement the GREEN production fix,
+run exact local-provider runtime acceptance, or start 4C-06 in this cycle.

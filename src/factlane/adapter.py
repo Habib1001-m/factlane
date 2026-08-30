@@ -153,7 +153,7 @@ class MemoryAdapter:
             query_prefix=definition["query_prefix"],
             base_url=ollama_url,
         )
-        provider.provider_status()
+        await asyncio.to_thread(provider.provider_status)
         engine = SQLiteVecEngine(db_path, provider.profile)
         await engine.open()
         return cls(
@@ -387,7 +387,7 @@ class MemoryAdapter:
                 authority = "UNRESOLVED"
                 last_verified_at = None
                 verified_by = "UNVERIFIED"
-            embedding = self.provider.embed_documents([fact])[0]
+            embedding = (await asyncio.to_thread(self.provider.embed_documents, [fact]))[0]
             record_id = str(uuid.uuid4())
             memory_id = str(uuid.uuid4())
             created_at = iso_now()
@@ -569,7 +569,7 @@ class MemoryAdapter:
             vector_scored: list[tuple[dict[str, Any], float]] = []
             keyword_rows: list[dict[str, Any]] = []
             if retrieval_mode_kind in {"SEMANTIC", "HYBRID"}:
-                vector = self.provider.embed_query(query.strip())
+                vector = await asyncio.to_thread(self.provider.embed_query, query.strip())
                 vector_scored = await self.engine.vector_candidates(vector, scope_context, limit=max(top_k * 4, 16), history=history)
             if retrieval_mode_kind in {"KEYWORD", "HYBRID"}:
                 keyword_rows = await self.engine.keyword_candidates(query.strip(), scope_context, limit=max(top_k * 4, 16), history=history)
@@ -737,7 +737,7 @@ class MemoryAdapter:
                 "embedding_model_digest": self.provider.profile.model_digest,
                 "embedding_output_dimension": self.provider.profile.output_dimension,
             }
-            embedding = self.provider.embed_documents([fact])[0]
+            embedding = (await asyncio.to_thread(self.provider.embed_documents, [fact]))[0]
             await self.engine.write_record(record, embedding, supersede_record_id=old["record_id"])
             readback_rows = await self.engine.get_record(new_memory_id, scope_context, history=True)
             readback = next((row for row in readback_rows if row["record_id"] == record_id), None)
@@ -765,7 +765,7 @@ class MemoryAdapter:
         if scope is not None:
             scope_context = self._safe_scope(scope, project_id, worktree_id, workflow_id, agent_id)
         backend = await self.engine.status(scope_context)
-        provider_status = self.provider.provider_status()
+        provider_status = await asyncio.to_thread(self.provider.provider_status)
         envelope = self._base_envelope(request_id, "memory_status", scope_context)
         envelope["memory_needed"] = False
         envelope["status"] = "OK"
