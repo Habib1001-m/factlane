@@ -5,7 +5,7 @@
 ```text
 SPEC_STATUS=OWNER_AUTHORIZED_IN_PROGRESS
 OWNER_AUTHORIZATION_DATE=2026-08-29
-CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_SLICE=S6B_4C_03_ATOMIC_MULTI_CLIENT_REVISION_CAS_AND_LOST_UPDATE_PREVENTION
 ```
 
 This specification defines the bounded S6B.4C campaign. It is not authorization to begin a later slice. Each slice has its own implementation and verification gate.
@@ -25,17 +25,16 @@ The campaign is limited to these slices, in order:
 5. **4C-05 — Async embedding concurrency and pinned-backend runtime proof**
 6. **4C-06 — Process/crash injection and final acceptance**
 
-4C-01 is CLOSED_PASS. The current implementation slice is 4C-02 only. 4C-02 must not implement atomic multi-client CAS, lost-update prevention, concurrent writers, crash injection, or embedding concurrency; those remain later campaign slices.
+4C-01 and 4C-02 are CLOSED_PASS. The current implementation slice is 4C-03 only. 4C-03 must not run real Codex/Hermes host concurrency, async embedding contention, crash injection, or later lifecycle work.
 
 ```text
 4C-01=CLOSED_PASS
-4C-02=CURRENT
-4C-03=NOT_STARTED
+4C-02=CLOSED_PASS
+4C-03=CURRENT
 4C-04=NOT_STARTED
 4C-05=NOT_STARTED
 4C-06=NOT_STARTED
 ```
-
 
 ## Explicitly out of scope
 
@@ -246,3 +245,83 @@ uv run factlane --help
 The 4C-02 evidence root is `.factlane-local/evidence/s6b4c-02/` and remains ignored.
 No native memory, live Codex/Hermes configuration, global MCP registration, backend pin,
 embedding identity, schema, or `uv.lock` may change.
+
+## 4C-03 contract: atomic multi-client revision/CAS and lost-update prevention
+
+4C-03 closes the gap between the adapter's early sequential `expected_revision` check and
+an actual atomic compare-and-swap decision across independent clients. The public
+`memory_update` API remains unchanged. The authoritative CAS decision belongs inside the
+FactLane storage transaction, not in a process-local `asyncio.Lock` and not in a new
+coordinator service.
+
+For an update carrying `supersede_record_id`, `SQLiteVecEngine.write_record` must:
+
+1. acquire the existing write transaction with `BEGIN IMMEDIATE` through the pinned
+   backend retry boundary;
+2. before inserting any adapter/native/vector row, read the expected parent inside that
+   transaction;
+3. require that the expected parent exists and is still `VALIDATED_CURRENT`;
+4. require that the new record's `parent_record_id` matches that same parent;
+5. otherwise raise deterministic `VERSION_CONFLICT` and roll back the transaction;
+6. only after the check succeeds, write the new record/vector and supersede the parent in
+   the same transaction.
+
+The first writer from a shared current parent therefore wins. Any later writer that was
+prepared from the same parent loses with `VERSION_CONFLICT`; it must leave no partial
+adapter row, native memory row, vector row, or competing current lineage branch.
+
+The rule applies to both existing update modes:
+
+- `REVERIFY`: the logical `memory_id` is preserved, revision advances once, and history
+  remains a single linear chain;
+- `REPLACE`: the replacement receives a new logical `memory_id` while the old current
+  parent is superseded exactly once and only one replacement becomes current.
+
+FactLane must not add duplicate SQLite lock/backoff logic. WAL, `busy_timeout`, and
+bounded `locked`/`busy` retry remain owned by the exact pinned backend. No schema,
+backend pin, lockfile, embedding identity, public tool, or gateway identity contract is
+changed by 4C-03.
+
+### 4C-03 deterministic disposable proof
+
+Use two separately constructed `SQLiteVecEngine`/`MemoryAdapter` clients with independent
+connections to one disposable database. Both clients must complete their read of the
+same current revision before either storage write proceeds. A test-only synchronization
+barrier at the write boundary makes this precondition deterministic rather than relying
+on scheduler timing.
+
+Required assertions for both `REVERIFY` and `REPLACE` are:
+
+```text
+INDEPENDENT_CLIENT_CONNECTIONS=2
+SHARED_PRE_READ_PARENT=YES
+SUCCESSFUL_WRITERS=1
+VERSION_CONFLICT_WRITERS=1
+CURRENT_LINEAGE_FORKS=0
+PARTIAL_LOSER_ROWS=0
+CURRENT_RECORD_COUNT=1
+LOST_UPDATE_PREVENTION=PASS
+```
+
+The proof is limited to independent in-process clients/connections over the real pinned
+SQLite-vec storage boundary. Real Codex/Hermes execution-context concurrency belongs to
+4C-04. Async embedding contention belongs to 4C-05. Process/crash injection belongs to
+4C-06.
+
+### 4C-03 TDD and verification boundary
+
+The RED test must fail on the pre-4C-03 implementation because both writers can succeed
+from one shared parent. The GREEN implementation is the smallest transaction-local CAS
+check described above. Before PR handoff, verify the exact final branch head with the
+repository CI equivalent:
+
+```text
+uv sync --frozen --dev
+uv run pytest -q
+uv run python -c "import factlane; print(factlane.__name__)"
+uv run factlane --help
+```
+
+Also verify by diff inspection that `uv.lock`, backend pin, embedding identity, schema,
+live Codex/Hermes configuration, native memory, global MCP registration, and later-slice
+implementation are unchanged.
