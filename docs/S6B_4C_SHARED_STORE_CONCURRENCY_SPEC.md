@@ -5,7 +5,7 @@
 ```text
 SPEC_STATUS=OWNER_AUTHORIZED_IN_PROGRESS
 OWNER_AUTHORIZATION_DATE=2026-08-29
-CURRENT_SLICE=S6B_4C_03_ATOMIC_MULTI_CLIENT_REVISION_CAS_AND_LOST_UPDATE_PREVENTION
+CURRENT_SLICE=S6B_4C_04_CODEX_HERMES_DISPOSABLE_SHARED_STORE_CONCURRENCY
 ```
 
 This specification defines the bounded S6B.4C campaign. It is not authorization to begin a later slice. Each slice has its own implementation and verification gate.
@@ -25,13 +25,13 @@ The campaign is limited to these slices, in order:
 5. **4C-05 — Async embedding concurrency and pinned-backend runtime proof**
 6. **4C-06 — Process/crash injection and final acceptance**
 
-4C-01 and 4C-02 are CLOSED_PASS. The current implementation slice is 4C-03 only. 4C-03 must not run real Codex/Hermes host concurrency, async embedding contention, crash injection, or later lifecycle work.
+4C-01, 4C-02, and 4C-03 are CLOSED_PASS. The current implementation/acceptance slice is 4C-04 only. 4C-04 must not expand into async embedding contention, crash injection, lifecycle work, live host configuration, native memory, or production migration.
 
 ```text
 4C-01=CLOSED_PASS
 4C-02=CLOSED_PASS
-4C-03=CURRENT
-4C-04=NOT_STARTED
+4C-03=CLOSED_PASS
+4C-04=CURRENT
 4C-05=NOT_STARTED
 4C-06=NOT_STARTED
 ```
@@ -325,3 +325,122 @@ uv run factlane --help
 Also verify by diff inspection that `uv.lock`, backend pin, embedding identity, schema,
 live Codex/Hermes configuration, native memory, global MCP registration, and later-slice
 implementation are unchanged.
+
+## 4C-04 contract: Codex/Hermes disposable shared-store concurrency
+
+4C-04 lifts the accepted 4C-03 single-winner CAS semantics across the execution-context
+boundary without changing the public API or adding coordination infrastructure. The
+proof must use one disposable store and two separately launched actors bound as
+`codex-disposable` and `hermes-disposable`.
+
+Two evidence levels are mandatory and must remain distinct:
+
+```text
+PROCESS_BOUNDARY_CI_PROOF=REQUIRED
+REAL_CODEX_HERMES_EXECUTION_CONTEXT_PROOF=REQUIRED
+ACTOR_LABEL_ALONE_IS_REAL_HOST_PROOF=NO
+```
+
+The repository integration test may use ordinary Python subprocesses to prove independent
+PIDs, independent connections, distinct effective `HOME`, distinct gateway instances,
+and one shared write barrier. That result is process-boundary evidence only. A real-host
+claim additionally requires accepted provenance that one actor command was launched from
+the actual Codex execution context and the other from the actual Hermes execution
+context using the same candidate bytes and shared disposable run directory.
+
+### 4C-04 tracked harness boundary
+
+The tracked harness is `tools/s6b4c04_disposable_shared_store.py`. It provides exactly
+three mechanical phases:
+
+1. `prepare` creates a fresh disposable database and seeds one current revision;
+2. each real execution context runs its own `actor` command against that same run;
+3. `verify` reads the resulting disposable state and emits the bounded verdict.
+
+The actor path constructs the existing `SQLiteVecEngine`, `MemoryAdapter`, `HostBinding`,
+and `MemoryGateway` independently in each process. A file-backed test barrier is installed
+only at the adapter-to-storage write seam so both actors have completed the same current
+revision pre-read before either authoritative write proceeds. The authoritative CAS remains
+the accepted 4C-03 database transaction; the harness must not add a coordinator, lock,
+retry loop, or alternate write path.
+
+The harness uses an acceptance-only deterministic embedding provider so 4C-04 varies the
+execution-context/process dimension without simultaneously varying embedding runtime
+behavior. Async embedding contention and exact provider/backend runtime proof remain
+4C-05 work. This provider substitution is proof instrumentation only and is not a
+production profile or product behavior change.
+
+Established candidate diagnostics confirm `CODEX_SANDBOX_INTERACTION=CONFIRMED`: normal
+Codex sandbox execution could access the shared evidence path but stalled at
+`OPEN_ADAPTER_START`, while the same candidate and Python 3.11 environment reached
+`BARRIER_READY` from the Owner shell and from an actual Codex context launched with
+`codex --sandbox danger-full-access`. `PYMILVUS_CAUSE=REJECTED`,
+`PYTHON_3_14_RUNTIME_DRIFT=REJECTED`, and `THREAD_AFFINITY_CAUSE=REJECTED`; the failure
+boundary is Codex sandbox interaction, not FactLane CAS/storage behavior.
+
+For final real-host acceptance only, use the already-established Python 3.11 environment
+from the same locked dependencies as canonical CI and start the Codex actor from an
+actual `codex --sandbox danger-full-access` session. This is an acceptance reproducibility
+choice and acceptance-only execution profile, not a product Python-support restriction or
+production requirement. The runbook's separate process-local HOME paths and its
+process-local `MCP_MEMORY_BASE_DIR=<RUN_DIR>/upstream-runtime/<actor>` are acceptance
+isolation only; actual Codex/Hermes launch provenance remains external accepted evidence.
+
+### 4C-04 required invariants
+
+The process proof and real-host proof must satisfy:
+
+```text
+SHARED_PRE_READ_PARENT=YES
+SUCCESSFUL_WRITERS=1
+VERSION_CONFLICT_WRITERS=1
+CURRENT_RECORD_COUNT=1
+CURRENT_LINEAGE_FORKS=0
+PARTIAL_LOSER_ROWS=0
+WINNER_MATCHES_CURRENT=YES
+WINNER_AUDIT_MATCHES_HOST_BINDING=YES
+LOST_UPDATE_PREVENTION=PASS
+```
+
+The process-level proof additionally requires distinct PIDs, effective homes, gateway
+instance IDs, and explicit disposable host bindings. The real-host acceptance additionally
+requires external accepted launch provenance for actual Codex and Hermes contexts; the
+verifier must not infer that provenance from actor labels, `HOME`, hostname, cwd,
+credentials, or PID.
+
+Evidence is disposable and remains only under:
+
+```text
+.factlane-local/evidence/s6b4c-04/<fresh-run-id>/
+```
+
+The database, manifest, barrier files, result files, and raw command output must remain
+ignored/untracked. No live Codex/Hermes configuration, credentials, native memory, global
+MCP registration, production store, backend pin, schema, embedding model, or `uv.lock`
+may change.
+
+### 4C-04 closure and verification boundary
+
+A CI subprocess PASS alone is insufficient to close 4C-04. Closure requires all of:
+
+1. deterministic RED-to-GREEN harness coverage in repository history;
+2. process-boundary integration proof on the exact candidate code;
+3. actual Codex and actual Hermes launch provenance using that same candidate;
+4. `verify` PASS with one winner, one `VERSION_CONFLICT`, no lineage fork, and no partial loser state;
+5. exact final-head repository verification;
+6. normal PR and Owner/Advisor merge disposition.
+
+The minimum repository verification remains:
+
+```text
+uv sync --frozen --dev
+uv run pytest -q
+uv run python -c "import factlane; print(factlane.__name__)"
+uv run factlane --help
+```
+
+The supporting mechanical commands are documented in
+`docs/S6B_4C_04_DISPOSABLE_HOST_ACCEPTANCE_RUNBOOK.md`. That runbook is not parallel
+execution authority. A passing 4C-04 result does not authorize 4C-05, crash injection,
+live configuration mutation, native-memory mutation, global registration, or production
+migration.

@@ -2,11 +2,11 @@
 
 > **For execution agents:** Execute only the current Owner-authorized slice with strict TDD. Closed slices below are retained as implementation history and must not be replayed.
 
-**Goal:** Establish the S6B.4C shared-store concurrency campaign slice-by-slice. S6B.4C-01 and 4C-02 are closed; the current slice is S6B.4C-03 atomic multi-client revision/CAS and lost-update prevention.
+**Goal:** Establish the S6B.4C shared-store concurrency campaign slice-by-slice. S6B.4C-01, 4C-02, and 4C-03 are closed; the current slice is S6B.4C-04 Codex/Hermes disposable shared-store concurrency.
 
-**Architecture:** Preserve the accepted execution-context and immutable transport-bound gateway boundaries from 4C-01/02. For 4C-03, keep the adapter's early `expected_revision` validation but place the authoritative compare-and-swap decision inside the existing SQLite write transaction, before any successor row is inserted. Reuse the pinned backend's WAL and bounded lock/busy retry rather than adding a new coordinator or lock layer.
+**Architecture:** Preserve the accepted execution-context, transport-bound gateway, and transaction-local CAS boundaries from 4C-01/02/03. For 4C-04, vary only the execution-context/process boundary: two separately launched actors use independent FactLane gateway/adapter/storage instances over one disposable database and synchronize only at a test acceptance barrier after reading the same current revision. The accepted SQLite transaction remains the sole CAS authority; no coordinator or new lock/retry layer is introduced.
 
-**Tech Stack:** Python 3.11+, stdlib dataclasses/uuid/argparse, existing FastMCP server, existing FactLane adapter/storage/contract, pytest, and the existing lockfile.
+**Tech Stack:** Python 3.11+, stdlib asyncio/subprocess/pathlib/json, existing FactLane gateway/adapter/storage/contract, pytest, and the existing lockfile.
 
 ---
 
@@ -17,15 +17,15 @@ Current execution:
 ```text
 4C-01 CLOSED_PASS
 4C-02 CLOSED_PASS
-4C-03 CURRENT
-4C-04 NOT_STARTED
+4C-03 CLOSED_PASS
+4C-04 CURRENT
 4C-05 NOT_STARTED
 4C-06 NOT_STARTED
 ```
 
-The detailed Tasks 1–13 below are retained as closed 4C-01/02 implementation history only. Do not rerun them as gates for 4C-03.
+The detailed Tasks 1–17 below are retained as closed 4C-01/02/03 implementation history only. Do not rerun them as gates for 4C-04.
 
-4C-04 real Codex/Hermes disposable concurrency, 4C-05 async embedding contention, and 4C-06 crash injection remain forbidden in the current slice.
+4C-05 async embedding contention and 4C-06 crash injection remain forbidden in the current slice.
 
 Do not implement retention/compaction/reclaim/recovery (S6B.4D), native-memory bootstrap or migration (S6B.5), live configuration, registration, backend-pin changes, embedding-model changes, or reopening accepted 4B results.
 
@@ -231,7 +231,7 @@ git commit -m "feat: add S6B.4C execution context preflight"
 
 Push only the task branch with the explicit Owner GitHub context. Open a PR with base `main`, report the exact head SHA and CI status, and stop for Owner/Advisor review. Do not self-approve or merge.
 
-## Current execution: S6B.4C-02 transport-bound host identity and shared gateway
+## Closed implementation history — S6B.4C-02 transport-bound host identity and shared gateway
 
 ### Task 9: Write the 4C-02 RED contract tests
 
@@ -359,13 +359,12 @@ Then run the complete repository gate, record raw output only under the ignored 
 
 ## Later-slice handoff notes
 
-- 4C-01 and 4C-02 are CLOSED_PASS; their detailed tasks above are retained for provenance only.
-- 4C-03 is the current Owner-authorized slice and must prove single-winner atomic revision/CAS semantics across independent clients/connections.
-- 4C-04 must use disposable stores and separate Codex/Hermes execution contexts.
+- 4C-01, 4C-02, and 4C-03 are CLOSED_PASS; their detailed tasks are retained for provenance only.
+- 4C-04 is the current Owner-authorized slice and must use one disposable store plus actual separate Codex/Hermes execution contexts.
 - 4C-05 must preserve exact embedding/model/backend identities while testing async contention.
 - 4C-06 must inject process termination/crash boundaries and rerun final acceptance.
 
-## Current execution: S6B.4C-03 atomic multi-client revision/CAS and lost-update prevention
+## Closed implementation history — S6B.4C-03 atomic multi-client revision/CAS and lost-update prevention
 
 ### Task 14: Write the deterministic RED lost-update proof
 
@@ -406,4 +405,99 @@ uv run factlane --help
 
 Inspect the final diff and confirm no change to `uv.lock`, backend pin, schema, embedding identity, public five-tool surface, live configuration, native memory, global MCP registration, or 4C-04/05/06 implementation.
 
-Open a PR to `main`, report the exact head SHA and CI result, and stop for Owner/Advisor review. Do not self-merge and do not start 4C-04. Canonical merged-closure reconciliation follows the merge boundary.
+The 4C-03 implementation and canonical merged closure are complete. Do not replay this task as a gate for 4C-04.
+
+## Current execution — S6B.4C-04 Codex/Hermes disposable shared-store concurrency
+
+### Task 18: Add the deterministic process-boundary RED proof
+
+Create `tests/integration/test_disposable_host_concurrency.py` before the tracked harness exists. The test launches two independent Python processes with distinct effective `HOME` values and explicit `codex-disposable` / `hermes-disposable` bindings against one fresh disposable run directory.
+
+The RED result must be attributable to the missing 4C-04 harness or a concrete 4C-04 contract failure, not to an unrelated existing test regression.
+
+### Task 19: Implement the minimal reusable disposable harness
+
+Create `tools/s6b4c04_disposable_shared_store.py` with `prepare`, `actor`, and `verify` commands.
+
+Constraints:
+
+- reuse the existing `SQLiteVecEngine`, `MemoryAdapter`, `HostBinding`, and `MemoryGateway`;
+- use one fresh disposable SQLite database only;
+- install synchronization only at the acceptance write seam after both actors have read the same parent/revision;
+- retain the accepted 4C-03 transaction as the sole CAS authority;
+- do not add product locks, retries, coordinators, schema, tools, or server paths;
+- use a deterministic acceptance-only embedding provider so embedding contention remains 4C-05 work;
+- capture only bounded non-secret actor/PID/HOME/gateway/outcome evidence;
+- keep all run state under `.factlane-local/evidence/s6b4c-04/`.
+
+Required process-level assertions:
+
+```text
+DISTINCT_PIDS=YES
+DISTINCT_EFFECTIVE_HOMES=YES
+DISTINCT_GATEWAY_INSTANCES=YES
+DISTINCT_HOST_BINDINGS=YES
+SHARED_PRE_READ_PARENT=YES
+SUCCESSFUL_WRITERS=1
+VERSION_CONFLICT_WRITERS=1
+CURRENT_RECORD_COUNT=1
+CURRENT_LINEAGE_FORKS=0
+PARTIAL_LOSER_ROWS=0
+WINNER_MATCHES_CURRENT=YES
+WINNER_AUDIT_MATCHES_HOST_BINDING=YES
+LOST_UPDATE_PREVENTION=PASS
+```
+
+### Task 20: Run the same harness from actual Codex and Hermes execution contexts
+
+Use the exact candidate checkout and one shared disposable `RUN_DIR`. Prepare once. Then launch the `codex-disposable` actor command from the actual Codex execution context and the `hermes-disposable` actor command from the actual Hermes execution context. Either may start first; it waits at the deterministic barrier for its peer.
+
+Established diagnostics record `CODEX_SANDBOX_INTERACTION=CONFIRMED`: normal Codex
+sandbox execution stalled at `OPEN_ADAPTER_START`, while the same candidate and Python
+3.11 environment reached `BARRIER_READY` from the Owner shell and from an actual Codex
+context launched with `codex --sandbox danger-full-access`. The alternate hypotheses
+`PYMILVUS_CAUSE=REJECTED`, `PYTHON_3_14_RUNTIME_DRIFT=REJECTED`, and
+`THREAD_AFFINITY_CAUSE=REJECTED`; this does not indicate a FactLane CAS/storage defect.
+
+For final real-host acceptance only, use the established Python 3.11 environment from
+the same locked dependencies as canonical CI and the acceptance-only Codex launch
+profile `codex --sandbox danger-full-access`. The separate process-local HOME paths are
+acceptance isolation only; HOME and actor labels do not establish provenance, and actual
+Codex/Hermes launch provenance remains external accepted evidence. The tracked harness
+continues to set process-local `MCP_MEMORY_BASE_DIR=<RUN_DIR>/upstream-runtime/<actor>`.
+
+The verifier does not establish host provenance. Accepted surrounding evidence must prove which real execution context launched each actor. Actor labels, `HOME`, PID, hostname, cwd, and credentials are not substitutes for that provenance.
+
+Follow `docs/S6B_4C_04_DISPOSABLE_HOST_ACCEPTANCE_RUNBOOK.md` exactly. Keep the disposable database and JSON evidence untracked.
+
+A process-only CI PASS is insufficient to complete this task.
+
+### Task 21: Reconcile, verify exact final head, and hand off by PR
+
+After the real Codex/Hermes acceptance passes:
+
+```bash
+uv sync --frozen --dev
+uv run pytest -q
+uv run python -c "import factlane; print(factlane.__name__)"
+uv run factlane --help
+```
+
+Audit the final diff and confirm:
+
+```text
+PRODUCT_SOURCE_CHANGE=NONE_UNLESS_REAL_HOST_PROOF_FOUND_A_PRODUCT_DEFECT
+UV_LOCK_CHANGE=NONE
+BACKEND_PIN_CHANGE=NONE
+SCHEMA_CHANGE=NONE
+EMBEDDING_MODEL_CHANGE=NONE
+PUBLIC_TOOL_SURFACE_CHANGE=NONE
+LIVE_CODEX_CONFIG_MUTATION=NONE
+LIVE_HERMES_CONFIG_MUTATION=NONE
+NATIVE_MEMORY_MUTATION=NONE
+GLOBAL_MCP_REGISTRATION=NONE
+S6B_4C_05_STARTED=NO
+S6B_4C_06_STARTED=NO
+```
+
+Open a PR to `main`, record the exact candidate head and CI evidence, and stop for Owner/Advisor merge disposition. Do not self-merge. Canonical merged-closure reconciliation follows the merge boundary.
