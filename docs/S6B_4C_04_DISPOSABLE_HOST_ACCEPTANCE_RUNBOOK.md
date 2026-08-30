@@ -36,6 +36,35 @@ This is disposable process-local runtime state, not live host configuration. It 
 
 Do not work around a failed actor by changing permissions under the real home, installing another backend, or setting a persistent host-global environment variable.
 
+## Bounded actor phase telemetry
+
+A later real Codex diagnostic established that Codex can read and write the same host-visible acceptance path, while the actor process can remain alive without reaching the tracked write barrier. To localize that pre-barrier stall without changing product behavior, the acceptance harness records one atomically replaced last-known phase file per actor:
+
+```text
+phases/codex-disposable.json
+phases/hermes-disposable.json
+```
+
+Possible phases are:
+
+```text
+BOOTSTRAP_PRE_IMPORT
+IMPORT_COMPLETE
+ACTOR_ENTER
+MANIFEST_LOADED
+OPEN_ADAPTER_START
+OPEN_ADAPTER_COMPLETE
+GATEWAY_READY
+DISPATCH_START
+BARRIER_READY
+BARRIER_RELEASED
+DISPATCH_COMPLETE
+VERSION_CONFLICT
+RESULT_WRITTEN
+```
+
+This telemetry is acceptance instrumentation only. It is not authoritative project state, does not prove real-host provenance, and does not change the CAS or storage contract. If an actor is interrupted or stalls, its last phase identifies the narrow component boundary to investigate next. A phase value alone is never an acceptance PASS.
+
 ## Why the harness uses a deterministic provider
 
 4C-04 changes only the execution-context/process dimension. The harness therefore uses an acceptance-only deterministic embedding provider while preserving the FactLane adapter, gateway, SQLite-vec storage boundary, schema, and pinned backend mechanics.
@@ -119,6 +148,8 @@ Keep the fresh disposable run directory until the Owner/Advisor accepts or rejec
 
 ```text
 manifest.json
+phases/codex-disposable.json
+phases/hermes-disposable.json
 ready/codex-disposable.json
 ready/hermes-disposable.json
 results/codex-disposable.json
