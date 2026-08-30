@@ -9,6 +9,24 @@ import sys
 import time
 from typing import Any
 
+
+def _bootstrap_actor_upstream_base() -> None:
+    """Keep pinned-backend import-time state inside the disposable 4C-04 run."""
+    args = sys.argv[1:]
+    if not args or args[0] != "actor":
+        return
+    try:
+        run_dir_index = args.index("--run-dir")
+        actor_index = args.index("--actor")
+        run_dir = Path(args[run_dir_index + 1]).resolve()
+        actor = args[actor_index + 1]
+    except (ValueError, IndexError):
+        return
+    os.environ["MCP_MEMORY_BASE_DIR"] = str(run_dir / "upstream-runtime" / actor)
+
+
+_bootstrap_actor_upstream_base()
+
 from factlane.adapter import MemoryAdapter
 from factlane.contract import AdapterError
 from factlane.embeddings import EmbeddingProfile
