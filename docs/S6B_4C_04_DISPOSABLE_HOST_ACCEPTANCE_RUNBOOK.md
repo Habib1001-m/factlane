@@ -22,6 +22,20 @@ The repository integration test may launch two ordinary Python subprocesses with
 
 The real-host acceptance reuses the exact tracked harness but each `actor` command must be launched from its actual execution context: one by Codex and one by Hermes. The actor label is an explicit trusted launcher binding for the disposable gateway; the launch provenance is external accepted evidence and must not be inferred from `HOME`, PID, hostname, cwd, credentials, or the label itself.
 
+## Read-only host-home isolation
+
+A real Codex execution-context probe on the first 4C-04 candidate established that the host may expose the Owner home as read-only. The pinned `mcp-memory-service` initializes a writable base directory at import time and otherwise defaults to `~/.local/share/mcp-memory`.
+
+The tracked 4C-04 actor harness therefore sets `MCP_MEMORY_BASE_DIR` **inside the actor process only**, before importing FactLane/backend modules, to:
+
+```text
+<RUN_DIR>/upstream-runtime/<actor>/
+```
+
+This is disposable process-local runtime state, not live host configuration. It does not copy, alter, chmod, or write the real Owner memory directory. Codex/Hermes actor acceptance must succeed even when their effective `HOME` is read-only. The integration regression deliberately uses read-only actor homes to enforce this boundary.
+
+Do not work around a failed actor by changing permissions under the real home, installing another backend, or setting a persistent host-global environment variable.
+
 ## Why the harness uses a deterministic provider
 
 4C-04 changes only the execution-context/process dimension. The harness therefore uses an acceptance-only deterministic embedding provider while preserving the FactLane adapter, gateway, SQLite-vec storage boundary, schema, and pinned backend mechanics.
@@ -110,6 +124,8 @@ ready/hermes-disposable.json
 results/codex-disposable.json
 results/hermes-disposable.json
 shared.db
+upstream-runtime/codex-disposable/
+upstream-runtime/hermes-disposable/
 ```
 
 Capture the three command outputs (`prepare`, both actors, `verify`) and the candidate Git HEAD in the local evidence packet. Do not commit the database or evidence directory.
