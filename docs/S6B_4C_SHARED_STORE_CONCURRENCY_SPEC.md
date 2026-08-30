@@ -5,7 +5,9 @@
 ```text
 SPEC_STATUS=OWNER_AUTHORIZED_IN_PROGRESS
 OWNER_AUTHORIZATION_DATE=2026-08-29
-CURRENT_SLICE=S6B_4C_04_CODEX_HERMES_DISPOSABLE_SHARED_STORE_CONCURRENCY
+CURRENT_SLICE=S6B_4C_05_ASYNC_EMBEDDING_CONCURRENCY_AND_PINNED_BACKEND_RUNTIME_PROOF
+CURRENT_SLICE_AUTHORIZATION_DATE=2026-08-30
+CURRENT_SLICE_PHASE=DESIGN_AND_RED_ONLY
 ```
 
 This specification defines the bounded S6B.4C campaign. It is not authorization to begin a later slice. Each slice has its own implementation and verification gate.
@@ -25,14 +27,14 @@ The campaign is limited to these slices, in order:
 5. **4C-05 — Async embedding concurrency and pinned-backend runtime proof**
 6. **4C-06 — Process/crash injection and final acceptance**
 
-4C-01, 4C-02, and 4C-03 are CLOSED_PASS. The current implementation/acceptance slice is 4C-04 only. 4C-04 must not expand into async embedding contention, crash injection, lifecycle work, live host configuration, native memory, or production migration.
+4C-01, 4C-02, 4C-03, and 4C-04 are CLOSED_PASS. The current implementation/acceptance slice is 4C-05 only. 4C-05 must not expand into process kill, cancellation cleanup, crash injection, lifecycle work, live host configuration, native memory, or production migration.
 
 ```text
 4C-01=CLOSED_PASS
 4C-02=CLOSED_PASS
 4C-03=CLOSED_PASS
-4C-04=CURRENT
-4C-05=NOT_STARTED
+4C-04=CLOSED_PASS
+4C-05=CURRENT
 4C-06=NOT_STARTED
 ```
 
@@ -441,6 +443,112 @@ uv run factlane --help
 
 The supporting mechanical commands are documented in
 `docs/S6B_4C_04_DISPOSABLE_HOST_ACCEPTANCE_RUNBOOK.md`. That runbook is not parallel
-execution authority. A passing 4C-04 result does not authorize 4C-05, crash injection,
-live configuration mutation, native-memory mutation, global registration, or production
-migration.
+execution authority. The 4C-04 result alone did not authorize 4C-05; the separate Owner
+authorization and current 4C-05 contract follow below. Crash injection, live
+configuration mutation, native-memory mutation, global registration, and production
+migration remain outside this campaign boundary.
+
+## 4C-05 contract: async embedding concurrency and pinned-backend runtime proof
+
+4C-05 removes event-loop blocking caused by synchronous local embedding-provider I/O at
+the async FactLane adapter boundary and proves the existing exact local provider plus
+pinned SQLite-vec backend runtime under controlled concurrent embedding work. This
+slice changes only the async scheduling boundary; it does not change the provider,
+storage, schema, public API, or accepted 4C-03 CAS behavior.
+
+### Required async boundary
+
+Potentially blocking synchronous provider operations used from async adapter paths must
+not execute on the event-loop thread:
+
+- document embedding (`embed_documents`), including `store` and `update`;
+- query embedding (`embed_query`), including semantic and hybrid `search`;
+- provider status/readiness HTTP probing (`provider_status`), including adapter creation
+  and `status`.
+
+The synchronous `EmbeddingProvider` protocol remains synchronous. The intended smallest
+implementation candidate is adapter-side `asyncio.to_thread(...)` using the standard
+asyncio default executor around those provider calls. RED/GREEN evidence must establish
+whether that candidate is sufficient before any broader design is considered.
+
+Provider worker threads perform provider work only. They must not own, pass, or
+manipulate SQLite connections, and the storage executor path is unchanged.
+
+4C-05 must not introduce:
+
+- an embedding coordinator, worker service, or new queue;
+- a custom retry layer or new backpressure/configuration subsystem;
+- `aiohttp` or another network dependency;
+- an async rewrite of `OllamaLocalProvider`;
+- backend thread-affinity changes or storage executor changes.
+
+### Preserved provider contract
+
+The async boundary must preserve all existing provider behavior:
+
+- local-only HTTP and no remote fallback;
+- exact model digest validation;
+- document/query prefixes;
+- `truncate=false`;
+- requested output dimension;
+- normalized finite-vector validation;
+- existing stable `AdapterError` codes.
+
+No production embedding profile is selected in 4C-05. For later real-runtime
+acceptance, `nomic-256` may be used only as the already-recorded engineering pilot
+candidate:
+
+```text
+PRODUCTION_EMBEDDING_PROFILE_SELECTION=NO
+```
+
+### Preserved storage/write contract
+
+- The accepted 4C-03 transaction-local CAS remains authoritative.
+- The existing adapter-local write lock is not promoted to correctness authority and is
+  not redesigned here.
+- The pinned backend retains WAL, busy-timeout, and retry ownership.
+- No schema, backend pin, lockfile, public tool, or gateway change is permitted.
+- Provider worker threads never own or manipulate SQLite connections.
+
+### Cancellation and crash boundary
+
+4C-05 does not solve process kill, cancellation cleanup, crash injection, or interrupted
+worker-thread semantics. Those belong to 4C-06 unless a concrete correctness defect
+prevents the 4C-05 proof. No crash-injection or cancellation campaign is part of this
+slice.
+
+### Deterministic RED proof
+
+Before production changes, add focused integration coverage using a deterministic
+synchronous test provider with valid normalized vectors, a `threading.Barrier` with a
+bounded timeout, thread IDs, and active-call tracking. The tests require no Ollama or
+network access and must fail deterministically against the current direct synchronous
+provider calls.
+
+Required future invariants are:
+
+```text
+EVENT_LOOP_BLOCKED_BY_QUERY_EMBEDDING=NO
+CONCURRENT_QUERY_EMBEDDING_OVERLAP=YES
+EVENT_LOOP_PROGRESS_DURING_EMBEDDING=YES
+EVENT_LOOP_BLOCKED_BY_DOCUMENT_EMBEDDING=NO
+EVENT_LOOP_BLOCKED_BY_PROVIDER_STATUS=NO
+```
+
+The document-embedding test uses genuinely independent adapter instances when checking
+overlap, so it measures provider/event-loop behavior without defeating the existing
+adapter-local write lock. It must not duplicate the 4C-03/4C-04 CAS campaign or add a
+new storage coordination mechanism.
+
+### Pinned-backend runtime proof
+
+After the RED/GREEN cycle, the runtime proof must exercise the existing
+`OllamaLocalProvider` local-only HTTP boundary and the exact pinned SQLite-vec backend
+under the same locked dependency contract used by canonical CI. Deterministic CI
+coverage proves scheduling behavior without external services; it does not by itself
+claim exact local-provider runtime acceptance. No `pymilvus` addition, backend pin
+change, embedding model change, or production profile selection is authorized.
+
+The 4C-05 current phase is design and RED only. A passing RED test is not a closure
+result, and no GREEN production fix or 4C-06 work is authorized by this contract.
