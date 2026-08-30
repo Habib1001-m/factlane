@@ -37,40 +37,46 @@ def test_disposable_process_clients_share_one_store_without_lost_update(tmp_path
     hermes_home = tmp_path / "hermes-home"
     codex_home.mkdir()
     hermes_home.mkdir()
+    codex_home.chmod(0o555)
+    hermes_home.chmod(0o555)
 
     prepared = _run("prepare", "--run-dir", run_dir)
     assert prepared["prepared"] is True
     assert prepared["expected_revision"] == 1
 
     actors: list[tuple[str, subprocess.Popen[str]]] = []
-    for actor, home in (("codex-disposable", codex_home), ("hermes-disposable", hermes_home)):
-        actors.append(
-            (
-                actor,
-                subprocess.Popen(
-                    [
-                        sys.executable,
-                        str(SCRIPT),
-                        "actor",
-                        "--run-dir",
-                        str(run_dir),
-                        "--actor",
-                        actor,
-                    ],
-                    cwd=ROOT,
-                    env=_actor_env(home),
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                ),
+    try:
+        for actor, home in (("codex-disposable", codex_home), ("hermes-disposable", hermes_home)):
+            actors.append(
+                (
+                    actor,
+                    subprocess.Popen(
+                        [
+                            sys.executable,
+                            str(SCRIPT),
+                            "actor",
+                            "--run-dir",
+                            str(run_dir),
+                            "--actor",
+                            actor,
+                        ],
+                        cwd=ROOT,
+                        env=_actor_env(home),
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    ),
+                )
             )
-        )
 
-    actor_payloads: dict[str, dict[str, object]] = {}
-    for actor, process in actors:
-        stdout, stderr = process.communicate(timeout=20)
-        assert process.returncode == 0, stderr or stdout
-        actor_payloads[actor] = json.loads(stdout)
+        actor_payloads: dict[str, dict[str, object]] = {}
+        for actor, process in actors:
+            stdout, stderr = process.communicate(timeout=20)
+            assert process.returncode == 0, stderr or stdout
+            actor_payloads[actor] = json.loads(stdout)
+    finally:
+        codex_home.chmod(0o755)
+        hermes_home.chmod(0o755)
 
     verified = _run("verify", "--run-dir", run_dir)
 
