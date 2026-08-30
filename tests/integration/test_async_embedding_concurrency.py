@@ -275,3 +275,38 @@ def test_event_loop_progresses_while_provider_status_is_pending() -> None:
     assert not provider.thread_ids["status"].intersection({loop_thread_id}), (
         "EVENT_LOOP_BLOCKED_BY_PROVIDER_STATUS=YES"
     )
+
+
+def test_create_provider_status_runs_off_event_loop(monkeypatch: Any) -> None:
+    provider_instance: ProbeProvider | None = None
+
+    class CreateProbeProvider(ProbeProvider):
+        def __init__(self, **_: Any) -> None:
+            nonlocal provider_instance
+            super().__init__(status_delay=0.05)
+            provider_instance = self
+
+    class CreateEngine:
+        def __init__(self, db_path: str, profile: EmbeddingProfile) -> None:
+            del db_path, profile
+
+        async def open(self) -> None:
+            return None
+
+    monkeypatch.setattr("factlane.adapter.OllamaLocalProvider", CreateProbeProvider)
+    monkeypatch.setattr("factlane.adapter.SQLiteVecEngine", CreateEngine)
+
+    async def run() -> tuple[ProbeProvider, int, int]:
+        loop_thread_id = threading.get_ident()
+        create_task = asyncio.create_task(MemoryAdapter.create("unused.db", "nomic-256"))
+        await asyncio.sleep(0)
+        assert provider_instance is not None
+        active_ticks = await _heartbeat_until(create_task, provider_instance, "status")
+        await create_task
+        return provider_instance, active_ticks, loop_thread_id
+
+    provider, active_ticks, loop_thread_id = _run(run())
+
+    assert active_ticks > 0, "EVENT_LOOP_PROGRESS_DURING_CREATE_PROVIDER_STATUS=NO"
+    provider_status_thread_id = next(iter(provider.thread_ids["status"]))
+    assert provider_status_thread_id != loop_thread_id, "EVENT_LOOP_BLOCKED_BY_CREATE_PROVIDER_STATUS=YES"
