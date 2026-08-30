@@ -1,7 +1,7 @@
 # FactLane Canonical Taskboard
 
 ```text
-TASKBOARD_VERSION=21
+TASKBOARD_VERSION=22
 TASKBOARD_UPDATE_MODE=IN_PLACE_APPEND_AND_RECONCILE
 CANONICAL_FILENAME=TASKBOARD.md
 NUMBERED_TASKBOARD_FILES_FUTURE_AUTHORITY=NO
@@ -686,6 +686,41 @@ FINAL_HEAD_REVIEWED=4aab3d3014fd16c77b3f8bdfb55d08fced905f7a
 FINAL_HEAD_REVIEWER=HOLD
 FINAL_HEAD_REVIEW_FINDING=TYPE_SETATTR_MEMORYGATEWAY_DISPATCH_AND_TRANSPORT_BYPASS
 PR5_CLASS_METHOD_AUTHORITY_REMEDIATION=e1149b7f24bba01861c8c2fee312c3f400d5fd19
+BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_FINAL_REVIEW
+BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_REVIEW
+FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
+S6B_4C=IN_PROGRESS
+S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY=IN_PROGRESS
+CURRENT_SLICE=S6B_4C_02_TRANSPORT_BOUND_HOST_IDENTITY_AND_SHARED_GATEWAY
+CURRENT_NEXT_ACTION=FRESH_FINAL_HEAD_SECURITY_REVIEW
+S6B_4C_03=NOT_STARTED
+S6B_4D=BLOCKED
+S6B_5=BLOCKED
+S6C_STARTED=NO
+```
+
+---
+
+## Reconciliation 2026-08-30 — Fresh reviewer HOLD and public authority-boundary remediation
+
+The fresh bounded reviewer examined exact candidate
+`39b56f22428c7bcdeb894b1e27b4e208b2122f15` and found that low-level class
+method replacement remained able to bypass gateway dispatch and transport
+checks through `object.__getattribute__`; the mutable metaclass authority store
+also allowed audit and newly constructed gateway spoofing. The remediation
+keeps the public `HostBinding` and `MemoryGateway` construction boundaries
+stable while operational instances use private authoritative implementations,
+removes the metaclass authority store, and adds direct low-level regressions.
+A new fresh bounded security review must inspect the exact post-remediation
+head. No merge, PR #4 closure, 4C-03 start, or later runtime mutation is
+authorized.
+
+```text
+PR_NUMBER=5
+FINAL_HEAD_REVIEWED=39b56f22428c7bcdeb894b1e27b4e208b2122f15
+FINAL_HEAD_REVIEWER=HOLD
+FINAL_HEAD_REVIEW_FINDINGS=OBJECT_GETATTRIBUTE_CLASS_METHOD_BYPASS_MUTABLE_METACLASS_AUTHORITY_STORE
+PR5_PUBLIC_AUTHORITY_BOUNDARY_REMEDIATION=38e6a3034bbbafcaba5cb980da53318c6f831335
 BLOCKER_1_GATEWAY_BINDING_IMMUTABILITY=CLOSED_PENDING_FINAL_REVIEW
 BLOCKER_2_TRANSPORT_ENFORCEMENT=CLOSED_PENDING_FINAL_REVIEW
 FINAL_POST_REMEDIATION_REVIEW_REQUIRED=YES
