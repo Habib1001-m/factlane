@@ -452,6 +452,20 @@ LOST_UPDATE_PREVENTION=PASS
 
 Use the exact candidate checkout and one shared disposable `RUN_DIR`. Prepare once. Then launch the `codex-disposable` actor command from the actual Codex execution context and the `hermes-disposable` actor command from the actual Hermes execution context. Either may start first; it waits at the deterministic barrier for its peer.
 
+Established diagnostics record `CODEX_SANDBOX_INTERACTION=CONFIRMED`: normal Codex
+sandbox execution stalled at `OPEN_ADAPTER_START`, while the same candidate and Python
+3.11 environment reached `BARRIER_READY` from the Owner shell and from an actual Codex
+context launched with `codex --sandbox danger-full-access`. The alternate hypotheses
+`PYMILVUS_CAUSE=REJECTED`, `PYTHON_3_14_RUNTIME_DRIFT=REJECTED`, and
+`THREAD_AFFINITY_CAUSE=REJECTED`; this does not indicate a FactLane CAS/storage defect.
+
+For final real-host acceptance only, use the established Python 3.11 environment from
+the same locked dependencies as canonical CI and the acceptance-only Codex launch
+profile `codex --sandbox danger-full-access`. The separate process-local HOME paths are
+acceptance isolation only; HOME and actor labels do not establish provenance, and actual
+Codex/Hermes launch provenance remains external accepted evidence. The tracked harness
+continues to set process-local `MCP_MEMORY_BASE_DIR=<RUN_DIR>/upstream-runtime/<actor>`.
+
 The verifier does not establish host provenance. Accepted surrounding evidence must prove which real execution context launched each actor. Actor labels, `HOME`, PID, hostname, cwd, and credentials are not substitutes for that provenance.
 
 Follow `docs/S6B_4C_04_DISPOSABLE_HOST_ACCEPTANCE_RUNBOOK.md` exactly. Keep the disposable database and JSON evidence untracked.

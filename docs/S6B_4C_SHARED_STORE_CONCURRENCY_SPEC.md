@@ -370,6 +370,22 @@ behavior. Async embedding contention and exact provider/backend runtime proof re
 4C-05 work. This provider substitution is proof instrumentation only and is not a
 production profile or product behavior change.
 
+Established candidate diagnostics confirm `CODEX_SANDBOX_INTERACTION=CONFIRMED`: normal
+Codex sandbox execution could access the shared evidence path but stalled at
+`OPEN_ADAPTER_START`, while the same candidate and Python 3.11 environment reached
+`BARRIER_READY` from the Owner shell and from an actual Codex context launched with
+`codex --sandbox danger-full-access`. `PYMILVUS_CAUSE=REJECTED`,
+`PYTHON_3_14_RUNTIME_DRIFT=REJECTED`, and `THREAD_AFFINITY_CAUSE=REJECTED`; the failure
+boundary is Codex sandbox interaction, not FactLane CAS/storage behavior.
+
+For final real-host acceptance only, use the already-established Python 3.11 environment
+from the same locked dependencies as canonical CI and start the Codex actor from an
+actual `codex --sandbox danger-full-access` session. This is an acceptance reproducibility
+choice and acceptance-only execution profile, not a product Python-support restriction or
+production requirement. The runbook's separate process-local HOME paths and its
+process-local `MCP_MEMORY_BASE_DIR=<RUN_DIR>/upstream-runtime/<actor>` are acceptance
+isolation only; actual Codex/Hermes launch provenance remains external accepted evidence.
+
 ### 4C-04 required invariants
 
 The process proof and real-host proof must satisfy:

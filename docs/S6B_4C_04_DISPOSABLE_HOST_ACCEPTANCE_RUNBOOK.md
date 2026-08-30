@@ -29,7 +29,7 @@ A real Codex execution-context probe on the first 4C-04 candidate established th
 The tracked 4C-04 actor harness therefore sets `MCP_MEMORY_BASE_DIR` **inside the actor process only**, before importing FactLane/backend modules, to:
 
 ```text
-<RUN_DIR>/upstream-runtime/<actor>/
+MCP_MEMORY_BASE_DIR=<RUN_DIR>/upstream-runtime/<actor>
 ```
 
 This is disposable process-local runtime state, not live host configuration. It does not copy, alter, chmod, or write the real Owner memory directory. Codex/Hermes actor acceptance must succeed even when their effective `HOME` is read-only. The integration regression deliberately uses read-only actor homes to enforce this boundary.
@@ -65,6 +65,55 @@ RESULT_WRITTEN
 
 This telemetry is acceptance instrumentation only. It is not authoritative project state, does not prove real-host provenance, and does not change the CAS or storage contract. If an actor is interrupted or stalls, its last phase identifies the narrow component boundary to investigate next. A phase value alone is never an acceptance PASS.
 
+## Established execution truth
+
+The established candidate was exercised in three bounded contexts. Actual Codex execution under its normal sandbox could read and write the shared evidence path but repeatedly stalled at `OPEN_ADAPTER_START`. The same candidate and Python 3.11 environment reached `BARRIER_READY` from the Owner shell and from an actual Codex execution context launched with:
+
+```text
+codex --sandbox danger-full-access
+```
+
+This localizes the failure boundary to Codex sandbox interaction, not FactLane CAS/storage behavior.
+
+```text
+CODEX_SANDBOX_INTERACTION=CONFIRMED
+PYMILVUS_CAUSE=REJECTED
+PYTHON_3_14_RUNTIME_DRIFT=REJECTED
+THREAD_AFFINITY_CAUSE=REJECTED
+```
+
+No `pymilvus` addition, supported-Python-range pin or narrowing, or storage/backend change follows from this evidence.
+
+## Final real-host acceptance execution profile
+
+For the final 4C-04 real-host acceptance only:
+
+- use the already-established Python 3.11 acceptance environment built from the same locked dependencies used by canonical CI;
+- treat that Python 3.11 choice as an acceptance reproducibility choice, not a new FactLane product Python-support restriction;
+- launch the Codex actor from an actual Codex session started explicitly with `codex --sandbox danger-full-access`;
+- treat `--sandbox danger-full-access` as an acceptance-only execution profile; do not persist it into global Codex configuration or describe it as a production requirement.
+
+Disposable `HOME` isolation below is acceptance isolation only. `HOME` does not establish real-host provenance, and the actor label does not establish real-host provenance. Actual Codex/Hermes launcher provenance remains external accepted evidence.
+
+## Reconciled boundary
+
+This is a documentation-only reconciliation. The following boundaries remain unchanged:
+
+```text
+DOCUMENTATION_RECONCILIATION_ONLY=YES
+COORDINATOR_INTRODUCED=NO
+PRODUCT_LOCK_BACKOFF_CHANGES=NONE
+STORAGE_BACKEND_BEHAVIOR_CHANGE=NONE
+SCHEMA_CHANGE=NONE
+BACKEND_PIN_CHANGE=NONE
+PUBLIC_TOOL_CHANGE=NONE
+EMBEDDING_CONCURRENCY_WORK=NOT_STARTED
+CRASH_INJECTION=NONE
+NATIVE_MEMORY_MUTATION=NONE
+HOST_GLOBAL_CONFIGURATION_MUTATION=NONE
+S6B_4C_05_WORK=NOT_STARTED
+```
+
 ## Why the harness uses a deterministic provider
 
 4C-04 changes only the execution-context/process dimension. The harness therefore uses an acceptance-only deterministic embedding provider while preserving the FactLane adapter, gateway, SQLite-vec storage boundary, schema, and pinned backend mechanics.
@@ -88,16 +137,18 @@ From the candidate FactLane checkout, after `uv sync --frozen --dev` has produce
 ```bash
 RUN_DIR="$(pwd)/.factlane-local/evidence/s6b4c-04/run-001"
 ./.venv/bin/python tools/s6b4c04_disposable_shared_store.py prepare --run-dir "$RUN_DIR"
+mkdir -p "$RUN_DIR/homes/codex-disposable" "$RUN_DIR/homes/hermes-disposable"
 ```
 
 `prepare` creates a new disposable SQLite store, seeds exactly one current revision, and writes a non-secret manifest. The run directory must not already exist.
 
 ## Actual Codex execution context
 
-Launch this command **from the actual Codex execution context**:
+Start the actual Codex session explicitly with `codex --sandbox danger-full-access`. From that actual Codex execution context, launch:
 
 ```bash
-./.venv/bin/python tools/s6b4c04_disposable_shared_store.py actor \
+HOME="$RUN_DIR/homes/codex-disposable" \
+  ./.venv/bin/python tools/s6b4c04_disposable_shared_store.py actor \
   --run-dir "$RUN_DIR" \
   --actor codex-disposable
 ```
@@ -109,12 +160,15 @@ The command waits at the tracked write barrier until the Hermes actor has also c
 Launch this command **from the actual Hermes execution context** against the same checkout-visible run directory:
 
 ```bash
-./.venv/bin/python tools/s6b4c04_disposable_shared_store.py actor \
+HOME="$RUN_DIR/homes/hermes-disposable" \
+  ./.venv/bin/python tools/s6b4c04_disposable_shared_store.py actor \
   --run-dir "$RUN_DIR" \
   --actor hermes-disposable
 ```
 
 Either actor may be started first. The first waits for the second; no timing-based race is required.
+
+The `HOME=...` assignments are process-local and are the only HOME overrides for these actor launches; do not export or persist them. The tracked harness continues to set its own process-local `MCP_MEMORY_BASE_DIR=<RUN_DIR>/upstream-runtime/<actor>` before importing FactLane/backend modules.
 
 ## Verify after both actors return
 
@@ -140,6 +194,8 @@ WINNER_AUDIT_MATCHES_HOST_BINDING=YES
 LOST_UPDATE_PREVENTION=PASS
 ```
 
+The final verifier result must derive `DISTINCT_EFFECTIVE_HOMES=YES` from the two recorded disposable HOME paths. A shared or inherited effective HOME is a verifier failure, regardless of actor labels or PIDs.
+
 For 4C-04 closure, the surrounding accepted evidence must additionally establish that the two actor commands were actually launched by the Codex and Hermes execution contexts. The verifier does not manufacture that provenance.
 
 ## Evidence to retain locally
@@ -154,6 +210,8 @@ ready/codex-disposable.json
 ready/hermes-disposable.json
 results/codex-disposable.json
 results/hermes-disposable.json
+homes/codex-disposable/
+homes/hermes-disposable/
 shared.db
 upstream-runtime/codex-disposable/
 upstream-runtime/hermes-disposable/
