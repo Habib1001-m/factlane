@@ -14,3 +14,8 @@ dist/
 
 # Private local custody / execution state. Never publish.
 .factlane-local/
+
+# Private project bootstrap/control state. Never publish.
+/AGENTS.md
+/TASKBOARD.md
+/.factlane-private/

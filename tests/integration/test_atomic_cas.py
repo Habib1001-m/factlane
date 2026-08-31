@@ -86,7 +86,7 @@ async def _seed_current(adapter: MemoryAdapter, *, key: str, fact: str) -> dict[
             "source_class": "CURRENT_REPO",
             "source_ref": key,
             "source_hash": "a" * 64,
-            "review_ref": "s6b4c03",
+            "review_ref": "atomic-cas",
             "extraction_method": "AUTOMATED_CHECK",
         },
         freshness_policy={"kind": "manual"},
@@ -97,7 +97,7 @@ async def _seed_current(adapter: MemoryAdapter, *, key: str, fact: str) -> dict[
         verified_by="OWNER",
         requested_lifecycle_state="VALIDATED_CURRENT",
         confidence=0.95,
-        tags=["subject:atomic-cas", "s6b4c03"],
+        tags=["subject:atomic-cas", "atomic-cas"],
     )
 
 
@@ -109,7 +109,7 @@ async def _race_two_reverify_updates(tmp_path) -> None:
         stamp = "2026-08-30T00:00:00Z"
         seed = await _seed_current(
             adapter_a,
-            key="s6b4c03-seed-reverify",
+            key="atomic-cas-seed-reverify",
             fact="FactLane uses atomic compare-and-swap for current memory revisions.",
         )
         memory_id = seed["results"][0]["memory_id"]
@@ -128,7 +128,7 @@ async def _race_two_reverify_updates(tmp_path) -> None:
                         "source_class": "CURRENT_REPO",
                         "source_ref": key,
                         "source_hash": ("b" if key.endswith("a") else "c") * 64,
-                        "review_ref": "s6b4c03",
+                        "review_ref": "atomic-cas",
                         "extraction_method": "AUTOMATED_CHECK",
                     },
                     "source_timestamp": stamp,
@@ -137,8 +137,8 @@ async def _race_two_reverify_updates(tmp_path) -> None:
             )
 
         outcomes = await asyncio.gather(
-            update(adapter_a, "s6b4c03-update-a"),
-            update(adapter_b, "s6b4c03-update-b"),
+            update(adapter_a, "atomic-cas-update-a"),
+            update(adapter_b, "atomic-cas-update-b"),
             return_exceptions=True,
         )
 
@@ -171,7 +171,7 @@ async def _race_two_replace_updates(tmp_path) -> None:
         stamp = "2026-08-30T00:00:00Z"
         seed = await _seed_current(
             adapter_a,
-            key="s6b4c03-seed-replace",
+            key="atomic-cas-seed-replace",
             fact="The shared-store rule is revision one.",
         )
         memory_id = seed["results"][0]["memory_id"]
@@ -193,19 +193,19 @@ async def _race_two_replace_updates(tmp_path) -> None:
                         "source_class": "CURRENT_REPO",
                         "source_ref": key,
                         "source_hash": marker * 64,
-                        "review_ref": "s6b4c03",
+                        "review_ref": "atomic-cas",
                         "extraction_method": "AUTOMATED_CHECK",
                     },
                     "freshness_policy": {"kind": "manual"},
                     "source_timestamp": stamp,
                     "verified_by": "AUTOMATED_CHECK",
-                    "tags": ["subject:atomic-cas", "s6b4c03"],
+                    "tags": ["subject:atomic-cas", "atomic-cas"],
                 },
             )
 
         outcomes = await asyncio.gather(
-            update(adapter_a, "s6b4c03-replace-a", "The shared-store rule is replacement A.", "d"),
-            update(adapter_b, "s6b4c03-replace-b", "The shared-store rule is replacement B.", "e"),
+            update(adapter_a, "atomic-cas-replace-a", "The shared-store rule is replacement A.", "d"),
+            update(adapter_b, "atomic-cas-replace-b", "The shared-store rule is replacement B.", "e"),
             return_exceptions=True,
         )
 
