@@ -736,7 +736,6 @@ async def _run_acceptance_body(run_dir: Path, gate: TransactionTraceGate) -> dic
         "GLOBAL_MCP_REGISTRATION": "NONE",
         "S6B_4D_STARTED": "NO",
         "S6B_5_STARTED": "NO",
-        "S6B_4C_06_STARTED": "NO",
         "coherence": coherence,
         "scenarios": scenarios,
         "cancellation": cancellation,

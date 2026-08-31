@@ -694,7 +694,7 @@ unless a failed proof is first reported for review.
 The final proof must record `PROCESS_SIGKILL_PROOF=PASS`, all five scenario
 passes, `ASYNC_CANCELLATION_SEMANTICS=PASS`, zero stale locks/forks/partial rows,
 unchanged backend pin and lockfile, unchanged schema/tools/provider/profile,
-`ACTUAL_CODEX_OR_HERMES_PROCESS_KILLED=NO`, and `S6B_4C_06_STARTED=NO` for the
-later-slice guard. After the focused test, run the Python 3.11 frozen environment
+`ACTUAL_CODEX_OR_HERMES_PROCESS_KILLED=NO`, and `S6B_4D_STARTED=NO` plus
+`S6B_5_STARTED=NO` for the later-slice guards. After the focused test, run the Python 3.11 frozen environment
 gate and complete repository verification. Commit and push only if all proofs pass;
 do not merge, open a PR, close 4C-06, or start S6B.4D in this slice.

@@ -36,3 +36,6 @@ def test_process_crash_and_cancellation_acceptance(tmp_path: Path) -> None:
     assert summary["PARTIAL_NATIVE_ROWS"] == 0
     assert summary["PARTIAL_VECTOR_ROWS"] == 0
     assert summary["ACTUAL_CODEX_OR_HERMES_PROCESS_KILLED"] == "NO"
+    assert summary["S6B_4D_STARTED"] == "NO"
+    assert summary["S6B_5_STARTED"] == "NO"
+    assert "S6B_4C_06_STARTED" not in summary
