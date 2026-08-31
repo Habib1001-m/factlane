@@ -437,6 +437,87 @@ class SQLiteVecEngine:
 
         await self._run(transaction)
 
+    async def compact_superseded_record(self, record_id: str) -> bool:
+        """Compact one fully materialized superseded record into history."""
+
+        def transaction() -> bool:
+            assert self.conn is not None
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.conn.execute(
+                    "SELECT lifecycle_state, native_content_hash FROM adapter_records WHERE record_id = ?",
+                    (record_id,),
+                ).fetchone()
+                if not row:
+                    raise AdapterError("NOT_FOUND", "record_id was not found")
+
+                lifecycle_state, content_hash = row
+                native = self.conn.execute(
+                    "SELECT id, deleted_at FROM memories WHERE content_hash = ?",
+                    (content_hash,),
+                ).fetchone()
+                native_id = native[0] if native else None
+                vector = (
+                    self.conn.execute(
+                        "SELECT 1 FROM memory_embeddings WHERE rowid = ? AND store = ?",
+                        (native_id, self.profile.profile_id),
+                    ).fetchone()
+                    if native_id is not None
+                    else None
+                )
+                graph = self.conn.execute(
+                    "SELECT 1 FROM memory_graph WHERE source_hash = ? OR target_hash = ? LIMIT 1",
+                    (content_hash, content_hash),
+                ).fetchone()
+
+                if lifecycle_state == "HISTORICAL":
+                    if native is None and graph is None:
+                        self.conn.commit()
+                        return False
+                    raise AdapterError(
+                        "COMPACTION_STATE_INVALID",
+                        "historical record still has materialized state",
+                    )
+                if lifecycle_state != "SUPERSEDED":
+                    raise AdapterError(
+                        "COMPACTION_NOT_ELIGIBLE",
+                        "only superseded records can be compacted",
+                    )
+                if native is None or native[1] is not None or vector is None:
+                    raise AdapterError(
+                        "COMPACTION_STATE_INVALID",
+                        "superseded record has partial materialization",
+                    )
+
+                updated = self.conn.execute(
+                    "UPDATE adapter_records SET lifecycle_state = 'HISTORICAL' "
+                    "WHERE record_id = ? AND lifecycle_state = 'SUPERSEDED'",
+                    (record_id,),
+                )
+                if updated.rowcount != 1:
+                    raise AdapterError("COMPACTION_NOT_ELIGIBLE", "record is no longer superseded")
+                self.conn.execute(
+                    "DELETE FROM memory_embeddings WHERE rowid = ? AND store = ?",
+                    (native_id, self.profile.profile_id),
+                )
+                self.conn.execute(
+                    "DELETE FROM memory_graph WHERE source_hash = ? OR target_hash = ?",
+                    (content_hash, content_hash),
+                )
+                deleted = self.conn.execute(
+                    "DELETE FROM memories WHERE id = ? AND content_hash = ? AND deleted_at IS NULL",
+                    (native_id, content_hash),
+                )
+                if deleted.rowcount != 1:
+                    raise AdapterError("COMPACTION_STATE_INVALID", "native materialization changed during compaction")
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
+
+        return await self._run(transaction)
+
     async def vector_candidates(
         self,
         vector: list[float],
