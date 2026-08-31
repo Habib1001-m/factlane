@@ -1,6 +1,6 @@
 # S6B.4C Shared-Store Concurrency Implementation Plan
 
-> **For execution agents:** Execute only the current Owner-authorized slice with strict TDD. Closed slices below are retained as implementation history and must not be replayed.
+> **Completed implementation history:** S6B.4C-01 through S6B.4C-06 are CLOSED_PASS. The tasks below are retained as accepted implementation history and must not be replayed as current execution gates.
 
 **Goal:** Record the completed S6B.4C shared-store concurrency campaign and its accepted implementation history. S6B.4C-01 through 4C-06 are closed; S6B.4D is pending Owner start.
 
@@ -37,7 +37,7 @@ CURRENT_EXECUTION=NONE
 NEXT_PHASE=S6B_4D_PENDING_OWNER_START
 ```
 
-The detailed Tasks 1–21 below are retained as closed 4C-01/02/03/04 implementation history only. Do not rerun them as gates for the current slice.
+The detailed Tasks 1–27 below are retained as closed S6B.4C implementation history. Do not rerun them as current execution gates.
 
 4C-06 was a proof-only slice. No production change was required.
 
@@ -375,7 +375,7 @@ Then run the complete repository gate, record raw output only under the ignored 
 
 - 4C-01, 4C-02, and 4C-03 are CLOSED_PASS; their detailed tasks are retained for provenance only.
 - 4C-04 is CLOSED_PASS after the disposable shared-store concurrency proof and accepted Codex/Hermes launcher provenance.
-- 4C-05 is the current Owner-authorized slice and must preserve exact embedding/model/backend identities while testing async contention.
+- 4C-05 is CLOSED_PASS; its accepted embedding/model/backend identities remain preserved in the implementation history.
 - 4C-06 must inject process termination/crash boundaries and rerun final acceptance.
 
 ## Closed implementation history — S6B.4C-03 atomic multi-client revision/CAS and lost-update prevention
