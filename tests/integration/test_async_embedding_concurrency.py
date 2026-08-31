@@ -10,7 +10,7 @@ from factlane.adapter import MemoryAdapter
 from factlane.embeddings import EmbeddingProfile
 
 PROFILE = EmbeddingProfile(
-    profile_id="s6b4c05-test-256",
+    profile_id="async-embedding-test-256",
     provider_kind="OLLAMA_LOCAL",
     base_model_identity="nomic-embed-text:latest",
     model_digest="0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
@@ -229,20 +229,20 @@ def test_event_loop_progresses_while_document_embedding_is_pending() -> None:
                 memory_type="PROJECT_LEARNED_FACT",
                 source_provenance={
                     "source_class": "CURRENT_REPO",
-                    "source_ref": "s6b4c05-document",
+                    "source_ref": "async-embedding-document",
                     "source_hash": "a" * 64,
-                    "review_ref": "s6b4c05",
+                    "review_ref": "async-embedding",
                     "extraction_method": "AUTOMATED_CHECK",
                 },
                 freshness_policy={"kind": "manual"},
-                idempotency_key="s6b4c05-document",
+                idempotency_key="async-embedding-document",
                 project_id="factlane",
                 source_timestamp="2026-08-30T00:00:00Z",
                 last_verified_at="2026-08-30T00:00:00Z",
                 verified_by="OWNER",
                 requested_lifecycle_state="VALIDATED_CURRENT",
                 confidence=0.95,
-                tags=["subject:async-embedding", "s6b4c05"],
+                tags=["subject:async-embedding", "async-embedding"],
             )
         )
         await asyncio.sleep(0)

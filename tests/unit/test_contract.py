@@ -46,6 +46,26 @@ def test_normal_agent_surface_is_exactly_five() -> None:
     ]
 
 
+class _StatusEngine:
+    async def status(self, scope: object) -> dict[str, bool]:
+        return {"ready": True}
+
+
+class _StatusProvider:
+    document_calls = 0
+    query_calls = 0
+
+    def provider_status(self) -> dict[str, bool]:
+        return {"ready": True}
+
+
+def test_status_token_measurement_preserves_existing_metadata_contract() -> None:
+    response = asyncio.run(MemoryAdapter(_StatusEngine(), _StatusProvider()).status(scope="PROJECT", project_id="p"))  # type: ignore[arg-type]
+
+    assert response["token_measurement"]["codex_exact_equivalence"] == "UNVERIFIED"
+    assert "exact_token_equivalence" not in response["token_measurement"]
+
+
 def test_provider_rejects_remote_url() -> None:
     with pytest.raises(AdapterError):
         OllamaLocalProvider(

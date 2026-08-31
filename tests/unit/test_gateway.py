@@ -55,7 +55,7 @@ class FakeAdapter:
         }
 
 
-def gateway(*, host_id: str = "codex-disposable", adapter: Any | None = None) -> MemoryGateway:
+def gateway(*, host_id: str = "host-a", adapter: Any | None = None) -> MemoryGateway:
     return MemoryGateway(
         adapter or FakeAdapter(),
         HostBinding(host_id, "stdio", "trusted-launcher"),
@@ -73,10 +73,10 @@ def test_unbound_gateway_fails_closed() -> None:
 
 
 def test_binding_validation_and_immutability() -> None:
-    binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
+    binding = HostBinding("host-a", "stdio", "trusted-launcher")
     bound = gateway()
 
-    assert binding.bound_host_id == "codex-disposable"
+    assert binding.bound_host_id == "host-a"
     assert binding.transport_kind == "stdio"
     assert binding.binding_source == "trusted-launcher"
     assert len(binding.gateway_instance_id) == 32
@@ -89,7 +89,7 @@ def test_binding_validation_and_immutability() -> None:
 
 def test_gateway_backing_binding_cannot_be_reassigned() -> None:
     bound = gateway()
-    replacement = HostBinding("hermes-disposable", "stdio", "trusted-launcher")
+    replacement = HostBinding("host-b", "stdio", "trusted-launcher")
 
     with pytest.raises(AttributeError):
         bound._binding = replacement  # type: ignore[misc]
@@ -97,11 +97,11 @@ def test_gateway_backing_binding_cannot_be_reassigned() -> None:
         del bound._binding  # type: ignore[misc]
 
     assert bound.binding is not None
-    assert bound.binding.bound_host_id == "codex-disposable"
+    assert bound.binding.bound_host_id == "host-a"
 
 
 def test_selected_transport_is_required() -> None:
-    binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
+    binding = HostBinding("host-a", "stdio", "trusted-launcher")
 
     with pytest.raises(TypeError):
         MemoryGateway(FakeAdapter(), binding)  # type: ignore[call-arg]
@@ -114,7 +114,7 @@ def test_selected_transport_is_required() -> None:
 
 @pytest.mark.parametrize(
     "bound_host_id",
-    [None, "", " ", "codex\ndisposable", "codex\x00disposable", "\ud800", "x" * 129, "/private/path", "secret:" + "a" * 32],
+    [None, "", " ", "host\ndisposable", "host\x00disposable", "\ud800", "x" * 129, "/private/path", "secret:" + "a" * 32],
 )
 def test_invalid_host_binding_fails_closed(bound_host_id: object) -> None:
     with pytest.raises(AdapterError) as error:
@@ -132,7 +132,7 @@ def test_invalid_transport_or_source_binding_fails_closed(field: str) -> None:
     values[field] = "invalid\nvalue"
 
     with pytest.raises(AdapterError) as error:
-        HostBinding("codex-disposable", values["transport_kind"], values["binding_source"])  # type: ignore[arg-type]
+        HostBinding("host-a", values["transport_kind"], values["binding_source"])  # type: ignore[arg-type]
 
     assert error.value.code == "INVALID_HOST_BINDING"
 
@@ -151,7 +151,7 @@ def test_invalid_transport_or_source_binding_fails_closed(field: str) -> None:
 )
 def test_request_identity_claim_is_denied(claim: str) -> None:
     adapter = FakeAdapter()
-    request = {"scope": "PROJECT", "project_id": "p", claim: "codex-disposable"}
+    request = {"scope": "PROJECT", "project_id": "p", claim: "host-a"}
 
     with pytest.raises(AdapterError) as error:
         asyncio.run(gateway(adapter=adapter).dispatch("memory_status", request))
@@ -162,7 +162,7 @@ def test_request_identity_claim_is_denied(claim: str) -> None:
 
 def test_matching_request_side_identity_is_still_not_authoritative() -> None:
     adapter = FakeAdapter()
-    request = {"scope": "PROJECT", "project_id": "p", "host_id": "codex-disposable"}
+    request = {"scope": "PROJECT", "project_id": "p", "host_id": "host-a"}
 
     with pytest.raises(AdapterError) as error:
         asyncio.run(gateway(adapter=adapter).dispatch("memory_status", request))
@@ -172,7 +172,7 @@ def test_matching_request_side_identity_is_still_not_authoritative() -> None:
 
 
 def test_selected_transport_must_match_bound_transport() -> None:
-    binding = HostBinding("codex-disposable", "stdio", "trusted-launcher")
+    binding = HostBinding("host-a", "stdio", "trusted-launcher")
 
     with pytest.raises(AdapterError) as error:
         MemoryGateway(FakeAdapter(), binding, transport_kind="http")
@@ -196,7 +196,7 @@ def test_server_rejects_unsupported_runtime_transport(monkeypatch, transport: st
 
 
 def test_non_stdio_gateway_transport_fails_closed() -> None:
-    binding = HostBinding("codex-disposable", "http", "trusted-launcher")
+    binding = HostBinding("host-a", "http", "trusted-launcher")
 
     with pytest.raises(AdapterError) as error:
         MemoryGateway(FakeAdapter(), binding, transport_kind="http")
@@ -206,7 +206,7 @@ def test_non_stdio_gateway_transport_fails_closed() -> None:
 
 def test_gateway_instances_have_distinct_internal_identities() -> None:
     first = gateway()
-    second = gateway(host_id="hermes-disposable")
+    second = gateway(host_id="host-b")
 
     assert first.binding is not None
     assert second.binding is not None
@@ -222,7 +222,7 @@ def test_host_binding_does_not_rewrite_scope_agent_id() -> None:
     )
 
     assert response["scope"]["agent_id"] == "scope-agent"
-    assert response["audit"]["host_binding"]["host_id"] == "codex-disposable"
+    assert response["audit"]["host_binding"]["host_id"] == "host-a"
     assert response["scope"]["agent_id"] != response["audit"]["host_binding"]["host_id"]
 
 
@@ -233,7 +233,7 @@ def test_audit_binding_is_gateway_owned_bounded_and_immutable() -> None:
     second = asyncio.run(bound.dispatch("memory_status", {"scope": "PROJECT", "project_id": "p"}))
 
     assert second["audit"]["host_binding"] == {
-        "host_id": "codex-disposable",
+        "host_id": "host-a",
         "transport": "stdio",
         "gateway_instance_id": bound.binding.gateway_instance_id if bound.binding else None,
         "binding_source": "trusted-launcher",
@@ -282,14 +282,8 @@ def test_registered_server_handler_dispatches_through_gateway() -> None:
 
     response = asyncio.run(tool.fn({"scope": "PROJECT", "project_id": "p"}))
 
-    assert response["audit"]["host_binding"]["host_id"] == "codex-disposable"
+    assert response["audit"]["host_binding"]["host_id"] == "host-a"
     assert adapter.calls == [("memory_status", {"scope": "PROJECT", "project_id": "p"})]
-
-
-def test_disposable_mcp_probe_passes_explicit_host_identity() -> None:
-    text = Path("tests/acceptance/s6b4b_pilot.py").read_text(encoding="utf-8")
-
-    assert '"--host-id", "acceptance-disposable"' in text
 
 
 class DeterministicProvider:
@@ -363,12 +357,12 @@ def test_sequential_cross_gateway_visibility_uses_one_disposable_store(tmp_path:
         adapter_b = MemoryAdapter(engine_b, provider_b)
         gateway_a = MemoryGateway(
             adapter_a,
-            HostBinding("codex-disposable", "stdio", "trusted-launcher"),
+            HostBinding("host-a", "stdio", "trusted-launcher"),
             transport_kind="stdio",
         )
         gateway_b = MemoryGateway(
             adapter_b,
-            HostBinding("hermes-disposable", "stdio", "trusted-launcher"),
+            HostBinding("host-b", "stdio", "trusted-launcher"),
             transport_kind="stdio",
         )
         try:
@@ -392,10 +386,10 @@ def test_sequential_cross_gateway_visibility_uses_one_disposable_store(tmp_path:
 
     assert write["status"] == "OK"
     assert write["scope"]["agent_id"] == "scope-agent"
-    assert write["audit"]["host_binding"]["host_id"] == "codex-disposable"
+    assert write["audit"]["host_binding"]["host_id"] == "host-a"
     assert read["results"][0]["memory_id"] == write["results"][0]["memory_id"]
     assert read["scope"]["agent_id"] == "scope-agent"
-    assert read["audit"]["host_binding"]["host_id"] == "hermes-disposable"
+    assert read["audit"]["host_binding"]["host_id"] == "host-b"
     assert write["audit"]["host_binding"]["gateway_instance_id"] != read["audit"]["host_binding"]["gateway_instance_id"]
 
 

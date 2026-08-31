@@ -24,35 +24,18 @@ def test_update_api_preserves_expected_revision_contract() -> None:
     assert "expected_revision" in parameters
 
 
-def test_governance_surface_exists() -> None:
+def test_public_product_surface_exists() -> None:
     required = [
-        "AGENTS.md",
-        "TASKBOARD.md",
         "README.md",
         "LICENSE",
         "SECURITY.md",
         "environment-provenance.json",
         "docs/ARCHITECTURE.md",
-        "docs/GOVERNANCE.md",
         "docs/ENVIRONMENT.md",
-        "docs/PROJECT_HISTORY.md",
+        ".github/workflows/ci.yml",
     ]
     missing = [path for path in required if not Path(path).is_file()]
     assert missing == []
-
-
-def test_taskboard_is_single_in_place_authority() -> None:
-    text = Path("TASKBOARD.md").read_text(encoding="utf-8")
-    assert "CANONICAL_FILENAME=TASKBOARD.md" in text
-    assert "TASKBOARD_UPDATE_MODE=IN_PLACE_APPEND_AND_RECONCILE" in text
-    assert "NUMBERED_TASKBOARD_FILES_FUTURE_AUTHORITY=NO" in text
-    tracked = subprocess.run(
-        ["git", "ls-files", "TASKBOARD_V*.md", "*TASKBOARD_V*.md"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert tracked == ""
 
 
 def _tracked_files() -> list[str]:
@@ -65,14 +48,37 @@ def _tracked_files() -> list[str]:
     return [line for line in output.splitlines() if line]
 
 
+def test_public_tree_excludes_private_operational_surfaces() -> None:
+    tracked = _tracked_files()
+    forbidden_exact = {
+        "AGENTS.md",
+        "TASKBOARD.md",
+        "docs/GOVERNANCE.md",
+        "docs/WORKFLOW_TEMPLATE.md",
+        "docs/S6B_4C_04_DISPOSABLE_HOST_ACCEPTANCE_RUNBOOK.md",
+        "docs/S6B_4C_SHARED_STORE_CONCURRENCY_SPEC.md",
+        "src/factlane/execution_context.py",
+        "tests/unit/test_execution_context.py",
+        "tests/acceptance/s6b4b_pilot.py",
+        "tests/integration/test_disposable_host_concurrency.py",
+        "tests/integration/test_process_crash_acceptance.py",
+        "tools/s6b4c04_disposable_shared_store.py",
+        "tools/s6b4c06_crash_acceptance.py",
+    }
+    forbidden_prefixes = ("docs/superpowers/", ".factlane-local/")
+    forbidden = [
+        path
+        for path in tracked
+        if path in forbidden_exact or path.startswith(forbidden_prefixes)
+    ]
+    assert forbidden == []
+
+
 def test_public_tree_tracks_no_runtime_or_private_evidence() -> None:
     tracked = _tracked_files()
     forbidden_suffixes = (".db", ".sqlite", ".sqlite3")
     assert not any(path.endswith(forbidden_suffixes) for path in tracked)
     assert not any(path.startswith("pilot-evidence/") for path in tracked)
-    legacy_package_prefix = "src/" + "one_linux_" + "codex_memory/"
-    assert not any(path.startswith(legacy_package_prefix) for path in tracked)
-    assert not any("ONE_LINUX_MEMORY_CANONICAL_REVIEW_CLONE" in path for path in tracked)
     assert not any(".egg-info/" in path for path in tracked)
 
 
