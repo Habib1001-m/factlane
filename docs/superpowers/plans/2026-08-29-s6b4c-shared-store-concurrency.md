@@ -2,9 +2,9 @@
 
 > **For execution agents:** Execute only the current Owner-authorized slice with strict TDD. Closed slices below are retained as implementation history and must not be replayed.
 
-**Goal:** Establish the S6B.4C shared-store concurrency campaign slice-by-slice. S6B.4C-01 through 4C-04 are closed; the current slice is S6B.4C-05 async embedding concurrency and pinned-backend runtime proof.
+**Goal:** Establish the S6B.4C shared-store concurrency campaign slice-by-slice. S6B.4C-01 through 4C-05 are closed; the current slice is S6B.4C-06 process/crash injection and final acceptance.
 
-**Architecture:** Preserve the accepted execution-context, transport-bound gateway, transaction-local CAS, and disposable Codex/Hermes boundaries from 4C-01/02/03/04. For 4C-05, vary only the async scheduling boundary: synchronous local embedding-provider work is offloaded at the async adapter edge while the synchronous provider protocol, pinned SQLite-vec backend, and accepted CAS authority remain unchanged. No embedding coordinator, worker service, queue, custom retry layer, or storage executor is introduced.
+**Architecture:** Preserve the accepted execution-context, transport-bound gateway, transaction-local CAS, disposable Codex/Hermes, and async provider boundaries from 4C-01/02/03/04/05. For 4C-06, vary only the disposable process/cancellation proof dimension: inject child-process `SIGKILL` at exact transaction boundaries and characterize existing `asyncio.to_thread` cancellation semantics. No recovery service, coordinator, supervisor, queue, custom retry layer, thread-abort mechanism, or storage executor is introduced.
 
 **Tech Stack:** Python 3.11+, stdlib asyncio/threading/subprocess/pathlib/json, existing FactLane gateway/adapter/storage/contract, pytest, and the existing lockfile.
 
@@ -19,13 +19,13 @@ Current execution:
 4C-02 CLOSED_PASS
 4C-03 CLOSED_PASS
 4C-04 CLOSED_PASS
-4C-05 CURRENT
-4C-06 NOT_STARTED
+4C-05 CLOSED_PASS
+4C-06 CURRENT
 ```
 
 The detailed Tasks 1–21 below are retained as closed 4C-01/02/03/04 implementation history only. Do not rerun them as gates for the current slice.
 
-4C-06 process/crash injection remains forbidden in the current slice. Cancellation cleanup and interrupted worker-thread semantics are also deferred unless a concrete correctness defect prevents the 4C-05 proof.
+4C-06 is a proof-only slice. Production changes are not expected; any concrete correctness defect must be reported before changing `src/factlane/**`.
 
 Do not implement retention/compaction/reclaim/recovery (S6B.4D), native-memory bootstrap or migration (S6B.5), live configuration, registration, backend-pin changes, embedding-model changes, or reopening accepted 4B results.
 
@@ -502,9 +502,9 @@ S6B_4C_06_STARTED=NO
 
 Open a PR to `main`, record the exact candidate head and CI evidence, and stop for Owner/Advisor merge disposition. Do not self-merge. Canonical merged-closure reconciliation follows the merge boundary.
 
-## Current execution — S6B.4C-05 async embedding concurrency and pinned-backend runtime proof
+## Closed execution history — S6B.4C-05 async embedding concurrency and pinned-backend runtime proof
 
-The Owner authorized this cycle for design and RED only. The current production paths
+The Owner authorized that cycle for design and RED only. The production paths
 call synchronous `embed_documents`, `embed_query`, and `provider_status` directly from
 async adapter methods. The synchronous `EmbeddingProvider` protocol remains unchanged.
 
@@ -547,11 +547,96 @@ EVENT_LOOP_BLOCKED_BY_DOCUMENT_EMBEDDING=NO
 EVENT_LOOP_BLOCKED_BY_PROVIDER_STATUS=NO
 ```
 
-### Task 24: DESIGN_AND_RED verification boundary
+### Task 24: DESIGN_AND_RED verification boundary (closed)
 
 Commit the three authority-file contract update first, then commit only the RED test
 file. Run the focused test and prove it fails deterministically against the unchanged
 production implementation for the intended event-loop blocking/serial provider-call
 reason. Run the full suite only to show existing unrelated tests remain green and the
-intentional RED coverage is the only failure. Do not implement the GREEN production fix,
-run exact local-provider runtime acceptance, or start 4C-06 in this cycle.
+intentional RED coverage is the only failure. The GREEN production fix and exact local
+provider runtime acceptance were completed in the accepted 4C-05 candidate; 4C-06 is
+defined below and is not covered by this historical task.
+
+## Current execution — S6B.4C-06 process/crash injection and final acceptance
+
+The Owner authorized this final proof slice on 2026-08-31. It must use a new
+isolated worktree and the existing accepted Python 3.11 dependency contract. No
+production behavior change is expected. Do not develop on `main`, kill any live
+Codex/Hermes/Gateway/Ollama process, or start S6B.4D.
+
+### Task 25: Define the final-slice contract
+
+Update only `TASKBOARD.md`, this plan, and
+`docs/S6B_4C_SHARED_STORE_CONCURRENCY_SPEC.md` first. Set 4C-06 to `IN_PROGRESS`,
+set `PROCESS_KILL_CRASH_INJECTION=IN_PROGRESS_4C_06`, and point the active next
+action at completion of this slice. Do not close 4C-06 or claim production
+embedding-profile selection.
+
+The proof must cover pre-commit `SIGKILL` rollback for STORE, REVERIFY, and
+REPLACE; post-commit/pre-response durability and idempotent replay for REVERIFY;
+in-flight embedding process death; and async caller cancellation while a
+synchronous provider worker is active and after the storage worker reaches the
+pre-commit boundary. A caller may become ambiguous after a completed commit, but
+the exact idempotency key must resolve it without duplicate successor rows.
+
+### Task 26: Add deterministic crash acceptance coverage
+
+Create only the following tracked implementation files after the contract commit:
+
+```text
+tools/s6b4c06_crash_acceptance.py
+tests/integration/test_process_crash_acceptance.py
+docs/S6B_4C_06_CRASH_ACCEPTANCE_RUNBOOK.md  # optional
+```
+
+Use the real `SQLiteVecEngine` and `MemoryAdapter` with deterministic synchronous
+embedding test providers. Prefer test-only `threading.settrace()` scoped to the
+exact `write_record.<locals>.transaction` frame and the source line containing
+`self.conn.commit()`. Emit bounded pre/post-commit markers, block the disposable
+worker, and have the parent send `SIGKILL` only to its exact `Popen.pid`. Do not
+rewrite source, add production failpoints, use magic line numbers, or use
+probabilistic sleep-based kills.
+
+After each crash reopen the same disposable database through the production engine
+and check `PRAGMA quick_check`, WAL, `busy_timeout=5000`, bounded adapter/native/
+vector counts, zero orphan rows, zero lineage forks, no stale lock, and a subsequent
+write or idempotent replay. Cancellation tests must wait for the provider worker,
+cancel only the caller task, release the provider, and prove no thread abort is
+promised and no cancelled coroutine performs a late storage write.
+
+### Task 27: Exact acceptance and handoff
+
+Keep run output only under `.factlane-local/evidence/s6b4c-06/real-runtime-001/`.
+Use `.factlane-local/envs/s6b4c06-py311` with Python 3.11 and frozen lock sync.
+Run focused crash tests first, then the tracked harness, the complete repository
+gate, and focused Ruff if available. Required final evidence is:
+
+```text
+PROCESS_SIGKILL_PROOF=PASS
+STORE_PRECOMMIT_ROLLBACK=PASS
+REVERIFY_PRECOMMIT_ROLLBACK=PASS
+REPLACE_PRECOMMIT_ROLLBACK=PASS
+POSTCOMMIT_DURABILITY=PASS
+POSTCOMMIT_IDEMPOTENT_REPLAY=PASS
+EMBEDDING_INFLIGHT_PROCESS_KILL=PASS
+ASYNC_CANCELLATION_SEMANTICS=PASS
+SQLITE_QUICK_CHECK_AFTER_CRASHES=PASS
+STALE_WRITER_LOCKS=0
+CURRENT_LINEAGE_FORKS=0
+PARTIAL_ADAPTER_ROWS=0
+PARTIAL_NATIVE_ROWS=0
+PARTIAL_VECTOR_ROWS=0
+BACKEND_PIN_CHANGE=NONE
+UV_LOCK_CHANGE=NONE
+SCHEMA_CHANGE=NONE
+PUBLIC_TOOL_CHANGE=NONE
+PRODUCTION_EMBEDDING_PROFILE_SELECTION=NO
+ACTUAL_CODEX_OR_HERMES_PROCESS_KILLED=NO
+```
+
+If any invariant fails, stop with the exact bounded evidence before changing
+`src/factlane/**`. If all pass, commit the harness/tests/runbook separately as
+`test: prove crash-safe FactLane transactions`, push
+`codex/s6b4c06-crash-final-acceptance`, wait for exact-head push CI, and stop.
+Do not open a PR or close 4C-06 in this slice; later closure is a separate
+post-merge reconciliation.

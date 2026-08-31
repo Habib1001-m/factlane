@@ -5,9 +5,9 @@
 ```text
 SPEC_STATUS=OWNER_AUTHORIZED_IN_PROGRESS
 OWNER_AUTHORIZATION_DATE=2026-08-29
-CURRENT_SLICE=S6B_4C_05_ASYNC_EMBEDDING_CONCURRENCY_AND_PINNED_BACKEND_RUNTIME_PROOF
-CURRENT_SLICE_AUTHORIZATION_DATE=2026-08-30
-CURRENT_SLICE_PHASE=DESIGN_AND_RED_ONLY
+CURRENT_SLICE=S6B_4C_06_PROCESS_CRASH_INJECTION_AND_FINAL_ACCEPTANCE
+CURRENT_SLICE_AUTHORIZATION_DATE=2026-08-31
+CURRENT_SLICE_PHASE=CONTRACT_AND_FINAL_ACCEPTANCE
 ```
 
 This specification defines the bounded S6B.4C campaign. It is not authorization to begin a later slice. Each slice has its own implementation and verification gate.
@@ -27,15 +27,18 @@ The campaign is limited to these slices, in order:
 5. **4C-05 — Async embedding concurrency and pinned-backend runtime proof**
 6. **4C-06 — Process/crash injection and final acceptance**
 
-4C-01, 4C-02, 4C-03, and 4C-04 are CLOSED_PASS. The current implementation/acceptance slice is 4C-05 only. 4C-05 must not expand into process kill, cancellation cleanup, crash injection, lifecycle work, live host configuration, native memory, or production migration.
+4C-01, 4C-02, 4C-03, 4C-04, and 4C-05 are CLOSED_PASS. The current
+implementation/acceptance slice is 4C-06 only. 4C-06 must not expand into
+recovery services, lifecycle work, live host configuration, native memory, or
+production migration.
 
 ```text
 4C-01=CLOSED_PASS
 4C-02=CLOSED_PASS
 4C-03=CLOSED_PASS
 4C-04=CLOSED_PASS
-4C-05=CURRENT
-4C-06=NOT_STARTED
+4C-05=CLOSED_PASS
+4C-06=CURRENT
 ```
 
 ## Explicitly out of scope
@@ -550,5 +553,148 @@ coverage proves scheduling behavior without external services; it does not by it
 claim exact local-provider runtime acceptance. No `pymilvus` addition, backend pin
 change, embedding model change, or production profile selection is authorized.
 
-The 4C-05 current phase is design and RED only. A passing RED test is not a closure
-result, and no GREEN production fix or 4C-06 work is authorized by this contract.
+The 4C-05 phase was design and RED only; its GREEN and real pinned-backend runtime
+proof are accepted separately. Process/crash injection and cancellation
+characterization are reserved for the current 4C-06 contract below.
+
+## 4C-06 contract: process/crash injection and final acceptance
+
+4C-06 is a proof slice over the already accepted adapter, transaction/CAS,
+idempotency, provider, and pinned SQLite-vec boundaries. No production change is
+expected. If the proof exposes a concrete correctness defect, stop with the exact
+defect before changing `src/factlane/**`.
+
+```text
+CURRENT_SLICE=S6B_4C_06_PROCESS_CRASH_INJECTION_AND_FINAL_ACCEPTANCE
+PROCESS_KILL_CRASH_INJECTION=IN_PROGRESS_4C_06
+S6B_4C_06=IN_PROGRESS
+```
+
+### Scope and exclusions
+
+Only disposable child processes created by the 4C-06 harness may be terminated,
+and the parent may send `SIGKILL` only to the exact `Popen.pid` it created. The
+actual Codex, Hermes, Gateway, Ollama, or host process must never be killed. Do
+not add a recovery service, journal manager, transaction coordinator, process
+supervisor, queue, custom executor, thread-abort mechanism, retry/backoff layer,
+retention, compaction, reclaim, archive/restore, native-memory mutation,
+production migration, live configuration, registration, or profile selection.
+
+The backend pin, lockfile, schema, public five-tool contract, gateway, provider
+identity, accepted 4C-03 CAS semantics, 4C-04 harness, and 4C-05 async provider
+boundary remain unchanged.
+
+### Required crash boundaries
+
+The harness must prove these five disposable scenarios with the real
+`SQLiteVecEngine` and `MemoryAdapter`:
+
+1. `STORE_PRECOMMIT_SIGKILL`: kill a writer after all transaction mutations but
+   immediately before the transaction's `self.conn.commit()`. Reopen the same
+   database and prove quick-check success, no stale lock, zero partial adapter,
+   native, or vector rows, zero current-lineage forks, and a successful exact-key
+   retry.
+2. `REVERIFY_PRECOMMIT_SIGKILL`: after a seeded revision-1 current parent, kill
+   after successor/parent mutations but before commit. The parent remains current,
+   history has one row, the killed successor and idempotency row are absent, there
+   are no orphan rows, and the exact update retry creates one revision-2 current
+   successor.
+3. `REPLACE_PRECOMMIT_SIGKILL`: apply the same pre-commit kill boundary to
+   replacement. The old parent remains current with no replacement branch or
+   orphan rows, and the exact retry succeeds once.
+4. `UPDATE_POSTCOMMIT_PRE_RESPONSE_SIGKILL`: arm after commit completes but before
+   the storage worker returns to the adapter. Reopen and prove revision 2 is
+   durable, revision 1 is superseded, history has exactly two rows, quick-check
+   passes, and the exact-key retry is an idempotent replay with no extra embedding
+   or successor row.
+5. `EMBEDDING_INFLIGHT_SIGKILL`: kill while a deterministic synchronous
+   `embed_documents` call is running and before `write_record()`. Reopen and prove
+   no storage mutation, quick-check success, and a subsequent normal store.
+
+Pre-commit results must include:
+
+```text
+SQLITE_QUICK_CHECK=PASS
+STALE_WRITER_LOCK=NO
+PRECOMMIT_PARTIAL_ADAPTER_ROWS=0
+PRECOMMIT_PARTIAL_NATIVE_ROWS=0
+PRECOMMIT_PARTIAL_VECTOR_ROWS=0
+CURRENT_LINEAGE_FORKS=0
+ORIGINAL_PARENT_REMAINS_CURRENT=YES
+FAILED_SUCCESSOR_IDEMPOTENCY_ROW=ABSENT
+```
+
+Post-commit results must include:
+
+```text
+COMMITTED_WRITE_DURABLE=YES
+PARTIAL_STATE=0
+IDEMPOTENT_REPLAY=YES
+DUPLICATE_SUCCESSOR_ROWS=0
+SECOND_COMMIT_FOR_SAME_OPERATION=NO
+RETURNED_REVISION=2
+CURRENT_REVISION=2
+HISTORY_RECORDS=2
+ADDITIONAL_EMBEDDING_FOR_REPLAY=0
+ADDITIONAL_SUCCESSOR_ROW=0
+```
+
+### Cancellation characterization
+
+Do not forcibly terminate Python worker threads. With a deterministic provider
+blocked in `embed_documents`, cancel the async caller only after the provider
+worker is observed running; then release the provider, prove the worker finishes,
+no later storage write occurs from the cancelled coroutine, and a subsequent
+normal operation passes. Also characterize cancellation after the storage worker
+has reached the pre-commit boundary. An already-running synchronous worker may
+finish after caller cancellation; acceptable evidence is:
+
+```text
+CALLER_CANCELLED=YES
+PROVIDER_WORKER_FINISHED=YES
+LATE_STORAGE_WRITE_AFTER_EMBEDDING_CANCELLATION=NO
+SUBSEQUENT_OPERATION=PASS
+ASYNC_CANCELLATION_DOES_NOT_CREATE_PARTIAL_TRANSACTION=YES
+COMMIT_OUTCOME_MAY_BECOME_CALLER_AMBIGUOUS=YES
+IDEMPOTENCY_REPLAY_RESOLVES_AMBIGUOUS_COMMIT=YES
+```
+
+### Deterministic failpoint and coherence rules
+
+Use test/harness-only Python tracing or an equivalent deterministic mechanism.
+Prefer `threading.settrace()` scoped to the exact
+`write_record.<locals>.transaction` frame and the source line containing
+`self.conn.commit()`, discovered from the checked-out source rather than a magic
+line number. Emit bounded `PRECOMMIT_ARMED` and `POSTCOMMIT_ARMED` markers and
+block the disposable worker until the parent observes the marker and sends
+`SIGKILL`. Do not rewrite source, monkeypatch transaction semantics, or add a
+production failpoint. Do not use probabilistic sleep-based kills.
+
+After every crash, reopen through the production engine and perform bounded
+read-only checks:
+
+```text
+PRAGMA_QUICK_CHECK=ok
+JOURNAL_MODE=wal
+BUSY_TIMEOUT=5000
+```
+
+Verify bounded adapter/native/vector relational counts and zero orphan rows. A
+leftover WAL file is not itself a failure; readable coherent state, quick-check,
+no stale lock, and a subsequent write are authoritative.
+
+The tracked implementation is limited to
+`tools/s6b4c06_crash_acceptance.py`,
+`tests/integration/test_process_crash_acceptance.py`, and an optional concise
+`docs/S6B_4C_06_CRASH_ACCEPTANCE_RUNBOOK.md`, alongside this specification,
+the plan, and `TASKBOARD.md`. All run output remains under
+`.factlane-local/evidence/s6b4c-06/`. No `src/factlane/**` change is allowed
+unless a failed proof is first reported for review.
+
+The final proof must record `PROCESS_SIGKILL_PROOF=PASS`, all five scenario
+passes, `ASYNC_CANCELLATION_SEMANTICS=PASS`, zero stale locks/forks/partial rows,
+unchanged backend pin and lockfile, unchanged schema/tools/provider/profile,
+`ACTUAL_CODEX_OR_HERMES_PROCESS_KILLED=NO`, and `S6B_4D_STARTED=NO` plus
+`S6B_5_STARTED=NO` for the later-slice guards. After the focused test, run the Python 3.11 frozen environment
+gate and complete repository verification. Commit and push only if all proofs pass;
+do not merge, open a PR, close 4C-06, or start S6B.4D in this slice.
