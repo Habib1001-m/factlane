@@ -13,15 +13,32 @@ The core principle is **share facts, not context**.
 ## Core flow
 
 ```text
-Host edge
-  -> TruthRouter / FactLane Router decision
-  -> five-operation MemoryAdapter
-  -> SQLiteVecEngine compatibility boundary
-  -> pinned mcp-memory-service / SQLite-vec
-  -> local EmbeddingProvider
+Host / trusted launcher
+  -> HostBinding
+  -> stdio-only FastMCP boundary
+  -> MemoryGateway
+  -> MemoryAdapter / five operations
+       -> TruthRouter for bounded search routing decisions
+       -> EmbeddingProvider
+       -> SQLiteVecEngine
+            -> adapter-owned transaction/CAS semantics
+            -> pinned backend SQLite/SQLite-vec primitives
 ```
 
 The normal operations are `memory_search`, `memory_get`, `memory_store`, `memory_update`, and `memory_status`.
+
+`TruthRouter` makes bounded memory-routing decisions inside the adapter; it is not
+the transport gateway.
+
+## HostBinding and MemoryGateway
+
+`HostBinding` is an immutable binding supplied by the trusted launcher. The current
+runtime supports the `stdio` transport only, and an unbound gateway fails closed.
+Reserved transport-identity claims in request payloads are rejected. The gateway
+projects its own bound host identity into the audit envelope; launcher binding is
+separate from an arbitrary request `agent_id`. This boundary does not claim
+cryptographic or operating-system identity attestation. Where required, real-host
+provenance remains external accepted launcher evidence.
 
 ## Ownership boundary
 
@@ -47,7 +64,11 @@ FactLane does not reimplement those lock/retry mechanics. The compatibility boun
 
 ## Revision/CAS boundary
 
-The adapter already exposes `expected_revision` and rejects a stale sequential revision. That API is **not** proof of atomic multi-client compare-and-swap behavior. S6B.4C must test and, where needed, implement single-winner concurrent revision semantics and lost-update prevention across independent clients/processes.
+FactLane uses transaction-local parent-current CAS. A stale independent writer
+receives deterministic `VERSION_CONFLICT`; successor insertion, vector write, and
+parent supersession occur in one transaction. SQLite lock/busy/WAL mechanics remain
+delegated to the pinned backend, and no duplicate coordinator or backoff subsystem
+was added.
 
 ## Embedding boundary
 
@@ -55,8 +76,26 @@ The provider receives raw fact/query text. Nomic profiles apply exactly one `sea
 
 Embedding profile changes create a new projection/index boundary. Canonical memory records are separate from vector projections.
 
+The provider API remains synchronous, but potentially blocking provider calls are
+offloaded from the asyncio event loop at the adapter boundary using the standard
+library thread-offload mechanism. No custom worker service, executor, or thread
+abort mechanism is a product dependency.
+
+## Crash boundary
+
+The accepted 4C-06 proof showed that pre-commit process death leaves no partial
+adapter/native/vector rows, while post-commit/pre-response death leaves durable
+state resolvable through idempotent replay. The proof also found no stale writer
+locks or lineage forks. This is crash-safety evidence at tested boundaries, not a
+crash-recovery service or subsystem.
+
 ## Later ownership
 
-S6B.4C owns transport-bound host identity, shared gateway/write-plane behavior, multi-client revision/CAS, lost-update prevention, async embedding concurrency, and crash-injection proof.
+S6B.4C owns and has accepted transport-bound host identity, shared gateway/write-plane
+behavior, multi-client revision/CAS, lost-update prevention, async embedding
+concurrency, and crash-injection proof.
 
-S6B.4D owns retention, compaction/reclaim, archive/recovery, and lifecycle hygiene. SQLite-vec delete/reclaim behavior is an explicit input to that phase.
+S6B.4D remains the later owner of retention, compaction/reclaim, archive/recovery,
+lifecycle hygiene, and vec0 delete/reclaim behavior investigation. S6B.5 remains
+the native-memory/bootstrap/migration phase. Production embedding-profile selection
+is unresolved.

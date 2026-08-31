@@ -1,10 +1,18 @@
 # FactLane Canonical Public Genesis — Design
 
-**Status:** Owner-approved design amended after independent review; awaiting final written-spec approval
+**Original drafting status:** Owner-approved design amended after independent review; awaiting final written-spec approval
 **Date:** 2026-08-29
 **Source pilot head:** `6ac7f2a4a19c57e4e0e70c85dd055b5de9ad074c`
 **Source branch:** `codex-s6b4b-memory-adapter`
 **Public target:** `Habib1001-m/factlane`
+
+```text
+ARTIFACT_STATUS=HISTORICAL_IMPLEMENTED_GENESIS_DESIGN
+CURRENT_EXECUTION_AUTHORITY=NO
+```
+
+This document records genesis design provenance. Current truth is `TASKBOARD.md`;
+subsequent S6B.4C work is intentionally outside this genesis document.
 
 ## 0. Independent-review reconciliation
 

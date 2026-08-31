@@ -44,4 +44,13 @@ The exact effective context capability is runtime evidence for the approved mode
 
 ## Pinned backend reuse
 
-At the accepted backend pin, FactLane reuses the backend connection lock, thread offload, SQLite locked/busy retry, WAL journal mode, and `busy_timeout`. These mechanics solve lower-level SQLite coordination only; higher-level FactLane revision/CAS and lost-update semantics remain separate.
+At the accepted backend pin, the pinned backend continues to own reusable SQLite
+connection locking, synchronous database thread offload, bounded `locked`/`busy`
+retry, WAL journal mode, and `busy_timeout`. FactLane owns the higher-level
+transaction-local revision/CAS and lost-update semantics accepted in 4C-03. No
+duplicate lock/backoff layer was added.
+
+Synchronous local provider calls are offloaded from the asyncio event loop at the
+adapter boundary. The accepted 4C-05 proof observed concurrent provider work while
+preserving the pinned backend/runtime contract; no custom executor or provider
+worker service became a product dependency.
