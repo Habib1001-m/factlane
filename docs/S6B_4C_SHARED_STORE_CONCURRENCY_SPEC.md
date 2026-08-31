@@ -3,11 +3,20 @@
 ## Status
 
 ```text
-SPEC_STATUS=OWNER_AUTHORIZED_IN_PROGRESS
+SPEC_STATUS=CLOSED_PASS
 OWNER_AUTHORIZATION_DATE=2026-08-29
-CURRENT_SLICE=S6B_4C_06_PROCESS_CRASH_INJECTION_AND_FINAL_ACCEPTANCE
+S6B_4C=CLOSED_PASS
+CURRENT_SLICE=NONE
 CURRENT_SLICE_AUTHORIZATION_DATE=2026-08-31
-CURRENT_SLICE_PHASE=CONTRACT_AND_FINAL_ACCEPTANCE
+CURRENT_SLICE_PHASE=COMPLETED_HISTORICAL_CAMPAIGN
+4C-01=CLOSED_PASS
+4C-02=CLOSED_PASS
+4C-03=CLOSED_PASS
+4C-04=CLOSED_PASS
+4C-05=CLOSED_PASS
+4C-06=CLOSED_PASS
+S6B_4D_STARTED=NO
+S6B_5_STARTED=NO
 ```
 
 This specification defines the bounded S6B.4C campaign. It is not authorization to begin a later slice. Each slice has its own implementation and verification gate.
@@ -27,8 +36,8 @@ The campaign is limited to these slices, in order:
 5. **4C-05 — Async embedding concurrency and pinned-backend runtime proof**
 6. **4C-06 — Process/crash injection and final acceptance**
 
-4C-01, 4C-02, 4C-03, 4C-04, and 4C-05 are CLOSED_PASS. The current
-implementation/acceptance slice is 4C-06 only. 4C-06 must not expand into
+4C-01, 4C-02, 4C-03, 4C-04, 4C-05, and 4C-06 are CLOSED_PASS. The campaign
+has no current implementation/acceptance slice. 4C-06 did not expand into
 recovery services, lifecycle work, live host configuration, native memory, or
 production migration.
 
@@ -38,7 +47,7 @@ production migration.
 4C-03=CLOSED_PASS
 4C-04=CLOSED_PASS
 4C-05=CLOSED_PASS
-4C-06=CURRENT
+4C-06=CLOSED_PASS
 ```
 
 ## Explicitly out of scope
@@ -555,11 +564,11 @@ change, embedding model change, or production profile selection is authorized.
 
 The 4C-05 phase was design and RED only; its GREEN and real pinned-backend runtime
 proof are accepted separately. Process/crash injection and cancellation
-characterization are reserved for the current 4C-06 contract below.
+characterization are recorded in the accepted historical 4C-06 contract below.
 
-## 4C-06 contract: process/crash injection and final acceptance
+## 4C-06 contract (accepted historical evidence): process/crash injection and final acceptance
 
-4C-06 is a proof slice over the already accepted adapter, transaction/CAS,
+4C-06 was a proof slice over the already accepted adapter, transaction/CAS,
 idempotency, provider, and pinned SQLite-vec boundaries. No production change is
 expected. If the proof exposes a concrete correctness defect, stop with the exact
 defect before changing `src/factlane/**`.
@@ -698,3 +707,10 @@ unchanged backend pin and lockfile, unchanged schema/tools/provider/profile,
 `S6B_5_STARTED=NO` for the later-slice guards. After the focused test, run the Python 3.11 frozen environment
 gate and complete repository verification. Commit and push only if all proofs pass;
 do not merge, open a PR, close 4C-06, or start S6B.4D in this slice.
+
+## Final S6B.4C closure note
+
+PR #14 was squash-merged at `e521ab48b7948785acc35b1e01d75db36a0a4088`, and
+post-merge main CI run `33344933719` passed. The complete S6B.4C campaign is
+closed; S6B.4D remains pending Owner start and the detailed slice contracts
+above are retained as historical acceptance evidence.

@@ -1,12 +1,24 @@
 # S6B.4C Shared-Store Concurrency Implementation Plan
 
-> **For execution agents:** Execute only the current Owner-authorized slice with strict TDD. Closed slices below are retained as implementation history and must not be replayed.
+> **Completed implementation history:** S6B.4C-01 through S6B.4C-06 are CLOSED_PASS. The tasks below are retained as accepted implementation history and must not be replayed as current execution gates.
 
-**Goal:** Establish the S6B.4C shared-store concurrency campaign slice-by-slice. S6B.4C-01 through 4C-05 are closed; the current slice is S6B.4C-06 process/crash injection and final acceptance.
+**Goal:** Record the completed S6B.4C shared-store concurrency campaign and its accepted implementation history. S6B.4C-01 through 4C-06 are closed; S6B.4D is pending Owner start.
 
-**Architecture:** Preserve the accepted execution-context, transport-bound gateway, transaction-local CAS, disposable Codex/Hermes, and async provider boundaries from 4C-01/02/03/04/05. For 4C-06, vary only the disposable process/cancellation proof dimension: inject child-process `SIGKILL` at exact transaction boundaries and characterize existing `asyncio.to_thread` cancellation semantics. No recovery service, coordinator, supervisor, queue, custom retry layer, thread-abort mechanism, or storage executor is introduced.
+**Architecture:** Preserve the accepted execution-context, transport-bound gateway, transaction-local CAS, disposable Codex/Hermes, async provider, and process/crash proof boundaries from S6B.4C-01 through 4C-06. No recovery service, coordinator, supervisor, queue, custom retry layer, thread-abort mechanism, or storage executor was introduced.
 
 **Tech Stack:** Python 3.11+, stdlib asyncio/threading/subprocess/pathlib/json, existing FactLane gateway/adapter/storage/contract, pytest, and the existing lockfile.
+
+```text
+S6B_4C_PLAN_STATUS=CLOSED_PASS
+4C-01 CLOSED_PASS
+4C-02 CLOSED_PASS
+4C-03 CLOSED_PASS
+4C-04 CLOSED_PASS
+4C-05 CLOSED_PASS
+4C-06 CLOSED_PASS
+CURRENT_EXECUTION=NONE
+NEXT_PHASE=S6B_4D_PENDING_OWNER_START
+```
 
 ---
 
@@ -20,12 +32,14 @@ Current execution:
 4C-03 CLOSED_PASS
 4C-04 CLOSED_PASS
 4C-05 CLOSED_PASS
-4C-06 CURRENT
+4C-06 CLOSED_PASS
+CURRENT_EXECUTION=NONE
+NEXT_PHASE=S6B_4D_PENDING_OWNER_START
 ```
 
-The detailed Tasks 1–21 below are retained as closed 4C-01/02/03/04 implementation history only. Do not rerun them as gates for the current slice.
+The detailed Tasks 1–27 below are retained as closed S6B.4C implementation history. Do not rerun them as current execution gates.
 
-4C-06 is a proof-only slice. Production changes are not expected; any concrete correctness defect must be reported before changing `src/factlane/**`.
+4C-06 was a proof-only slice. No production change was required.
 
 Do not implement retention/compaction/reclaim/recovery (S6B.4D), native-memory bootstrap or migration (S6B.5), live configuration, registration, backend-pin changes, embedding-model changes, or reopening accepted 4B results.
 
@@ -361,7 +375,7 @@ Then run the complete repository gate, record raw output only under the ignored 
 
 - 4C-01, 4C-02, and 4C-03 are CLOSED_PASS; their detailed tasks are retained for provenance only.
 - 4C-04 is CLOSED_PASS after the disposable shared-store concurrency proof and accepted Codex/Hermes launcher provenance.
-- 4C-05 is the current Owner-authorized slice and must preserve exact embedding/model/backend identities while testing async contention.
+- 4C-05 is CLOSED_PASS; its accepted embedding/model/backend identities remain preserved in the implementation history.
 - 4C-06 must inject process termination/crash boundaries and rerun final acceptance.
 
 ## Closed implementation history — S6B.4C-03 atomic multi-client revision/CAS and lost-update prevention
@@ -557,12 +571,12 @@ intentional RED coverage is the only failure. The GREEN production fix and exact
 provider runtime acceptance were completed in the accepted 4C-05 candidate; 4C-06 is
 defined below and is not covered by this historical task.
 
-## Current execution — S6B.4C-06 process/crash injection and final acceptance
+## Completed execution history — S6B.4C-06 process/crash injection and final acceptance
 
-The Owner authorized this final proof slice on 2026-08-31. It must use a new
-isolated worktree and the existing accepted Python 3.11 dependency contract. No
-production behavior change is expected. Do not develop on `main`, kill any live
-Codex/Hermes/Gateway/Ollama process, or start S6B.4D.
+The Owner authorized this final proof slice on 2026-08-31. It used a new isolated
+worktree and the existing accepted Python 3.11 dependency contract. No production
+behavior change was required, no live host process was killed, and S6B.4D was not
+started.
 
 ### Task 25: Define the final-slice contract
 
