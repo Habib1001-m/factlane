@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import time
 from collections.abc import Callable
@@ -618,12 +619,95 @@ class SQLiteVecEngine:
             for state, count in rows:
                 if state in counts:
                     counts[state] = int(count)
+            inventory = self.conn.execute(
+                f"SELECT lifecycle_state, native_content_hash FROM adapter_records a {suffix}",
+                params,
+            ).fetchall()
+            compaction_ready = 0
+            compaction_blocked_partial = 0
+            for lifecycle_state, content_hash in inventory:
+                if lifecycle_state != "SUPERSEDED":
+                    continue
+                native = self.conn.execute(
+                    "SELECT id, deleted_at FROM memories WHERE content_hash = ?",
+                    (content_hash,),
+                ).fetchone()
+                vector = (
+                    self.conn.execute(
+                        "SELECT 1 FROM memory_embeddings WHERE rowid = ? AND store = ?",
+                        (native[0], self.profile.profile_id),
+                    ).fetchone()
+                    if native is not None and native[1] is None
+                    else None
+                )
+                if vector is not None:
+                    compaction_ready += 1
+                else:
+                    compaction_blocked_partial += 1
+
+            def file_size(path: str) -> int | None:
+                try:
+                    return os.path.getsize(path)
+                except FileNotFoundError:
+                    return 0
+                except OSError:
+                    return None
+
+            page_size_bytes = int(self.conn.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(self.conn.execute("PRAGMA page_count").fetchone()[0])
+            freelist_count = int(self.conn.execute("PRAGMA freelist_count").fetchone()[0])
+            try:
+                filesystem_free_bytes: int | None = int(shutil.disk_usage(os.path.dirname(self.db_path)).free)
+            except OSError:
+                filesystem_free_bytes = None
+            database_file_bytes = file_size(self.db_path)
+            wal_file_bytes = file_size(f"{self.db_path}-wal")
+            shm_file_bytes = file_size(f"{self.db_path}-shm")
+            if filesystem_free_bytes is None or None in (database_file_bytes, wal_file_bytes, shm_file_bytes):
+                capacity_observation = "UNKNOWN"
+                mutation_preflight = "BLOCKED_UNKNOWN_CAPACITY"
+                next_action = "RESTORE_CAPACITY_OBSERVABILITY_BEFORE_MEMORY_MUTATION"
+            else:
+                capacity_observation = "KNOWN"
+                mutation_preflight = "REQUIRES_BOUNDED_OPERATION_REQUIREMENT"
+                next_action = "COMPARE_FILESYSTEM_FREE_BYTES_TO_BOUNDED_OPERATION_REQUIREMENT"
+
             return {
                 "available": True,
                 "backend": "sqlite_vec",
                 "profile": self.profile.to_dict(),
                 "counts": counts,
                 "native_columns": sorted(self.native_columns),
+                "retention": {
+                    "policy_version": 1,
+                    "trigger": "CAPACITY_PRESSURE_NOT_SESSION_COUNT",
+                    "automatic_housekeeping": False,
+                    "eligible_lifecycle_states": ["SUPERSEDED"],
+                    "current_authority_reclaim": False,
+                    "duplicate_reclaim": "NOT_APPLICABLE_IN_CURRENT_SCHEMA",
+                    "expired_reclaim": "NOT_APPLICABLE_IN_CURRENT_SCHEMA",
+                    "superseded_total": counts["SUPERSEDED"],
+                    "compaction_ready": compaction_ready,
+                    "compaction_blocked_partial": compaction_blocked_partial,
+                    "historical_total": counts["HISTORICAL"],
+                    "validated_current_total": counts["VALIDATED_CURRENT"],
+                },
+                "capacity": {
+                    "observation": capacity_observation,
+                    "page_size_bytes": page_size_bytes,
+                    "page_count": page_count,
+                    "freelist_count": freelist_count,
+                    "database_allocated_bytes": page_size_bytes * page_count,
+                    "freelist_bytes": page_size_bytes * freelist_count,
+                    "database_file_bytes": database_file_bytes,
+                    "wal_file_bytes": wal_file_bytes,
+                    "shm_file_bytes": shm_file_bytes,
+                    "filesystem_free_bytes": filesystem_free_bytes,
+                    "pressure_threshold_bytes": None,
+                    "pressure_evaluation": "REQUIRES_BOUNDED_OPERATION_REQUIREMENT",
+                    "mutation_preflight": mutation_preflight,
+                    "next_action": next_action,
+                },
             }
 
         return await self._run(query)
