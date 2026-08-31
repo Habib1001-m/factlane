@@ -465,21 +465,13 @@ class SQLiteVecEngine:
                     if native_id is not None
                     else None
                 )
-                orphan_vector = (
-                    self.conn.execute(
-                        "SELECT 1 FROM memory_embeddings e "
-                        "WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = e.rowid) LIMIT 1"
-                    ).fetchone()
-                    if native is None
-                    else None
-                )
                 graph = self.conn.execute(
                     "SELECT 1 FROM memory_graph WHERE source_hash = ? OR target_hash = ? LIMIT 1",
                     (content_hash, content_hash),
                 ).fetchone()
 
                 if lifecycle_state == "HISTORICAL":
-                    if native is None and vector is None and orphan_vector is None and graph is None:
+                    if native is None and graph is None:
                         self.conn.commit()
                         return False
                     raise AdapterError(

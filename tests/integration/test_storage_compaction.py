@@ -422,9 +422,11 @@ def test_compaction_rolls_back_after_late_transaction_failure(tmp_path) -> None:
 async def _verify_idempotent_compaction(tmp_path) -> None:
     engine, adapter = await _open_adapter(tmp_path)
     try:
-        old, _ = await _lineage(adapter, key="idempotent")
+        old, current = await _lineage(adapter, key="idempotent")
         assert engine.conn is not None
-        old_row = (await engine.get_record(old["memory_id"], _scope(adapter), history=True))[0]
+        scope = _scope(adapter)
+        old_row = (await engine.get_record(old["memory_id"], scope, history=True))[0]
+        current_before = (await engine.get_record(current["memory_id"], scope, history=True))[0]
         old_native_id = engine.conn.execute(
             "SELECT id FROM memories WHERE content_hash = ?",
             (old_row["native_content_hash"],),
@@ -437,16 +439,26 @@ async def _verify_idempotent_compaction(tmp_path) -> None:
         before = _snapshot(engine)
         assert await engine.compact_superseded_record(old["record_id"]) is False
         assert _snapshot(engine) == before
+        target_after = (await engine.get_record(old["memory_id"], scope, history=True))[0]
         assert vector is not None
+        current_native_ids = {
+            row[0] for row in engine.conn.execute("SELECT id FROM memories").fetchall()
+        }
+        unrelated_orphan_id = max(current_native_ids) + 1000
         engine.conn.execute(
             "INSERT INTO memory_embeddings(rowid, content_embedding, store) VALUES (?, ?, ?)",
-            (old_native_id, vector[0], vector[1]),
+            (unrelated_orphan_id, vector[0], vector[1]),
         )
         engine.conn.commit()
-        before = _snapshot(engine)
-        with pytest.raises(AdapterError):
-            await engine.compact_superseded_record(old["record_id"])
-        assert _snapshot(engine) == before
+        assert await engine.compact_superseded_record(old["record_id"]) is False
+        assert (await engine.get_record(old["memory_id"], scope, history=True))[0] == target_after
+        assert (await engine.get_record(current["memory_id"], scope, history=True))[0] == current_before
+        orphan = engine.conn.execute(
+            "SELECT rowid, content_embedding, store FROM memory_embeddings WHERE rowid = ?",
+            (unrelated_orphan_id,),
+        ).fetchone()
+        assert orphan is not None
+        assert orphan[1:] == vector
     finally:
         await adapter.close()
 
