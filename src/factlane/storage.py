@@ -645,11 +645,13 @@ class SQLiteVecEngine:
                 else:
                     compaction_blocked_partial += 1
 
-            def file_size(path: str) -> int:
+            def file_size(path: str) -> int | None:
                 try:
                     return os.path.getsize(path)
-                except OSError:
+                except FileNotFoundError:
                     return 0
+                except OSError:
+                    return None
 
             page_size_bytes = int(self.conn.execute("PRAGMA page_size").fetchone()[0])
             page_count = int(self.conn.execute("PRAGMA page_count").fetchone()[0])
@@ -657,10 +659,14 @@ class SQLiteVecEngine:
             try:
                 filesystem_free_bytes: int | None = int(shutil.disk_usage(os.path.dirname(self.db_path)).free)
             except OSError:
+                filesystem_free_bytes = None
+            database_file_bytes = file_size(self.db_path)
+            wal_file_bytes = file_size(f"{self.db_path}-wal")
+            shm_file_bytes = file_size(f"{self.db_path}-shm")
+            if filesystem_free_bytes is None or None in (database_file_bytes, wal_file_bytes, shm_file_bytes):
                 capacity_observation = "UNKNOWN"
                 mutation_preflight = "BLOCKED_UNKNOWN_CAPACITY"
                 next_action = "RESTORE_CAPACITY_OBSERVABILITY_BEFORE_MEMORY_MUTATION"
-                filesystem_free_bytes = None
             else:
                 capacity_observation = "KNOWN"
                 mutation_preflight = "REQUIRES_BOUNDED_OPERATION_REQUIREMENT"
@@ -693,9 +699,9 @@ class SQLiteVecEngine:
                     "freelist_count": freelist_count,
                     "database_allocated_bytes": page_size_bytes * page_count,
                     "freelist_bytes": page_size_bytes * freelist_count,
-                    "database_file_bytes": file_size(self.db_path),
-                    "wal_file_bytes": file_size(f"{self.db_path}-wal"),
-                    "shm_file_bytes": file_size(f"{self.db_path}-shm"),
+                    "database_file_bytes": database_file_bytes,
+                    "wal_file_bytes": wal_file_bytes,
+                    "shm_file_bytes": shm_file_bytes,
                     "filesystem_free_bytes": filesystem_free_bytes,
                     "pressure_threshold_bytes": None,
                     "pressure_evaluation": "REQUIRES_BOUNDED_OPERATION_REQUIREMENT",

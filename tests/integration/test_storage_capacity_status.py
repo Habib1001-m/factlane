@@ -385,3 +385,28 @@ def test_capacity_observation_failure_is_unknown_and_fail_closed(tmp_path, monke
             await adapter.close()
 
     asyncio.run(run())
+
+
+def test_file_size_oserror_is_unknown_and_blocks_capacity_preflight(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        engine, adapter = await _open_adapter(tmp_path)
+        try:
+            original_getsize = os.path.getsize
+
+            def unavailable_database_file(path: str) -> int:
+                if os.fspath(path) == engine.db_path:
+                    raise PermissionError("database file stat unavailable")
+                return original_getsize(path)
+
+            monkeypatch.setattr(os.path, "getsize", unavailable_database_file)
+            capacity = (await engine.status(_scope(adapter)))["capacity"]
+            assert capacity["observation"] == "UNKNOWN"
+            assert capacity["database_file_bytes"] is None
+            assert isinstance(capacity["filesystem_free_bytes"], int)
+            assert capacity["mutation_preflight"] == "BLOCKED_UNKNOWN_CAPACITY"
+            assert capacity["next_action"] == "RESTORE_CAPACITY_OBSERVABILITY_BEFORE_MEMORY_MUTATION"
+            assert capacity["pressure_threshold_bytes"] is None
+        finally:
+            await adapter.close()
+
+    asyncio.run(run())
