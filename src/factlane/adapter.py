@@ -774,7 +774,7 @@ class MemoryAdapter:
         envelope["token_measurement"] = {
             "available": self.token_counter.available,
             "profile": "PORTABLE_MEASUREMENT_PROFILE" if self.token_counter.available else "UNMEASURED",
-            "exact_token_equivalence": "UNVERIFIED",
+            "codex_exact_equivalence": "UNVERIFIED",
         }
         return envelope
 
