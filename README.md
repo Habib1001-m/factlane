@@ -6,7 +6,39 @@ FactLane is a local-first, multi-host governed memory plane for AI agents. It is
 
 ## Current status
 
-FactLane is an early public engineering project. The S6B.4B single-client contract pilot is accepted. Shared Codex/Hermes multi-client concurrency, transport-bound host identity, crash recovery, retention/compaction, and the production embedding profile are **not yet accepted**.
+FactLane is an early public engineering project.
+
+```text
+S6B_4B=CLOSED_PASS
+S6B_4C=CLOSED_PASS
+```
+
+The accepted S6B.4C milestones are transport-bound host identity and the shared
+gateway (4C-02), transaction-local multi-client CAS/lost-update prevention (4C-03),
+disposable Codex/Hermes shared-store concurrency (4C-04), async embedding
+concurrency and pinned-backend runtime proof (4C-05), and process-crash atomicity,
+durability/idempotent replay, and cancellation characterization (4C-06). The
+4C-06 result is crash-safety evidence; it does not introduce or accept a crash
+recovery service or subsystem.
+
+Retention/compaction/reclaim, archive/recovery/lifecycle hygiene, and native-memory
+bootstrap/migration are **not yet accepted**. The production embedding profile
+remains **undecided**.
+
+```text
+TRANSPORT_BOUND_HOST_IDENTITY=ACCEPTED_4C_02
+SHARED_GATEWAY=ACCEPTED_4C_02
+ATOMIC_MULTI_CLIENT_CAS=ACCEPTED_4C_03
+LOST_UPDATE_PREVENTION=ACCEPTED_4C_03
+DISPOSABLE_CODEX_HERMES_SHARED_STORE_CONCURRENCY=ACCEPTED_4C_04
+ASYNC_EMBEDDING_CONCURRENCY=ACCEPTED_4C_05
+PINNED_BACKEND_RUNTIME_PROOF=ACCEPTED_4C_05
+PROCESS_CRASH_ATOMICITY_DURABILITY_PROOF=ACCEPTED_4C_06
+RETENTION_COMPACTION_RECLAIM=NOT_YET_ACCEPTED
+ARCHIVE_RECOVERY_LIFECYCLE_HYGIENE=NOT_YET_ACCEPTED
+NATIVE_MEMORY_BOOTSTRAP_MIGRATION=NOT_YET_ACCEPTED
+PRODUCTION_EMBEDDING_PROFILE=UNDECIDED
+```
 
 The live project state is always `TASKBOARD.md`.
 
@@ -25,12 +57,16 @@ The normal agent surface does not expose delete/purge, backend administration, c
 ## Architecture
 
 ```text
-Host edge
-  -> FactLane Router
-  -> five-operation narrow adapter
-  -> backend compatibility boundary
-  -> mcp-memory-service / SQLite-vec
-  -> local embedding provider
+Host / trusted launcher
+  -> HostBinding
+  -> stdio-only FastMCP boundary
+  -> MemoryGateway
+  -> MemoryAdapter / five operations
+       -> TruthRouter for bounded search routing decisions
+       -> EmbeddingProvider
+       -> SQLiteVecEngine
+            -> adapter-owned transaction/CAS semantics
+            -> pinned backend SQLite/SQLite-vec primitives
 ```
 
 FactLane owns scope, freshness, authority, contradiction handling, logical lineage, idempotency, retrieval budgets, and its adapter schema/transactions. The pinned backend owns reusable SQLite/SQLite-vec mechanics behind an explicit compatibility boundary.

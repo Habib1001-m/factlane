@@ -1,6 +1,11 @@
 # FactLane Canonical Public Genesis Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Historical completed genesis implementation plan:** The task-by-task instructions below are retained for provenance and must not be replayed as current execution gates.
+
+```text
+ARTIFACT_STATUS=HISTORICAL_COMPLETED_GENESIS_IMPLEMENTATION_PLAN
+CURRENT_EXECUTION_AUTHORITY=NO
+```
 
 **Goal:** Convert the accepted S6B.4B `one-linux-codex-memory` pilot at `6ac7f2a4a19c57e4e0e70c85dd055b5de9ad074c` into one verified, public, host-neutral FactLane canonical genesis commit without starting S6B.4C or mutating live Codex/Hermes configuration.
 

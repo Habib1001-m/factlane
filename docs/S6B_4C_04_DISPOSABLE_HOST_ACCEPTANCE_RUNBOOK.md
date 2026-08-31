@@ -1,12 +1,16 @@
 # S6B.4C-04 Disposable Codex/Hermes Acceptance Runbook
 
 ```text
-STATUS=OWNER_AUTHORIZED_IN_PROGRESS
+STATUS=CLOSED_PASS_HISTORICAL_RUNBOOK
 ROLE=SUPPORTING_EXECUTION_RUNBOOK_NOT_PARALLEL_AUTHORITY
+CURRENT_EXECUTION_AUTHORITY=NO
 SLICE=S6B_4C_04_CODEX_HERMES_DISPOSABLE_SHARED_STORE_CONCURRENCY
 ```
 
-The canonical authority remains `AGENTS.md`, `TASKBOARD.md`, and the active S6B.4C specification/plan. This runbook only defines the bounded mechanical proof for the current Owner-authorized 4C-04 slice.
+The canonical authority remains `AGENTS.md` and `TASKBOARD.md`. S6B.4C-04 is
+CLOSED_PASS; this runbook is retained as accepted historical execution evidence
+and only defines its bounded mechanical proof. It is not current execution
+authority or a parallel authority.
 
 ## Proof boundary
 

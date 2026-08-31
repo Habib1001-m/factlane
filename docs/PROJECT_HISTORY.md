@@ -49,3 +49,28 @@ Hermes runtime dependencies: 0
 ```
 
 This acceptance did not authorize or start S6B.4C and did not mutate live Codex/Hermes configuration, real memory, legacy data, or Knowledge.
+
+## S6B.4C shared-store concurrency campaign
+
+The completed S6B.4C campaign extended the accepted FactLane baseline in six
+bounded slices: 4C-01 established the execution-context preflight and harness;
+4C-02 accepted transport-bound host identity and the shared gateway; 4C-03
+accepted transaction-local atomic CAS and lost-update prevention; 4C-04 accepted
+disposable process concurrency plus real Codex/Hermes execution-context evidence;
+4C-05 accepted async embedding concurrency and real pinned-backend/local-provider
+runtime proof; and 4C-06 accepted disposable-process SIGKILL crash atomicity,
+post-commit durability/idempotent replay, and async cancellation characterization.
+
+```text
+S6B_4C=CLOSED_PASS
+FINAL_4C_IMPLEMENTATION_PR=14
+PR14_MERGE_SHA=e521ab48b7948785acc35b1e01d75db36a0a4088
+FINAL_4C_CLOSURE_PR=15
+PR15_MERGE_SHA=fae180954f6add312d4a53d8bd2e9f266e7e190c
+PR15_POST_MERGE_CI_RUN=33347562429
+PR15_POST_MERGE_CI=PASS
+FULL_4C06_ACCEPTANCE_TESTS=90_PASS
+```
+
+No S6B.4D implementation was started, and no S6B.5/native-memory migration was
+started. Production embedding-profile selection remains undecided.

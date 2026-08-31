@@ -371,12 +371,12 @@ UV_LOCK_CHANGE=NONE
 
 Then run the complete repository gate, record raw output only under the ignored evidence root, and leave the branch for one fresh bounded independent reviewer before commit.
 
-## Later-slice handoff notes
+## Historical later-slice handoff notes
 
 - 4C-01, 4C-02, and 4C-03 are CLOSED_PASS; their detailed tasks are retained for provenance only.
 - 4C-04 is CLOSED_PASS after the disposable shared-store concurrency proof and accepted Codex/Hermes launcher provenance.
 - 4C-05 is CLOSED_PASS; its accepted embedding/model/backend identities remain preserved in the implementation history.
-- 4C-06 must inject process termination/crash boundaries and rerun final acceptance.
+- 4C-06 is CLOSED_PASS after process/crash boundary injection and final acceptance.
 
 ## Closed implementation history — S6B.4C-03 atomic multi-client revision/CAS and lost-update prevention
 

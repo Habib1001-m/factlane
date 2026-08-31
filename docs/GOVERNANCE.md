@@ -6,7 +6,7 @@
 repo truth
 -> TASKBOARD.md
 -> fresh/synchronized main
--> hermes/<task>
+-> task branch / isolated worktree
 -> implementation/docs/tests
 -> bounded evidence
 -> commit
@@ -20,23 +20,27 @@ repo truth
 
 `TASKBOARD.md` is the one live project board. Its version is an internal field. Never create a new numbered taskboard file per cycle.
 
-## Hermes change governance
+## Execution-agent change governance
 
 ```text
 NO_DIRECT_PUSH_TO_MAIN_BY_EXECUTION_AGENTS=TRUE
-HERMES_DIRECT_PUSH_TO_ORIGIN_MAIN=FORBIDDEN
-HERMES_DIRECT_PUSH_TO_MAIN=FORBIDDEN
-HERMES_FORCE_PUSH=FORBIDDEN
-HERMES_MAIN_DEVELOPMENT=FORBIDDEN
-HERMES_WORK_BRANCH_PREFIX=hermes/
-TASK_BRANCH_REQUIRED=TRUE
+TASK_BRANCH_OR_ISOLATED_WORKTREE_REQUIRED=TRUE
+TASK_BRANCH_PREFIX=NOT_CANONICALLY_FIXED
 PR_REQUIRED=TRUE
 CI_BEFORE_MERGE=TRUE
 OWNER_OR_ADVISOR_MERGE_GATE=REQUIRED
 SAME_ACCOUNT_PR_DOES_NOT_EQUAL_INDEPENDENT_REVIEW=TRUE
 ```
 
-Execution agents use a task branch and a pull request; they do not push directly to `main`, force-push, self-approve, invent a second reviewer identity, or bypass protection. A pull request from the single GitHub account currently in use is not an independent identity approval (`PR != independent identity approval`), but it remains the change boundary for scope, diff, CI, audit trail, and Owner/Advisor review. Independent decision review is performed outside the GitHub approval identity against the same PR head SHA. Hermes opens the PR, returns evidence, and stops; Owner/Advisor performs the merge.
+Execution agents may include Codex, Hermes, or another eligible agent. A designated
+execution agent/operator may prepare, push, and open the pull request; it must not
+push directly to `main`, force-push, self-approve, invent a second reviewer
+identity, or bypass protection. A pull request from the single GitHub account in
+use is not an independent identity approval (`PR != independent identity approval`),
+but it remains the change boundary for scope, diff, CI, audit trail, and
+Owner/Advisor review. Independent decision review is performed outside the GitHub
+approval identity against the same PR head SHA. Owner/Advisor owns the acceptance
+and merge gate.
 
 See [WORKFLOW_TEMPLATE.md](WORKFLOW_TEMPLATE.md) for an adaptable user-facing example. It is a template, not a prescription.
 
