@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import pytest
 
+from factlane.adapter import MODEL_DIGESTS, PROFILE_DEFINITIONS
 from factlane.contract import AdapterError
-from factlane.embeddings import OllamaLocalProvider, _context_length_from_model_info
+from factlane.embeddings import (
+    OllamaLocalProvider,
+    _context_length_from_model_info,
+    _embedding_length_from_model_info,
+)
 
 
 NOMIC_DIGEST = "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f"
+EMBEDDINGGEMMA_DIGEST = "85462619ee721b466c5927d109d4cb765861907d5417b9109caebc4e614679f1"
 
 
 class RecordingProvider(OllamaLocalProvider):
@@ -62,6 +68,35 @@ def test_context_length_accepts_suffix_fallback() -> None:
 
 def test_context_length_missing_is_unknown() -> None:
     assert _context_length_from_model_info({"nomic-bert.embedding_length": 768}) is None
+
+
+def test_embedding_length_single_architecture_key_is_supported() -> None:
+    assert _embedding_length_from_model_info({"gemma3.embedding_length": 768}) == 768
+
+
+def test_embedding_length_missing_is_unknown() -> None:
+    assert _embedding_length_from_model_info({"gemma3.context_length": 2048}) is None
+
+
+def test_embedding_length_conflict_is_fail_closed() -> None:
+    assert _embedding_length_from_model_info({"gemma3.embedding_length": 768, "bert.embedding_length": 384}) is None
+
+
+def test_embedding_length_legacy_nomic_and_bert_keys_are_unchanged() -> None:
+    assert _embedding_length_from_model_info({"nomic-bert.embedding_length": 768}) == 768
+    assert _embedding_length_from_model_info({"bert.embedding_length": 384}) == 384
+
+
+def test_selected_embeddinggemma_profile_definition_is_exact() -> None:
+    definition = PROFILE_DEFINITIONS["embeddinggemma-300m-768"]
+    assert MODEL_DIGESTS["embeddinggemma:300m"] == EMBEDDINGGEMMA_DIGEST
+    assert definition == {
+        "model": "embeddinggemma:300m",
+        "output_dimension": 768,
+        "source_dimension": 768,
+        "document_prefix": "title: none | text: ",
+        "query_prefix": "task: search result | query: ",
+    }
 
 
 class RejectingProvider(OllamaLocalProvider):

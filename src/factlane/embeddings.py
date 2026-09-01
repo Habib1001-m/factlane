@@ -33,6 +33,22 @@ def _context_length_from_model_info(model_info: dict[str, object]) -> int | None
     return None
 
 
+def _embedding_length_from_model_info(model_info: dict[str, object]) -> int | None:
+    legacy_keys = {"nomic-bert.embedding_length", "bert.embedding_length"}
+    values = [
+        value
+        for key, value in model_info.items()
+        if isinstance(key, str)
+        and (key in legacy_keys or key.endswith(".embedding_length"))
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+    ]
+    if not values or len(set(values)) != 1:
+        return None
+    return values[0]
+
+
 @dataclass(frozen=True)
 class EmbeddingProfile:
     profile_id: str
@@ -155,8 +171,8 @@ class OllamaLocalProvider:
         model_info = show.get("model_info")
         if not isinstance(model_info, dict):
             raise AdapterError("SCHEMA_MISMATCH", "local model metadata has an invalid shape")
-        native = model_info.get("nomic-bert.embedding_length") or model_info.get("bert.embedding_length")
-        if not isinstance(native, int) or native != self.profile.source_dimension:
+        native = _embedding_length_from_model_info(model_info)
+        if native is None or native != self.profile.source_dimension:
             raise AdapterError("SCHEMA_MISMATCH", "local model native dimension differs from the profile")
         capabilities = show.get("capabilities")
         if not isinstance(capabilities, list) or "embedding" not in capabilities:
