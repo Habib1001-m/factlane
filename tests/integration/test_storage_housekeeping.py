@@ -667,3 +667,79 @@ def test_report_is_bounded_and_capacity_requirement_is_not_persisted(tmp_path, m
             await adapter.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("health_after", "field", "value"),
+    (
+        ((1, 0, "ok", "ok"), "vector_orphans_after", 1),
+        ((0, 1, "ok", "ok"), "current_lineage_forks_after", 1),
+        ((0, 0, "not ok", "ok"), "quick_check_after", "not ok"),
+        ((0, 0, "ok", "not ok"), "integrity_check_after", "not ok"),
+    ),
+)
+def test_unhealthy_post_maintenance_truth_blocks_capacity_success(
+    tmp_path,
+    monkeypatch,
+    health_after: tuple[int, int, str, str],
+    field: str,
+    value: int | str,
+) -> None:
+    async def run() -> None:
+        engine, adapter = await _open_adapter(tmp_path)
+        try:
+            old, _ = await _superseded(adapter, f"post-health-{field}")
+            calls = 0
+
+            async def staged_health(_scope) -> tuple[int, int, str, str]:
+                nonlocal calls
+                calls += 1
+                return (0, 0, "ok", "ok") if calls == 1 else health_after
+
+            monkeypatch.setattr(engine, "_housekeeping_health", staged_health, raising=False)
+            _patch_free_space(monkeypatch, 0, 1000)
+            result = await engine.housekeep_superseded(
+                _scope(adapter), max_records=1, required_free_bytes=100
+            )
+            assert result["mutation"] == "BOUNDED_COMPACTION"
+            assert result["compacted_records"] == 1
+            assert result["outcome"] == "BLOCKED_POST_MAINTENANCE_HEALTH"
+            assert result["next_action"] == "REPAIR_POST_MAINTENANCE_HEALTH_BEFORE_MEMORY_MUTATION"
+            assert result[field] == value
+            assert (await engine.get_record(old["memory_id"], _scope(adapter), history=True))[0]["lifecycle_state"] == "HISTORICAL"
+        finally:
+            await adapter.close()
+
+    asyncio.run(run())
+
+
+def test_unknown_post_maintenance_capacity_is_not_reported_as_not_met(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        engine, adapter = await _open_adapter(tmp_path)
+        try:
+            old, _ = await _superseded(adapter, "post-capacity")
+            calls = 0
+
+            def changing_capacity(_path: str) -> _Usage:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return _Usage(0)
+                raise OSError("capacity observation unavailable after maintenance")
+
+            monkeypatch.setattr(shutil, "disk_usage", changing_capacity)
+            result = await engine.housekeep_superseded(
+                _scope(adapter), max_records=1, required_free_bytes=100
+            )
+            assert result["mutation"] == "BOUNDED_COMPACTION"
+            assert result["compacted_records"] == 1
+            assert result["capacity_requirement_met_before"] is False
+            assert result["capacity_requirement_met_after"] is None
+            assert result["filesystem_free_bytes_after"] is None
+            assert result["outcome"] == "BLOCKED_POST_MAINTENANCE_UNKNOWN_CAPACITY"
+            assert result["next_action"] == "RESTORE_CAPACITY_OBSERVABILITY_BEFORE_MEMORY_MUTATION"
+            assert (await engine.get_record(old["memory_id"], _scope(adapter), history=True))[0]["lifecycle_state"] == "HISTORICAL"
+        finally:
+            await adapter.close()
+
+    asyncio.run(run())

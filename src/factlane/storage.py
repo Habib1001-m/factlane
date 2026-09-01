@@ -669,7 +669,28 @@ class SQLiteVecEngine:
 
         after = await self.status(scope)
         after_health = await self._housekeeping_health(scope)
-        if capacity_requirement_met(after["capacity"]):
+        if after_health[0] or after_health[1] or after_health[2] != "ok" or after_health[3] != "ok":
+            return report(
+                "BLOCKED_POST_MAINTENANCE_HEALTH",
+                "REPAIR_POST_MAINTENANCE_HEALTH_BEFORE_MEMORY_MUTATION",
+                mutation="BOUNDED_COMPACTION",
+                selected_records=len(selected),
+                compacted_records=compacted,
+                after=after,
+                health_after=after_health,
+            )
+        after_capacity_met = capacity_requirement_met(after["capacity"])
+        if after_capacity_met is None:
+            return report(
+                "BLOCKED_POST_MAINTENANCE_UNKNOWN_CAPACITY",
+                "RESTORE_CAPACITY_OBSERVABILITY_BEFORE_MEMORY_MUTATION",
+                mutation="BOUNDED_COMPACTION",
+                selected_records=len(selected),
+                compacted_records=compacted,
+                after=after,
+                health_after=after_health,
+            )
+        if after_capacity_met:
             return report(
                 "HOUSEKEEPING_COMPLETE_CAPACITY_REQUIREMENT_MET",
                 "NO_ACTION_REQUIRED",
