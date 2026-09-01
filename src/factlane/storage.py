@@ -519,6 +519,197 @@ class SQLiteVecEngine:
 
         return await self._run(transaction)
 
+    async def _housekeeping_health(self, scope: ScopeContext) -> tuple[int, int, str, str]:
+        where, params = self._scope_where(scope)
+
+        def query() -> tuple[int, int, str, str]:
+            assert self.conn is not None
+            vector_orphans = int(
+                self.conn.execute(
+                    "SELECT COUNT(*) FROM memory_embeddings e "
+                    "WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = e.rowid)"
+                ).fetchone()[0]
+            )
+            fork_rows = self.conn.execute(
+                "SELECT a.memory_id, COUNT(*) FROM adapter_records a "
+                f"WHERE {where} AND a.lifecycle_state = 'VALIDATED_CURRENT' "
+                "GROUP BY a.memory_id HAVING COUNT(*) > 1",
+                params,
+            ).fetchall()
+            current_lineage_forks = sum(int(row[1]) - 1 for row in fork_rows)
+
+            def check(name: str) -> str:
+                try:
+                    row = self.conn.execute(f"PRAGMA {name}").fetchone()
+                except sqlite3.Error:
+                    return "ERROR"
+                return str(row[0]) if row else "ERROR"
+
+            return vector_orphans, current_lineage_forks, check("quick_check"), check("integrity_check")
+
+        return await self._run(query)
+
+    async def housekeep_superseded(
+        self,
+        scope: ScopeContext,
+        *,
+        max_records: int,
+        required_free_bytes: int,
+    ) -> dict[str, Any]:
+        """Compact a bounded set of eligible superseded records under pressure."""
+        if isinstance(max_records, bool) or not isinstance(max_records, int) or max_records < 1:
+            raise AdapterError("INVALID_ENVELOPE", "max_records must be a positive integer")
+        if isinstance(required_free_bytes, bool) or not isinstance(required_free_bytes, int) or required_free_bytes < 0:
+            raise AdapterError("INVALID_ENVELOPE", "required_free_bytes must be a non-negative integer")
+
+        before = await self.status(scope)
+        before_capacity = before["capacity"]
+        before_retention = before["retention"]
+
+        def capacity_requirement_met(capacity: dict[str, Any]) -> bool | None:
+            free_bytes = capacity["filesystem_free_bytes"]
+            if capacity["observation"] != "KNOWN" or free_bytes is None:
+                return None
+            return free_bytes >= required_free_bytes
+
+        def report(
+            outcome: str,
+            next_action: str,
+            *,
+            mutation: str = "NONE",
+            selected_records: int = 0,
+            compacted_records: int = 0,
+            after: dict[str, Any] | None = None,
+            health_after: tuple[int | None, int | None, str | None, str | None] | None = None,
+        ) -> dict[str, Any]:
+            after_capacity = after["capacity"] if after else before_capacity
+            after_retention = after["retention"] if after else before_retention
+            vector_orphans, current_lineage_forks, quick_check, integrity_check = health_after or (None, None, None, None)
+            return {
+                "outcome": outcome,
+                "next_action": next_action,
+                "mutation": mutation,
+                "required_free_bytes": required_free_bytes,
+                "max_records": max_records,
+                "filesystem_free_bytes_before": before_capacity["filesystem_free_bytes"],
+                "filesystem_free_bytes_after": after_capacity["filesystem_free_bytes"],
+                "capacity_requirement_met_before": capacity_requirement_met(before_capacity),
+                "capacity_requirement_met_after": capacity_requirement_met(after_capacity),
+                "compaction_ready_before": before_retention["compaction_ready"],
+                "selected_records": selected_records,
+                "compacted_records": compacted_records,
+                "compaction_ready_after": after_retention["compaction_ready"],
+                "compaction_blocked_partial": before_retention["compaction_blocked_partial"],
+                "historical_total_before": before_retention["historical_total"],
+                "historical_total_after": after_retention["historical_total"],
+                "vector_orphans_after": vector_orphans,
+                "current_lineage_forks_after": current_lineage_forks,
+                "quick_check_after": quick_check,
+                "integrity_check_after": integrity_check,
+                "physical_file_shrink_claimed": False,
+                "automatic_housekeeping": False,
+            }
+
+        if before_capacity["observation"] != "KNOWN":
+            return report(
+                "BLOCKED_UNKNOWN_CAPACITY",
+                "RESTORE_CAPACITY_OBSERVABILITY_BEFORE_MEMORY_MUTATION",
+            )
+        if capacity_requirement_met(before_capacity):
+            return report("NO_ACTION_CAPACITY_REQUIREMENT_ALREADY_MET", "NO_ACTION_REQUIRED")
+        if before_retention["compaction_blocked_partial"]:
+            return report("BLOCKED_PARTIAL_RECLAIM_STATE", "REPAIR_PARTIAL_RECLAIM_STATE_BEFORE_MEMORY_MUTATION")
+
+        before_health = await self._housekeeping_health(scope)
+        if before_health[0]:
+            return report(
+                "BLOCKED_PREEXISTING_VECTOR_ORPHAN",
+                "REPAIR_VECTOR_ORPHANS_BEFORE_MEMORY_MUTATION",
+                health_after=before_health,
+            )
+        if before_health[1]:
+            return report(
+                "BLOCKED_PREEXISTING_CURRENT_FORK",
+                "REPAIR_CURRENT_LINEAGE_FORK_BEFORE_MEMORY_MUTATION",
+                health_after=before_health,
+            )
+        if before_health[2] != "ok" or before_health[3] != "ok":
+            return report(
+                "BLOCKED_DATABASE_INTEGRITY",
+                "REPAIR_DATABASE_INTEGRITY_BEFORE_MEMORY_MUTATION",
+                health_after=before_health,
+            )
+
+        where, params = self._scope_where(scope)
+
+        def select_records() -> list[str]:
+            assert self.conn is not None
+            rows = self.conn.execute(
+                "SELECT a.record_id FROM adapter_records a "
+                "JOIN memories m ON m.content_hash = a.native_content_hash AND m.deleted_at IS NULL "
+                "JOIN memory_embeddings e ON e.rowid = m.id AND e.store = ? "
+                f"WHERE {where} AND a.lifecycle_state = 'SUPERSEDED' "
+                "ORDER BY a.created_at, a.record_id LIMIT ?",
+                [self.profile.profile_id, *params, max_records],
+            ).fetchall()
+            return [str(row[0]) for row in rows]
+
+        selected = await self._run(select_records)
+        if not selected:
+            return report(
+                "NO_ELIGIBLE_RECORDS_CAPACITY_REQUIREMENT_NOT_MET",
+                "ADDITIONAL_CAPACITY_OR_OPERATOR_ACTION_REQUIRED",
+                health_after=before_health,
+            )
+
+        compacted = 0
+        for record_id in selected:
+            if await self.compact_superseded_record(record_id):
+                compacted += 1
+
+        after = await self.status(scope)
+        after_health = await self._housekeeping_health(scope)
+        if after_health[0] or after_health[1] or after_health[2] != "ok" or after_health[3] != "ok":
+            return report(
+                "BLOCKED_POST_MAINTENANCE_HEALTH",
+                "REPAIR_POST_MAINTENANCE_HEALTH_BEFORE_MEMORY_MUTATION",
+                mutation="BOUNDED_COMPACTION",
+                selected_records=len(selected),
+                compacted_records=compacted,
+                after=after,
+                health_after=after_health,
+            )
+        after_capacity_met = capacity_requirement_met(after["capacity"])
+        if after_capacity_met is None:
+            return report(
+                "BLOCKED_POST_MAINTENANCE_UNKNOWN_CAPACITY",
+                "RESTORE_CAPACITY_OBSERVABILITY_BEFORE_MEMORY_MUTATION",
+                mutation="BOUNDED_COMPACTION",
+                selected_records=len(selected),
+                compacted_records=compacted,
+                after=after,
+                health_after=after_health,
+            )
+        if after_capacity_met:
+            return report(
+                "HOUSEKEEPING_COMPLETE_CAPACITY_REQUIREMENT_MET",
+                "NO_ACTION_REQUIRED",
+                mutation="BOUNDED_COMPACTION",
+                selected_records=len(selected),
+                compacted_records=compacted,
+                after=after,
+                health_after=after_health,
+            )
+        return report(
+            "HOUSEKEEPING_COMPLETE_CAPACITY_REQUIREMENT_NOT_MET",
+            "ADDITIONAL_CAPACITY_OR_OPERATOR_ACTION_REQUIRED",
+            mutation="BOUNDED_COMPACTION",
+            selected_records=len(selected),
+            compacted_records=compacted,
+            after=after,
+            health_after=after_health,
+        )
+
     async def vector_candidates(
         self,
         vector: list[float],
