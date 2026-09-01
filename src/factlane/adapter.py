@@ -32,6 +32,7 @@ from .storage import SQLiteVecEngine
 MODEL_DIGESTS = {
     "nomic-embed-text:latest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
     "all-minilm:l6-v2": "1b226e2802dbb772b5fc32a58f103ca1804ef7501331012de126ab22f67475ef",
+    "embeddinggemma:300m": "85462619ee721b466c5927d109d4cb765861907d5417b9109caebc4e614679f1",
 }
 PROFILE_DEFINITIONS = {
     "nomic-768": {
@@ -61,6 +62,13 @@ PROFILE_DEFINITIONS = {
         "source_dimension": 384,
         "document_prefix": "",
         "query_prefix": "",
+    },
+    "embeddinggemma-300m-768": {
+        "model": "embeddinggemma:300m",
+        "output_dimension": 768,
+        "source_dimension": 768,
+        "document_prefix": "title: none | text: ",
+        "query_prefix": "task: search result | query: ",
     },
 }
 
