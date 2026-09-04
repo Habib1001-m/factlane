@@ -31,10 +31,14 @@
   },
   "embedding": {
     "provider": "Ollama local loopback",
-    "model": "nomic-embed-text",
-    "model_digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
-    "document_prefix": "search_document: ",
-    "query_prefix": "search_query: ",
+    "profile_id": "embeddinggemma-300m-768",
+    "model": "embeddinggemma:300m",
+    "model_digest": "85462619ee721b466c5927d109d4cb765861907d5417b9109caebc4e614679f1",
+    "architecture": "gemma3",
+    "source_dimension": 768,
+    "output_dimension": 768,
+    "document_prefix": "title: none | text: ",
+    "query_prefix": "task: search result | query: ",
     "truncate": false,
     "effective_context_window": 2048
   }
