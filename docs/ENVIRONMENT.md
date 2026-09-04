@@ -36,16 +36,26 @@ Host integration belongs at the edge; portable policy belongs in the core.
 
 ## Local embedding provider
 
-The baseline provider accepts loopback HTTP only. Non-local provider URLs and automatic
-external fallbacks are rejected.
+The provider accepts loopback HTTP only. Non-local provider URLs and automatic external
+fallbacks are rejected.
 
-For Nomic profiles:
+The selected production profile is:
 
 ```text
-DOCUMENT_PREFIX=search_document:
-QUERY_PREFIX=search_query:
+PROFILE=embeddinggemma-300m-768
+PROVIDER=OLLAMA_LOCAL_LOOPBACK
+MODEL=embeddinggemma:300m
+MODEL_DIGEST=85462619ee721b466c5927d109d4cb765861907d5417b9109caebc4e614679f1
+SOURCE_DIMENSION=768
+OUTPUT_DIMENSION=768
+DOCUMENT_PREFIX=title: none | text:
+QUERY_PREFIX=task: search result | query:
 TRUNCATE_POLICY=FAIL_CLOSED_PROVIDER_REJECTION
+EFFECTIVE_CONTEXT_WINDOW=2048
 ```
+
+Nomic profiles remain supported and retain exactly one `search_document: ` prefix for
+documents and one `search_query: ` prefix for queries.
 
 The exact effective context capability is runtime evidence for the approved model
 artifact; FactLane does not fabricate a larger capability or silently reduce its input
@@ -61,3 +71,10 @@ lost-update semantics. No duplicate lock/backoff layer was added.
 Synchronous local provider calls are offloaded from the asyncio event loop at the
 adapter boundary. No custom executor or provider worker service became a product
 dependency.
+
+## Deployment state
+
+A bounded authoritative local bootstrap using the selected EmbeddingGemma profile has
+passed exact readback, storage integrity, retrieval smoke, and restart-durability checks.
+That evidence does not imply remote/cloud deployment, bulk historical-memory migration,
+or final production-grade acceptance.

@@ -8,14 +8,20 @@ context windows, or historical memory into execution authority.
 
 ## Current status
 
-FactLane is an early public engineering project. The implementation provides
-transport-bound host identity, a narrow shared gateway, transaction-local
-lost-update prevention, asynchronous local-provider offload, and crash-safe
-transaction boundaries.
+FactLane is an early public engineering project with a production-capable local core.
+The implementation provides transport-bound host identity, a narrow shared gateway,
+transaction-local lost-update prevention, asynchronous local-provider offload,
+crash-safe transaction boundaries, retention/capacity observability, atomic compaction
+of eligible superseded state, and bounded manual housekeeping.
 
-Retention, compaction, reclaim, archive/recovery, lifecycle hygiene, and native-memory
-bootstrap/migration remain future work. The production embedding profile remains
-undecided.
+The selected production embedding profile is `embeddinggemma-300m-768`, served through
+a local loopback Ollama provider with an exact pinned model digest. A bounded
+authoritative local bootstrap has been validated, including restart durability and
+storage-integrity checks.
+
+FactLane does **not** yet claim final production-grade closure. Remaining acceptance
+work includes retrieval specificity under Arabic/mixed-language and document-crowding
+cases, real-host production-path acceptance, and authoritative backup/restore proof.
 
 ## Normal agent surface
 
