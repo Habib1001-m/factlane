@@ -22,6 +22,26 @@ FactLane does not automatically download models. The model required by the selec
 profile must already exist in the local Ollama runtime and match the exact identity
 pinned by that profile. Provider identity or dimension mismatches fail closed.
 
+If you want to reproduce the **current tested FactLane deployment** rather than choose a
+profile for your own workload, install the model used by that deployment:
+
+```bash
+ollama pull embeddinggemma:300m
+```
+
+and use:
+
+```text
+PROFILE=embeddinggemma-300m-768
+MODEL=embeddinggemma:300m
+```
+
+This is a reproducibility path for the deployment tested by this project, not a claim
+that EmbeddingGemma is the best model for every user or workload.
+
+If you choose another built-in profile, install the model required by that profile
+instead. The profile table below shows what this project actually tested.
+
 ## 2. Choose a database and embedding profile
 
 A normal launch needs:
@@ -41,7 +61,9 @@ Example server command shape:
   --host-id <host-id>
 ```
 
-The MCP client should normally launch this process for you over stdio.
+The MCP client should normally launch this process for you over stdio. Running the
+server command directly is not an interactive application; it waits for an MCP client on
+stdin/stdout.
 
 ### Models and profiles we evaluated
 
@@ -69,14 +91,14 @@ added in future work, but that is not a supported runtime feature today.
 Codex is one of the tested FactLane hosts. Configure a stdio MCP server in Codex and use
 a stable host ID such as `codex`.
 
-Example `~/.codex/config.toml` entry:
+Example `~/.codex/config.toml` entry reproducing the current tested profile:
 
 ```toml
 [mcp_servers.factlane]
 command = "/absolute/path/to/factlane/.venv/bin/factlane"
 args = [
   "--db", "/absolute/path/to/state/factlane.sqlite3",
-  "--profile", "<profile-id>",
+  "--profile", "embeddinggemma-300m-768",
   "--host-id", "codex"
 ]
 enabled = true
@@ -98,7 +120,7 @@ mcp_servers:
       - "--db"
       - "/absolute/path/to/state/factlane.sqlite3"
       - "--profile"
-      - "<profile-id>"
+      - "embeddinggemma-300m-768"
       - "--host-id"
       - "hermes"
 ```
