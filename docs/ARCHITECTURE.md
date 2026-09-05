@@ -14,7 +14,7 @@ The core principle is **share facts, not context**.
 ## Core flow
 
 ```text
-Host / trusted launcher
+MCP host / trusted launcher
   -> HostBinding
   -> stdio-only FastMCP boundary
   -> MemoryGateway
@@ -33,7 +33,7 @@ The normal operations are `memory_search`, `memory_get`, `memory_store`,
 transport gateway. The search path supports exact, keyword, semantic, and hybrid
 retrieval modes behind the same scope/freshness/authority filtering boundary.
 
-## Host identity and gateway
+## Host identity and MCP compatibility
 
 `HostBinding` is an immutable binding supplied by the trusted launcher. The runtime
 supports the `stdio` transport only, and an unbound gateway fails closed. Reserved
@@ -41,6 +41,15 @@ transport-identity claims in request payloads are rejected. The gateway projects
 bound host identity into the audit envelope; launcher binding is separate from an
 arbitrary request `agent_id`. This boundary is not cryptographic or operating-system
 identity attestation.
+
+The server implementation does not contain Codex- or Hermes-specific dispatch logic.
+Codex and Hermes are the currently tested host integrations because they were the first
+product targets. Another MCP client can use the same FactLane executable when it can
+launch a local command-based stdio MCP server and supply a stable `--host-id`. That is a
+protocol compatibility statement, not a claim that every MCP client has been certified.
+
+SSE and streamable HTTP MCP server transports are intentionally rejected by the current
+runtime.
 
 ## Ownership boundary
 
@@ -66,11 +75,12 @@ and parent supersession occur in one transaction.
 
 ## Embedding boundary
 
-Embedding requests are local-only and fail closed when runtime model identity,
-capability, native dimension, or input-size expectations do not match the selected
-profile.
+The adapter depends on an `EmbeddingProvider` contract, while the current shipped
+provider implementation is local Ollama over loopback HTTP. Runtime model identity,
+capability, native dimension, and input-size expectations fail closed when they do not
+match the selected profile.
 
-The selected production profile is:
+The selected production profile for the current FactLane deployment is:
 
 ```text
 PROFILE=embeddinggemma-300m-768
@@ -86,11 +96,28 @@ CONTEXT_WINDOW=2048
 
 Nomic profiles remain supported product profiles with their documented
 `search_document: ` and `search_query: ` prefixes, but they are not the selected
-production profile.
+production profile. Other models used during evaluation are evidence, not silently
+promoted runtime profiles.
+
+A remote or managed embedding provider is architecturally possible behind the provider
+boundary, but the current product does not ship or accept one. Adding it requires an
+explicit implementation and acceptance path rather than pointing the existing local
+provider at a non-loopback URL.
 
 Potentially blocking provider calls are offloaded from the asyncio event loop at the
 adapter boundary using the standard library thread-offload mechanism. No custom worker
 service or executor is a product dependency.
+
+## Fact plane versus corpus indexing
+
+FactLane stores bounded facts; it is not a raw document crawler or bulk directory
+indexer. Source collections may be much larger than FactLane's durable fact set, but an
+upstream ingestion/extraction layer is responsible for deciding which source material
+becomes a fact and for carrying the required provenance into that admission.
+
+This separation is intentional. A large-corpus ingestion system may need different
+batching, hardware, embedding models, or managed-provider economics without changing the
+governed FactLane storage/authority contract.
 
 ## Retention and housekeeping
 
