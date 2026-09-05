@@ -2,17 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .contract import AdapterError, ScopeContext
-
-INTENT_CLASSES = {
-    "CURRENT_PROJECT_STATE",
-    "PROJECT_DESIGN_RATIONALE",
-    "USER_PREFERENCE_OR_DURABLE_FACT",
-    "WORKFLOW_RULE",
-    "TOOL_ENVIRONMENT_STATE",
-    "HISTORICAL_QUESTION",
-    "GENERAL_TASK_NO_MEMORY_REQUIRED",
-}
+from .contract import (
+    INTENT_CLASSES,
+    RETRIEVAL_MODES,
+    AdapterError,
+    ScopeContext,
+    supported_values,
+)
 
 
 @dataclass(frozen=True)
@@ -39,11 +35,21 @@ class TruthRouter:
         retrieval_mode: str = "CURRENT",
     ) -> RouteDecision:
         if intent_class not in INTENT_CLASSES:
-            raise AdapterError("UNKNOWN_INTENT", "intent class is not supported")
+            raise AdapterError(
+                "UNKNOWN_INTENT",
+                f"intent class is not supported; choose one of: {supported_values(INTENT_CLASSES)}",
+            )
         if operation not in {"memory_search", "memory_get", "memory_store", "memory_update", "memory_status"}:
-            raise AdapterError("INVALID_ENVELOPE", "operation is not part of the five-operation surface")
-        if retrieval_mode not in {"CURRENT", "REVIEW_HISTORY"}:
-            raise AdapterError("INVALID_ENUM", "retrieval mode is invalid")
+            raise AdapterError(
+                "INVALID_ENVELOPE",
+                "operation is not part of the five-operation surface; use one of: "
+                "memory_search, memory_get, memory_store, memory_update, memory_status",
+            )
+        if retrieval_mode not in RETRIEVAL_MODES:
+            raise AdapterError(
+                "INVALID_ENUM",
+                f"retrieval mode is invalid; choose one of: {supported_values(RETRIEVAL_MODES)}",
+            )
         if intent_class == "GENERAL_TASK_NO_MEMORY_REQUIRED":
             return RouteDecision("NO_MEMORY_NEEDED", intent_class, operation, scope, retrieval_mode, "self-contained task")
         if direct_truth_available:

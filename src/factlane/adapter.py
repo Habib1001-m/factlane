@@ -8,6 +8,10 @@ from typing import Any
 
 from .contract import (
     CURRENT_LIFECYCLE,
+    PUBLIC_TOOL_NAMES,
+    RETRIEVAL_MODE_KINDS,
+    RETRIEVAL_MODES,
+    UPDATE_MODES,
     MEMORY_TYPES,
     AdapterError,
     ScopeContext,
@@ -24,6 +28,7 @@ from .contract import (
     validate_identifier,
     validate_provenance,
     validate_scope,
+    supported_values,
 )
 from .embeddings import EmbeddingProvider, OllamaLocalProvider
 from .router import TruthRouter
@@ -112,7 +117,7 @@ class AdapterLimits:
 class MemoryAdapter:
     """Truth-router-backed, five-operation adapter over SQLite-vec."""
 
-    TOOL_NAMES = ("memory_search", "memory_get", "memory_store", "memory_update", "memory_status")
+    TOOL_NAMES = PUBLIC_TOOL_NAMES
 
     def __init__(
         self,
@@ -330,13 +335,19 @@ class MemoryAdapter:
         source_timestamp = self._normalize_timestamp(source_timestamp)
         last_verified_at = self._normalize_timestamp(last_verified_at)
         if verified_by not in {"OWNER", "CURRENT_REPO_CHECK", "AUTOMATED_CHECK", "UNVERIFIED"}:
-            raise AdapterError("INVALID_ENUM", "verified_by is invalid")
+            raise AdapterError(
+                "INVALID_ENUM",
+                "verified_by is invalid; choose one of: OWNER, CURRENT_REPO_CHECK, AUTOMATED_CHECK, UNVERIFIED",
+            )
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
             raise AdapterError("INVALID_ENVELOPE", "confidence must be between 0 and 1")
         tags_value = self._tags(tags)
         subject_value = self._subject(subject, tags_value, fact)
         if requested_lifecycle_state not in {"CANDIDATE", CURRENT_LIFECYCLE}:
-            raise AdapterError("INVALID_ENUM", "normal store accepts candidate or validated current only")
+            raise AdapterError(
+                "INVALID_ENUM",
+                "normal store accepts requested_lifecycle_state CANDIDATE or VALIDATED_CURRENT",
+            )
         expected_authority = self._authority_for(scope_context)
         if requested_lifecycle_state == CURRENT_LIFECYCLE:
             if not source_timestamp:
@@ -344,7 +355,11 @@ class MemoryAdapter:
             if not last_verified_at or verified_by == "UNVERIFIED":
                 raise AdapterError("UNVERIFIED_CURRENT", "validated current admission requires explicit verification")
             if authority_role not in {None, expected_authority}:
-                raise AdapterError("INVALID_ENVELOPE", "authority role does not match exact scope")
+                raise AdapterError(
+                    "INVALID_ENVELOPE",
+                    f"authority_role does not match exact scope; for {scope_context.scope} use "
+                    f"{expected_authority} or omit authority_role",
+                )
             authority = expected_authority
             lifecycle = CURRENT_LIFECYCLE
         else:
@@ -460,8 +475,11 @@ class MemoryAdapter:
             uuid.UUID(memory_id)
         except (ValueError, AttributeError) as exc:
             raise AdapterError("INVALID_ENVELOPE", "memory_id must be a UUID") from exc
-        if retrieval_mode not in {"CURRENT", "REVIEW_HISTORY"}:
-            raise AdapterError("INVALID_ENUM", "retrieval mode is invalid")
+        if retrieval_mode not in RETRIEVAL_MODES:
+            raise AdapterError(
+                "INVALID_ENUM",
+                f"retrieval mode is invalid; choose one of: {supported_values(RETRIEVAL_MODES)}",
+            )
         scope_context = self._safe_scope(scope, project_id, worktree_id, workflow_id, agent_id)
         rows = await self.engine.get_record(memory_id, scope_context, history=retrieval_mode == "REVIEW_HISTORY")
         if not rows:
@@ -560,8 +578,11 @@ class MemoryAdapter:
         for name, value in (("top_k", top_k), ("max_memories", max_memories), ("max_bytes", max_bytes), ("max_tokens", max_tokens)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise AdapterError("INVALID_ENVELOPE", f"{name} must be a positive integer")
-        if retrieval_mode_kind not in {"EXACT", "KEYWORD", "SEMANTIC", "HYBRID"}:
-            raise AdapterError("INVALID_ENUM", "retrieval mode kind is invalid")
+        if retrieval_mode_kind not in RETRIEVAL_MODE_KINDS:
+            raise AdapterError(
+                "INVALID_ENUM",
+                f"retrieval mode kind is invalid; choose one of: {supported_values(RETRIEVAL_MODE_KINDS)}",
+            )
         if include_graph_links:
             raise AdapterError("ADMIN_OPERATION_DENIED", "graph expansion is not available in the normal agent path")
         requested_top_k = top_k
@@ -632,10 +653,16 @@ class MemoryAdapter:
     ) -> dict[str, Any]:
         request_id = self._request_id(request_id)
         scope_context = self._safe_scope(scope, project_id, worktree_id, workflow_id, agent_id)
-        if mode not in {"REVERIFY", "REPLACE"}:
-            raise AdapterError("INVALID_ENUM", "update mode is invalid")
+        if mode not in UPDATE_MODES:
+            raise AdapterError(
+                "INVALID_ENUM",
+                f"update mode is invalid; choose one of: {supported_values(UPDATE_MODES)}",
+            )
         if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
-            raise AdapterError("INVALID_ENVELOPE", "expected_revision is invalid")
+            raise AdapterError(
+                "INVALID_ENVELOPE",
+                "expected_revision must be the positive current revision returned by memory_get",
+            )
         validate_identifier(idempotency_key, "idempotency_key", required=True)
         try:
             uuid.UUID(memory_id)
@@ -664,7 +691,10 @@ class MemoryAdapter:
             raise AdapterError("NOT_FOUND", "current memory_id was not found")
         old = current_rows[0]
         if old["revision"] != expected_revision:
-            raise AdapterError("VERSION_CONFLICT", "expected_revision does not match current revision")
+            raise AdapterError(
+                "VERSION_CONFLICT",
+                "expected_revision does not match current revision; read memory_get and retry with that revision",
+            )
         old_provenance = json.loads(old["source_provenance"])
         old_freshness = json.loads(old["freshness_policy"])
         if mode == "REVERIFY":
@@ -680,6 +710,20 @@ class MemoryAdapter:
             contradiction_key = old["contradiction_key"]
         else:
             data = replacement or {}
+            required_replacement = (
+                "fact",
+                "source_provenance",
+                "freshness_policy",
+                "source_timestamp",
+                "verified_by",
+            )
+            missing_replacement = [field for field in required_replacement if field not in data]
+            if missing_replacement:
+                raise AdapterError(
+                    "INVALID_ENVELOPE",
+                    "REPLACE requires replacement fields: "
+                    + ", ".join(f"replacement.{field}" for field in missing_replacement),
+                )
             fact = validate_fact(data.get("fact"))
             provenance = validate_provenance(data.get("source_provenance"))
             freshness = validate_freshness(data.get("freshness_policy"))
@@ -693,7 +737,10 @@ class MemoryAdapter:
         if not source_timestamp:
             raise AdapterError("PROVENANCE_REQUIRED", "updated current record requires source_timestamp")
         if verified_by not in {"OWNER", "CURRENT_REPO_CHECK", "AUTOMATED_CHECK"}:
-            raise AdapterError("UNVERIFIED_CURRENT", "update requires explicit current verification")
+            raise AdapterError(
+                "UNVERIFIED_CURRENT",
+                "update requires explicit current verification; verified_by must be OWNER, CURRENT_REPO_CHECK, or AUTOMATED_CHECK",
+            )
         last_verified_at = self._normalize_timestamp(data.get("last_verified_at", iso_now()), required=True)
         memory_type = data.get("memory_type", old["memory_type"])
         if memory_type not in MEMORY_TYPES:

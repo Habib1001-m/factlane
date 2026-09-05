@@ -145,6 +145,11 @@ class MemoryGateway:
         if method_name is None:
             raise AdapterError("INVALID_OPERATION", "operation is not part of the public gateway surface")
         safe_request = self._validate_request(request)
+        if operation in {"memory_store", "memory_update"} and "provenance" in safe_request:
+            raise AdapterError(
+                "INVALID_ENVELOPE",
+                "use source_provenance (an object); provenance is not a FactLane request field",
+            )
         handler = getattr(self._adapter, method_name, None)
         if not callable(handler):
             raise AdapterError("INVALID_OPERATION", "adapter does not implement the requested operation")

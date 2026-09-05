@@ -9,6 +9,15 @@ from mcp.server.fastmcp import FastMCP
 from .adapter import PROFILE_DEFINITIONS, MemoryAdapter
 from .contract import AdapterError
 from .gateway import HostBinding, MemoryGateway
+from .public_contract import (
+    MemoryGetRequest,
+    MemorySearchRequest,
+    MemoryStatusRequest,
+    MemoryStoreRequest,
+    MemoryUpdateRequest,
+    TOOL_DESCRIPTIONS,
+    render_tool_help,
+)
 
 STDIO_TRANSPORT = "stdio"
 
@@ -46,24 +55,24 @@ def build_mcp_server(gateway: MemoryGateway) -> FastMCP:
         port=8000,
     )
 
-    @server.tool(name="memory_search", description="Search validated memory in one exact scope.")
-    async def memory_search(request: dict[str, Any]) -> dict[str, Any]:
+    @server.tool(name="memory_search", description=TOOL_DESCRIPTIONS["memory_search"])
+    async def memory_search(request: MemorySearchRequest) -> dict[str, Any]:
         return await gateway.dispatch("memory_search", request)
 
-    @server.tool(name="memory_get", description="Get one logical memory record in one exact scope.")
-    async def memory_get(request: dict[str, Any]) -> dict[str, Any]:
+    @server.tool(name="memory_get", description=TOOL_DESCRIPTIONS["memory_get"])
+    async def memory_get(request: MemoryGetRequest) -> dict[str, Any]:
         return await gateway.dispatch("memory_get", request)
 
-    @server.tool(name="memory_store", description="Admit one bounded, provenance-bearing memory candidate.")
-    async def memory_store(request: dict[str, Any]) -> dict[str, Any]:
+    @server.tool(name="memory_store", description=TOOL_DESCRIPTIONS["memory_store"])
+    async def memory_store(request: MemoryStoreRequest) -> dict[str, Any]:
         return await gateway.dispatch("memory_store", request)
 
-    @server.tool(name="memory_update", description="Reverify or explicitly replace one logical memory record.")
-    async def memory_update(request: dict[str, Any]) -> dict[str, Any]:
+    @server.tool(name="memory_update", description=TOOL_DESCRIPTIONS["memory_update"])
+    async def memory_update(request: MemoryUpdateRequest) -> dict[str, Any]:
         return await gateway.dispatch("memory_update", request)
 
-    @server.tool(name="memory_status", description="Return bounded backend/profile status for one scope.")
-    async def memory_status(request: dict[str, Any]) -> dict[str, Any]:
+    @server.tool(name="memory_status", description=TOOL_DESCRIPTIONS["memory_status"])
+    async def memory_status(request: MemoryStatusRequest) -> dict[str, Any]:
         return await gateway.dispatch("memory_status", request)
 
     return server
@@ -71,13 +80,20 @@ def build_mcp_server(gateway: MemoryGateway) -> FastMCP:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", required=True)
+    parser.add_argument("--db")
     parser.add_argument("--profile", choices=sorted(PROFILE_DEFINITIONS), default="nomic-768")
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--tokenizer-path", default=None)
-    parser.add_argument("--host-id", required=True)
+    parser.add_argument("--host-id")
     parser.add_argument("--binding-source", default="explicit-launcher")
+    parser.add_argument("--help-tools", action="store_true", help="print the complete five-tool request reference")
+    parser.add_argument("--help-tool", choices=sorted(TOOL_DESCRIPTIONS), help="print one tool's request reference")
     args = parser.parse_args(argv)
+    if args.help_tools or args.help_tool:
+        print(render_tool_help(args.help_tool))
+        return
+    if not args.db or not args.host_id:
+        parser.error("the following arguments are required: --db and --host-id")
     try:
         binding = HostBinding(args.host_id, STDIO_TRANSPORT, args.binding_source)
     except AdapterError as exc:
