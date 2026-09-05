@@ -27,6 +27,8 @@ integrity, real Codex/Hermes shared-store concurrency, lost-update prevention,
 crash-safety, retention/capacity observability, atomic compaction of eligible superseded
 state, and bounded manual housekeeping.
 
+The repository's CI and CodeQL security checks are part of the verified project baseline.
+
 FactLane does **not** yet claim final production-grade closure. Remaining work is final
 real-host production-path acceptance, preparation and curation of the real production
 corpus, and authoritative backup/restore proof. Historical retrieval evaluation on an
