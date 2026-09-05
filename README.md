@@ -27,10 +27,11 @@ integrity, real Codex/Hermes shared-store concurrency, lost-update prevention,
 crash-safety, retention/capacity observability, atomic compaction of eligible superseded
 state, and bounded manual housekeeping.
 
-FactLane does **not** yet claim final production-grade closure. Remaining acceptance work
-includes retrieval specificity under Arabic/mixed-language and document-crowding cases,
-security-lane closure, final real-host production-path acceptance, and authoritative
-backup/restore proof.
+FactLane does **not** yet claim final production-grade closure. Remaining work is final
+real-host production-path acceptance, preparation and curation of the real production
+corpus, and authoritative backup/restore proof. Historical retrieval evaluation on an
+experimental corpus did not justify a ranking-policy change; production retrieval
+validation remains deferred until a curated production corpus exists.
 
 ## Start here
 
