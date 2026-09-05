@@ -2,50 +2,95 @@
 
 **Share facts, not context.**
 
-FactLane is a local-first, multi-host governed memory plane for AI agents. It shares
-small, validated, provenance-bearing facts without turning raw transcripts, whole
+FactLane is a production-capable, local-first governed memory product for AI agents. It
+shares small, validated, provenance-bearing facts without turning raw transcripts, whole
 context windows, or historical memory into execution authority.
+
+## What it does
+
+A connected agent gets five normal memory operations:
+
+- `memory_search` — find validated facts in one exact scope;
+- `memory_get` — read one logical memory record;
+- `memory_store` — admit one bounded, provenance-bearing fact;
+- `memory_update` — reverify or explicitly replace a fact with revision/CAS protection;
+- `memory_status` — inspect bounded backend/profile health for one scope.
+
+FactLane keeps scope, freshness, authority, contradictions, lineage, idempotency, and
+retrieval budgets in the product boundary. It is supporting memory, never execution
+authority.
 
 ## Current status
 
-FactLane is an early public engineering project with a production-capable local core.
-The implementation provides transport-bound host identity, a narrow shared gateway,
-transaction-local lost-update prevention, asynchronous local-provider offload,
-crash-safe transaction boundaries, retention/capacity observability, atomic compaction
-of eligible superseded state, and bounded manual housekeeping.
+The local core has passed bounded production bootstrap, restart durability, storage
+integrity, real Codex/Hermes shared-store concurrency, lost-update prevention,
+crash-safety, retention/capacity observability, atomic compaction of eligible superseded
+state, and bounded manual housekeeping.
 
-The selected production embedding profile is `embeddinggemma-300m-768`, served through
-a local loopback Ollama provider with an exact pinned model digest. A bounded
-authoritative local bootstrap has been validated, including restart durability and
-storage-integrity checks.
+FactLane does **not** yet claim final production-grade closure. Remaining acceptance work
+includes retrieval specificity under Arabic/mixed-language and document-crowding cases,
+security-lane closure, final real-host production-path acceptance, and authoritative
+backup/restore proof.
 
-FactLane does **not** yet claim final production-grade closure. Remaining acceptance
-work includes retrieval specificity under Arabic/mixed-language and document-crowding
-cases, real-host production-path acceptance, and authoritative backup/restore proof.
+## Start here
 
-## Normal agent surface
+See [docs/QUICKSTART.md](docs/QUICKSTART.md) for installation, host connection examples,
+model/profile notes, and current limitations.
 
-FactLane exposes exactly five normal memory operations:
+The short version is:
 
-- `memory_search`
-- `memory_get`
-- `memory_store`
-- `memory_update`
-- `memory_status`
+```bash
+git clone https://github.com/Habib1001-m/factlane.git
+cd factlane
+uv sync --frozen
+uv run factlane --help
+```
 
-The normal agent surface does not expose delete/purge, backend administration,
-configuration mutation, harvesting, distillation, consolidation, or service-control
-operations.
+FactLane is an MCP server over **stdio**. Configure your MCP client to launch the
+project-owned `factlane` executable with a database path, profile, and host ID.
+
+Codex and Hermes are the currently tested host integrations. The server implementation
+is not hard-coded to either host: another MCP client can use the same path when it
+supports local command-based stdio MCP servers. Other clients are not individually
+certified yet, and HTTP/SSE MCP transport is not supported by the current FactLane
+server.
+
+## Embedding profiles
+
+The current FactLane deployment selected `embeddinggemma-300m-768` after project-specific
+fresh-blind evaluation. That is a tested deployment decision, **not a universal model
+recommendation**.
+
+Model choice depends on language mix, retrieval quality, latency, hardware, corpus/fact
+shape, and operating cost. FactLane also contains supported Nomic profiles, while other
+models were used as diagnostic/evaluation candidates during development. See
+[docs/QUICKSTART.md](docs/QUICKSTART.md) and [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) for
+the exact classification.
+
+The current provider implementation is local Ollama over loopback HTTP only. Remote
+embedding services are not a supported runtime option in this release.
+
+## What FactLane is not
+
+FactLane is not a raw transcript store, whole-repository memory dump, general document
+search engine, or bulk folder indexer. A FactLane fact is intentionally bounded. If you
+have a very large corpus, an upstream ingestion/extraction pipeline should decide what
+becomes a durable fact before it reaches FactLane.
+
+For very large ingestion workloads, embedding throughput, batching, hardware, and
+provider economics may matter more than the model selected for this project's current
+local deployment. Do not extrapolate the project's small controlled benchmarks into a
+claim that one local model is appropriate for every scale.
 
 ## Architecture
 
 ```text
-Host / trusted launcher
+MCP host / trusted launcher
   -> HostBinding
   -> stdio-only FastMCP boundary
   -> MemoryGateway
   -> MemoryAdapter / five operations
-       -> TruthRouter for bounded search routing decisions
+       -> TruthRouter
        -> EmbeddingProvider
        -> SQLiteVecEngine
             -> adapter-owned transaction/CAS semantics
@@ -59,8 +104,8 @@ reusable SQLite/SQLite-vec mechanics behind an explicit compatibility boundary.
 ## Local-first baseline
 
 The baseline is CPU-capable and does not require Docker, a GPU, a cloud LLM, or an
-external embedding API. The embedding provider accepts loopback HTTP only and has no
-automatic external fallback.
+external embedding API. The current embedding provider accepts loopback HTTP only and
+has no automatic external fallback.
 
 ## Development
 
@@ -75,8 +120,8 @@ uv run factlane --help
 ## Security
 
 See [SECURITY.md](SECURITY.md) for reporting guidance and product security boundaries.
-Architecture details are documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
-and runtime requirements in [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
+Architecture details are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and runtime/model
+requirements are in [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
 
 FactLane is licensed under Apache-2.0. Upstream projects remain owned and licensed by
 their respective authors; FactLane does not vendor the pinned backend or SQLite-vec
