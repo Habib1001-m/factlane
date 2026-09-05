@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any, NotRequired, Required, TypedDict
+from typing import Annotated, Any
 
 from pydantic import Field, TypeAdapter
+from typing_extensions import NotRequired, Required, TypedDict
 
 from .contract import (
     AUTHORITY_ROLES,
