@@ -22,6 +22,11 @@ evidence; it is never execution authority.
 Search first. Use `memory_get` with the returned exact `memory_id` when exact readback,
 revision, or provenance matters.
 
+For a normal search, choose scope and intent and let FactLane perform the lookup. Do not
+invent routing overrides to suppress an explicit memory search, and do not request admin-only
+graph expansion. For normal project-scoped stores, omit `authority_role`; FactLane derives the
+authority from the exact scope.
+
 ## Before writing
 
 Persist or update only when the active Owner/host policy explicitly authorizes it. Store

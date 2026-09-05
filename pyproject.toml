@@ -10,8 +10,10 @@ requires-python = ">=3.11"
 dependencies = [
   "mcp-memory-service @ git+https://github.com/doobidoo/mcp-memory-service.git@e5155b937051db4fa99a384018c5ebd621d8c5ef",
   "mcp==1.29.1",
+  "pydantic==2.13.5",
   "sqlite-vec==0.1.9",
   "tokenizers==0.23.1",
+  "typing-extensions==4.16.0",
 ]
 
 [dependency-groups]

@@ -623,6 +623,37 @@ wheels = [
 ]
 
 [[package]]
+name = "factlane"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "mcp" },
+    { name = "mcp-memory-service" },
+    { name = "pydantic" },
+    { name = "sqlite-vec" },
+    { name = "tokenizers" },
+    { name = "typing-extensions" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "mcp", specifier = "==1.29.1" },
+    { name = "mcp-memory-service", git = "https://github.com/doobidoo/mcp-memory-service.git?rev=e5155b937051db4fa99a384018c5ebd621d8c5ef" },
+    { name = "pydantic", specifier = "==2.13.5" },
+    { name = "sqlite-vec", specifier = "==0.1.9" },
+    { name = "tokenizers", specifier = "==0.23.1" },
+    { name = "typing-extensions", specifier = "==4.16.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = "==9.0.3" }]
+
+[[package]]
 name = "fastapi"
 version = "0.141.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1252,33 +1283,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f1/18/195d6b86cd72dbbc501edfa778005fa6b87afd34c153e46028cd3a0938f4/numpy-2.5.2-cp315-cp315t-win_amd64.whl", hash = "sha256:e5651f3f87add730ee6608d915009e19c911fba0cb000c7e3ea994b7d768eb12", size = 12782559, upload-time = "2026-08-09T13:48:21.023Z" },
     { url = "https://files.pythonhosted.org/packages/b4/07/458c344f0f0c178f4481dad5cca790626ffe4c34eabf9467069d06ee4999/numpy-2.5.2-cp315-cp315t-win_arm64.whl", hash = "sha256:5f8e00be2ec6f45f4e8a41a527f68d44a7d96fee92a650e4d8b1326f77f61e6e", size = 10748103, upload-time = "2026-08-09T13:48:24.21Z" },
 ]
-
-[[package]]
-name = "factlane"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "mcp" },
-    { name = "mcp-memory-service" },
-    { name = "sqlite-vec" },
-    { name = "tokenizers" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "mcp", specifier = "==1.29.1" },
-    { name = "mcp-memory-service", git = "https://github.com/doobidoo/mcp-memory-service.git?rev=e5155b937051db4fa99a384018c5ebd621d8c5ef" },
-    { name = "sqlite-vec", specifier = "==0.1.9" },
-    { name = "tokenizers", specifier = "==0.23.1" },
-]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = "==9.0.3" }]
 
 [[package]]
 name = "packaging"

@@ -7,7 +7,6 @@ from pydantic import Field, TypeAdapter
 from typing_extensions import NotRequired, Required, TypedDict
 
 from .contract import (
-    AUTHORITY_ROLES,
     CURRENT_LIFECYCLE,
     FRESHNESS_KINDS,
     INTENT_CLASSES,
@@ -51,12 +50,6 @@ RetrievalKindValue = _enum_field(
 UpdateModeValue = _enum_field(UPDATE_MODES, "REVERIFY preserves the logical memory; REPLACE creates a new logical revision.")
 MemoryTypeValue = _enum_field(MEMORY_TYPES, "Fact category for one bounded memory record.")
 VerifiedByValue = _enum_field(VERIFIED_BY, "Verification source. UNVERIFIED stores a candidate, not a current fact.", default="UNVERIFIED")
-AuthorityRoleValue = _enum_field(
-    AUTHORITY_ROLES,
-    "Optional; normally omit because the adapter derives the exact scope role. If supplied: "
-    "GLOBAL_USER=OWNER_CURRENT, PROJECT=PROJECT_CURRENT, WORKFLOW=WORKFLOW_CURRENT, "
-    "TOOL_ENVIRONMENT=TOOL_ENV_CURRENT.",
-)
 FreshnessKindValue = _enum_field(FRESHNESS_KINDS, "Freshness policy. ttl additionally requires ttl_seconds.")
 
 ProjectId = Annotated[str, Field(description="Exact project identity; required for PROJECT and WORKFLOW scope.")]
@@ -115,9 +108,6 @@ class MemorySearchRequest(ScopeFields, total=False):
     max_memories: NotRequired[Annotated[int, Field(default=5, ge=1, le=8, description="Returned-memory budget; default 5.")]]
     max_bytes: NotRequired[Annotated[int, Field(default=6000, ge=1, le=8000, description="Serialized-byte budget; default 6000.")]]
     max_tokens: NotRequired[Annotated[int, Field(default=1200, ge=1, le=1600, description="Serialized-token budget; default 1200.")]]
-    include_graph_links: NotRequired[Annotated[bool, Field(default=False, description="Reserved admin-only expansion; keep false.")]]
-    direct_truth_available: NotRequired[Annotated[bool, Field(default=False, description="Set true only when the active request already supplies direct truth.")]]
-    user_supplied: NotRequired[Annotated[bool, Field(default=False, description="Set true only when the active request supplies the needed context.")]]
     request_id: NotRequired[RequestId]
 
 
@@ -136,7 +126,6 @@ class MemoryStoreRequest(ScopeFields, total=False):
     source_timestamp: NotRequired[Annotated[str, Field(description="ISO-8601 source timestamp; required for VALIDATED_CURRENT.")]]
     last_verified_at: NotRequired[Annotated[str, Field(description="ISO-8601 verification timestamp for VALIDATED_CURRENT.")]]
     verified_by: NotRequired[VerifiedByValue]
-    authority_role: NotRequired[AuthorityRoleValue]
     requested_lifecycle_state: NotRequired[
         _enum_field({"CANDIDATE", CURRENT_LIFECYCLE}, "CANDIDATE is the safe default; VALIDATED_CURRENT requires explicit verification.", default="CANDIDATE")
     ]

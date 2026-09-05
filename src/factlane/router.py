@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from .contract import (
     INTENT_CLASSES,
+    PUBLIC_TOOL_NAMES,
     RETRIEVAL_MODES,
     AdapterError,
     ScopeContext,
@@ -39,11 +40,11 @@ class TruthRouter:
                 "UNKNOWN_INTENT",
                 f"intent class is not supported; choose one of: {supported_values(INTENT_CLASSES)}",
             )
-        if operation not in {"memory_search", "memory_get", "memory_store", "memory_update", "memory_status"}:
+        if operation not in PUBLIC_TOOL_NAMES:
             raise AdapterError(
                 "INVALID_ENVELOPE",
                 "operation is not part of the five-operation surface; use one of: "
-                "memory_search, memory_get, memory_store, memory_update, memory_status",
+                + ", ".join(PUBLIC_TOOL_NAMES),
             )
         if retrieval_mode not in RETRIEVAL_MODES:
             raise AdapterError(

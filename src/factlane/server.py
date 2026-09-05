@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -79,21 +80,27 @@ def build_mcp_server(gateway: MemoryGateway) -> FastMCP:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db")
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    help_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    help_parser.add_argument("--help-tools", action="store_true")
+    help_parser.add_argument("--help-tool", choices=sorted(TOOL_DESCRIPTIONS))
+    help_args, _ = help_parser.parse_known_args(raw_argv)
+    if help_args.help_tools or help_args.help_tool:
+        print(render_tool_help(help_args.help_tool))
+        return
+
+    parser = argparse.ArgumentParser(
+        description="Launch the FactLane stdio MCP server (requires --db and --host-id)."
+    )
+    parser.add_argument("--db", required=True, help="SQLite database path (required for server launch)")
     parser.add_argument("--profile", choices=sorted(PROFILE_DEFINITIONS), default="nomic-768")
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--tokenizer-path", default=None)
-    parser.add_argument("--host-id")
+    parser.add_argument("--host-id", required=True, help="stable non-secret host label (required for server launch)")
     parser.add_argument("--binding-source", default="explicit-launcher")
     parser.add_argument("--help-tools", action="store_true", help="print the complete five-tool request reference")
     parser.add_argument("--help-tool", choices=sorted(TOOL_DESCRIPTIONS), help="print one tool's request reference")
-    args = parser.parse_args(argv)
-    if args.help_tools or args.help_tool:
-        print(render_tool_help(args.help_tool))
-        return
-    if not args.db or not args.host_id:
-        parser.error("the following arguments are required: --db and --host-id")
+    args = parser.parse_args(raw_argv)
     try:
         binding = HostBinding(args.host_id, STDIO_TRANSPORT, args.binding_source)
     except AdapterError as exc:

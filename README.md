@@ -46,6 +46,10 @@ uv sync --frozen
 uv run factlane --help
 ```
 
+Use `uv run factlane --help-tools` for the complete offline request reference. The optional
+[using-factlane Agent Skill](skills/using-factlane/SKILL.md) accelerates agent use, but the
+MCP schemas remain the authoritative interface and do not require the Skill.
+
 FactLane is an MCP server over **stdio**. Configure your MCP client to launch the
 project-owned `factlane` executable with a database path, profile, and host ID.
 

@@ -8,7 +8,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 from .adapter import MemoryAdapter
-from .contract import AdapterError, contains_sensitive
+from .contract import PUBLIC_TOOL_NAMES, AdapterError, contains_sensitive
 
 _MAX_BINDING_BYTES = 128
 _BINDING_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -23,13 +23,7 @@ _RESERVED_IDENTITY_CLAIMS = frozenset(
         "transport_kind",
     }
 )
-_OPERATION_METHODS = {
-    "memory_search": "search",
-    "memory_get": "get",
-    "memory_store": "store",
-    "memory_update": "update",
-    "memory_status": "status",
-}
+_OPERATION_METHODS = {name: name.removeprefix("memory_") for name in PUBLIC_TOOL_NAMES}
 
 
 def _validate_binding_value(value: object, field: str) -> str:

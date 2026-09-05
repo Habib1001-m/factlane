@@ -16,6 +16,7 @@ git clone https://github.com/Habib1001-m/factlane.git
 cd factlane
 uv sync --frozen
 uv run factlane --help
+uv run factlane --help-tools
 ```
 
 FactLane does not automatically download models. The model required by the selected
@@ -145,6 +146,11 @@ claim. The current FactLane server deliberately rejects SSE and streamable HTTP 
 transport.
 
 ## 6. Verify the connection before storing anything
+
+The offline `factlane --help-tools` reference describes all five requests, scope rules,
+defaults, provenance, freshness, idempotency, and revision/CAS requirements. The optional
+[using-factlane Agent Skill](../skills/using-factlane/SKILL.md) provides portable guidance;
+clients remain compliant when they use the live MCP schemas without loading the Skill.
 
 First verify that the client discovers exactly these normal tools:
 

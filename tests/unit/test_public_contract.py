@@ -4,6 +4,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,54 @@ def test_mcp_contract_exposes_finite_choices_and_defaults() -> None:
     assert search["properties"]["retrieval_mode_kind"]["default"] == "SEMANTIC"
 
 
+def test_public_search_schema_excludes_self_suppressing_routing_hints() -> None:
+    search = _request_schema("memory_search")
+    assert not {"include_graph_links", "direct_truth_available", "user_supplied"}.intersection(search["properties"])
+
+
+def test_public_store_schema_does_not_ask_agents_to_choose_derived_authority() -> None:
+    store = _request_schema("memory_store")
+    assert "authority_role" not in store["properties"]
+
+
+def test_public_search_ignores_legacy_routing_hints_at_the_mcp_boundary() -> None:
+    class RecordingAdapter:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def search(self, **request: Any) -> dict[str, Any]:
+            self.calls.append(request)
+            return {"status": "OK", "results": [], "audit": {}}
+
+    adapter = RecordingAdapter()
+    server = build_mcp_server(
+        MemoryGateway(
+            adapter,
+            HostBinding("contract-test", "stdio", "unit-test"),
+            transport_kind="stdio",
+        )
+    )
+    asyncio.run(
+        server.call_tool(
+            "memory_search",
+            {
+                "request": {
+                    "query": "lifecycle policy",
+                    "intent_class": "WORKFLOW_RULE",
+                    "scope": "PROJECT",
+                    "project_id": "factlane",
+                    "include_graph_links": True,
+                    "direct_truth_available": False,
+                    "user_supplied": True,
+                }
+            },
+        )
+    )
+
+    assert len(adapter.calls) == 1
+    assert not {"include_graph_links", "direct_truth_available", "user_supplied"}.intersection(adapter.calls[0])
+
+
 def test_store_and_update_contracts_explain_governed_write_fields() -> None:
     store = _request_schema("memory_store")
     update = _request_schema("memory_update")
@@ -90,8 +139,7 @@ def test_store_and_update_contracts_explain_governed_write_fields() -> None:
     assert "source_provenance" in store["required"]
     assert "freshness_policy" in store["properties"]
     assert "idempotency_key" in store["required"]
-    assert "PROJECT_CURRENT" in store["properties"]["authority_role"]["description"]
-    assert "WORKFLOW_CURRENT" in store["properties"]["authority_role"]["description"]
+    assert "authority_role" not in store["properties"]
     assert "expected_revision" in update["required"]
     assert set(update["properties"]["mode"]["enum"]) == {"REVERIFY", "REPLACE"}
     assert "required for replace" in update["properties"]["replacement"]["description"].casefold()
@@ -108,6 +156,39 @@ def test_runtime_constants_cli_help_and_mcp_schema_stay_in_parity() -> None:
     help_text = render_tool_help()
     for value in (*PUBLIC_TOOL_NAMES, *INTENT_CLASSES, *RETRIEVAL_MODES, *RETRIEVAL_MODE_KINDS, *UPDATE_MODES):
         assert value in help_text
+
+
+def test_gateway_operation_surface_uses_the_canonical_tool_names() -> None:
+    assert tuple(MemoryGateway.tool_names()) == PUBLIC_TOOL_NAMES
+
+
+def test_public_contract_runtime_dependencies_are_declared() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = set(project["project"]["dependencies"])
+    assert "pydantic==2.13.5" in dependencies
+    assert "typing-extensions==4.16.0" in dependencies
+
+
+def test_normal_cli_help_states_server_arguments_are_required() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", "from factlane.server import main; main(['--help'])"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "requires --db and --host-id" in result.stdout
+    assert "--help-tools" in result.stdout
+
+
+def test_public_docs_discover_offline_help_and_optional_skill() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    quickstart = Path("docs/QUICKSTART.md").read_text(encoding="utf-8")
+    assert "--help-tools" in readme
+    assert "--help-tools" in quickstart
+    assert "using-factlane" in readme
+    assert "using-factlane" in quickstart
 
 
 def test_invalid_intent_error_lists_safe_supported_choices() -> None:
