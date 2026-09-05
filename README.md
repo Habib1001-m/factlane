@@ -27,10 +27,13 @@ integrity, real Codex/Hermes shared-store concurrency, lost-update prevention,
 crash-safety, retention/capacity observability, atomic compaction of eligible superseded
 state, and bounded manual housekeeping.
 
-FactLane does **not** yet claim final production-grade closure. Remaining acceptance work
-includes retrieval specificity under Arabic/mixed-language and document-crowding cases,
-security-lane closure, final real-host production-path acceptance, and authoritative
-backup/restore proof.
+The repository's CI and CodeQL security checks are part of the verified project baseline.
+
+FactLane does **not** yet claim final production-grade closure. Remaining work is final
+real-host production-path acceptance, preparation and curation of the real production
+corpus, and authoritative backup/restore proof. Historical retrieval evaluation on an
+experimental corpus did not justify a ranking-policy change; production retrieval
+validation remains deferred until a curated production corpus exists.
 
 ## Start here
 
@@ -45,6 +48,10 @@ cd factlane
 uv sync --frozen
 uv run factlane --help
 ```
+
+Use `uv run factlane --help-tools` for the complete offline request reference. The optional
+[using-factlane Agent Skill](skills/using-factlane/SKILL.md) accelerates agent use, but the
+MCP schemas remain the authoritative interface and do not require the Skill.
 
 FactLane is an MCP server over **stdio**. Configure your MCP client to launch the
 project-owned `factlane` executable with a database path, profile, and host ID.

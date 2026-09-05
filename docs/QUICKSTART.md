@@ -16,6 +16,7 @@ git clone https://github.com/Habib1001-m/factlane.git
 cd factlane
 uv sync --frozen
 uv run factlane --help
+uv run factlane --help-tools
 ```
 
 FactLane does not automatically download models. The model required by the selected
@@ -146,6 +147,11 @@ transport.
 
 ## 6. Verify the connection before storing anything
 
+The offline `factlane --help-tools` reference describes all five requests, scope rules,
+defaults, provenance, freshness, idempotency, and revision/CAS requirements. The optional
+[using-factlane Agent Skill](../skills/using-factlane/SKILL.md) provides portable guidance;
+clients remain compliant when they use the live MCP schemas without loading the Skill.
+
 First verify that the client discovers exactly these normal tools:
 
 ```text
@@ -193,7 +199,8 @@ our controlled small-corpus tests.
 - Remote embedding-provider support is not implemented in the current release.
 - FactLane is a governed fact plane, not a raw transcript, repository dump, or bulk
   document-indexing product.
-- Retrieval specificity under Arabic/mixed-language and document-crowding cases remains
-  an open quality debt before final production-grade closure.
-- Final real-host production-path acceptance and authoritative backup/restore acceptance
-  are still open closure items.
+- Production retrieval validation remains deferred until a curated real production corpus
+  is prepared; historical experimental-corpus evaluation did not justify a ranking-policy
+  change.
+- Final real-host production-path acceptance, production-corpus preparation/admission, and
+  authoritative backup/restore acceptance remain open closure items.

@@ -6,9 +6,23 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from collections.abc import Iterable
 from typing import Any
 
+PUBLIC_TOOL_NAMES = ("memory_search", "memory_get", "memory_store", "memory_update", "memory_status")
 SCOPES = {"GLOBAL_USER", "PROJECT", "WORKFLOW", "TOOL_ENVIRONMENT"}
+INTENT_CLASSES = {
+    "CURRENT_PROJECT_STATE",
+    "PROJECT_DESIGN_RATIONALE",
+    "USER_PREFERENCE_OR_DURABLE_FACT",
+    "WORKFLOW_RULE",
+    "TOOL_ENVIRONMENT_STATE",
+    "HISTORICAL_QUESTION",
+    "GENERAL_TASK_NO_MEMORY_REQUIRED",
+}
+RETRIEVAL_MODES = {"CURRENT", "REVIEW_HISTORY"}
+RETRIEVAL_MODE_KINDS = {"EXACT", "KEYWORD", "SEMANTIC", "HYBRID"}
+UPDATE_MODES = {"REVERIFY", "REPLACE"}
 MEMORY_TYPES = {
     "USER_FACT",
     "PREFERENCE",
@@ -72,6 +86,10 @@ class AdapterError(Exception):
                 "raw_content_logged": False,
             },
         }
+
+
+def supported_values(values: Iterable[str]) -> str:
+    return ", ".join(sorted(values))
 
 
 def utc_now() -> datetime:
@@ -154,20 +172,29 @@ def validate_scope(
     agent_id: str | None = None,
 ) -> ScopeContext:
     if scope not in SCOPES:
-        raise AdapterError("INVALID_ENUM", "scope is not supported")
+        raise AdapterError("INVALID_ENUM", f"scope is not supported; choose one of: {supported_values(SCOPES)}")
     project_id = validate_identifier(project_id, "project_id")
     worktree_id = validate_identifier(worktree_id, "worktree_id")
     workflow_id = validate_identifier(workflow_id, "workflow_id")
     agent_id = validate_identifier(agent_id, "agent_id")
     if scope == "GLOBAL_USER":
         if project_id or worktree_id or workflow_id:
-            raise AdapterError("CROSS_SCOPE_DENIED", "GLOBAL_USER cannot carry project identity")
+            raise AdapterError(
+                "CROSS_SCOPE_DENIED",
+                "GLOBAL_USER cannot carry project_id, worktree_id, or workflow_id",
+            )
     elif scope == "PROJECT":
-        if not project_id or workflow_id:
+        if not project_id:
             raise AdapterError("UNKNOWN_PROJECT_ID", "PROJECT requires one exact project_id")
+        if workflow_id:
+            raise AdapterError("CROSS_SCOPE_DENIED", "PROJECT cannot carry workflow_id")
     elif scope == "WORKFLOW":
-        if not project_id or not workflow_id:
-            raise AdapterError("UNKNOWN_PROJECT_ID", "WORKFLOW requires exact project and workflow identities")
+        missing = [field for field, value in (("project_id", project_id), ("workflow_id", workflow_id)) if not value]
+        if missing:
+            raise AdapterError(
+                "UNKNOWN_PROJECT_ID",
+                "WORKFLOW requires exact project_id and workflow_id",
+            )
     elif scope == "TOOL_ENVIRONMENT" and not agent_id:
         raise AdapterError("UNKNOWN_AGENT", "TOOL_ENVIRONMENT requires an exact agent_id")
     return ScopeContext(scope, project_id, worktree_id, workflow_id, agent_id)
@@ -193,11 +220,19 @@ def validate_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(provenance, dict):
         raise AdapterError("PROVENANCE_REQUIRED", "source_provenance must be an object")
     required = {"source_class", "source_ref", "source_hash", "review_ref", "extraction_method"}
-    if not required.issubset(provenance):
-        raise AdapterError("PROVENANCE_REQUIRED", "source provenance is incomplete")
+    missing = sorted(required - provenance.keys())
+    if missing:
+        raise AdapterError(
+            "PROVENANCE_REQUIRED",
+            f"source_provenance is incomplete; provide: {', '.join(missing)}",
+        )
     allowed = required | {"source_fingerprint"}
     if set(provenance) - allowed:
-        raise AdapterError("INVALID_ENVELOPE", "source provenance contains unknown fields")
+        raise AdapterError(
+            "INVALID_ENVELOPE",
+            "source_provenance contains unknown fields; allowed fields: "
+            f"{supported_values(allowed)}",
+        )
     result: dict[str, Any] = {}
     for field, limit in (("source_class", 96), ("source_ref", 256), ("review_ref", 256), ("extraction_method", 96)):
         value = provenance.get(field)
@@ -224,7 +259,10 @@ def validate_freshness(policy: dict[str, Any]) -> dict[str, Any]:
         raise AdapterError("INVALID_ENVELOPE", "freshness_policy is invalid")
     kind = policy.get("kind")
     if kind not in FRESHNESS_KINDS:
-        raise AdapterError("INVALID_ENUM", "freshness policy kind is invalid")
+        raise AdapterError(
+            "INVALID_ENUM",
+            f"freshness policy kind is invalid; choose one of: {supported_values(FRESHNESS_KINDS)}",
+        )
     ttl = policy.get("ttl_seconds")
     if kind == "ttl":
         if isinstance(ttl, bool) or not isinstance(ttl, int) or not 1 <= ttl <= 31_536_000:
