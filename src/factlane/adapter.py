@@ -36,7 +36,7 @@ from .contract import (
 )
 from .embeddings import EmbeddingProvider, OllamaLocalProvider
 from .router import TruthRouter
-from .storage import SQLiteVecEngine
+from .storage import RecordUniquenessConflict, SQLiteVecEngine
 
 _AUTHORIZATION_CLASSES = frozenset(
     {"READ_ONLY", "DELEGATED_AGENT_CONTRIBUTION", "DIRECT_OWNER_OPERATOR", "TRUSTED_ADMIN_OPERATOR"}
@@ -431,6 +431,20 @@ class MemoryAdapter:
                 )
 
     @staticmethod
+    def _validate_on_change_freshness(source_provenance: dict[str, Any], freshness_policy: dict[str, Any]) -> None:
+        if freshness_policy["kind"] != "on_change":
+            return
+        recheck_ref = freshness_policy.get("recheck_ref")
+        fingerprint = freshness_policy.get("source_fingerprint")
+        if not isinstance(recheck_ref, str) or not recheck_ref.strip():
+            raise AdapterError("INVALID_FRESHNESS", "on_change requires a non-empty freshness_policy.recheck_ref")
+        if fingerprint != source_provenance["source_hash"]:
+            raise AdapterError(
+                "INVALID_FRESHNESS",
+                "on_change freshness_policy.source_fingerprint must equal source_provenance.source_hash",
+            )
+
+    @staticmethod
     def _validate_cross_project_freshness(source_provenance: object, freshness_policy: object) -> None:
         if not isinstance(source_provenance, dict) or not isinstance(freshness_policy, dict):
             return
@@ -445,15 +459,7 @@ class MemoryAdapter:
         if kind not in {"on_change", "manual"}:
             raise AdapterError("INVALID_FRESHNESS", "CROSS_PROJECT_WORKFLOW freshness must be on_change or manual")
         if kind == "on_change":
-            recheck_ref = freshness.get("recheck_ref")
-            fingerprint = freshness.get("source_fingerprint")
-            if not isinstance(recheck_ref, str) or not recheck_ref.strip():
-                raise AdapterError("INVALID_FRESHNESS", "on_change requires a non-empty freshness_policy.recheck_ref")
-            if fingerprint != provenance["source_hash"]:
-                raise AdapterError(
-                    "INVALID_FRESHNESS",
-                    "on_change freshness_policy.source_fingerprint must equal source_provenance.source_hash",
-                )
+            MemoryAdapter._validate_on_change_freshness(provenance, freshness)
         elif freshness.get("recheck_ref") is not None or freshness.get("source_fingerprint") is not None:
             raise AdapterError(
                 "INVALID_FRESHNESS",
@@ -956,7 +962,26 @@ class MemoryAdapter:
                 "embedding_model_digest": self.provider.profile.model_digest,
                 "embedding_output_dimension": self.provider.profile.output_dimension,
             }
-            await self.engine.write_record(record, embedding)
+            try:
+                await self.engine.write_record(record, embedding)
+            except RecordUniquenessConflict:
+                concurrent_idempotent = await self.engine.find_idempotency(idempotency_key)
+                if concurrent_idempotent:
+                    if concurrent_idempotent["payload_fingerprint"] != payload_fingerprint:
+                        raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different payload")
+                    envelope = self._base_envelope(request_id, "memory_store", scope_context)
+                    envelope["results"] = [self._public(concurrent_idempotent)]
+                    envelope["idempotent_replay"] = True
+                    envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
+                    return envelope
+                concurrent_exact = await self.engine.find_exact(stable_hash)
+                if concurrent_exact:
+                    envelope = self._base_envelope(request_id, "memory_store", scope_context)
+                    envelope["status"] = "DUPLICATE"
+                    envelope["results"] = [self._public(concurrent_exact)]
+                    envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
+                    return envelope
+                raise AdapterError("WRITE_UNCONFIRMED", "concurrent store conflict could not be reconciled")
             rows = await self.engine.get_record(memory_id, scope_context, history=True)
             readback = next((row for row in rows if row["record_id"] == record_id), None)
             if not readback:
@@ -1111,6 +1136,9 @@ class MemoryAdapter:
         envelope = self._base_envelope(request_id, "memory_search", scope_context)
         envelope["budget"].update({"requested_top_k": requested_top_k, "max_bytes": max_bytes, "max_tokens": max_tokens})
         history = retrieval_mode == "REVIEW_HISTORY"
+        history_semantic_partial = False
+        if history and retrieval_mode_kind in {"SEMANTIC", "HYBRID"}:
+            history_semantic_partial = await self.engine.has_unmaterialized_history(scope_context)
         if retrieval_mode_kind == "EXACT":
             exact_rows = await self.engine.keyword_candidates(query.strip(), scope_context, limit=top_k * 4, history=history, exact=True)
             scored = [(row, 1.0) for row in exact_rows]
@@ -1152,6 +1180,9 @@ class MemoryAdapter:
         elif envelope["contradictions"] and not envelope["results"]:
             envelope["status"] = "CONTRADICTION"
             envelope["degradation"] = "CONTRADICTION_UNRESOLVED"
+        elif history_semantic_partial:
+            envelope["status"] = "DEGRADED"
+            envelope["degradation"] = "HISTORY_SEMANTIC_PARTIAL"
         envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
         return self._fit_budget(envelope)
 
@@ -1292,6 +1323,7 @@ class MemoryAdapter:
         memory_type = data.get("memory_type", old["memory_type"])
         if memory_type not in MEMORY_TYPES:
             raise AdapterError("INVALID_ENUM", "memory_type is not supported")
+        self._validate_on_change_freshness(provenance, freshness)
         if scope_context.scope == "CROSS_PROJECT_WORKFLOW":
             if memory_type not in {"WORKFLOW_RULE", "DECISION_RATIONALE"}:
                 raise AdapterError("SCOPE_TYPE_MISMATCH", "memory_type is incompatible with CROSS_PROJECT_WORKFLOW")
@@ -1370,7 +1402,18 @@ class MemoryAdapter:
                     envelope["results"] = [self._public(equivalent)]
                     return self._fit_budget(envelope)
             else:
-                await self.engine.write_record(record, embedding, supersede_record_id=old["record_id"])
+                try:
+                    await self.engine.write_record(record, embedding, supersede_record_id=old["record_id"])
+                except RecordUniquenessConflict:
+                    concurrent_idempotent = await self.engine.find_idempotency(idempotency_key)
+                    if concurrent_idempotent:
+                        if concurrent_idempotent["payload_fingerprint"] != fingerprint:
+                            raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different update")
+                        envelope = self._base_envelope(request_id, "memory_update", scope_context)
+                        envelope["results"] = [self._public(concurrent_idempotent)]
+                        envelope["idempotent_replay"] = True
+                        return envelope
+                    raise AdapterError("WRITE_UNCONFIRMED", "concurrent update conflict could not be reconciled")
             readback_rows = await self.engine.get_record(new_memory_id, scope_context, history=True)
             readback = next((row for row in readback_rows if row["record_id"] == record_id), None)
             if not readback or not self._fresh_current(readback):

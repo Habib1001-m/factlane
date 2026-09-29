@@ -21,6 +21,14 @@ _WRITER_FUNCTION = "factlane_contract_v2_writer"
 _LEGACY_ORIGIN_JSON = canonical_json({"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None})
 
 
+class RecordUniquenessConflict(RuntimeError):
+    """Internal signal for an adapter-record UNIQUE race that must be reconciled above storage."""
+
+    def __init__(self, constraint: str) -> None:
+        super().__init__("adapter record uniqueness conflict")
+        self.constraint = constraint
+
+
 def register_storage_v2_writer(conn: sqlite3.Connection) -> None:
     """Mark one trusted FactLane connection as an authorized storage-v2 writer."""
     conn.create_function(_WRITER_FUNCTION, 0, lambda: 1)
@@ -557,6 +565,14 @@ class SQLiteVecEngine:
                             (record["native_content_hash"], superseded_native_hash),
                         )
                 self.conn.commit()
+            except sqlite3.IntegrityError as exc:
+                self.conn.rollback()
+                message = str(exc)
+                if "adapter_records.native_content_hash" in message:
+                    raise RecordUniquenessConflict("native_content_hash") from None
+                if "adapter_records.idempotency_key" in message:
+                    raise RecordUniquenessConflict("idempotency_key") from None
+                raise
             except Exception:
                 self.conn.rollback()
                 raise
@@ -971,6 +987,24 @@ class SQLiteVecEngine:
                 [value, *params, limit],
             ).fetchall()
             return [self._row_to_dict(row) for row in rows]
+
+        return await self._run(query)
+
+    async def has_unmaterialized_history(self, scope: ScopeContext) -> bool:
+        """Return whether compacted/corrupt historical rows are invisible to vector retrieval."""
+        where, params = self._scope_where(scope)
+
+        def query() -> bool:
+            assert self.conn is not None
+            row = self.conn.execute(
+                "SELECT 1 FROM adapter_records a "
+                "LEFT JOIN memories m ON m.content_hash = a.native_content_hash AND m.deleted_at IS NULL "
+                "LEFT JOIN memory_embeddings e ON e.rowid = m.id AND e.store = ? "
+                f"WHERE {where} AND a.lifecycle_state = 'HISTORICAL' "
+                "AND (m.id IS NULL OR e.rowid IS NULL) LIMIT 1",
+                [self.profile.profile_id, *params],
+            ).fetchone()
+            return row is not None
 
         return await self._run(query)
 

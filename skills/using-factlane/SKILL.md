@@ -31,6 +31,10 @@ This Skill describes Public Contract Revision 2.
 3. Select `EXACT`, `KEYWORD`, `SEMANTIC`, or `HYBRID`; use `CURRENT` normally and
    `REVIEW_HISTORY` for history.
 
+Compaction can remove vectors from `HISTORICAL` rows. `REVIEW_HISTORY` with `SEMANTIC` or
+`HYBRID` then reports `HISTORY_SEMANTIC_PARTIAL`; use `KEYWORD`/`EXACT` or `memory_get` when
+compacted history must not depend on vectors.
+
 For `CROSS_PROJECT_WORKFLOW`, allowed searches are `WORKFLOW_RULE + CURRENT`,
 `WORKFLOW_RULE + REVIEW_HISTORY`, and `HISTORICAL_QUESTION + REVIEW_HISTORY`.
 `GENERAL_TASK_NO_MEMORY_REQUIRED` returns `NO_MEMORY_NEEDED` after shape validation; other

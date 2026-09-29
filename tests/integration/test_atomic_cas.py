@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
 from factlane.contract import AdapterError
 from factlane.embeddings import EmbeddingProfile
@@ -243,3 +245,193 @@ def test_two_independent_clients_have_single_winner_for_same_revision(tmp_path) 
 
 def test_two_independent_replace_clients_cannot_fork_current_lineage(tmp_path) -> None:
     asyncio.run(_race_two_replace_updates(tmp_path))
+
+
+@pytest.mark.parametrize("mode", ["REVERIFY", "REPLACE"])
+def test_on_change_update_rejects_stale_fingerprint_before_mutation(tmp_path, mode: str) -> None:
+    async def run() -> None:
+        engine_a, _, adapter, adapter_b = await _open_clients(tmp_path, f"on-change-{mode.lower()}.db")
+        stamp = "2026-09-30T00:00:00Z"
+        try:
+            seed = await adapter.store(
+                fact="FactLane rejects stale on-change fingerprints before durable update mutation.",
+                scope="PROJECT",
+                memory_type="PROJECT_LEARNED_FACT",
+                source_provenance={
+                    "source_class": "CURRENT_REPO",
+                    "source_ref": "on-change-seed",
+                    "source_hash": "a" * 64,
+                    "review_ref": "external-review-remediation",
+                    "extraction_method": "AUTOMATED_CHECK",
+                },
+                freshness_policy={
+                    "kind": "on_change",
+                    "recheck_ref": "repo-state",
+                    "source_fingerprint": "a" * 64,
+                },
+                idempotency_key=f"on-change-seed-{mode.lower()}",
+                project_id="factlane",
+                source_timestamp=stamp,
+                last_verified_at=stamp,
+                verified_by="AUTOMATED_CHECK",
+                requested_lifecycle_state="VALIDATED_CURRENT",
+                tags=["subject:on-change-remediation"],
+            )
+            current = seed["results"][0]
+            scope = adapter._safe_scope("PROJECT", "factlane", None, None, None)
+            before = await engine_a.get_record(current["memory_id"], scope, history=True)
+
+            kwargs: dict[str, Any]
+            if mode == "REVERIFY":
+                kwargs = {
+                    "verification": {
+                        "source_provenance": {
+                            "source_class": "CURRENT_REPO",
+                            "source_ref": "on-change-reverify",
+                            "source_hash": "b" * 64,
+                            "review_ref": "external-review-remediation",
+                            "extraction_method": "AUTOMATED_CHECK",
+                        },
+                        "source_timestamp": stamp,
+                        "verified_by": "AUTOMATED_CHECK",
+                    }
+                }
+            else:
+                kwargs = {
+                    "replacement": {
+                        "fact": "FactLane replacement must align on-change provenance and freshness before commit.",
+                        "memory_type": "PROJECT_LEARNED_FACT",
+                        "source_provenance": {
+                            "source_class": "CURRENT_REPO",
+                            "source_ref": "on-change-replace",
+                            "source_hash": "b" * 64,
+                            "review_ref": "external-review-remediation",
+                            "extraction_method": "AUTOMATED_CHECK",
+                        },
+                        "freshness_policy": {
+                            "kind": "on_change",
+                            "recheck_ref": "repo-state",
+                            "source_fingerprint": "a" * 64,
+                        },
+                        "source_timestamp": stamp,
+                        "verified_by": "AUTOMATED_CHECK",
+                        "tags": ["subject:on-change-remediation"],
+                    }
+                }
+
+            with pytest.raises(AdapterError) as error:
+                await adapter.update(
+                    memory_id=current["memory_id"],
+                    scope="PROJECT",
+                    project_id="factlane",
+                    expected_revision=1,
+                    mode=mode,
+                    idempotency_key=f"on-change-update-{mode.lower()}",
+                    **kwargs,
+                )
+            assert error.value.code == "INVALID_FRESHNESS"
+
+            after = await engine_a.get_record(current["memory_id"], scope, history=True)
+            assert [(row["record_id"], row["revision"], row["lifecycle_state"]) for row in after] == [
+                (before[0]["record_id"], 1, "VALIDATED_CURRENT")
+            ]
+            assert (await engine_a.status(scope))["counts"]["VALIDATED_CURRENT"] == 1
+            assert (await engine_a.status(scope))["counts"]["SUPERSEDED"] == 0
+        finally:
+            await adapter.close()
+            await adapter_b.close()
+
+    asyncio.run(run())
+
+
+def test_concurrent_duplicate_store_returns_governed_duplicate_not_sqlite_error(tmp_path) -> None:
+    async def run() -> None:
+        engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "duplicate-store.db")
+        _install_write_barrier(engine_a, engine_b)
+        stamp = "2026-09-30T00:00:00Z"
+
+        async def store(adapter: MemoryAdapter, key: str) -> dict[str, Any]:
+            return await adapter.store(
+                fact="Concurrent duplicate admission resolves through the governed duplicate contract.",
+                scope="PROJECT",
+                project_id="factlane",
+                memory_type="PROJECT_LEARNED_FACT",
+                source_provenance={
+                    "source_class": "CURRENT_REPO",
+                    "source_ref": key,
+                    "source_hash": "c" * 64,
+                    "review_ref": "external-review-remediation",
+                    "extraction_method": "AUTOMATED_CHECK",
+                },
+                freshness_policy={"kind": "manual"},
+                idempotency_key=key,
+                source_timestamp=stamp,
+                last_verified_at=stamp,
+                verified_by="AUTOMATED_CHECK",
+                requested_lifecycle_state="VALIDATED_CURRENT",
+                tags=["subject:duplicate-store-remediation"],
+            )
+
+        try:
+            outcomes = await asyncio.gather(
+                store(adapter_a, "duplicate-store-a"),
+                store(adapter_b, "duplicate-store-b"),
+                return_exceptions=True,
+            )
+            assert all(isinstance(outcome, dict) for outcome in outcomes), outcomes
+            statuses = sorted(outcome["status"] for outcome in outcomes if isinstance(outcome, dict))
+            assert statuses == ["DUPLICATE", "OK"]
+        finally:
+            await adapter_a.close()
+            await adapter_b.close()
+
+    asyncio.run(run())
+
+
+def test_concurrent_idempotency_collision_returns_stable_conflict_not_sqlite_error(tmp_path) -> None:
+    async def run() -> None:
+        engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "idempotency-store.db")
+        _install_write_barrier(engine_a, engine_b)
+        stamp = "2026-09-30T00:00:00Z"
+
+        async def store(adapter: MemoryAdapter, source_ref: str, fact: str) -> dict[str, Any]:
+            return await adapter.store(
+                fact=fact,
+                scope="PROJECT",
+                project_id="factlane",
+                memory_type="PROJECT_LEARNED_FACT",
+                source_provenance={
+                    "source_class": "CURRENT_REPO",
+                    "source_ref": source_ref,
+                    "source_hash": ("d" if source_ref.endswith("a") else "e") * 64,
+                    "review_ref": "external-review-remediation",
+                    "extraction_method": "AUTOMATED_CHECK",
+                },
+                freshness_policy={"kind": "manual"},
+                idempotency_key="shared-idempotency-race",
+                source_timestamp=stamp,
+                last_verified_at=stamp,
+                verified_by="AUTOMATED_CHECK",
+                requested_lifecycle_state="VALIDATED_CURRENT",
+                tags=[f"subject:{source_ref}"],
+            )
+
+        try:
+            outcomes = await asyncio.gather(
+                store(adapter_a, "idempotency-a", "Concurrent idempotency payload A."),
+                store(adapter_b, "idempotency-b", "Concurrent idempotency payload B."),
+                return_exceptions=True,
+            )
+            successes = [outcome for outcome in outcomes if isinstance(outcome, dict)]
+            conflicts = [
+                outcome
+                for outcome in outcomes
+                if isinstance(outcome, AdapterError) and outcome.code == "IDEMPOTENCY_CONFLICT"
+            ]
+            assert len(successes) == 1
+            assert len(conflicts) == 1
+        finally:
+            await adapter_a.close()
+            await adapter_b.close()
+
+    asyncio.run(run())

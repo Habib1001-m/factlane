@@ -236,8 +236,22 @@ async def _verify_compaction_and_restart(tmp_path) -> None:
             retrieval_mode="REVIEW_HISTORY",
             retrieval_mode_kind="SEMANTIC",
         )
+        assert semantic_history["status"] == "DEGRADED"
+        assert semantic_history["degradation"] == "HISTORY_SEMANTIC_PARTIAL"
         assert old["record_id"] not in {row["record_id"] for row in semantic_history["results"]}
         assert current["record_id"] in {row["record_id"] for row in semantic_history["results"]}
+
+        hybrid_history = await adapter.search(
+            query=old["fact"],
+            intent_class="HISTORICAL_QUESTION",
+            scope="PROJECT",
+            project_id="factlane",
+            retrieval_mode="REVIEW_HISTORY",
+            retrieval_mode_kind="HYBRID",
+        )
+        assert hybrid_history["status"] == "DEGRADED"
+        assert hybrid_history["degradation"] == "HISTORY_SEMANTIC_PARTIAL"
+        assert old["record_id"] in {row["record_id"] for row in hybrid_history["results"]}
 
         current_get = await adapter.get(
             memory_id=current["memory_id"],
