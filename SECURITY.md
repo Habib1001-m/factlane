@@ -53,8 +53,10 @@ synthetic reproduction that demonstrates the issue.
 - FactLane is not a distributed coordination system.
 - Housekeeping is not an automatic background retention service, backup system, or
   disaster-recovery subsystem.
-- Authoritative backup/restore acceptance and final real-host production-path acceptance
-  are not yet part of the final production-grade claim.
+- Controlled Codex/Hermes real-host qualification is accepted evidence for the qualified
+  post-R2 identity, but it does not by itself make this checkout/package a deployed or
+  publicly released security baseline. Authoritative backup/restore acceptance is not yet
+  part of the final production-grade claim.
 - Retrieval specificity under Arabic/mixed-language and document-crowding cases remains
   a known quality limitation; it is not treated as an authority or scope bypass.
 

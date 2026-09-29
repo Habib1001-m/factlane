@@ -23,6 +23,14 @@ FactLane does not automatically download models. The model required by the selec
 profile must already exist in the local Ollama runtime and match the exact identity
 pinned by that profile. Provider identity or dimension mismatches fail closed.
 
+The public distribution also includes the portable `using-factlane` Skill. In a source
+checkout it is at `skills/using-factlane/SKILL.md`; a built wheel carries the same artifact
+under `share/factlane/skills/using-factlane/SKILL.md`. The live MCP schemas remain the
+authoritative request interface, but the Skill is the behavioral baseline for normal
+natural-use operation. MCP-only use is appropriate for protocol/mechanical integration.
+Wheel installation does not auto-register the Skill or change host configuration; expose
+the shipped artifact through the host's supported Skill discovery/installation mechanism.
+
 If you want to reproduce the **current tested FactLane deployment** rather than choose a
 profile for your own workload, install the model used by that deployment:
 
@@ -87,7 +95,7 @@ Choose a model/profile for **your** language mix, fact shape, latency target, ha
 quality target, and operating cost. A result from this project's data is not a guarantee
 that another user's data will produce the same ranking.
 
-The current release does not accept a remote embedding endpoint. The provider interface
+The current implementation does not accept a remote embedding endpoint. The provider interface
 is an explicit product boundary, so a remote/provider-specific implementation can be
 added in future work, but that is not a supported runtime feature today.
 
@@ -95,6 +103,9 @@ added in future work, but that is not a supported runtime feature today.
 
 Codex is one of the tested FactLane hosts. Configure a stdio MCP server in Codex and use
 a stable host ID such as `codex`.
+
+The public package does not ship the private Codex enhancement plugin used in controlled
+qualification. Normal natural-use guidance comes from the portable `using-factlane` Skill.
 
 Example `~/.codex/config.toml` entry reproducing the current tested profile:
 
@@ -116,6 +127,9 @@ Codex version, then verify that the five FactLane memory tools are visible.
 
 Hermes is the other currently tested FactLane host. Add a command-based stdio MCP server
 to `~/.hermes/config.yaml` and use a stable host ID such as `hermes`.
+
+The public package does not ship the private Hermes enhancement plugin used in controlled
+qualification. Normal natural-use guidance comes from the portable `using-factlane` Skill.
 
 ```yaml
 mcp_servers:
@@ -210,11 +224,15 @@ our controlled small-corpus tests.
 - Codex and Hermes are tested hosts; other stdio MCP clients are not individually
   certified yet.
 - The current embedding runtime is local Ollama over loopback HTTP only.
-- Remote embedding-provider support is not implemented in the current release.
+- Remote embedding-provider support is not implemented in the current implementation.
 - FactLane is a governed fact plane, not a raw transcript, repository dump, or bulk
   document-indexing product.
 - Production retrieval validation remains deferred until a curated real production corpus
   is prepared; historical experimental-corpus evaluation did not justify a ranking-policy
   change.
-- Final real-host production-path acceptance, production-corpus preparation/admission, and
-  authoritative backup/restore acceptance remain open closure items.
+- Controlled Codex/Hermes real-host natural-use qualification has passed for the project's
+  qualified post-R2 product identity. That evidence does not by itself claim that this
+  checkout/package has been merged, publicly released, or deployed.
+- Production-corpus preparation/admission, production retrieval validation,
+  authoritative backup/restore acceptance, and final public package/distribution review
+  remain open closure items.
