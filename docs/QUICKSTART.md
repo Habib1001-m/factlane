@@ -166,9 +166,9 @@ transport.
 ## 6. Verify the connection before storing anything
 
 The offline `factlane --help-tools` reference describes all five requests, scope rules,
-defaults, provenance, freshness, idempotency, and revision/CAS requirements. The optional
-[using-factlane Agent Skill](../skills/using-factlane/SKILL.md) provides portable guidance;
-clients remain compliant when they use the live MCP schemas without loading the Skill.
+defaults, provenance, freshness, idempotency, and revision/CAS requirements. The portable
+[using-factlane Agent Skill](../skills/using-factlane/SKILL.md) provides the normal-use behavioral baseline;
+live MCP schemas remain authoritative, and MCP-only use remains valid for protocol/mechanical integration.
 
 First verify that the client discovers exactly these normal tools:
 
