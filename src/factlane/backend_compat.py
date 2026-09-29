@@ -64,9 +64,21 @@ def assert_backend_class_contract(storage_class: type[Any]) -> None:
     initialize_signature = inspect.signature(initialize)
     if tuple(initialize_signature.parameters) != ("self",):
         raise _compatibility_error("pinned backend embedding initialization signature changed")
+    initialize_self = initialize_signature.parameters["self"]
+    if initialize_self.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD:
+        raise _compatibility_error("pinned backend embedding initialization signature changed")
+    if initialize_self.default is not inspect.Parameter.empty:
+        raise _compatibility_error("pinned backend embedding initialization signature changed")
 
     retry_signature = inspect.signature(retry)
     if tuple(retry_signature.parameters) != ("self", "operation", "max_retries", "initial_delay"):
+        raise _compatibility_error("pinned backend SQLite retry signature changed")
+    for name in ("self", "operation", "max_retries", "initial_delay"):
+        if retry_signature.parameters[name].kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD:
+            raise _compatibility_error("pinned backend SQLite retry signature changed")
+    if retry_signature.parameters["self"].default is not inspect.Parameter.empty:
+        raise _compatibility_error("pinned backend SQLite retry signature changed")
+    if retry_signature.parameters["operation"].default is not inspect.Parameter.empty:
         raise _compatibility_error("pinned backend SQLite retry signature changed")
     if retry_signature.parameters["max_retries"].default != 5:
         raise _compatibility_error("pinned backend SQLite retry count changed")
@@ -91,6 +103,8 @@ def bind_deferred_embedding_initializer(
     current = getattr(storage, "_initialize_embedding_model", None)
     if not inspect.iscoroutinefunction(current):
         raise _compatibility_error("pinned backend embedding initialization boundary changed")
+    if inspect.signature(current).parameters:
+        raise _compatibility_error("pinned backend embedding initialization signature changed")
     storage._initialize_embedding_model = initializer
 
 
@@ -98,4 +112,16 @@ async def execute_with_backend_retry(storage: Any, operation: Callable[[], Any])
     retry = getattr(storage, "_execute_with_retry", None)
     if not inspect.iscoroutinefunction(retry):
         raise _compatibility_error("pinned backend SQLite retry boundary changed")
+    retry_signature = inspect.signature(retry)
+    if tuple(retry_signature.parameters) != ("operation", "max_retries", "initial_delay"):
+        raise _compatibility_error("pinned backend SQLite retry signature changed")
+    for name in ("operation", "max_retries", "initial_delay"):
+        if retry_signature.parameters[name].kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD:
+            raise _compatibility_error("pinned backend SQLite retry signature changed")
+    if retry_signature.parameters["operation"].default is not inspect.Parameter.empty:
+        raise _compatibility_error("pinned backend SQLite retry signature changed")
+    if retry_signature.parameters["max_retries"].default != 5:
+        raise _compatibility_error("pinned backend SQLite retry count changed")
+    if retry_signature.parameters["initial_delay"].default != 0.2:
+        raise _compatibility_error("pinned backend SQLite retry delay changed")
     return await retry(operation)

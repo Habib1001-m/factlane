@@ -14,6 +14,7 @@ from factlane.backend_compat import (
     PINNED_BACKEND_VERSION,
     assert_backend_class_contract,
     assert_pinned_backend_identity,
+    execute_with_backend_retry,
 )
 from factlane.contract import AdapterError
 from factlane.embeddings import EmbeddingProfile
@@ -123,12 +124,12 @@ def test_backend_malformed_vcs_provenance_fails_closed(monkeypatch) -> None:
     assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
 
 
-def test_private_signature_drift_fails_closed() -> None:
+def test_embedding_initializer_signature_drift_fails_closed() -> None:
     class DriftedStorage:
         async def _initialize_embedding_model(self, unexpected):
             return None
 
-        async def _execute_with_retry(self, operation, max_retries=9, initial_delay=0.2):
+        async def _execute_with_retry(self, operation, max_retries=5, initial_delay=0.2):
             return operation()
 
     with pytest.raises(AdapterError) as exc_info:
@@ -136,11 +137,34 @@ def test_private_signature_drift_fails_closed() -> None:
     assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
 
 
+def test_retry_parameter_kind_drift_fails_closed() -> None:
+    class DriftedStorage:
+        async def _initialize_embedding_model(self):
+            return None
+
+        async def _execute_with_retry(self, *, operation, max_retries=5, initial_delay=0.2):
+            return operation()
+
+    with pytest.raises(AdapterError) as exc_info:
+        assert_backend_class_contract(DriftedStorage)
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+
+
+def test_bound_retry_parameter_kind_drift_fails_closed() -> None:
+    class DriftedStorage:
+        async def _execute_with_retry(self, *, operation, max_retries=5, initial_delay=0.2):
+            return operation()
+
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(execute_with_backend_retry(DriftedStorage(), lambda: 42))
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+
+
 class FakeStorage:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def _execute_with_retry(self, operation):
+    async def _execute_with_retry(self, operation, max_retries=5, initial_delay=0.2):
         self.calls += 1
         return operation()
 
