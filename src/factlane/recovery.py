@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable
 
 from .contract import PUBLIC_TOOL_NAMES, canonical_json
 from .embeddings import EmbeddingProfile
-from .storage import SQLiteVecEngine
+from .storage import SQLiteVecEngine, register_storage_v2_writer
 
 
 _SAFE_OPERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -412,6 +412,7 @@ class SensitiveMemoryRecoveryOperator:
             raise RecoveryHold("HOLD_DB_NOT_FOUND_NO_MUTATION", "target database was not found")
         conn = sqlite3.connect(db_path, timeout=5.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
+        register_storage_v2_writer(conn)
         conn.execute("PRAGMA busy_timeout=5000")
         try:
             import sqlite_vec

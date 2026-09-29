@@ -8,11 +8,11 @@ from typing import Any
 
 import pytest
 
-from factlane.adapter import MemoryAdapter
+from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
 from factlane.contract import PUBLIC_TOOL_NAMES, ScopeContext
 from factlane.embeddings import EmbeddingProfile
 from factlane.recovery import MaintenanceLease, PM0, PM1, RecoveryHold, RecoveryPlan, RecoveryScope, RecoveryTarget, SensitiveMemoryRecoveryOperator
-from factlane.storage import SQLiteVecEngine
+from factlane.storage import SQLiteVecEngine, register_storage_v2_writer
 
 
 def profile() -> EmbeddingProfile:
@@ -48,7 +48,14 @@ async def _open_adapter(tmp_path: Path, filename: str = "memory.db") -> tuple[SQ
     p = profile()
     engine = SQLiteVecEngine(str(tmp_path / filename), p)
     await engine.open()
-    return engine, MemoryAdapter(engine, FixedProvider(p))  # type: ignore[arg-type]
+    return engine, MemoryAdapter(
+        engine,
+        FixedProvider(p),  # type: ignore[arg-type]
+        trusted_write_context=trusted_write_context_for_profile(
+            "owner-current",
+            contributor_ref="sensitive-recovery-tests",
+        ),
+    )
 
 
 def _provenance(key: str, marker: str) -> dict[str, str]:
@@ -450,7 +457,11 @@ def test_r13_review_history_returns_only_safe_tombstone_after_purge(tmp_path: Pa
         )
         reopened = SQLiteVecEngine(str(tmp_path / "memory.db"), profile())
         await reopened.open()
-        reviewer = MemoryAdapter(reopened, FixedProvider(profile()))  # type: ignore[arg-type]
+        reviewer = MemoryAdapter(
+            reopened,
+            FixedProvider(profile()),  # type: ignore[arg-type]
+            trusted_write_context=trusted_write_context_for_profile("read-only"),
+        )
         try:
             result = await reviewer.get(memory_id=row["memory_id"], scope="PROJECT", project_id="factlane", retrieval_mode="REVIEW_HISTORY")
             return result
@@ -660,6 +671,9 @@ def test_r21_resume_rejects_drifted_recovery_tombstone(tmp_path: Path) -> None:
         _run(plan, tmp_path, operator=FailSealOnce(foreign_handle_provider=lambda _: []))
     conn = sqlite3.connect(db)
     try:
+        # This test intentionally simulates trusted internal post-commit drift. Raw
+        # legacy writers remain fenced by the dedicated storage-v2 negative control.
+        register_storage_v2_writer(conn)
         conn.execute("UPDATE adapter_records SET tags = '[\"drifted\"]' WHERE record_id = ?", (row["record_id"],))
         conn.commit()
     finally:

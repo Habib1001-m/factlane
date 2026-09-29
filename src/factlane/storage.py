@@ -21,6 +21,11 @@ _WRITER_FUNCTION = "factlane_contract_v2_writer"
 _LEGACY_ORIGIN_JSON = canonical_json({"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None})
 
 
+def register_storage_v2_writer(conn: sqlite3.Connection) -> None:
+    """Mark one trusted FactLane connection as an authorized storage-v2 writer."""
+    conn.create_function(_WRITER_FUNCTION, 0, lambda: 1)
+
+
 _RECORD_COLUMNS = (
     "record_id",
     "memory_id",
@@ -110,7 +115,7 @@ class SQLiteVecEngine:
             self.conn = storage.conn
             if self.conn is None:
                 raise AdapterError("BACKEND_UNAVAILABLE", "SQLite-vec backend did not expose a connection")
-            self.conn.create_function(_WRITER_FUNCTION, 0, lambda: 1)
+            register_storage_v2_writer(self.conn)
             actual_dimension = await self._run(self._read_dimension)
             if actual_dimension != self.profile.output_dimension:
                 await self.close()
