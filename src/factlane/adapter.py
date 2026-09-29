@@ -845,6 +845,7 @@ class MemoryAdapter:
             raise AdapterError("INVALID_ENUM", "memory_type is not supported")
         provenance = validate_provenance(source_provenance)
         freshness = validate_freshness(freshness_policy)
+        self._validate_on_change_freshness(provenance, freshness)
         validate_identifier(idempotency_key, "idempotency_key", required=True)
         source_timestamp = self._normalize_timestamp(source_timestamp)
         last_verified_at = self._normalize_timestamp(last_verified_at)

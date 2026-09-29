@@ -344,6 +344,47 @@ def test_on_change_update_rejects_stale_fingerprint_before_mutation(tmp_path, mo
     asyncio.run(run())
 
 
+def test_on_change_store_rejects_stale_fingerprint_before_mutation(tmp_path) -> None:
+    async def run() -> None:
+        engine_a, _, adapter, adapter_b = await _open_clients(tmp_path, "on-change-store.db")
+        scope = adapter._safe_scope("PROJECT", "factlane", None, None, None)
+        try:
+            with pytest.raises(AdapterError) as error:
+                await adapter.store(
+                    fact="Initial on-change current admission must align source fingerprint before commit.",
+                    scope="PROJECT",
+                    project_id="factlane",
+                    memory_type="PROJECT_LEARNED_FACT",
+                    source_provenance={
+                        "source_class": "CURRENT_REPO",
+                        "source_ref": "on-change-store",
+                        "source_hash": "b" * 64,
+                        "review_ref": "external-review-remediation",
+                        "extraction_method": "AUTOMATED_CHECK",
+                    },
+                    freshness_policy={
+                        "kind": "on_change",
+                        "recheck_ref": "repo-state",
+                        "source_fingerprint": "a" * 64,
+                    },
+                    idempotency_key="on-change-store-mismatch",
+                    source_timestamp="2026-09-30T00:00:00Z",
+                    last_verified_at="2026-09-30T00:00:00Z",
+                    verified_by="AUTOMATED_CHECK",
+                    requested_lifecycle_state="VALIDATED_CURRENT",
+                    tags=["subject:on-change-store-remediation"],
+                )
+            assert error.value.code == "INVALID_FRESHNESS"
+            status = await engine_a.status(scope)
+            assert status["counts"]["VALIDATED_CURRENT"] == 0
+            assert status["counts"]["CANDIDATE"] == 0
+        finally:
+            await adapter.close()
+            await adapter_b.close()
+
+    asyncio.run(run())
+
+
 def test_concurrent_duplicate_store_returns_governed_duplicate_not_sqlite_error(tmp_path) -> None:
     async def run() -> None:
         engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "duplicate-store.db")
