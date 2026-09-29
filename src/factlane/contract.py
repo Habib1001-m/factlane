@@ -9,8 +9,9 @@ from datetime import datetime, timedelta, timezone
 from collections.abc import Iterable
 from typing import Any
 
+PUBLIC_CONTRACT_REVISION = 2
 PUBLIC_TOOL_NAMES = ("memory_search", "memory_get", "memory_store", "memory_update", "memory_status")
-SCOPES = {"GLOBAL_USER", "PROJECT", "WORKFLOW", "TOOL_ENVIRONMENT"}
+SCOPES = {"GLOBAL_USER", "PROJECT", "WORKFLOW", "TOOL_ENVIRONMENT", "CROSS_PROJECT_WORKFLOW"}
 INTENT_CLASSES = {
     "CURRENT_PROJECT_STATE",
     "PROJECT_DESIGN_RATIONALE",
@@ -197,6 +198,12 @@ def validate_scope(
             )
     elif scope == "TOOL_ENVIRONMENT" and not agent_id:
         raise AdapterError("UNKNOWN_AGENT", "TOOL_ENVIRONMENT requires an exact agent_id")
+    elif scope == "CROSS_PROJECT_WORKFLOW":
+        if any(value is not None for value in (project_id, worktree_id, workflow_id, agent_id)):
+            raise AdapterError(
+                "CROSS_SCOPE_DENIED",
+                "CROSS_PROJECT_WORKFLOW cannot carry project_id, worktree_id, workflow_id, or agent_id",
+            )
     return ScopeContext(scope, project_id, worktree_id, workflow_id, agent_id)
 
 

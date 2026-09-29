@@ -7,9 +7,9 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .adapter import PROFILE_DEFINITIONS, MemoryAdapter
+from .adapter import PROFILE_DEFINITIONS, MemoryAdapter, trusted_write_context_for_profile
 from .contract import AdapterError
-from .gateway import HostBinding, MemoryGateway
+from .gateway import HostBinding, MemoryGateway, TrustedContextBinding
 from .public_contract import (
     MemoryGetRequest,
     MemorySearchRequest,
@@ -98,11 +98,35 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--tokenizer-path", default=None)
     parser.add_argument("--host-id", required=True, help="stable non-secret host label (required for server launch)")
     parser.add_argument("--binding-source", default="explicit-launcher")
+    parser.add_argument("--project-id", default=None, help="trusted exact current project identity, when available")
+    parser.add_argument("--workflow-id", default=None, help="trusted exact current workflow identity, when available")
+    parser.add_argument("--agent-id", default=None, help="trusted exact current tool/agent identity, when available")
+    parser.add_argument("--project-id-source", default=None, help="trusted provenance label for project_id")
+    parser.add_argument("--workflow-id-source", default=None, help="trusted provenance label for workflow_id")
+    parser.add_argument("--agent-id-source", default=None, help="trusted provenance label for agent_id")
+    parser.add_argument("--context-binding-source", default="explicit-launcher")
+    parser.add_argument(
+        "--write-profile",
+        choices=("read-only", "delegated-candidate", "owner-current", "repo-verifier", "automated-verifier"),
+        default="read-only",
+        help="trusted launcher write profile; omission is fail-closed read-only, while writing agents require an explicit grant",
+    )
     parser.add_argument("--help-tools", action="store_true", help="print the complete five-tool request reference")
     parser.add_argument("--help-tool", choices=sorted(TOOL_DESCRIPTIONS), help="print one tool's request reference")
     args = parser.parse_args(raw_argv)
     try:
         binding = HostBinding(args.host_id, STDIO_TRANSPORT, args.binding_source)
+        context_binding = None
+        if any(value is not None for value in (args.project_id, args.workflow_id, args.agent_id)):
+            context_binding = TrustedContextBinding(
+                project_id=args.project_id,
+                workflow_id=args.workflow_id,
+                agent_id=args.agent_id,
+                project_id_source=args.project_id_source,
+                workflow_id_source=args.workflow_id_source,
+                agent_id_source=args.agent_id_source,
+                binding_source=args.context_binding_source,
+            )
     except AdapterError as exc:
         parser.error(exc.safe_message)
     adapter = asyncio.run(
@@ -111,10 +135,20 @@ def main(argv: list[str] | None = None) -> None:
             args.profile,
             ollama_url=args.ollama_url,
             tokenizer_path=args.tokenizer_path,
+            trusted_write_context=trusted_write_context_for_profile(
+                args.write_profile,
+                contributor_ref=args.host_id,
+                grant_ref=f"launcher:{args.write_profile}:{args.host_id}",
+            ),
         )
     )
     try:
-        gateway = MemoryGateway(adapter, binding, transport_kind=STDIO_TRANSPORT)
+        gateway = MemoryGateway(
+            adapter,
+            binding,
+            transport_kind=STDIO_TRANSPORT,
+            context_binding=context_binding,
+        )
         build_mcp_server(gateway).run(STDIO_TRANSPORT)
     finally:
         asyncio.run(adapter.close())

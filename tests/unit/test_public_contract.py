@@ -10,7 +10,9 @@ from typing import Any
 
 import pytest
 
-from factlane.adapter import MemoryAdapter
+from mcp.server.fastmcp.exceptions import ToolError
+
+from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
 from factlane.contract import (
     INTENT_CLASSES,
     PUBLIC_TOOL_NAMES,
@@ -94,14 +96,15 @@ def test_public_store_schema_does_not_ask_agents_to_choose_derived_authority() -
     assert "authority_role" not in store["properties"]
 
 
-def test_public_search_ignores_legacy_routing_hints_at_the_mcp_boundary() -> None:
+def test_public_mcp_preserves_unknown_fields_for_policy_rejection() -> None:
     class RecordingAdapter:
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
 
-        async def search(self, **request: Any) -> dict[str, Any]:
-            self.calls.append(request)
-            return {"status": "OK", "results": [], "audit": {}}
+        async def dispatch(self, operation: str, request: dict[str, Any]) -> dict[str, Any]:
+            assert operation == "memory_search"
+            self.calls.append(request.copy())
+            raise AdapterError("INVALID_ENVELOPE", "unknown field reached raw policy")
 
     adapter = RecordingAdapter()
     server = build_mcp_server(
@@ -111,25 +114,89 @@ def test_public_search_ignores_legacy_routing_hints_at_the_mcp_boundary() -> Non
             transport_kind="stdio",
         )
     )
-    asyncio.run(
-        server.call_tool(
+    with pytest.raises(ToolError):
+        asyncio.run(server.call_tool(
             "memory_search",
-            {
-                "request": {
-                    "query": "lifecycle policy",
-                    "intent_class": "WORKFLOW_RULE",
-                    "scope": "PROJECT",
-                    "project_id": "factlane",
-                    "include_graph_links": True,
-                    "direct_truth_available": False,
-                    "user_supplied": True,
-                }
-            },
+            {"request": {
+                "query": "lifecycle policy",
+                "intent_class": "WORKFLOW_RULE",
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "unknown_extra": "must-not-be-stripped",
+            }},
+        ))
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0]["unknown_extra"] == "must-not-be-stripped"
+
+
+class _PublicBoundaryAdapter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def dispatch(self, operation: str, request: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((operation, request.copy()))
+        return {"status": "OK", "results": [], "audit": {}}
+
+
+@pytest.mark.parametrize("claim", ["authority_role", "trusted_write_context", "write_capability"])
+def test_public_mcp_reserved_claims_are_rejected_before_adapter(claim: str) -> None:
+    adapter = _PublicBoundaryAdapter()
+    server = build_mcp_server(
+        MemoryGateway(
+            adapter,
+            HostBinding("contract-test", "stdio", "unit-test"),
+            transport_kind="stdio",
         )
     )
+    with pytest.raises(ToolError):
+        asyncio.run(server.call_tool(
+            "memory_status",
+            {"request": {"scope": "PROJECT", "project_id": "factlane", claim: "spoofed"}},
+        ))
+    assert adapter.calls == []
 
-    assert len(adapter.calls) == 1
-    assert not {"include_graph_links", "direct_truth_available", "user_supplied"}.intersection(adapter.calls[0])
+
+def test_public_mcp_preserves_explicit_null_identity_for_cross_scope_policy_error() -> None:
+    class RecordingAdapter:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def dispatch(self, operation: str, request: dict[str, Any]) -> dict[str, Any]:
+            assert operation == "memory_status"
+            self.calls.append(request.copy())
+            raise AdapterError("CROSS_SCOPE_DENIED", "explicit null identity key is still present")
+
+    adapter = RecordingAdapter()
+    server = build_mcp_server(
+        MemoryGateway(
+            adapter,
+            HostBinding("contract-test", "stdio", "unit-test"),
+            transport_kind="stdio",
+        )
+    )
+    with pytest.raises(ToolError, match="explicit null identity key"):
+        asyncio.run(
+            server.call_tool(
+                "memory_status",
+                {"request": {"scope": "CROSS_PROJECT_WORKFLOW", "project_id": None}},
+            )
+        )
+    assert adapter.calls == [{"scope": "CROSS_PROJECT_WORKFLOW", "project_id": None}]
+
+
+def test_public_request_schemas_are_closed_even_when_runtime_preserves_raw_extras() -> None:
+    for name in TOOL_NAMES:
+        schema = _request_schema(name)
+        assert schema.get("additionalProperties") is False
+        assert schema.get("x-factlane-public-contract-revision") == 2
+
+
+def test_help_documents_cross_project_search_and_freshness_matrix() -> None:
+    help_text = render_tool_help()
+    assert "CROSS_PROJECT_WORKFLOW search matrix" in help_text
+    assert "GENERAL_TASK_NO_MEMORY_REQUIRED -> NO_MEMORY_NEEDED after scope-shape validation" in help_text
+    assert "on_change requires non-empty recheck_ref and source_fingerprint" in help_text
+    assert "source_fingerprint must equal source_provenance.source_hash" in help_text
 
 
 def test_store_and_update_contracts_explain_governed_write_fields() -> None:
@@ -212,7 +279,9 @@ def test_scope_error_names_exact_identity_requirements() -> None:
 
 
 def test_retrieval_and_update_errors_list_safe_choices() -> None:
-    adapter = MemoryAdapter(object(), object())  # validation stops before engine/provider use
+    adapter = MemoryAdapter(
+        object(), object(), trusted_write_context=trusted_write_context_for_profile("owner-current")
+    )  # validation stops before engine/provider use
     with pytest.raises(AdapterError) as retrieval_error:
         asyncio.run(
             adapter.search(
@@ -250,8 +319,10 @@ def test_write_validation_errors_explain_required_governance_fields() -> None:
     assert "manual" in freshness_error.value.safe_message
 
 
-def test_scope_authority_error_names_the_derived_role() -> None:
-    adapter = MemoryAdapter(object(), object())
+def test_public_scope_authority_claim_is_denied_before_role_derivation() -> None:
+    adapter = MemoryAdapter(
+        object(), object(), trusted_write_context=trusted_write_context_for_profile("owner-current")
+    )
     with pytest.raises(AdapterError) as error:
         asyncio.run(
             adapter.store(
@@ -276,7 +347,8 @@ def test_scope_authority_error_names_the_derived_role() -> None:
             )
         )
 
-    assert "PROJECT_CURRENT" in error.value.safe_message
+    assert error.value.code == "WRITE_AUTHORIZATION_DENIED"
+    assert "trusted or derived authority" in error.value.safe_message
 
 
 def test_replace_error_explains_conditional_replacement_requirements() -> None:
@@ -300,7 +372,9 @@ def test_replace_error_explains_conditional_replacement_requirements() -> None:
                 }
             ]
 
-    adapter = MemoryAdapter(ExistingRecordEngine(), object())
+    adapter = MemoryAdapter(
+        ExistingRecordEngine(), object(), trusted_write_context=trusted_write_context_for_profile("owner-current")
+    )
     with pytest.raises(AdapterError) as error:
         asyncio.run(
             adapter.update(

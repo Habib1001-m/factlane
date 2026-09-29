@@ -8,10 +8,11 @@ from typing import Any
 import pytest
 from mcp.server.fastmcp import FastMCP
 
-from factlane.adapter import MemoryAdapter
+import factlane.server as server_module
+from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
 from factlane.contract import AdapterError
 from factlane.embeddings import EmbeddingProfile
-from factlane.gateway import HostBinding, MemoryGateway
+from factlane.gateway import HostBinding, MemoryGateway, TrustedContextBinding
 from factlane.server import build_mcp_server
 from factlane.storage import SQLiteVecEngine
 
@@ -20,20 +21,8 @@ class FakeAdapter:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def search(self, **request: Any) -> dict[str, Any]:
-        return self._response("memory_search", request)
-
-    async def get(self, **request: Any) -> dict[str, Any]:
-        return self._response("memory_get", request)
-
-    async def store(self, **request: Any) -> dict[str, Any]:
-        return self._response("memory_store", request)
-
-    async def update(self, **request: Any) -> dict[str, Any]:
-        return self._response("memory_update", request)
-
-    async def status(self, **request: Any) -> dict[str, Any]:
-        return self._response("memory_status", request)
+    async def dispatch(self, operation: str, request: dict[str, Any]) -> dict[str, Any]:
+        return self._response(operation, request)
 
     def _response(self, operation: str, request: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((operation, request.copy()))
@@ -55,11 +44,17 @@ class FakeAdapter:
         }
 
 
-def gateway(*, host_id: str = "host-a", adapter: Any | None = None) -> MemoryGateway:
+def gateway(
+    *,
+    host_id: str = "host-a",
+    adapter: Any | None = None,
+    context_binding: TrustedContextBinding | None = None,
+) -> MemoryGateway:
     return MemoryGateway(
         adapter or FakeAdapter(),
         HostBinding(host_id, "stdio", "trusted-launcher"),
         transport_kind="stdio",
+        context_binding=context_binding,
     )
 
 
@@ -204,6 +199,122 @@ def test_non_stdio_gateway_transport_fails_closed() -> None:
     assert error.value.code == "HOST_TRANSPORT_IDENTITY_MISMATCH"
 
 
+def test_server_omitted_write_profile_is_fail_closed_read_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeRuntimeAdapter:
+        async def close(self) -> None:
+            captured["closed"] = True
+
+    class FakeMemoryAdapter:
+        @classmethod
+        async def create(cls, *args: Any, **kwargs: Any) -> FakeRuntimeAdapter:
+            captured["trusted_write_context"] = kwargs["trusted_write_context"]
+            return FakeRuntimeAdapter()
+
+    class FakeServer:
+        def run(self, transport: str) -> None:
+            captured["transport"] = transport
+
+    monkeypatch.setattr(server_module, "MemoryAdapter", FakeMemoryAdapter)
+    monkeypatch.setattr(server_module, "build_mcp_server", lambda gateway: FakeServer())
+
+    server_module.main(["--db", str(tmp_path / "unused.db"), "--host-id", "test-host"])
+
+    context = captured["trusted_write_context"]
+    assert context.authorization_class == "READ_ONLY"
+    assert context.permitted_operations == frozenset()
+    assert context.max_lifecycle == "NONE"
+    assert captured["transport"] == "stdio"
+    assert captured["closed"] is True
+
+
+def test_server_builds_trusted_context_binding_from_launcher_args(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeRuntimeAdapter:
+        async def close(self) -> None:
+            captured["closed"] = True
+
+    class FakeMemoryAdapter:
+        @classmethod
+        async def create(cls, *args: Any, **kwargs: Any) -> FakeRuntimeAdapter:
+            return FakeRuntimeAdapter()
+
+    class FakeServer:
+        def run(self, transport: str) -> None:
+            captured["transport"] = transport
+
+    def capture_gateway(bound: MemoryGateway) -> FakeServer:
+        captured["context_binding"] = bound.context_binding
+        return FakeServer()
+
+    monkeypatch.setattr(server_module, "MemoryAdapter", FakeMemoryAdapter)
+    monkeypatch.setattr(server_module, "build_mcp_server", capture_gateway)
+
+    server_module.main(
+        [
+            "--db",
+            str(tmp_path / "unused.db"),
+            "--host-id",
+            "test-host",
+            "--project-id",
+            "github.com/example/project",
+            "--workflow-id",
+            "workflow-a",
+            "--agent-id",
+            "codex-session",
+            "--project-id-source",
+            "git-origin",
+            "--workflow-id-source",
+            "host-env-FACTLANE_WORKFLOW_ID",
+            "--agent-id-source",
+            "host-config",
+            "--context-binding-source",
+            "session-bootstrap",
+        ]
+    )
+
+    binding = captured["context_binding"]
+    assert isinstance(binding, TrustedContextBinding)
+    assert binding.project_id == "github.com/example/project"
+    assert binding.workflow_id == "workflow-a"
+    assert binding.agent_id == "codex-session"
+    assert binding.project_id_source == "git-origin"
+    assert binding.workflow_id_source == "host-env-FACTLANE_WORKFLOW_ID"
+    assert binding.agent_id_source == "host-config"
+    assert binding.binding_source == "session-bootstrap"
+    assert captured["transport"] == "stdio"
+    assert captured["closed"] is True
+
+
+def test_server_rejects_workflow_context_without_project_before_adapter_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def adapter_must_not_start(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("adapter startup must not run with an invalid trusted context binding")
+
+    monkeypatch.setattr(server_module.MemoryAdapter, "create", adapter_must_not_start)
+
+    with pytest.raises(SystemExit) as error:
+        server_module.main(
+            [
+                "--db",
+                str(tmp_path / "unused.db"),
+                "--host-id",
+                "test-host",
+                "--workflow-id",
+                "workflow-a",
+            ]
+        )
+
+    assert error.value.code == 2
+
+
 def test_gateway_instances_have_distinct_internal_identities() -> None:
     first = gateway()
     second = gateway(host_id="host-b")
@@ -224,6 +335,182 @@ def test_host_binding_does_not_rewrite_scope_agent_id() -> None:
     assert response["scope"]["agent_id"] == "scope-agent"
     assert response["audit"]["host_binding"]["host_id"] == "host-a"
     assert response["scope"]["agent_id"] != response["audit"]["host_binding"]["host_id"]
+
+
+def test_trusted_context_binding_validation_and_immutability() -> None:
+    binding = TrustedContextBinding(
+        project_id="github.com/example/project",
+        workflow_id="workflow-a",
+        agent_id="codex-session",
+        binding_source="session-bootstrap",
+    )
+
+    assert binding.project_id == "github.com/example/project"
+    assert binding.workflow_id == "workflow-a"
+    assert binding.agent_id == "codex-session"
+    assert binding.project_id_source == "session-bootstrap"
+    assert binding.workflow_id_source == "session-bootstrap"
+    assert binding.agent_id_source == "session-bootstrap"
+    with pytest.raises(FrozenInstanceError):
+        binding.project_id = "spoofed"  # type: ignore[misc]
+
+    with pytest.raises(AdapterError) as empty_error:
+        TrustedContextBinding()
+    assert empty_error.value.code == "INVALID_CONTEXT_BINDING"
+
+    with pytest.raises(AdapterError) as workflow_error:
+        TrustedContextBinding(workflow_id="workflow-a")
+    assert workflow_error.value.code == "INVALID_CONTEXT_BINDING"
+
+
+def test_project_scope_injects_missing_trusted_project_identity() -> None:
+    adapter = FakeAdapter()
+    binding = TrustedContextBinding(
+        project_id="github.com/example/project",
+        binding_source="session-bootstrap",
+    )
+
+    response = asyncio.run(
+        gateway(adapter=adapter, context_binding=binding).dispatch(
+            "memory_status",
+            {"scope": "PROJECT"},
+        )
+    )
+
+    assert response["scope"]["project_id"] == "github.com/example/project"
+    assert adapter.calls == [
+        ("memory_status", {"scope": "PROJECT", "project_id": "github.com/example/project"})
+    ]
+
+
+def test_matching_explicit_project_identity_is_allowed_but_conflict_fails_closed() -> None:
+    adapter = FakeAdapter()
+    binding = TrustedContextBinding(
+        project_id="github.com/example/project",
+        binding_source="session-bootstrap",
+    )
+    bound = gateway(adapter=adapter, context_binding=binding)
+
+    asyncio.run(
+        bound.dispatch(
+            "memory_status",
+            {"scope": "PROJECT", "project_id": "github.com/example/project"},
+        )
+    )
+    with pytest.raises(AdapterError) as error:
+        asyncio.run(
+            bound.dispatch(
+                "memory_status",
+                {"scope": "PROJECT", "project_id": "other-project"},
+            )
+        )
+
+    assert error.value.code == "BOUND_CONTEXT_IDENTITY_MISMATCH"
+    assert len(adapter.calls) == 1
+
+
+def test_workflow_scope_injects_exact_trusted_project_and_workflow_identities() -> None:
+    adapter = FakeAdapter()
+    binding = TrustedContextBinding(
+        project_id="github.com/example/project",
+        workflow_id="workflow-a",
+        binding_source="session-bootstrap",
+    )
+
+    response = asyncio.run(
+        gateway(adapter=adapter, context_binding=binding).dispatch(
+            "memory_status",
+            {"scope": "WORKFLOW"},
+        )
+    )
+
+    assert response["scope"]["project_id"] == "github.com/example/project"
+    assert response["scope"]["workflow_id"] == "workflow-a"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project_id", "other-project"),
+        ("workflow_id", "different-workflow"),
+    ],
+)
+def test_workflow_scope_rejects_conflicting_caller_identity(field: str, value: str) -> None:
+    adapter = FakeAdapter()
+    binding = TrustedContextBinding(
+        project_id="github.com/example/project",
+        workflow_id="workflow-a",
+        binding_source="session-bootstrap",
+    )
+    request = {"scope": "WORKFLOW", field: value}
+
+    with pytest.raises(AdapterError) as error:
+        asyncio.run(gateway(adapter=adapter, context_binding=binding).dispatch("memory_status", request))
+
+    assert error.value.code == "BOUND_CONTEXT_IDENTITY_MISMATCH"
+    assert adapter.calls == []
+
+
+def test_tool_environment_scope_injects_bound_agent_without_conflating_host_id() -> None:
+    binding = TrustedContextBinding(agent_id="codex-session", binding_source="session-bootstrap")
+
+    response = asyncio.run(
+        gateway(context_binding=binding).dispatch(
+            "memory_status",
+            {"scope": "TOOL_ENVIRONMENT"},
+        )
+    )
+
+    assert response["scope"]["agent_id"] == "codex-session"
+    assert response["audit"]["host_binding"]["host_id"] == "host-a"
+    assert response["audit"]["context_binding"]["agent_id"] == "codex-session"
+    assert response["scope"]["agent_id"] != response["audit"]["host_binding"]["host_id"]
+
+
+@pytest.mark.parametrize("scope", ["GLOBAL_USER", "CROSS_PROJECT_WORKFLOW"])
+def test_identity_free_scopes_do_not_receive_trusted_bound_identities(scope: str) -> None:
+    adapter = FakeAdapter()
+    binding = TrustedContextBinding(
+        project_id="github.com/example/project",
+        workflow_id="workflow-a",
+        agent_id="codex-session",
+        binding_source="session-bootstrap",
+    )
+
+    response = asyncio.run(
+        gateway(adapter=adapter, context_binding=binding).dispatch(
+            "memory_status",
+            {"scope": scope},
+        )
+    )
+
+    assert response["scope"]["project_id"] is None
+    assert response["scope"]["workflow_id"] is None
+    assert response["scope"]["agent_id"] is None
+    assert adapter.calls == [("memory_status", {"scope": scope})]
+
+
+def test_context_binding_audit_is_gateway_owned_and_caller_cannot_claim_it() -> None:
+    adapter = FakeAdapter()
+    binding = TrustedContextBinding(project_id="project-a", binding_source="session-bootstrap")
+    bound = gateway(adapter=adapter, context_binding=binding)
+    first = asyncio.run(bound.dispatch("memory_status", {"scope": "PROJECT"}))
+    first["audit"]["context_binding"]["project_id"] = "spoofed"
+    second = asyncio.run(bound.dispatch("memory_status", {"scope": "PROJECT"}))
+
+    assert second["audit"]["context_binding"] == {
+        "binding_source": "session-bootstrap",
+        "project_id": "project-a",
+        "project_id_source": "session-bootstrap",
+    }
+    with pytest.raises(AdapterError) as error:
+        asyncio.run(
+            bound.dispatch(
+                "memory_status",
+                {"scope": "PROJECT", "context_binding": "spoofed"},
+            )
+        )
+    assert error.value.code == "HOST_IDENTITY_CLAIM_DENIED"
 
 
 def test_audit_binding_is_gateway_owned_bounded_and_immutable() -> None:
@@ -353,8 +640,16 @@ def test_sequential_cross_gateway_visibility_uses_one_disposable_store(tmp_path:
         engine_b = SQLiteVecEngine(str(db_path), provider_b.profile)
         await engine_a.open()
         await engine_b.open()
-        adapter_a = MemoryAdapter(engine_a, provider_a)
-        adapter_b = MemoryAdapter(engine_b, provider_b)
+        adapter_a = MemoryAdapter(
+            engine_a,
+            provider_a,
+            trusted_write_context=trusted_write_context_for_profile("automated-verifier"),
+        )
+        adapter_b = MemoryAdapter(
+            engine_b,
+            provider_b,
+            trusted_write_context=trusted_write_context_for_profile("read-only"),
+        )
         gateway_a = MemoryGateway(
             adapter_a,
             HostBinding("host-a", "stdio", "trusted-launcher"),

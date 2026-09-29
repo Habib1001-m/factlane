@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from factlane.adapter import MemoryAdapter
+from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
 from factlane.contract import AdapterError
 from factlane.embeddings import EmbeddingProfile
 from factlane.storage import SQLiteVecEngine
@@ -71,8 +71,9 @@ async def _open_clients(tmp_path, filename: str):
     engine_b = SQLiteVecEngine(db_path, embedding_profile)
     await engine_a.open()
     await engine_b.open()
-    adapter_a = MemoryAdapter(engine_a, FakeProvider(embedding_profile))  # type: ignore[arg-type]
-    adapter_b = MemoryAdapter(engine_b, FakeProvider(embedding_profile))  # type: ignore[arg-type]
+    context = trusted_write_context_for_profile("automated-verifier")
+    adapter_a = MemoryAdapter(engine_a, FakeProvider(embedding_profile), trusted_write_context=context)  # type: ignore[arg-type]
+    adapter_b = MemoryAdapter(engine_b, FakeProvider(embedding_profile), trusted_write_context=context)  # type: ignore[arg-type]
     return engine_a, engine_b, adapter_a, adapter_b
 
 
@@ -94,7 +95,7 @@ async def _seed_current(adapter: MemoryAdapter, *, key: str, fact: str) -> dict[
         project_id="factlane",
         source_timestamp=stamp,
         last_verified_at=stamp,
-        verified_by="OWNER",
+        verified_by="AUTOMATED_CHECK",
         requested_lifecycle_state="VALIDATED_CURRENT",
         confidence=0.95,
         tags=["subject:atomic-cas", "atomic-cas"],

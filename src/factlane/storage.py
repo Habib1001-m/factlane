@@ -11,6 +11,10 @@ from typing import Any
 from .contract import AdapterError, ScopeContext, canonical_json, parse_iso
 from .embeddings import EmbeddingProfile
 
+STORAGE_CONTRACT_VERSION = 2
+_WRITER_FUNCTION = "factlane_contract_v2_writer"
+_LEGACY_ORIGIN_JSON = canonical_json({"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None})
+
 
 _RECORD_COLUMNS = (
     "record_id",
@@ -30,6 +34,7 @@ _RECORD_COLUMNS = (
     "last_verified_at",
     "verified_by",
     "authority_role",
+    "contribution_origin",
     "freshness_policy",
     "supersedes",
     "contradiction_key",
@@ -99,6 +104,9 @@ class SQLiteVecEngine:
             await storage.initialize(strict_dimension_check=True)
             self.storage = storage
             self.conn = storage.conn
+            if self.conn is None:
+                raise AdapterError("BACKEND_UNAVAILABLE", "SQLite-vec backend did not expose a connection")
+            self.conn.create_function(_WRITER_FUNCTION, 0, lambda: 1)
             actual_dimension = await self._run(self._read_dimension)
             if actual_dimension != self.profile.output_dimension:
                 await self.close()
@@ -151,56 +159,110 @@ class SQLiteVecEngine:
         assert self.conn is not None
         return {row[1] for row in self.conn.execute("PRAGMA table_info(memories)").fetchall()}
 
+    def _migration_checkpoint(self, name: str) -> None:
+        """Private no-op seam used to prove transactional migration rollback."""
+        return None
+
     def _create_adapter_schema(self) -> None:
         assert self.conn is not None
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS adapter_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS adapter_records (
-                record_id TEXT PRIMARY KEY,
-                memory_id TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                parent_record_id TEXT,
-                scope TEXT NOT NULL,
-                project_id TEXT,
-                worktree_id TEXT,
-                workflow_id TEXT,
-                agent_id TEXT,
-                memory_type TEXT NOT NULL,
-                fact TEXT NOT NULL,
-                source_provenance TEXT NOT NULL,
-                source_timestamp TEXT,
-                created_at TEXT NOT NULL,
-                last_verified_at TEXT,
-                verified_by TEXT NOT NULL,
-                authority_role TEXT NOT NULL,
-                freshness_policy TEXT NOT NULL,
-                supersedes TEXT NOT NULL,
-                contradiction_key TEXT NOT NULL,
-                contradiction_state TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                tags TEXT NOT NULL,
-                lifecycle_state TEXT NOT NULL,
-                native_content_hash TEXT NOT NULL UNIQUE,
-                payload_fingerprint TEXT NOT NULL,
-                idempotency_key TEXT NOT NULL UNIQUE,
-                embedding_profile_id TEXT NOT NULL,
-                embedding_model_digest TEXT NOT NULL,
-                embedding_output_dimension INTEGER NOT NULL,
-                CHECK (confidence >= 0.0 AND confidence <= 1.0)
-            );
-            CREATE INDEX IF NOT EXISTS idx_adapter_scope_current
-                ON adapter_records(scope, project_id, worktree_id, workflow_id, agent_id, lifecycle_state);
-            CREATE INDEX IF NOT EXISTS idx_adapter_memory_id
-                ON adapter_records(memory_id, revision);
-            CREATE INDEX IF NOT EXISTS idx_adapter_contradiction
-                ON adapter_records(contradiction_key, lifecycle_state);
-            """
-        )
-        self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS adapter_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            version_row = self.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='contract_version'"
+            ).fetchone()
+            if version_row is not None:
+                try:
+                    existing_version = int(version_row[0])
+                except (TypeError, ValueError) as exc:
+                    raise AdapterError("SCHEMA_MISMATCH", "storage contract version is invalid") from exc
+                if existing_version not in {1, STORAGE_CONTRACT_VERSION}:
+                    raise AdapterError("SCHEMA_MISMATCH", "storage contract version is unsupported")
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS adapter_records (
+                    record_id TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    parent_record_id TEXT,
+                    scope TEXT NOT NULL,
+                    project_id TEXT,
+                    worktree_id TEXT,
+                    workflow_id TEXT,
+                    agent_id TEXT,
+                    memory_type TEXT NOT NULL,
+                    fact TEXT NOT NULL,
+                    source_provenance TEXT NOT NULL,
+                    source_timestamp TEXT,
+                    created_at TEXT NOT NULL,
+                    last_verified_at TEXT,
+                    verified_by TEXT NOT NULL,
+                    authority_role TEXT NOT NULL,
+                    contribution_origin TEXT,
+                    freshness_policy TEXT NOT NULL,
+                    supersedes TEXT NOT NULL,
+                    contradiction_key TEXT NOT NULL,
+                    contradiction_state TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    tags TEXT NOT NULL,
+                    lifecycle_state TEXT NOT NULL,
+                    native_content_hash TEXT NOT NULL UNIQUE,
+                    payload_fingerprint TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    embedding_profile_id TEXT NOT NULL,
+                    embedding_model_digest TEXT NOT NULL,
+                    embedding_output_dimension INTEGER NOT NULL,
+                    CHECK (confidence >= 0.0 AND confidence <= 1.0)
+                )
+                """
+            )
+            columns = {row[1] for row in self.conn.execute("PRAGMA table_info(adapter_records)")}
+            migrating_v1 = "contribution_origin" not in columns
+            if migrating_v1:
+                self.conn.execute("ALTER TABLE adapter_records ADD COLUMN contribution_origin TEXT")
+                self._migration_checkpoint("after_add_field")
+            self.conn.execute(
+                "UPDATE adapter_records SET contribution_origin = ? WHERE contribution_origin IS NULL",
+                (_LEGACY_ORIGIN_JSON,),
+            )
+            if migrating_v1:
+                self._migration_checkpoint("after_backfill")
+            remaining_null = self.conn.execute(
+                "SELECT COUNT(*) FROM adapter_records WHERE contribution_origin IS NULL"
+            ).fetchone()[0]
+            if remaining_null:
+                raise AdapterError("SCHEMA_MISMATCH", "storage v2 contribution-origin backfill is incomplete")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_adapter_scope_current "
+                "ON adapter_records(scope, project_id, worktree_id, workflow_id, agent_id, lifecycle_state)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_adapter_memory_id ON adapter_records(memory_id, revision)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_adapter_contradiction ON adapter_records(contradiction_key, lifecycle_state)"
+            )
+            for name, action in (
+                ("factlane_v2_adapter_insert_fence", "INSERT"),
+                ("factlane_v2_adapter_update_fence", "UPDATE"),
+                ("factlane_v2_adapter_delete_fence", "DELETE"),
+            ):
+                self.conn.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {action} ON adapter_records "
+                    f"WHEN {_WRITER_FUNCTION}() != 1 BEGIN "
+                    "SELECT RAISE(ABORT, 'FACTLANE_STORAGE_V2_WRITER_REQUIRED'); END"
+                )
+            self.conn.execute(
+                "INSERT INTO adapter_meta(key, value) VALUES ('contract_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(STORAGE_CONTRACT_VERSION),),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def _check_profile(self) -> None:
         assert self.conn is not None
@@ -225,7 +287,6 @@ class SQLiteVecEngine:
                 raise AdapterError("PROFILE_MISMATCH", "pilot database contains a different embedding profile")
         else:
             self.conn.execute("INSERT INTO adapter_meta(key, value) VALUES (?, ?)", ("embedding_profile", canonical_json(expected)))
-            self.conn.execute("INSERT INTO adapter_meta(key, value) VALUES (?, ?)", ("contract_version", "1"))
             self.conn.commit()
 
     @staticmethod
@@ -318,6 +379,52 @@ class SQLiteVecEngine:
 
         return await self._run(query)
 
+    def _insert_materialized_record(self, record: dict[str, Any], embedding: list[float]) -> None:
+        """Insert one adapter/native/vector record inside an existing transaction."""
+        assert self.conn is not None
+        values = [
+            record["record_id"], record["memory_id"], record["revision"], record.get("parent_record_id"),
+            record["scope"], record.get("project_id"), record.get("worktree_id"), record.get("workflow_id"),
+            record.get("agent_id"), record["memory_type"], record["fact"], canonical_json(record["source_provenance"]),
+            record.get("source_timestamp"), record["created_at"], record.get("last_verified_at"), record["verified_by"],
+            record["authority_role"], canonical_json(record.get("contribution_origin") or {"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None}),
+            canonical_json(record["freshness_policy"]), canonical_json(record.get("supersedes", [])), record["contradiction_key"],
+            record["contradiction_state"], record["confidence"], canonical_json(record.get("tags", [])), record["lifecycle_state"],
+            record["native_content_hash"], record["payload_fingerprint"], record["idempotency_key"], record["embedding_profile_id"],
+            record["embedding_model_digest"], record["embedding_output_dimension"],
+        ]
+        self.conn.execute(
+            f"INSERT INTO adapter_records ({','.join(_RECORD_COLUMNS)}) VALUES ({','.join('?' for _ in _RECORD_COLUMNS)})",
+            values,
+        )
+        native_metadata = canonical_json({
+            "adapter_record_id": record["record_id"], "adapter_memory_id": record["memory_id"],
+            "embedding_profile_id": record["embedding_profile_id"], "lifecycle_state": record["lifecycle_state"],
+        })
+        native_values: dict[str, Any] = {
+            "content_hash": record["native_content_hash"], "content": record["fact"], "tags": ",".join(record.get("tags", [])),
+            "memory_type": record["memory_type"], "metadata": native_metadata,
+            "created_at": parse_iso(record["created_at"], required=True).timestamp(),
+            "updated_at": parse_iso(record["created_at"], required=True).timestamp(),
+            "created_at_iso": record["created_at"], "updated_at_iso": record["created_at"], "store": self.profile.profile_id,
+        }
+        if "confidence" in self.native_columns:
+            native_values["confidence"] = record["confidence"]
+        if "last_accessed" in self.native_columns:
+            native_values["last_accessed"] = None
+        native_fields = [field for field in native_values if field in self.native_columns]
+        cursor = self.conn.execute(
+            f"INSERT INTO memories ({','.join(native_fields)}) VALUES ({','.join('?' for _ in native_fields)})",
+            [native_values[field] for field in native_fields],
+        )
+        if cursor.lastrowid is None:
+            raise sqlite3.IntegrityError("native memory rowid was not returned")
+        from sqlite_vec import serialize_float32
+        self.conn.execute(
+            "INSERT INTO memory_embeddings (rowid, content_embedding, store) VALUES (?, ?, ?)",
+            (cursor.lastrowid, serialize_float32(embedding), self.profile.profile_id),
+        )
+
     async def write_record(
         self,
         record: dict[str, Any],
@@ -344,6 +451,18 @@ class SQLiteVecEngine:
                         raise AdapterError("VERSION_CONFLICT", "update lineage parent does not match expected revision")
                     superseded_native_hash = str(old[0])
 
+                if record["lifecycle_state"] == "VALIDATED_CURRENT":
+                    exact_scope = ScopeContext(record["scope"], record.get("project_id"), record.get("worktree_id"), record.get("workflow_id"), record.get("agent_id"))
+                    where, params = self._scope_where(exact_scope)
+                    current_rows = self.conn.execute(self._select_sql(f"WHERE a.contradiction_key=? AND a.lifecycle_state='VALIDATED_CURRENT' AND {where} ORDER BY a.created_at, a.record_id"), [record["contradiction_key"], *params]).fetchall()
+                    incoming_fact = " ".join(str(record["fact"]).casefold().split())
+                    for current_row in current_rows:
+                        current = self._row_to_dict(current_row)
+                        if supersede_record_id and current["record_id"] == supersede_record_id:
+                            continue
+                        if " ".join(str(current["fact"]).casefold().split()) != incoming_fact:
+                            raise AdapterError("CONTRADICTION", "a different validated current fact already exists for this contradiction key")
+
                 values = [
                     record["record_id"],
                     record["memory_id"],
@@ -362,6 +481,10 @@ class SQLiteVecEngine:
                     record.get("last_verified_at"),
                     record["verified_by"],
                     record["authority_role"],
+                    canonical_json(
+                        record.get("contribution_origin")
+                        or {"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None}
+                    ),
                     canonical_json(record["freshness_policy"]),
                     canonical_json(record.get("supersedes", [])),
                     record["contradiction_key"],
@@ -437,6 +560,72 @@ class SQLiteVecEngine:
                 raise
 
         await self._run(transaction)
+
+    async def promote_candidate(
+        self,
+        record: dict[str, Any],
+        embedding: list[float],
+        scope: ScopeContext,
+        *,
+        expected_record_id: str,
+        expected_revision: int,
+    ) -> dict[str, Any] | None:
+        """Atomically promote one exact Candidate lineage parent to validated current."""
+        where, params = self._scope_where(scope)
+
+        def transaction() -> dict[str, Any] | None:
+            assert self.conn is not None
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                parent_row = self.conn.execute(
+                    self._select_sql(
+                        f"WHERE a.memory_id=? AND a.record_id=? AND a.revision=? "
+                        f"AND a.lifecycle_state='CANDIDATE' AND {where}"
+                    ),
+                    [record["memory_id"], expected_record_id, expected_revision, *params],
+                ).fetchone()
+                if parent_row is None:
+                    raise AdapterError("VERSION_CONFLICT", "candidate lineage parent no longer matches expected record and revision")
+                parent = self._row_to_dict(parent_row)
+                if parent["contradiction_state"] in {"UNRESOLVED", "QUARANTINED"}:
+                    raise AdapterError("CONTRADICTION", "candidate has an unresolved contradiction and cannot be promoted")
+                if record.get("parent_record_id") != expected_record_id or record.get("revision") != expected_revision + 1:
+                    raise AdapterError("VERSION_CONFLICT", "promotion successor does not match candidate lineage")
+
+                current_rows = self.conn.execute(
+                    self._select_sql(
+                        f"WHERE a.contradiction_key=? AND a.lifecycle_state='VALIDATED_CURRENT' AND {where} "
+                        "ORDER BY a.created_at, a.record_id"
+                    ),
+                    [parent["contradiction_key"], *params],
+                ).fetchall()
+                for current_row in current_rows:
+                    current = self._row_to_dict(current_row)
+                    if " ".join(current["fact"].casefold().split()) == " ".join(parent["fact"].casefold().split()):
+                        self.conn.commit()
+                        return current
+                    raise AdapterError("CONTRADICTION", "a different validated current fact already exists for this contradiction key")
+
+                self._insert_materialized_record(record, embedding)
+                updated = self.conn.execute(
+                    "UPDATE adapter_records SET lifecycle_state='SUPERSEDED' "
+                    "WHERE record_id=? AND memory_id=? AND revision=? AND lifecycle_state='CANDIDATE'",
+                    (expected_record_id, record["memory_id"], expected_revision),
+                )
+                if updated.rowcount != 1:
+                    raise AdapterError("VERSION_CONFLICT", "candidate lineage changed during promotion")
+                if "superseded_by" in self.native_columns:
+                    self.conn.execute(
+                        "UPDATE memories SET superseded_by=? WHERE content_hash=?",
+                        (record["native_content_hash"], parent["native_content_hash"]),
+                    )
+                self.conn.commit()
+                return None
+            except Exception:
+                self.conn.rollback()
+                raise
+
+        return await self._run(transaction)
 
     async def compact_superseded_record(self, record_id: str) -> bool:
         """Compact one fully materialized superseded record into history."""
@@ -719,22 +908,39 @@ class SQLiteVecEngine:
         history: bool,
     ) -> list[tuple[dict[str, Any], float]]:
         where, params = self._scope_where(scope)
-        lifecycle = "" if history else " AND a.lifecycle_state IN ('VALIDATED_CURRENT', 'CANDIDATE')"
 
         def query() -> list[tuple[dict[str, Any], float]]:
             assert self.conn is not None
             from sqlite_vec import serialize_float32
 
             columns = ", ".join(f"a.{column}" for column in _RECORD_COLUMNS)
-            rows = self.conn.execute(
-                f"SELECT {columns}, e.distance FROM adapter_records a "
-                "JOIN memories m ON m.content_hash = a.native_content_hash "
-                "JOIN (SELECT rowid, distance FROM memory_embeddings "
-                "WHERE content_embedding MATCH ? AND k = ? AND store = ?) e ON e.rowid = m.id "
-                f"WHERE m.deleted_at IS NULL AND {where}{lifecycle} "
-                "ORDER BY e.distance ASC LIMIT ?",
-                [serialize_float32(vector), max(limit * 4, limit), self.profile.profile_id, *params, limit],
-            ).fetchall()
+            if history:
+                rows = self.conn.execute(
+                    f"SELECT {columns}, e.distance FROM adapter_records a "
+                    "JOIN memories m ON m.content_hash = a.native_content_hash "
+                    "JOIN (SELECT rowid, distance FROM memory_embeddings "
+                    "WHERE content_embedding MATCH ? AND k = ? AND store = ?) e ON e.rowid = m.id "
+                    f"WHERE m.deleted_at IS NULL AND {where} "
+                    "ORDER BY e.distance ASC LIMIT ?",
+                    [serialize_float32(vector), max(limit * 4, limit), self.profile.profile_id, *params, limit],
+                ).fetchall()
+            else:
+                eligible_where, eligible_params = self._scope_where(scope, alias="eligible")
+                rows = self.conn.execute(
+                    f"SELECT {columns}, e.distance FROM adapter_records a "
+                    "JOIN memories m ON m.content_hash = a.native_content_hash "
+                    "JOIN (SELECT rowid, distance FROM memory_embeddings "
+                    "WHERE content_embedding MATCH ? "
+                    "AND rowid IN ("
+                    "SELECT native.id FROM memories native "
+                    "JOIN adapter_records eligible ON eligible.native_content_hash = native.content_hash "
+                    f"WHERE native.deleted_at IS NULL AND {eligible_where} "
+                    "AND eligible.lifecycle_state = 'VALIDATED_CURRENT') "
+                    "AND k = ? AND store = ?) e ON e.rowid = m.id "
+                    f"WHERE m.deleted_at IS NULL AND {where} AND a.lifecycle_state = 'VALIDATED_CURRENT' "
+                    "ORDER BY e.distance ASC LIMIT ?",
+                    [serialize_float32(vector), *eligible_params, limit, self.profile.profile_id, *params, limit],
+                ).fetchall()
             return [(self._row_to_dict(row[:-1]), float(row[-1])) for row in rows]
 
         return await self._run(query)
@@ -749,7 +955,7 @@ class SQLiteVecEngine:
         exact: bool = False,
     ) -> list[dict[str, Any]]:
         where, params = self._scope_where(scope)
-        lifecycle = "" if history else " AND a.lifecycle_state IN ('VALIDATED_CURRENT', 'CANDIDATE')"
+        lifecycle = "" if history else " AND a.lifecycle_state = 'VALIDATED_CURRENT'"
         operator = "=" if exact else "LIKE"
         value = query_text.casefold() if exact else f"%{query_text.casefold()}%"
 

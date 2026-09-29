@@ -13,7 +13,7 @@ A connected agent gets five normal memory operations:
 - `memory_search` — find validated facts in one exact scope;
 - `memory_get` — read one logical memory record;
 - `memory_store` — admit one bounded, provenance-bearing fact;
-- `memory_update` — reverify or explicitly replace a fact with revision/CAS protection;
+- `memory_update` — reverify/promote a reviewed Candidate or explicitly replace a current fact with revision/CAS protection;
 - `memory_status` — inspect bounded backend/profile health for one scope.
 
 FactLane keeps scope, freshness, authority, contradictions, lineage, idempotency, and
@@ -62,6 +62,12 @@ supports local command-based stdio MCP servers. Other clients are not individual
 certified yet, and HTTP/SSE MCP transport is not supported by the current FactLane
 server.
 
+### Public Contract Revision 2
+
+FactLane has five exact scopes. `CROSS_PROJECT_WORKFLOW` is for workflow doctrine that applies across projects and carries no `project_id`, `worktree_id`, `workflow_id`, or `agent_id`; those keys must be absent. Existing `WORKFLOW` remains project-bound and still requires exact `project_id` plus `workflow_id`. There is no implicit inheritance or cross-scope fanout.
+
+Normal agent connections use the `delegated-candidate` write profile: they may contribute bounded Candidates but cannot make themselves current by claiming Owner or verification authority in a request. Current verification is supplied by a separately trusted launcher profile such as `owner-current`, `repo-verifier`, or `automated-verifier`. Candidate review uses `REVIEW_HISTORY`; promotion uses `memory_update` with `REVERIFY`, `expected_revision`, and the Candidate `expected_record_id`.
+
 ## Embedding profiles
 
 The current FactLane deployment selected `embeddinggemma-300m-768` after project-specific
@@ -93,10 +99,10 @@ claim that one local model is appropriate for every scale.
 
 ```text
 MCP host / trusted launcher
-  -> HostBinding
+  -> HostBinding + immutable TrustedWriteContext
   -> stdio-only FastMCP boundary
   -> MemoryGateway
-  -> MemoryAdapter / five operations
+  -> MemoryAdapter.dispatch / five operations
        -> TruthRouter
        -> EmbeddingProvider
        -> SQLiteVecEngine

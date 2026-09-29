@@ -51,6 +51,7 @@ A normal launch needs:
 --db <path-to-sqlite-database>
 --profile <profile-id>
 --host-id <stable-non-secret-host-label>
+--write-profile <trusted-launch-profile>
 ```
 
 Example server command shape:
@@ -59,12 +60,15 @@ Example server command shape:
 /path/to/factlane/.venv/bin/factlane \
   --db /path/to/state/factlane.sqlite3 \
   --profile <profile-id> \
-  --host-id <host-id>
+  --host-id <host-id> \
+  --write-profile delegated-candidate
 ```
 
 The MCP client should normally launch this process for you over stdio. Running the
 server command directly is not an interactive application; it waits for an MCP client on
 stdin/stdout.
+
+`delegated-candidate` is the normal agent profile. It can contribute Candidates but cannot create `VALIDATED_CURRENT` records. Use `read-only` for a non-writing connection. `owner-current`, `repo-verifier`, and `automated-verifier` are trusted launcher/operator profiles for explicit verification workflows; they are not request fields an agent can self-assert.
 
 ### Models and profiles we evaluated
 
@@ -170,6 +174,16 @@ Then call `memory_status` with an exact scope. For example, a project-scoped che
   "project_id": "example-project"
 }
 ```
+
+The exact scopes are:
+
+- `GLOBAL_USER` — no project/workflow identity;
+- `PROJECT` — exact `project_id`;
+- `WORKFLOW` — exact `project_id` and `workflow_id`;
+- `TOOL_ENVIRONMENT` — exact `agent_id`;
+- `CROSS_PROJECT_WORKFLOW` — cross-project workflow doctrine with all four identity keys absent.
+
+For `CROSS_PROJECT_WORKFLOW`, normal recall uses `WORKFLOW_RULE + CURRENT`. Candidate or historical review uses `REVIEW_HISTORY`. A trusted verifier promotes a Candidate with `memory_update(mode=REVERIFY)` using both `expected_revision` and `expected_record_id`. The scope does not fan out into `PROJECT` or `WORKFLOW`; callers choose it explicitly.
 
 Do not start by importing a large body of context. FactLane is designed to admit small,
 reviewable facts with explicit scope, provenance, freshness, and authority semantics.

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
 from .contract import (
     CURRENT_LIFECYCLE,
+    PUBLIC_CONTRACT_REVISION,
     PUBLIC_TOOL_NAMES,
     RETRIEVAL_MODE_KINDS,
     RETRIEVAL_MODES,
+    SCOPES,
     UPDATE_MODES,
     MEMORY_TYPES,
     AdapterError,
@@ -33,6 +37,190 @@ from .contract import (
 from .embeddings import EmbeddingProvider, OllamaLocalProvider
 from .router import TruthRouter
 from .storage import SQLiteVecEngine
+
+_AUTHORIZATION_CLASSES = frozenset(
+    {"READ_ONLY", "DELEGATED_AGENT_CONTRIBUTION", "DIRECT_OWNER_OPERATOR", "TRUSTED_ADMIN_OPERATOR"}
+)
+_CONTRIBUTOR_CLASSES = frozenset({"OWNER", "DELEGATED_AGENT", "AUTOMATION", "INGESTION_OPERATOR", "LEGACY_UNKNOWN"})
+_CURRENT_VERIFICATIONS = frozenset({"OWNER", "CURRENT_REPO_CHECK", "AUTOMATED_CHECK"})
+_RESERVED_TRUST_CLAIMS = frozenset(
+    {
+        "authority_role",
+        "contribution_origin",
+        "contributor_class",
+        "contributor_ref",
+        "effective_authority",
+        "effective_authority_role",
+        "effective_lifecycle",
+        "effective_lifecycle_state",
+        "effective_verified_by",
+        "grant_ref",
+        "owner_authorized",
+        "principal_class",
+        "public_contract_revision",
+        "public_contract_revision_override",
+        "runtime_contract_marker",
+        "storage_contract_version",
+        "trusted_actor",
+        "trusted_write_context",
+        "verification_authority",
+        "write_authorization",
+        "write_capability",
+    }
+)
+_IDENTITY_KEYS = frozenset({"project_id", "worktree_id", "workflow_id", "agent_id"})
+_SOURCE_PROVENANCE_FIELDS = frozenset(
+    {"source_class", "source_ref", "source_hash", "review_ref", "extraction_method", "source_fingerprint"}
+)
+_FRESHNESS_POLICY_FIELDS = frozenset({"kind", "ttl_seconds", "recheck_ref", "source_fingerprint"})
+_VERIFICATION_FIELDS = frozenset(
+    {
+        "source_provenance", "freshness_policy", "source_timestamp", "last_verified_at", "verified_by",
+        "memory_type", "confidence", "tags", "subject",
+    }
+)
+_REPLACEMENT_FIELDS = _VERIFICATION_FIELDS | frozenset({"fact"})
+_UNSET = object()
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedWriteContext:
+    """Immutable launcher-supplied write authority; never derived from an MCP request."""
+
+    authorization_class: str
+    permitted_operations: frozenset[str]
+    permitted_scopes: frozenset[str]
+    max_lifecycle: str
+    permitted_verifications: frozenset[str]
+    contributor_class: str
+    contributor_ref: str | None
+    grant_ref: str
+
+    def __post_init__(self) -> None:
+        if self.authorization_class not in _AUTHORIZATION_CLASSES:
+            raise AdapterError("INVALID_WRITE_CONTEXT", "authorization_class is invalid")
+        if not isinstance(self.permitted_operations, frozenset) or not self.permitted_operations.issubset(
+            {"memory_store", "memory_update"}
+        ):
+            raise AdapterError("INVALID_WRITE_CONTEXT", "permitted_operations is invalid")
+        if not isinstance(self.permitted_scopes, frozenset) or not self.permitted_scopes.issubset(SCOPES):
+            raise AdapterError("INVALID_WRITE_CONTEXT", "permitted_scopes is invalid")
+        if self.max_lifecycle not in {"NONE", "CANDIDATE", CURRENT_LIFECYCLE}:
+            raise AdapterError("INVALID_WRITE_CONTEXT", "max_lifecycle is invalid")
+        if not isinstance(self.permitted_verifications, frozenset) or not self.permitted_verifications.issubset(
+            _CURRENT_VERIFICATIONS
+        ):
+            raise AdapterError("INVALID_WRITE_CONTEXT", "permitted_verifications is invalid")
+        if self.contributor_class not in _CONTRIBUTOR_CLASSES:
+            raise AdapterError("INVALID_WRITE_CONTEXT", "contributor_class is invalid")
+        if self.authorization_class == "READ_ONLY":
+            if self.permitted_operations or self.max_lifecycle != "NONE" or self.permitted_verifications:
+                raise AdapterError(
+                    "INVALID_WRITE_CONTEXT",
+                    "READ_ONLY cannot carry write operations, writable lifecycle, or verification capability",
+                )
+        elif self.authorization_class == "DELEGATED_AGENT_CONTRIBUTION":
+            if (
+                not self.permitted_operations.issubset({"memory_store"})
+                or self.max_lifecycle != "CANDIDATE"
+                or self.permitted_verifications
+                or self.contributor_class != "DELEGATED_AGENT"
+            ):
+                raise AdapterError(
+                    "INVALID_WRITE_CONTEXT",
+                    "delegated contribution is Candidate-only and cannot carry current verification authority",
+                )
+        elif self.authorization_class == "DIRECT_OWNER_OPERATOR":
+            if (
+                self.max_lifecycle != CURRENT_LIFECYCLE
+                or not self.permitted_verifications
+                or not self.permitted_verifications.issubset({"OWNER"})
+                or self.contributor_class != "OWNER"
+            ):
+                raise AdapterError(
+                    "INVALID_WRITE_CONTEXT",
+                    "direct Owner operator requires bounded OWNER current-verification authority",
+                )
+        elif self.authorization_class == "TRUSTED_ADMIN_OPERATOR":
+            if (
+                self.max_lifecycle != CURRENT_LIFECYCLE
+                or not self.permitted_verifications
+                or not self.permitted_verifications.issubset({"CURRENT_REPO_CHECK", "AUTOMATED_CHECK"})
+                or self.contributor_class not in {"AUTOMATION", "INGESTION_OPERATOR"}
+            ):
+                raise AdapterError(
+                    "INVALID_WRITE_CONTEXT",
+                    "trusted admin authority is limited to explicitly granted repo/automated verification",
+                )
+        if self.contributor_ref is not None:
+            validate_identifier(self.contributor_ref, "contributor_ref", required=True)
+        validate_identifier(self.grant_ref, "grant_ref", required=True)
+
+
+@dataclass(frozen=True, slots=True)
+class _PolicyDecision:
+    token: object
+    operation: str
+    request_fingerprint: str
+
+
+def trusted_write_context_for_profile(
+    profile: str,
+    *,
+    contributor_ref: str | None = None,
+    grant_ref: str | None = None,
+) -> TrustedWriteContext:
+    """Build one bounded launcher profile; the result is immutable for the adapter lifetime."""
+
+    all_scopes = frozenset(SCOPES)
+    ref = grant_ref or f"profile:{profile}"
+    profiles: dict[str, TrustedWriteContext] = {
+        "read-only": TrustedWriteContext("READ_ONLY", frozenset(), all_scopes, "NONE", frozenset(), "LEGACY_UNKNOWN", contributor_ref, ref),
+        "delegated-candidate": TrustedWriteContext(
+            "DELEGATED_AGENT_CONTRIBUTION",
+            frozenset({"memory_store"}),
+            all_scopes,
+            "CANDIDATE",
+            frozenset(),
+            "DELEGATED_AGENT",
+            contributor_ref,
+            ref,
+        ),
+        "owner-current": TrustedWriteContext(
+            "DIRECT_OWNER_OPERATOR",
+            frozenset({"memory_store", "memory_update"}),
+            all_scopes,
+            CURRENT_LIFECYCLE,
+            frozenset({"OWNER"}),
+            "OWNER",
+            contributor_ref,
+            ref,
+        ),
+        "repo-verifier": TrustedWriteContext(
+            "TRUSTED_ADMIN_OPERATOR",
+            frozenset({"memory_store", "memory_update"}),
+            all_scopes,
+            CURRENT_LIFECYCLE,
+            frozenset({"CURRENT_REPO_CHECK"}),
+            "AUTOMATION",
+            contributor_ref,
+            ref,
+        ),
+        "automated-verifier": TrustedWriteContext(
+            "TRUSTED_ADMIN_OPERATOR",
+            frozenset({"memory_store", "memory_update"}),
+            all_scopes,
+            CURRENT_LIFECYCLE,
+            frozenset({"AUTOMATED_CHECK"}),
+            "AUTOMATION",
+            contributor_ref,
+            ref,
+        ),
+    }
+    try:
+        return profiles[profile]
+    except KeyError as exc:
+        raise AdapterError("INVALID_WRITE_CONTEXT", "trusted write profile is invalid") from exc
 
 MODEL_DIGESTS = {
     "nomic-embed-text:latest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
@@ -118,28 +306,324 @@ class MemoryAdapter:
     """Truth-router-backed, five-operation adapter over SQLite-vec."""
 
     TOOL_NAMES = PUBLIC_TOOL_NAMES
+    _PUBLIC_REQUEST_FIELDS = {
+        "memory_search": frozenset(
+            {
+                "query", "intent_class", "scope", "project_id", "worktree_id", "workflow_id", "agent_id",
+                "retrieval_mode", "retrieval_mode_kind", "top_k", "max_memories", "max_bytes", "max_tokens", "request_id",
+            }
+        ),
+        "memory_get": frozenset(
+            {"memory_id", "scope", "project_id", "worktree_id", "workflow_id", "agent_id", "retrieval_mode", "request_id"}
+        ),
+        "memory_store": frozenset(
+            {
+                "fact", "scope", "project_id", "worktree_id", "workflow_id", "agent_id", "memory_type",
+                "source_provenance", "freshness_policy", "idempotency_key", "source_timestamp", "last_verified_at",
+                "verified_by", "requested_lifecycle_state", "confidence", "tags", "subject", "request_id",
+            }
+        ),
+        "memory_update": frozenset(
+            {
+                "memory_id", "expected_record_id", "scope", "project_id", "worktree_id", "workflow_id", "agent_id",
+                "expected_revision", "mode", "idempotency_key", "replacement", "verification", "request_id",
+            }
+        ),
+        "memory_status": frozenset({"scope", "project_id", "worktree_id", "workflow_id", "agent_id", "request_id"}),
+    }
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_trusted_write_context" and hasattr(self, "_trusted_write_context"):
+            raise AttributeError("TrustedWriteContext is assign-once for the adapter lifetime")
+        super().__setattr__(name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name == "_trusted_write_context":
+            raise AttributeError("TrustedWriteContext is assign-once for the adapter lifetime")
+        super().__delattr__(name)
 
     def __init__(
         self,
         engine: SQLiteVecEngine,
         provider: EmbeddingProvider,
         *,
+        trusted_write_context: TrustedWriteContext,
         token_counter: TokenCounter | None = None,
         limits: AdapterLimits | None = None,
         runtime_agent_id: str = "factlane-local",
     ) -> None:
+        if not isinstance(trusted_write_context, TrustedWriteContext):
+            raise AdapterError("INVALID_WRITE_CONTEXT", "MemoryAdapter requires an immutable TrustedWriteContext")
         self.engine = engine
         self.provider = provider
+        self._trusted_write_context = trusted_write_context
         self.token_counter = token_counter or TokenCounter(None)
         self.limits = limits or AdapterLimits()
         self.runtime_agent_id = runtime_agent_id
         self.router = TruthRouter()
         self._write_lock: asyncio.Lock | None = None
+        self._policy_decision_var: ContextVar[_PolicyDecision | None] = ContextVar(
+            f"factlane_policy_decision_{id(self)}",
+            default=None,
+        )
 
     def _get_write_lock(self) -> asyncio.Lock:
         if self._write_lock is None:
             self._write_lock = asyncio.Lock()
         return self._write_lock
+
+    def _require_policy_token(self, token: object, operation: str, bound_values: dict[str, Any]) -> None:
+        active = self._policy_decision_var.get()
+        payload = {
+            key: value
+            for key, value in bound_values.items()
+            if key not in {"self", "_policy_token"}
+        }
+        if (
+            active is None
+            or token is not active.token
+            or operation != active.operation
+            or digest(payload) != active.request_fingerprint
+        ):
+            raise AdapterError("POLICY_BYPASS_DENIED", "adapter operation must enter through MemoryAdapter.dispatch")
+
+    @staticmethod
+    def _walk_keys(value: object) -> set[str]:
+        keys: set[str] = set()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if isinstance(key, str):
+                    keys.add(key)
+                keys.update(MemoryAdapter._walk_keys(child))
+        elif isinstance(value, list):
+            for child in value:
+                keys.update(MemoryAdapter._walk_keys(child))
+        return keys
+
+    @staticmethod
+    def _reject_unknown_mapping_fields(value: object, allowed: frozenset[str], path: str) -> None:
+        if not isinstance(value, dict):
+            return
+        unknown = set(value) - allowed
+        if unknown:
+            raise AdapterError(
+                "INVALID_ENVELOPE",
+                f"{path} contains unsupported fields: " + ", ".join(sorted(unknown)),
+            )
+
+    @classmethod
+    def _validate_nested_request_fields(cls, raw_request: dict[str, Any]) -> None:
+        cls._reject_unknown_mapping_fields(
+            raw_request.get("source_provenance"), _SOURCE_PROVENANCE_FIELDS, "source_provenance"
+        )
+        cls._reject_unknown_mapping_fields(
+            raw_request.get("freshness_policy"), _FRESHNESS_POLICY_FIELDS, "freshness_policy"
+        )
+        for field, allowed in (("verification", _VERIFICATION_FIELDS), ("replacement", _REPLACEMENT_FIELDS)):
+            payload = raw_request.get(field)
+            cls._reject_unknown_mapping_fields(payload, allowed, field)
+            if isinstance(payload, dict):
+                cls._reject_unknown_mapping_fields(
+                    payload.get("source_provenance"), _SOURCE_PROVENANCE_FIELDS, f"{field}.source_provenance"
+                )
+                cls._reject_unknown_mapping_fields(
+                    payload.get("freshness_policy"), _FRESHNESS_POLICY_FIELDS, f"{field}.freshness_policy"
+                )
+
+    @staticmethod
+    def _validate_cross_project_freshness(source_provenance: object, freshness_policy: object) -> None:
+        if not isinstance(source_provenance, dict) or not isinstance(freshness_policy, dict):
+            return
+        if "source_fingerprint" in source_provenance:
+            raise AdapterError(
+                "SCOPE_FRESHNESS_MISMATCH",
+                "CROSS_PROJECT_WORKFLOW uses freshness_policy.source_fingerprint as the sole fingerprint authority",
+            )
+        provenance = validate_provenance(source_provenance)
+        freshness = validate_freshness(freshness_policy)
+        kind = freshness["kind"]
+        if kind not in {"on_change", "manual"}:
+            raise AdapterError("INVALID_FRESHNESS", "CROSS_PROJECT_WORKFLOW freshness must be on_change or manual")
+        if kind == "on_change":
+            recheck_ref = freshness.get("recheck_ref")
+            fingerprint = freshness.get("source_fingerprint")
+            if not isinstance(recheck_ref, str) or not recheck_ref.strip():
+                raise AdapterError("INVALID_FRESHNESS", "on_change requires a non-empty freshness_policy.recheck_ref")
+            if fingerprint != provenance["source_hash"]:
+                raise AdapterError(
+                    "INVALID_FRESHNESS",
+                    "on_change freshness_policy.source_fingerprint must equal source_provenance.source_hash",
+                )
+        elif freshness.get("recheck_ref") is not None or freshness.get("source_fingerprint") is not None:
+            raise AdapterError(
+                "INVALID_FRESHNESS",
+                "manual CROSS_PROJECT_WORKFLOW freshness cannot carry recheck_ref or source_fingerprint",
+            )
+
+    @staticmethod
+    def _validate_cross_project_update_payload(payload: object, label: str) -> None:
+        if not isinstance(payload, dict):
+            return
+        memory_type = payload.get("memory_type")
+        if memory_type is not None and memory_type not in {"WORKFLOW_RULE", "DECISION_RATIONALE"}:
+            raise AdapterError("SCOPE_TYPE_MISMATCH", f"{label} memory_type is incompatible with CROSS_PROJECT_WORKFLOW")
+        provenance = payload.get("source_provenance")
+        freshness = payload.get("freshness_policy")
+        if isinstance(provenance, dict):
+            if "source_fingerprint" in provenance:
+                raise AdapterError(
+                    "SCOPE_FRESHNESS_MISMATCH",
+                    "CROSS_PROJECT_WORKFLOW uses freshness_policy.source_fingerprint as the sole fingerprint authority",
+                )
+            validate_provenance(provenance)
+        if isinstance(freshness, dict):
+            checked = validate_freshness(freshness)
+            if checked["kind"] not in {"on_change", "manual"}:
+                raise AdapterError("INVALID_FRESHNESS", "CROSS_PROJECT_WORKFLOW freshness must be on_change or manual")
+            if checked["kind"] == "on_change":
+                recheck_ref = checked.get("recheck_ref")
+                fingerprint = checked.get("source_fingerprint")
+                if not isinstance(recheck_ref, str) or not recheck_ref.strip() or not isinstance(fingerprint, str) or not fingerprint:
+                    raise AdapterError(
+                        "INVALID_FRESHNESS",
+                        "on_change requires non-empty freshness_policy.recheck_ref and source_fingerprint",
+                    )
+                if isinstance(provenance, dict) and fingerprint != provenance["source_hash"]:
+                    raise AdapterError(
+                        "INVALID_FRESHNESS",
+                        "on_change freshness_policy.source_fingerprint must equal source_provenance.source_hash",
+                    )
+            elif checked.get("recheck_ref") is not None or checked.get("source_fingerprint") is not None:
+                raise AdapterError(
+                    "INVALID_FRESHNESS",
+                    "manual CROSS_PROJECT_WORKFLOW freshness cannot carry recheck_ref or source_fingerprint",
+                )
+
+    def _validate_raw_policy(self, operation: str, raw_request: dict[str, Any]) -> ScopeContext:
+        if operation not in PUBLIC_TOOL_NAMES:
+            raise AdapterError("INVALID_OPERATION", "operation is not part of the five-operation surface")
+        allowed = self._PUBLIC_REQUEST_FIELDS[operation]
+        unknown = set(raw_request) - allowed
+        if unknown:
+            if unknown.intersection(_RESERVED_TRUST_CLAIMS):
+                raise AdapterError("WRITE_AUTHORIZATION_DENIED", "request cannot claim trusted or derived authority")
+            raise AdapterError("INVALID_ENVELOPE", "request contains unsupported fields: " + ", ".join(sorted(unknown)))
+        if self._walk_keys(raw_request).intersection(_RESERVED_TRUST_CLAIMS):
+            raise AdapterError("WRITE_AUTHORIZATION_DENIED", "request cannot claim trusted or derived authority")
+        self._validate_nested_request_fields(raw_request)
+        scope = raw_request.get("scope")
+        if not isinstance(scope, str):
+            raise AdapterError("UNKNOWN_SCOPE", "exact scope is required before memory access")
+        if scope == "CROSS_PROJECT_WORKFLOW" and _IDENTITY_KEYS.intersection(raw_request):
+            raise AdapterError(
+                "CROSS_SCOPE_DENIED",
+                "CROSS_PROJECT_WORKFLOW requires project_id, worktree_id, workflow_id, and agent_id keys to be absent",
+            )
+        scope_context = validate_scope(
+            scope,
+            raw_request.get("project_id"),
+            raw_request.get("worktree_id"),
+            raw_request.get("workflow_id"),
+            raw_request.get("agent_id"),
+        )
+        if scope != "CROSS_PROJECT_WORKFLOW":
+            return scope_context
+        if operation == "memory_search":
+            intent = raw_request.get("intent_class")
+            retrieval = raw_request.get("retrieval_mode", "CURRENT")
+            allowed_search = {
+                ("WORKFLOW_RULE", "CURRENT"),
+                ("WORKFLOW_RULE", "REVIEW_HISTORY"),
+                ("HISTORICAL_QUESTION", "REVIEW_HISTORY"),
+            }
+            if intent != "GENERAL_TASK_NO_MEMORY_REQUIRED" and (intent, retrieval) not in allowed_search:
+                raise AdapterError("SCOPE_INTENT_MISMATCH", "intent/retrieval mode is incompatible with CROSS_PROJECT_WORKFLOW")
+        elif operation == "memory_store":
+            if raw_request.get("memory_type") not in {"WORKFLOW_RULE", "DECISION_RATIONALE"}:
+                raise AdapterError("SCOPE_TYPE_MISMATCH", "memory_type is incompatible with CROSS_PROJECT_WORKFLOW")
+            self._validate_cross_project_freshness(
+                raw_request.get("source_provenance"), raw_request.get("freshness_policy")
+            )
+        elif operation == "memory_update":
+            self._validate_cross_project_update_payload(raw_request.get("verification"), "verification")
+            self._validate_cross_project_update_payload(raw_request.get("replacement"), "replacement")
+        return scope_context
+
+    def _effective_current_verification(self, requested: object) -> str:
+        permitted = self._trusted_write_context.permitted_verifications
+        if len(permitted) != 1:
+            raise AdapterError("WRITE_AUTHORIZATION_DENIED", "write context does not select one current verification basis")
+        effective = next(iter(permitted))
+        if requested not in {None, effective}:
+            raise AdapterError("WRITE_AUTHORIZATION_DENIED", "requested verification exceeds or conflicts with trusted authority")
+        return effective
+
+    def _authorize_write(self, operation: str, scope: ScopeContext, request: dict[str, Any]) -> dict[str, Any]:
+        context = self._trusted_write_context
+        if operation not in context.permitted_operations or scope.scope not in context.permitted_scopes:
+            raise AdapterError("WRITE_AUTHORIZATION_DENIED", "trusted write context does not authorize this operation and scope")
+        effective = dict(request)
+        if operation == "memory_store":
+            requested_lifecycle = effective.get("requested_lifecycle_state", "CANDIDATE")
+            if requested_lifecycle == "CANDIDATE":
+                if context.max_lifecycle not in {"CANDIDATE", CURRENT_LIFECYCLE}:
+                    raise AdapterError("WRITE_AUTHORIZATION_DENIED", "trusted write context cannot admit candidates")
+                if effective.get("verified_by") not in {None, "UNVERIFIED"}:
+                    raise AdapterError("WRITE_AUTHORIZATION_DENIED", "candidate writes cannot claim current verification")
+                effective["requested_lifecycle_state"] = "CANDIDATE"
+                effective["verified_by"] = "UNVERIFIED"
+            else:
+                if context.max_lifecycle != CURRENT_LIFECYCLE:
+                    raise AdapterError("WRITE_AUTHORIZATION_DENIED", "trusted write context cannot admit validated current records")
+                effective["verified_by"] = self._effective_current_verification(effective.get("verified_by"))
+        else:
+            if context.max_lifecycle != CURRENT_LIFECYCLE:
+                raise AdapterError("WRITE_AUTHORIZATION_DENIED", "trusted write context cannot update validated current authority")
+            mode = effective.get("mode")
+            payload_key = "verification" if mode == "REVERIFY" else "replacement"
+            payload = dict(effective.get(payload_key) or {})
+            payload["verified_by"] = self._effective_current_verification(payload.get("verified_by"))
+            effective[payload_key] = payload
+        return effective
+
+    def _contribution_origin(self) -> dict[str, Any]:
+        return {
+            "contributor_class": self._trusted_write_context.contributor_class,
+            "contributor_ref": self._trusted_write_context.contributor_ref,
+        }
+
+    async def dispatch(self, operation: str, raw_request: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(raw_request, dict) or any(not isinstance(key, str) for key in raw_request):
+            raise AdapterError("INVALID_ENVELOPE", "request must be an object with string keys")
+        request = dict(raw_request)
+        scope_context = self._validate_raw_policy(operation, request)
+        if operation in {"memory_store", "memory_update"}:
+            request = self._authorize_write(operation, scope_context, request)
+        handler = {
+            "memory_search": self._search,
+            "memory_get": self._get,
+            "memory_store": self._store,
+            "memory_update": self._update,
+            "memory_status": self._status,
+        }[operation]
+        policy_token = object()
+        bound = inspect.signature(handler).bind(_policy_token=policy_token, **request)
+        bound.apply_defaults()
+        bound_payload = {
+            key: value
+            for key, value in bound.arguments.items()
+            if key != "_policy_token"
+        }
+        decision = _PolicyDecision(
+            token=policy_token,
+            operation=operation,
+            request_fingerprint=digest(bound_payload),
+        )
+        reset_token = self._policy_decision_var.set(decision)
+        try:
+            return await handler(_policy_token=policy_token, **request)
+        finally:
+            self._policy_decision_var.reset(reset_token)
 
     @classmethod
     async def create(
@@ -150,6 +634,7 @@ class MemoryAdapter:
         ollama_url: str = "http://127.0.0.1:11434",
         tokenizer_path: str | None = None,
         runtime_agent_id: str = "factlane-local",
+        trusted_write_context: TrustedWriteContext,
     ) -> MemoryAdapter:
         try:
             definition = PROFILE_DEFINITIONS[profile_name]
@@ -172,6 +657,7 @@ class MemoryAdapter:
         return cls(
             engine,
             provider,
+            trusted_write_context=trusted_write_context,
             token_counter=TokenCounter(tokenizer_path),
             runtime_agent_id=runtime_agent_id,
         )
@@ -199,6 +685,7 @@ class MemoryAdapter:
             "GLOBAL_USER": "OWNER_CURRENT",
             "PROJECT": "PROJECT_CURRENT",
             "WORKFLOW": "WORKFLOW_CURRENT",
+            "CROSS_PROJECT_WORKFLOW": "WORKFLOW_CURRENT",
             "TOOL_ENVIRONMENT": "TOOL_ENV_CURRENT",
         }[scope.scope]
 
@@ -240,6 +727,18 @@ class MemoryAdapter:
     @staticmethod
     def _public(record: dict[str, Any], *, relevance_score: float | None = None, retrieval_rank: int | None = None) -> dict[str, Any]:
         provenance = json.loads(record["source_provenance"])
+        origin_value = record.get("contribution_origin")
+        if isinstance(origin_value, str):
+            try:
+                origin = json.loads(origin_value)
+            except json.JSONDecodeError:
+                origin = None
+        elif isinstance(origin_value, dict):
+            origin = origin_value
+        else:
+            origin = None
+        if not isinstance(origin, dict):
+            origin = {"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None}
         return {
             "memory_id": record["memory_id"],
             "record_id": record["record_id"],
@@ -260,6 +759,7 @@ class MemoryAdapter:
             "last_verified_at": record["last_verified_at"],
             "verified_by": record["verified_by"],
             "authority_role": record["authority_role"],
+            "contribution_origin": origin,
             "freshness_policy": json.loads(record["freshness_policy"]),
             "supersedes": json.loads(record["supersedes"]),
             "contradiction_state": record["contradiction_state"],
@@ -288,6 +788,7 @@ class MemoryAdapter:
             "audit": {
                 "request_id": request_id,
                 "operation": operation,
+                "public_contract_revision": PUBLIC_CONTRACT_REVISION,
                 "scope_digest": scope_digest(scope) if scope else None,
                 "source_classes": [],
                 "backend": "sqlite_vec",
@@ -301,9 +802,10 @@ class MemoryAdapter:
     def _payload_fingerprint(data: dict[str, Any]) -> str:
         return digest(data)
 
-    async def store(
+    async def _store(
         self,
         *,
+        _policy_token: object,
         fact: str,
         scope: str,
         memory_type: str,
@@ -324,8 +826,14 @@ class MemoryAdapter:
         subject: str | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        self._require_policy_token(_policy_token, "memory_store", locals())
         request_id = self._request_id(request_id)
         scope_context = self._safe_scope(scope, project_id, worktree_id, workflow_id, agent_id)
+        self._authorize_write(
+            "memory_store",
+            scope_context,
+            {"requested_lifecycle_state": requested_lifecycle_state, "verified_by": verified_by},
+        )
         fact = validate_fact(fact)
         if memory_type not in MEMORY_TYPES:
             raise AdapterError("INVALID_ENUM", "memory_type is not supported")
@@ -380,6 +888,7 @@ class MemoryAdapter:
             "confidence": float(confidence),
             "tags": tags_value,
             "subject": subject_value,
+            "contribution_origin": self._contribution_origin(),
         }
         payload_fingerprint = self._payload_fingerprint(fingerprint_input)
         async with self._get_write_lock():
@@ -432,6 +941,7 @@ class MemoryAdapter:
                 "last_verified_at": last_verified_at,
                 "verified_by": verified_by,
                 "authority_role": authority,
+                "contribution_origin": self._contribution_origin(),
                 "freshness_policy": freshness,
                 "supersedes": [],
                 "contradiction_key": contradiction_key,
@@ -458,9 +968,10 @@ class MemoryAdapter:
         envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
         return envelope
 
-    async def get(
+    async def _get(
         self,
         *,
+        _policy_token: object,
         memory_id: str,
         scope: str,
         project_id: str | None = None,
@@ -470,6 +981,7 @@ class MemoryAdapter:
         retrieval_mode: str = "CURRENT",
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        self._require_policy_token(_policy_token, "memory_get", locals())
         request_id = self._request_id(request_id)
         try:
             uuid.UUID(memory_id)
@@ -531,9 +1043,10 @@ class MemoryAdapter:
             envelope["degradation"] = "BUDGET_EXCEEDED"
         return envelope
 
-    async def search(
+    async def _search(
         self,
         *,
+        _policy_token: object,
         query: str,
         intent_class: str,
         scope: str,
@@ -552,8 +1065,21 @@ class MemoryAdapter:
         user_supplied: bool = False,
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        self._require_policy_token(_policy_token, "memory_search", locals())
         request_id = self._request_id(request_id)
         scope_context = self._safe_scope(scope, project_id, worktree_id, workflow_id, agent_id)
+        if not isinstance(query, str) or not query.strip() or len(query.encode("utf-8")) > 512:
+            raise AdapterError("INVALID_ENVELOPE", "query must be a bounded non-empty string")
+        for name, value in (("top_k", top_k), ("max_memories", max_memories), ("max_bytes", max_bytes), ("max_tokens", max_tokens)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise AdapterError("INVALID_ENVELOPE", f"{name} must be a positive integer")
+        if retrieval_mode_kind not in RETRIEVAL_MODE_KINDS:
+            raise AdapterError(
+                "INVALID_ENUM",
+                f"retrieval mode kind is invalid; choose one of: {supported_values(RETRIEVAL_MODE_KINDS)}",
+            )
+        if include_graph_links:
+            raise AdapterError("ADMIN_OPERATION_DENIED", "graph expansion is not available in the normal agent path")
         decision = self.router.decide(
             intent_class=intent_class,
             operation="memory_search",
@@ -571,20 +1097,14 @@ class MemoryAdapter:
                 "contradictions": [],
                 "budget": {"requested_top_k": top_k, "returned": 0, "serialized_bytes": 0, "serialized_tokens": 0, "truncated": False},
                 "degradation": None,
-                "audit": {"request_id": request_id, "operation": "memory_search", "scope_digest": scope_digest(scope_context), "raw_content_logged": False},
+                "audit": {
+                    "request_id": request_id,
+                    "operation": "memory_search",
+                    "scope_digest": scope_digest(scope_context),
+                    "public_contract_revision": PUBLIC_CONTRACT_REVISION,
+                    "raw_content_logged": False,
+                },
             }
-        if not isinstance(query, str) or not query.strip() or len(query.encode("utf-8")) > 512:
-            raise AdapterError("INVALID_ENVELOPE", "query must be a bounded non-empty string")
-        for name, value in (("top_k", top_k), ("max_memories", max_memories), ("max_bytes", max_bytes), ("max_tokens", max_tokens)):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise AdapterError("INVALID_ENVELOPE", f"{name} must be a positive integer")
-        if retrieval_mode_kind not in RETRIEVAL_MODE_KINDS:
-            raise AdapterError(
-                "INVALID_ENUM",
-                f"retrieval mode kind is invalid; choose one of: {supported_values(RETRIEVAL_MODE_KINDS)}",
-            )
-        if include_graph_links:
-            raise AdapterError("ADMIN_OPERATION_DENIED", "graph expansion is not available in the normal agent path")
         requested_top_k = top_k
         top_k = min(max(1, int(top_k)), self.limits.top_k_hard_max)
         max_memories = min(max(1, int(max_memories)), self.limits.max_memories_hard_max)
@@ -635,11 +1155,13 @@ class MemoryAdapter:
         envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
         return self._fit_budget(envelope)
 
-    async def update(
+    async def _update(
         self,
         *,
+        _policy_token: object,
         memory_id: str,
         scope: str,
+        expected_record_id: str | None = None,
         expected_revision: int,
         mode: str,
         idempotency_key: str,
@@ -651,8 +1173,14 @@ class MemoryAdapter:
         agent_id: str | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        self._require_policy_token(_policy_token, "memory_update", locals())
         request_id = self._request_id(request_id)
         scope_context = self._safe_scope(scope, project_id, worktree_id, workflow_id, agent_id)
+        self._authorize_write(
+            "memory_update",
+            scope_context,
+            {"mode": mode, "verification": verification, "replacement": replacement},
+        )
         if mode not in UPDATE_MODES:
             raise AdapterError(
                 "INVALID_ENUM",
@@ -670,11 +1198,13 @@ class MemoryAdapter:
             raise AdapterError("INVALID_ENVELOPE", "memory_id must be a UUID") from exc
         update_request_fingerprint = self._payload_fingerprint({
             "memory_id": memory_id,
+            "expected_record_id": expected_record_id,
             "scope": scope_context.to_dict(),
             "expected_revision": expected_revision,
             "mode": mode,
             "replacement": replacement or {},
             "verification": verification or {},
+            "contribution_origin": self._contribution_origin(),
         })
         replay = await self.engine.find_idempotency(idempotency_key)
         if replay:
@@ -685,11 +1215,28 @@ class MemoryAdapter:
             envelope["idempotent_replay"] = True
             return envelope
         current_rows = await self.engine.get_record(memory_id, scope_context, history=False)
-        if not current_rows:
-            if await self.engine.memory_exists_outside_scope(memory_id, scope_context):
-                raise AdapterError("CROSS_SCOPE_DENIED", "memory_id exists outside the requested scope")
-            raise AdapterError("NOT_FOUND", "current memory_id was not found")
-        old = current_rows[0]
+        candidate_promotion = False
+        if current_rows:
+            old = current_rows[0]
+            if expected_record_id is not None and expected_record_id != old["record_id"]:
+                raise AdapterError("VERSION_CONFLICT", "expected_record_id does not match the current lineage parent")
+        else:
+            history_rows = await self.engine.get_record(memory_id, scope_context, history=True)
+            candidates = [row for row in history_rows if row["lifecycle_state"] == "CANDIDATE"]
+            if candidates:
+                if mode == "REPLACE":
+                    raise AdapterError("CANDIDATE_REPLACE_DENIED", "Candidate records cannot be replaced before promotion")
+                if expected_record_id is None:
+                    raise AdapterError("INVALID_ENVELOPE", "Candidate REVERIFY requires expected_record_id")
+                matching = [row for row in candidates if row["record_id"] == expected_record_id]
+                if not matching:
+                    raise AdapterError("VERSION_CONFLICT", "expected_record_id does not match the Candidate lineage parent")
+                old = matching[0]
+                candidate_promotion = True
+            else:
+                if await self.engine.memory_exists_outside_scope(memory_id, scope_context):
+                    raise AdapterError("CROSS_SCOPE_DENIED", "memory_id exists outside the requested scope")
+                raise AdapterError("NOT_FOUND", "current memory_id was not found")
         if old["revision"] != expected_revision:
             raise AdapterError(
                 "VERSION_CONFLICT",
@@ -745,6 +1292,10 @@ class MemoryAdapter:
         memory_type = data.get("memory_type", old["memory_type"])
         if memory_type not in MEMORY_TYPES:
             raise AdapterError("INVALID_ENUM", "memory_type is not supported")
+        if scope_context.scope == "CROSS_PROJECT_WORKFLOW":
+            if memory_type not in {"WORKFLOW_RULE", "DECISION_RATIONALE"}:
+                raise AdapterError("SCOPE_TYPE_MISMATCH", "memory_type is incompatible with CROSS_PROJECT_WORKFLOW")
+            self._validate_cross_project_freshness(provenance, freshness)
         tags_value = self._tags(data.get("tags", json.loads(old["tags"])))
         confidence = float(data.get("confidence", old["confidence"]))
         if not 0 <= confidence <= 1:
@@ -760,6 +1311,17 @@ class MemoryAdapter:
                 envelope["idempotent_replay"] = True
                 return envelope
             record_id = str(uuid.uuid4())
+            if mode == "REVERIFY":
+                origin = old.get("contribution_origin")
+                if isinstance(origin, str):
+                    try:
+                        origin = json.loads(origin)
+                    except json.JSONDecodeError:
+                        origin = None
+                if not isinstance(origin, dict):
+                    origin = {"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None}
+            else:
+                origin = self._contribution_origin()
             record = {
                 "record_id": record_id,
                 "memory_id": new_memory_id,
@@ -778,6 +1340,7 @@ class MemoryAdapter:
                 "last_verified_at": last_verified_at,
                 "verified_by": verified_by,
                 "authority_role": authority,
+                "contribution_origin": origin,
                 "freshness_policy": freshness,
                 "supersedes": supersedes,
                 "contradiction_key": contradiction_key,
@@ -793,7 +1356,21 @@ class MemoryAdapter:
                 "embedding_output_dimension": self.provider.profile.output_dimension,
             }
             embedding = (await asyncio.to_thread(self.provider.embed_documents, [fact]))[0]
-            await self.engine.write_record(record, embedding, supersede_record_id=old["record_id"])
+            if candidate_promotion:
+                equivalent = await self.engine.promote_candidate(
+                    record,
+                    embedding,
+                    scope_context,
+                    expected_record_id=old["record_id"],
+                    expected_revision=expected_revision,
+                )
+                if equivalent is not None:
+                    envelope = self._base_envelope(request_id, "memory_update", scope_context)
+                    envelope["status"] = "ALREADY_CURRENT"
+                    envelope["results"] = [self._public(equivalent)]
+                    return self._fit_budget(envelope)
+            else:
+                await self.engine.write_record(record, embedding, supersede_record_id=old["record_id"])
             readback_rows = await self.engine.get_record(new_memory_id, scope_context, history=True)
             readback = next((row for row in readback_rows if row["record_id"] == record_id), None)
             if not readback or not self._fresh_current(readback):
@@ -803,9 +1380,10 @@ class MemoryAdapter:
         envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
         return self._fit_budget(envelope)
 
-    async def status(
+    async def _status(
         self,
         *,
+        _policy_token: object,
         scope: str | None = None,
         project_id: str | None = None,
         worktree_id: str | None = None,
@@ -813,6 +1391,7 @@ class MemoryAdapter:
         agent_id: str | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        self._require_policy_token(_policy_token, "memory_status", locals())
         request_id = self._request_id(request_id)
         if scope is None:
             raise AdapterError("UNKNOWN_SCOPE", "memory_status requires an exact scope")
@@ -832,6 +1411,194 @@ class MemoryAdapter:
             "codex_exact_equivalence": "UNVERIFIED",
         }
         return envelope
+
+    @staticmethod
+    def _public_request(**values: Any) -> dict[str, Any]:
+        return {key: value for key, value in values.items() if value is not _UNSET}
+
+    @staticmethod
+    def _identity_request(**values: Any) -> dict[str, Any]:
+        """Preserve explicit-null identity keys while omitting truly absent ones."""
+
+        return {key: value for key, value in values.items() if value is not _UNSET}
+
+    async def search(
+        self,
+        *,
+        query: str,
+        intent_class: str,
+        scope: str,
+        project_id: str | None | object = _UNSET,
+        worktree_id: str | None | object = _UNSET,
+        workflow_id: str | None | object = _UNSET,
+        agent_id: str | None | object = _UNSET,
+        retrieval_mode: str = "CURRENT",
+        retrieval_mode_kind: str = "SEMANTIC",
+        top_k: int = 5,
+        max_memories: int = 5,
+        max_bytes: int = 6000,
+        max_tokens: int = 1200,
+        include_graph_links: bool = False,
+        direct_truth_available: bool = False,
+        user_supplied: bool = False,
+        request_id: str | None | object = _UNSET,
+    ) -> dict[str, Any]:
+        if include_graph_links or direct_truth_available or user_supplied:
+            raise AdapterError(
+                "INVALID_ENVELOPE",
+                "routing hints and graph expansion are not accepted by the revision-2 adapter boundary",
+            )
+        request = self._public_request(
+                query=query,
+                intent_class=intent_class,
+                scope=scope,
+                retrieval_mode=retrieval_mode,
+                retrieval_mode_kind=retrieval_mode_kind,
+                top_k=top_k,
+                max_memories=max_memories,
+                max_bytes=max_bytes,
+                max_tokens=max_tokens,
+                request_id=request_id,
+        )
+        request.update(self._identity_request(
+            project_id=project_id,
+            worktree_id=worktree_id,
+            workflow_id=workflow_id,
+            agent_id=agent_id,
+        ))
+        return await self.dispatch("memory_search", request)
+
+    async def get(
+        self,
+        *,
+        memory_id: str,
+        scope: str,
+        project_id: str | None | object = _UNSET,
+        worktree_id: str | None | object = _UNSET,
+        workflow_id: str | None | object = _UNSET,
+        agent_id: str | None | object = _UNSET,
+        retrieval_mode: str = "CURRENT",
+        request_id: str | None | object = _UNSET,
+    ) -> dict[str, Any]:
+        request = self._public_request(
+                memory_id=memory_id,
+                scope=scope,
+                retrieval_mode=retrieval_mode,
+                request_id=request_id,
+        )
+        request.update(self._identity_request(
+            project_id=project_id,
+            worktree_id=worktree_id,
+            workflow_id=workflow_id,
+            agent_id=agent_id,
+        ))
+        return await self.dispatch("memory_get", request)
+
+    async def store(
+        self,
+        *,
+        fact: str,
+        scope: str,
+        memory_type: str,
+        source_provenance: dict[str, Any],
+        freshness_policy: dict[str, Any],
+        idempotency_key: str,
+        project_id: str | None | object = _UNSET,
+        worktree_id: str | None | object = _UNSET,
+        workflow_id: str | None | object = _UNSET,
+        agent_id: str | None | object = _UNSET,
+        source_timestamp: str | None | object = _UNSET,
+        last_verified_at: str | None | object = _UNSET,
+        verified_by: str = "UNVERIFIED",
+        authority_role: str | None | object = _UNSET,
+        requested_lifecycle_state: str = "CANDIDATE",
+        confidence: float = 0.5,
+        tags: list[str] | None | object = _UNSET,
+        subject: str | None | object = _UNSET,
+        request_id: str | None | object = _UNSET,
+    ) -> dict[str, Any]:
+        request = self._public_request(
+            fact=fact,
+            scope=scope,
+            memory_type=memory_type,
+            source_provenance=source_provenance,
+            freshness_policy=freshness_policy,
+            idempotency_key=idempotency_key,
+            source_timestamp=source_timestamp,
+            last_verified_at=last_verified_at,
+            verified_by=verified_by,
+            authority_role=authority_role,
+            requested_lifecycle_state=requested_lifecycle_state,
+            confidence=confidence,
+            tags=tags,
+            subject=subject,
+            request_id=request_id,
+        )
+        request.update(self._identity_request(
+            project_id=project_id,
+            worktree_id=worktree_id,
+            workflow_id=workflow_id,
+            agent_id=agent_id,
+        ))
+        return await self.dispatch("memory_store", request)
+
+    async def update(
+        self,
+        *,
+        memory_id: str,
+        scope: str,
+        expected_revision: int,
+        mode: str,
+        idempotency_key: str,
+        expected_record_id: str | None | object = _UNSET,
+        replacement: dict[str, Any] | None | object = _UNSET,
+        verification: dict[str, Any] | None | object = _UNSET,
+        project_id: str | None | object = _UNSET,
+        worktree_id: str | None | object = _UNSET,
+        workflow_id: str | None | object = _UNSET,
+        agent_id: str | None | object = _UNSET,
+        request_id: str | None | object = _UNSET,
+    ) -> dict[str, Any]:
+        request = self._public_request(
+                memory_id=memory_id,
+                scope=scope,
+                expected_record_id=expected_record_id,
+                expected_revision=expected_revision,
+                mode=mode,
+                idempotency_key=idempotency_key,
+                replacement=replacement,
+                verification=verification,
+                request_id=request_id,
+        )
+        request.update(self._identity_request(
+            project_id=project_id,
+            worktree_id=worktree_id,
+            workflow_id=workflow_id,
+            agent_id=agent_id,
+        ))
+        return await self.dispatch("memory_update", request)
+
+    async def status(
+        self,
+        *,
+        scope: str | None | object = _UNSET,
+        project_id: str | None | object = _UNSET,
+        worktree_id: str | None | object = _UNSET,
+        workflow_id: str | None | object = _UNSET,
+        agent_id: str | None | object = _UNSET,
+        request_id: str | None | object = _UNSET,
+    ) -> dict[str, Any]:
+        request = self._public_request(
+            scope=scope,
+            request_id=request_id,
+        )
+        request.update(self._identity_request(
+            project_id=project_id,
+            worktree_id=worktree_id,
+            workflow_id=workflow_id,
+            agent_id=agent_id,
+        ))
+        return await self.dispatch("memory_status", request)
 
     async def close(self) -> None:
         await self.engine.close()
