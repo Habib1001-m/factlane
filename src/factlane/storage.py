@@ -8,6 +8,11 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from .backend_compat import (
+    bind_deferred_embedding_initializer,
+    execute_with_backend_retry,
+    load_pinned_sqlite_vec_storage,
+)
 from .contract import AdapterError, ScopeContext, canonical_json, parse_iso
 from .embeddings import EmbeddingProfile
 
@@ -82,8 +87,7 @@ class SQLiteVecEngine:
         os.environ["MCP_INSIGHT_CARDS_ENABLED"] = "false"
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         try:
-            from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
-
+            SqliteVecMemoryStorage = load_pinned_sqlite_vec_storage()
             storage = SqliteVecMemoryStorage(
                 self.db_path,
                 embedding_model=self.profile.base_model_identity,
@@ -100,7 +104,7 @@ class SQLiteVecEngine:
                 storage.embedding_dimension = self.profile.output_dimension
                 storage.embedding_backend_degraded = False
 
-            storage._initialize_embedding_model = defer_native_embedding
+            bind_deferred_embedding_initializer(storage, defer_native_embedding)
             await storage.initialize(strict_dimension_check=True)
             self.storage = storage
             self.conn = storage.conn
@@ -131,15 +135,8 @@ class SQLiteVecEngine:
         if self.conn is None or self.storage is None:
             raise AdapterError("BACKEND_UNAVAILABLE", "backend is not open")
 
-        execute_with_retry = getattr(self.storage, "_execute_with_retry", None)
-        if not callable(execute_with_retry):
-            raise AdapterError(
-                "SCHEMA_MISMATCH",
-                "pinned backend no longer exposes the required SQLite retry boundary",
-            )
-
         try:
-            return await execute_with_retry(lambda: operation(*args))
+            return await execute_with_backend_retry(self.storage, lambda: operation(*args))
         except sqlite3.OperationalError as exc:
             if "locked" in str(exc).lower() or "busy" in str(exc).lower():
                 raise AdapterError("BACKEND_BUSY", "backend remained busy after bounded retry") from exc

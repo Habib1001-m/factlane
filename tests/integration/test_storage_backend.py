@@ -1,8 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
+from pathlib import Path
 
+import pytest
+
+from factlane import backend_compat
+from factlane.backend_compat import (
+    PINNED_BACKEND_COMMIT,
+    PINNED_BACKEND_URL,
+    PINNED_BACKEND_VERSION,
+    assert_backend_class_contract,
+    assert_pinned_backend_identity,
+)
+from factlane.contract import AdapterError
 from factlane.embeddings import EmbeddingProfile
 from factlane.storage import SQLiteVecEngine
 
@@ -26,9 +39,101 @@ def profile(dimension: int = 256) -> EmbeddingProfile:
 def test_pinned_backend_exposes_required_sqlite_primitives(tmp_path) -> None:
     from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
 
+    assert_pinned_backend_identity()
+    assert_backend_class_contract(SqliteVecMemoryStorage)
     storage = SqliteVecMemoryStorage(str(tmp_path / "memory.db"))
     assert hasattr(storage, "_conn_lock")
     assert callable(storage._execute_with_retry)
+
+
+def test_declared_backend_pin_matches_runtime_contract() -> None:
+    root = Path(__file__).resolve().parents[2]
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    lock = (root / "uv.lock").read_text(encoding="utf-8")
+
+    assert PINNED_BACKEND_VERSION == "11.10.0"
+    assert f"mcp-memory-service.git@{PINNED_BACKEND_COMMIT}" in pyproject
+    assert f"rev={PINNED_BACKEND_COMMIT}" in lock
+    assert f"#{PINNED_BACKEND_COMMIT}" in lock
+
+
+class FakeDistribution:
+    def __init__(self, *, version: str = PINNED_BACKEND_VERSION, direct_url: dict | None = None) -> None:
+        self.version = version
+        self.direct_url = direct_url or {
+            "url": PINNED_BACKEND_URL,
+            "vcs_info": {
+                "vcs": "git",
+                "commit_id": PINNED_BACKEND_COMMIT,
+                "requested_revision": PINNED_BACKEND_COMMIT,
+            },
+        }
+
+    def read_text(self, name: str) -> str | None:
+        if name != "direct_url.json":
+            return None
+        return json.dumps(self.direct_url)
+
+
+@pytest.mark.parametrize(
+    ("version", "direct_url"),
+    [
+        ("0.0.0", None),
+        (
+            PINNED_BACKEND_VERSION,
+            {
+                "url": "https://example.invalid/backend.git",
+                "vcs_info": {
+                    "vcs": "git",
+                    "commit_id": PINNED_BACKEND_COMMIT,
+                    "requested_revision": PINNED_BACKEND_COMMIT,
+                },
+            },
+        ),
+        (
+            PINNED_BACKEND_VERSION,
+            {
+                "url": PINNED_BACKEND_URL,
+                "vcs_info": {
+                    "vcs": "git",
+                    "commit_id": "0" * 40,
+                    "requested_revision": "0" * 40,
+                },
+            },
+        ),
+    ],
+)
+def test_backend_identity_drift_fails_closed(monkeypatch, version: str, direct_url: dict | None) -> None:
+    monkeypatch.setattr(
+        backend_compat,
+        "distribution",
+        lambda _: FakeDistribution(version=version, direct_url=direct_url),
+    )
+    with pytest.raises(AdapterError) as exc_info:
+        assert_pinned_backend_identity()
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+
+
+def test_backend_malformed_vcs_provenance_fails_closed(monkeypatch) -> None:
+    backend = FakeDistribution()
+    backend.read_text = lambda _: "[]"
+    monkeypatch.setattr(backend_compat, "distribution", lambda _: backend)
+    with pytest.raises(AdapterError) as exc_info:
+        assert_pinned_backend_identity()
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+
+
+def test_private_signature_drift_fails_closed() -> None:
+    class DriftedStorage:
+        async def _initialize_embedding_model(self, unexpected):
+            return None
+
+        async def _execute_with_retry(self, operation, max_retries=9, initial_delay=0.2):
+            return operation()
+
+    with pytest.raises(AdapterError) as exc_info:
+        assert_backend_class_contract(DriftedStorage)
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
 
 
 class FakeStorage:
