@@ -1,161 +1,128 @@
-# FactLane Architecture
+# Architecture
 
-## Purpose
+FactLane is a fact-sharing service for MCP agents. Its stored records support a decision but
+do not supersede the user's current instructions, repository state, or a live authoritative
+source. The system keeps the transport, authorization, fact lifecycle, and storage
+boundaries separate.
 
-FactLane is a governed fact-sharing plane for AI agents. It separates small durable
-facts from knowledge corpora, session history, and current project truth.
-
-```text
-MEMORY != KNOWLEDGE != SESSION_HISTORY != PROJECT_TRUTH
-```
-
-The core principle is **share facts, not context**.
-
-## Core flow
+## Request path
 
 ```text
-MCP host / trusted launcher
-  -> HostBinding + immutable TrustedWriteContext
-  -> stdio-only FastMCP boundary
-  -> MemoryGateway
-  -> MemoryAdapter.dispatch / five operations
-       -> TruthRouter for bounded search routing decisions
-       -> EmbeddingProvider
-       -> SQLiteVecEngine
-            -> adapter-owned transaction/CAS semantics
-            -> pinned backend SQLite/SQLite-vec primitives
+Local MCP host / trusted launcher
+  -> immutable host and write-context bindings
+  -> stdio MCP gateway (five tools)
+  -> scope, identity and authority checks
+  -> memory adapter / bounded retrieval routing
+  -> local embedding provider + SQLite-vec storage
 ```
 
-The normal operations are `memory_search`, `memory_get`, `memory_store`,
-`memory_update`, and `memory_status`.
+`MemoryGateway` receives the five operations: `memory_search`, `memory_get`,
+`memory_store`, `memory_update`, and `memory_status`. It rejects unsupported transports
+and caller-supplied host identity claims. `MemoryAdapter` owns request validation,
+freshness, permissions, contradiction handling, retrieval budgets, and revision policy;
+`TruthRouter` selects bounded search behavior inside the adapter. The backend supplies
+SQLite connections and SQLite-vec primitives, not FactLane's authorization decisions.
 
-`TruthRouter` makes bounded memory-routing decisions inside the adapter; it is not the
-transport gateway. The search path supports exact, keyword, semantic, and hybrid
-retrieval modes behind the same scope/freshness/authority filtering boundary.
+The server supports **local stdio only**. Codex and Hermes are tested host integrations, but
+the dispatch path is not specific to either. Another client that supports command-launched
+stdio MCP may use the same executable; it is not automatically a separately qualified host.
+Launcher identity is not operating-system or cryptographic attestation.
 
-## Host identity and MCP compatibility
+## Scope and trusted identity
 
-`HostBinding` is an immutable binding supplied by the trusted launcher. The runtime
-supports the `stdio` transport only, and an unbound gateway fails closed. Reserved
-transport-identity claims in request payloads are rejected. The gateway projects its
-bound host identity into the audit envelope; launcher binding is separate from an
-arbitrary request `agent_id`. This boundary is not cryptographic or operating-system
-identity attestation.
+The public contract defines five scopes:
 
-The server implementation does not contain Codex- or Hermes-specific dispatch logic.
-Codex and Hermes are the currently tested host integrations because they were the first
-product targets. Another MCP client can use the same FactLane executable when it can
-launch a local command-based stdio MCP server and supply a stable `--host-id`. That is a
-protocol compatibility statement, not a claim that every MCP client has been certified.
+| Scope | Identity requirement |
+| --- | --- |
+| `GLOBAL_USER` | No project/workflow identity. |
+| `PROJECT` | An exact `project_id`. |
+| `WORKFLOW` | Exact `project_id` and `workflow_id`. |
+| `TOOL_ENVIRONMENT` | An exact `agent_id`. |
+| `CROSS_PROJECT_WORKFLOW` | **All** project, worktree, workflow, and agent identity keys must be absent. |
 
-SSE and streamable HTTP MCP server transports are intentionally rejected by the current
-runtime.
+When the trusted launcher supplies current-context identities, the gateway inserts
+applicable missing values for `PROJECT`, `WORKFLOW`, and `TOOL_ENVIRONMENT`. A
+conflicting explicit value fails with `BOUND_CONTEXT_IDENTITY_MISMATCH`; the original
+request is not rewritten. `GLOBAL_USER` and `CROSS_PROJECT_WORKFLOW` do not inherit bound
+identities. The latter scope is for workflow rules that apply across projects, not a query
+that searches every project in turn.
 
-## Scope and write-authority model
+## Contributions, verification, and revisions
 
-Public Contract Revision 2 adds `CROSS_PROJECT_WORKFLOW` for workflow doctrine whose applicability is broader than one project. It is an exact no-identity scope: the raw request must omit `project_id`, `worktree_id`, `workflow_id`, and `agent_id`. Existing `WORKFLOW` semantics are unchanged and require exact project and workflow identities. FactLane never implicitly fans a record into another scope.
+A normal process starts with `--write-profile read-only` unless the launcher grants another
+profile. `delegated-candidate` permits an agent to submit a bounded `CANDIDATE` with source
+provenance, a freshness policy, and an idempotency key. It does not permit that agent to
+mint `VALIDATED_CURRENT` by asserting a verifier identity in its request.
 
-Every adapter is constructed with a deeply immutable `TrustedWriteContext`. Request payloads cannot set it or derived authority fields. The normal delegated-agent context is Candidate-only; current verification requires a distinct trusted launcher/operator context. Authorization is checked before idempotency replay, so a previously privileged idempotency key is not a bearer token. All five operations enter through raw `MemoryAdapter.dispatch`, where scope shape and semantic policy are applied before routing or storage access.
+Promotion is a distinct `memory_update` operation: a trusted verifier uses `REVERIFY`, the
+expected revision, and the exact Candidate `expected_record_id`. Storage contract v2 keeps
+`contribution_origin` separate from verification and preserves it on promotion. The verifier
+is recorded separately; an older record is not silently rewritten as if it had been
+contributed by the verifier.
 
-## Ownership boundary
+Revision changes use transaction-local compare-and-swap. A stale independent writer receives
+`VERSION_CONFLICT`. For a Candidate promotion, exact scope, logical memory, parent record,
+revision, lifecycle, and contradiction checks occur inside the same SQLite transaction.
+Duplicate or retried requests are resolved through the governed idempotency rules; an
+idempotency key from a more privileged request is not an authorization token.
 
-FactLane owns:
+Storage contract v2 also blocks stale legacy writers from inserting, updating, or deleting
+adapter records through an untrusted raw SQLite connection. The trusted maintenance path has
+a separate authorization boundary; it does not make arbitrary direct SQL writes part of the
+public API.
 
-- exact scope, freshness, and authority policy;
-- contradiction visibility and fail-closed behavior;
-- logical memory IDs, record revisions, lineage, supersession, and idempotency;
-- bounded result/tool envelopes;
-- embedding profile identity and projection metadata;
-- adapter-owned schema and transaction semantics;
-- the public five-operation surface.
+## Retrieval and history
 
-The exact pinned backend is reused for SQLite-vec extension/schema primitives,
-connection locking, synchronous database thread offload, bounded locked/busy retry,
-WAL initialization, and `busy_timeout`. FactLane does not duplicate those mechanics.
+`CURRENT` retrieval admits only eligible `VALIDATED_CURRENT` facts within the exact scope.
+For keyword search, the lifecycle filter precedes SQL limits. For semantic search,
+sqlite-vec KNN constrains eligible row IDs **inside the vector query before `k` **.
+Otherwise, many closer unverified Candidates could fill the top results and conceal a
+farther validated fact.
 
-## Revision and transaction semantics
+`REVIEW_HISTORY` exposes past revisions and Candidates for explicit inspection. Atomic
+compaction can retain a historical record without its original vector. If semantic or hybrid
+history is consequently incomplete, the result reports
+`degradation=HISTORY_SEMANTIC_PARTIAL`. When output also exceeds its result budget,
+`budget.truncated=true` preserves the independent truncation signal; an ordinary budget-only
+truncation reports `BUDGET_EXCEEDED`.
 
-FactLane uses transaction-local parent-current compare-and-swap. A stale independent
-writer receives deterministic `VERSION_CONFLICT`; successor insertion, vector write,
-and parent supersession occur in one transaction.
+## Storage and runtime compatibility
 
-Storage Contract Version 2 persists `contribution_origin` separately from verification and backfills pre-v2 rows as `LEGACY_UNKNOWN`. Candidate `REVERIFY` promotion performs exact scope + memory + record + revision + lifecycle CAS and contradiction recheck in the same `BEGIN IMMEDIATE` transaction. The promoted revision keeps the Candidate contribution origin; the verifier is recorded separately. Stale v1 writers fail closed on v2 adapter record INSERT/UPDATE/DELETE.
+FactLane uses a pinned `mcp-memory-service` backend for reusable SQLite/SQLite-vec
+mechanics, connection locking, bounded busy retries, WAL initialization, and
+connection-related primitives. FactLane owns higher-level schema/transaction and authority
+semantics. It does not assume a Python version proves SQLite feature support.
 
-For `CURRENT` retrieval, lifecycle eligibility is applied before SQL limits. Semantic KNN constrains sqlite-vec rowids to exact-scope `VALIDATED_CURRENT` rows inside the KNN query before `k`, preventing closer Candidates from crowding a farther eligible Current record.
+The linked SQLite runtime must be **3.42.0+**. `SQLiteVecEngine.open()` rejects an older
+runtime before database creation or opening, with `BACKEND_COMPATIBILITY_MISMATCH`. The
+floor covers sqlite-vec's eligible-row `IN` behavior and the FTS5 `secure-delete` feature
+required by sensitive-memory recovery. That operator also performs an independent feature
+probe before mutation.
 
-That storage contract requires a linked SQLite runtime of at least 3.42.0. Startup checks
-the runtime before backend initialization and fails closed when the floor is not met;
-Python version alone is not treated as proof of SQLite capability. The product-wide floor
-also covers the FTS5 `secure-delete` capability used by sensitive-memory recovery.
+Embedding calls use an `EmbeddingProvider` contract. The currently shipped provider is
+Ollama over loopback HTTP; model digest, capability, dimension, and input-size checks fail
+closed. Potentially blocking provider calls are offloaded from the asyncio event loop. No
+cloud embedding provider or automatic external fallback is shipped. See the
+[environment policy](ENVIRONMENT.md) for built-in profiles and exact prerequisites.
 
-## Embedding boundary
+## Maintenance and incident recovery
 
-The adapter depends on an `EmbeddingProvider` contract, while the current shipped
-provider implementation is local Ollama over loopback HTTP. Runtime model identity,
-capability, native dimension, and input-size expectations fail closed when they do not
-match the selected profile.
+`memory_status` provides bounded, read-only capacity and retention observations. Manual
+housekeeping compacts eligible superseded material through an atomic path while preserving
+current authority and logical history. It is not an automatic retention daemon, full backup
+facility, or sensitive-content erase operation.
 
-The selected production profile for the current FactLane deployment is:
+Sensitive-memory incident recovery lives in a **trusted local operator**, outside
+`MemoryGateway` and the five MCP tools. It requires explicit authorization, exact
+target/database binding, maintenance quiescence, known schema and propagation, supported
+SQLite and verified FTS5 capabilities. A pre-commit failure rolls back; post-commit sealing
+failure leaves normal service blocked until recovery completes. Local purge does not prove
+erasure from external copies or physical media. See [Security](../SECURITY.md).
 
-```text
-PROFILE=embeddinggemma-300m-768
-MODEL=embeddinggemma:300m
-MODEL_DIGEST=85462619ee721b466c5927d109d4cb765861907d5417b9109caebc4e614679f1
-SOURCE_DIMENSION=768
-OUTPUT_DIMENSION=768
-DOCUMENT_PREFIX=title: none | text:
-QUERY_PREFIX=task: search result | query:
-TRUNCATE=false
-CONTEXT_WINDOW=2048
-```
+## Qualification boundary
 
-Nomic profiles remain supported product profiles with their documented
-`search_document: ` and `search_query: ` prefixes, but they are not the selected
-production profile. Other models used during evaluation are evidence, not silently
-promoted runtime profiles.
-
-A remote or managed embedding provider is architecturally possible behind the provider
-boundary, but the current product does not ship or accept one. Adding it requires an
-explicit implementation and acceptance path rather than pointing the existing local
-provider at a non-loopback URL.
-
-Potentially blocking provider calls are offloaded from the asyncio event loop at the
-adapter boundary using the standard library thread-offload mechanism. No custom worker
-service or executor is a product dependency.
-
-## Fact plane versus corpus indexing
-
-FactLane stores bounded facts; it is not a raw document crawler or bulk directory
-indexer. Source collections may be much larger than FactLane's durable fact set, but an
-upstream ingestion/extraction layer is responsible for deciding which source material
-becomes a fact and for carrying the required provenance into that admission.
-
-This separation is intentional. A large-corpus ingestion system may need different
-batching, hardware, embedding models, or managed-provider economics without changing the
-governed FactLane storage/authority contract.
-
-## Retention and housekeeping
-
-FactLane exposes read-only retention/capacity observations and a bounded manual
-housekeeping path for eligible superseded state. Housekeeping reuses the accepted atomic
-compaction boundary, preserves current authority and logical history, fails closed on
-incomplete capacity/health observations, and does not introduce a background daemon,
-scheduler, or `VACUUM` requirement.
-
-This lifecycle support is distinct from disaster recovery. An authoritative
-backup-to-disposable-restore acceptance proof is not yet part of the accepted public
-product claim.
-
-## Crash safety
-
-Pre-commit process interruption leaves no partial adapter/native/vector rows. If a
-process ends after commit but before its response, durable state remains resolvable
-through idempotent replay. These guarantees apply at the tested transaction boundaries
-and do not imply a separate recovery service.
-
-## Current quality boundary
-
-The selected profile has strong bounded retrieval evidence overall, while retrieval
-specificity under Arabic/mixed-language and document-crowding cases remains an open
-quality debt. That debt does not reopen the accepted storage, transaction, host-identity,
-or embedding-profile architecture by default.
+Controlled local/host evidence establishes behavior for the tested configurations. It does
+not establish support for every MCP client, production-scale ingestion, disaster recovery,
+or every language mix. Arabic/mixed-language retrieval specificity and document crowding
+still need workload-specific validation. FactLane is a fact store, not a transcript archive
+or raw document crawler.

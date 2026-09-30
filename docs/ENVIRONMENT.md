@@ -1,131 +1,95 @@
-# FactLane Environment Policy
+# Environment and compatibility
 
-FactLane is local-first and portable by default. Current machine paths are evidence,
-not architecture constants.
+FactLane is a local Python application with a command-launched MCP server. A compatible
+Python interpreter is necessary but not sufficient: the version of **SQLite linked into that
+interpreter** determines whether the storage contract can run safely.
 
-## Baseline
+## Required runtime
 
-```text
-Python >= 3.11
-SQLite >= 3.42.0 (Python sqlite3 linked runtime)
-CPU_ONLY_BASELINE=YES
-GPU_REQUIRED=NO
-DOCKER_REQUIRED=NO
-EXTERNAL_LLM_REQUIRED=NO
-EXTERNAL_EMBEDDING_API_REQUIRED=NO
-PERSISTENT_SERVICE_REQUIRED=NO
+| Component | Requirement |
+| --- | --- |
+| Python | 3.11 or newer. |
+| Linked SQLite | **3.42.0 or newer**. |
+| Dependencies | Project `uv.lock`, installed into a project-owned environment. |
+| MCP host | Local command-based `stdio` client. |
+| Embeddings | Local Ollama reachable on loopback with a matching installed model. |
+
+A CPU-only setup is supported. A GPU, Docker, cloud LLM, remote embedding API, and always-on
+FactLane daemon are not prerequisites.
+
+After installing the project, inspect the SQLite version through the **same Python
+environment used by FactLane**:
+
+```bash
+uv sync --frozen
+uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
+uv run factlane --help
 ```
 
-Python packages are resolved by `uv.lock`. Use a project-owned virtual environment and
-run project tools through that environment.
+Startup fails with `BACKEND_COMPATIBILITY_MISMATCH` when the linked SQLite version is below
+3.42.0, before the engine creates or opens its database. This floor is required for
+eligible-row filtering inside sqlite-vec KNN and for the FTS5 `secure-delete` capability
+used by sensitive-memory recovery. Recovery checks that FTS5 capability independently;
+version eligibility does not bypass feature detection.
 
-The SQLite floor is an explicit runtime contract, not a Python-minor proxy. FactLane
-checks `sqlite3.sqlite_version_info` before backend initialization and fails closed on an
-older linked runtime. SQLite 3.42.0 is the product-wide floor because it covers both the
-virtual-table `IN` support required by CURRENT semantic KNN eligibility and the FTS5
-`secure-delete` command required by sensitive-memory recovery.
+## Model profiles
 
-## Reuse without hidden coupling
+FactLane checks the model identity and digest, native/output dimensions, context capability,
+and input-size policy against the selected profile. It does not download a model implicitly.
+Install the model in your local Ollama instance before launching the server.
 
-A local cache, wheel, source checkout, model blob, or CLI can be reused when its
-provenance and compatibility are verified. Reuse the asset; do not inherit another
-product's runtime owner.
-
-Caches are acquisition sources, not runtime authority. Once bootstrap resolves the
-environment, normal development uses declared project dependencies and explicit
-external assets rather than unbounded machine-wide discovery.
-
-## Host integration
-
-FactLane must not import or depend on a host application's private Python runtime,
-site-packages, configuration, MCP packages, or caches as product runtime authority.
-Host integration belongs at the edge; portable policy belongs in the core.
-
-The current MCP server supports local stdio transport only. Codex and Hermes are the
-currently tested host integrations. The server does not branch on those product names;
-other command-based stdio MCP clients can use the same executable and a distinct
-`--host-id`, but they are not individually certified by the current evidence. SSE and
-streamable HTTP server transports are intentionally rejected.
-
-## Local embedding provider
-
-The current provider accepts loopback HTTP only. Non-local provider URLs and automatic
-external fallbacks are rejected.
-
-The selected production profile for the current FactLane deployment is:
-
-```text
-PROFILE=embeddinggemma-300m-768
-PROVIDER=OLLAMA_LOCAL_LOOPBACK
-MODEL=embeddinggemma:300m
-MODEL_DIGEST=85462619ee721b466c5927d109d4cb765861907d5417b9109caebc4e614679f1
-SOURCE_DIMENSION=768
-OUTPUT_DIMENSION=768
-DOCUMENT_PREFIX=title: none | text:
-QUERY_PREFIX=task: search result | query:
-TRUNCATE_POLICY=FAIL_CLOSED_PROVIDER_REJECTION
-EFFECTIVE_CONTEXT_WINDOW=2048
-```
-
-This selection is project-specific evidence, not a recommendation that every FactLane
-installation should use the same model.
-
-### Profile and model evidence
-
-| Model / profile | Product status | Evidence boundary |
+| Built-in profile | Ollama model | Notes |
 | --- | --- | --- |
-| `embeddinggemma:300m` / `embeddinggemma-300m-768` | Built-in; selected current production profile | Selected by the project's fresh-blind comparison |
-| `nomic-embed-text:latest` / `nomic-768`, `nomic-512`, `nomic-256` | Built-in supported profiles | Tested baseline profiles; Nomic prefix contracts remain supported |
-| `all-minilm:l6-v2` / `minilm-384` | Built-in but limited by current no-truncation contract | Short-input embedding works; observed 512-token context rejected a maximum-size 2,000-byte fact |
-| `jina/jina-embeddings-v2-base-en:latest` | Evaluation only | Diagnostic retrieval candidate; not a built-in profile |
-| `qwen3-embedding:0.6b` | Evaluation only | Diagnostic retrieval/storage candidate; not a built-in profile |
+| `embeddinggemma-300m-768` | `embeddinggemma:300m` | The profile used in the project's controlled local configuration; 768 output dimensions. |
+| `nomic-768` | `nomic-embed-text:latest` | Nomic model with 768 output dimensions. |
+| `nomic-512` | `nomic-embed-text:latest` | Same source model, projected to 512 dimensions. |
+| `nomic-256` | `nomic-embed-text:latest` | Same source model, projected to 256 dimensions. |
+| `minilm-384` | `all-minilm:l6-v2` | Built-in, but observed context limits can reject a maximum-length fact under the no-truncation policy. Check suitability before use. |
 
-Model choice should be made against the user's own language mix, fact distribution,
-quality target, latency, hardware, throughput, and operating-cost constraints. A model
-that wins one controlled evaluation is not guaranteed to win another workload.
+For the first profile:
 
-The exact effective context capability is runtime evidence for the approved model
-artifact; FactLane does not fabricate a larger capability or silently reduce its input
-contract.
+```bash
+ollama pull embeddinggemma:300m
+uv run factlane --help
+```
 
-## Remote embedding providers
+The profile name must match the selected model and storage configuration. No universal
+ranking follows from one project's test data. Assess your own language mix, fact sizes,
+hardware, latency, and quality needs; Arabic/mixed-language retrieval and document crowding
+remain known qualification gaps.
 
-`EmbeddingProvider` is an explicit adapter boundary, but the current product only ships
-the local Ollama implementation. A managed or remote embedding provider would require a
-new provider implementation, explicit configuration/security policy, tests, and new
-acceptance evidence. It is therefore an extension path, not a current runtime option.
+The only shipped embedding-provider implementation communicates with Ollama on a **loopback
+URL** (by default `http://127.0.0.1:11434`). The provider interface permits future
+implementations, but a remote endpoint, automatic cloud fallback, or hosted embedding
+service is **not** a supported current configuration.
 
-This distinction matters for high-throughput workloads: a user may rationally prefer a
-managed service, GPU-backed provider, or another model when throughput and latency are
-more important than the local-only constraints used by this deployment. FactLane does
-not make that choice on the user's behalf.
+## Host and storage isolation
 
-## Large-corpus boundary
+Use the FactLane executable and dependencies installed for this project rather than
+importing packages or a private runtime from the MCP host. A stable, non-secret `--host-id`
+is required. `--db` identifies the SQLite database; `--profile` chooses one of the declared
+model profiles. `--write-profile` is a trusted **launcher** setting, not a privilege a tool
+request can grant itself. Its default is `read-only`; `delegated-candidate` allows only
+Candidate contributions.
 
-FactLane is a governed fact plane, not a crawler or arbitrary folder indexer. Facts are
-bounded to 2,000 UTF-8 bytes before storage. Large source collections should be handled
-by a separate ingestion/extraction layer that decides which source material becomes a
-durable FactLane fact.
+The upstream backend is pinned in `pyproject.toml` and resolved by `uv.lock`. It supplies
+reusable SQLite connection locking, thread offload, WAL, and bounded locked/busy retries;
+FactLane supplies scope policy and revision/CAS transactions. Avoid introducing a
+host-specific duplicate dependency or a second locking layer when reproducing the
+installation.
 
-The project has not benchmarked terabyte-scale raw-corpus ingestion, and its controlled
-small-corpus/profile measurements must not be extrapolated into a terabyte indexing-time
-claim. At that scale, parsing, deduplication, batching, embedding throughput, hardware,
-and provider economics become separate system-design decisions.
+FactLane's source package and wheel also carry the portable
+[`using-factlane` Skill](../skills/using-factlane/SKILL.md). Installing the package does
+not configure a particular host or auto-register that Skill.
 
-## Pinned backend reuse
+## Data and deployment limits
 
-At the exact backend pin, the backend owns reusable SQLite connection locking,
-synchronous database thread offload, bounded locked/busy retry, WAL journal mode, and
-`busy_timeout`. FactLane owns the higher-level transaction-local revision/CAS and
-lost-update semantics. No duplicate lock/backoff layer was added.
+A FactLane fact is bounded to **2,000 UTF-8 bytes**. This interface is not a large-directory
+crawler, transcript repository, or bulk document index. Very large source collections need a
+separate ingestion/extraction stage, which may have different throughput and provider
+requirements; no terabyte-scale ingestion rate is claimed here.
 
-Synchronous local provider calls are offloaded from the asyncio event loop at the
-adapter boundary. No custom executor or provider worker service became a product
-dependency.
-
-## Deployment state
-
-A bounded authoritative local bootstrap using the selected EmbeddingGemma profile has
-passed exact readback, storage integrity, retrieval smoke, and restart-durability checks.
-That evidence does not imply remote/cloud deployment, bulk historical-memory migration,
-raw-corpus indexing, or final production-grade acceptance.
+Controlled local checks do not constitute authoritative backup/restore acceptance or a
+public-production-readiness claim. Keep production data and backup operations under their
+own authorization and validation procedures. See [Security](../SECURITY.md),
+[Architecture](ARCHITECTURE.md), and the [Quick Start](QUICKSTART.md).

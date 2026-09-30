@@ -5,65 +5,76 @@ description: Use when an agent needs to search, read, store, or update bounded F
 
 # Using FactLane
 
-FactLane shares bounded facts, not transcripts. Memory is supporting evidence, never
-execution authority. Current Owner instructions, project/repository authority, and verified
-live truth outrank memory.
+FactLane stores bounded, provenance-bearing facts, not transcripts. Memory is **supporting
+evidence**, never execution authority. Current user instructions, current repository/product
+truth, and verified live sources outrank remembered facts.
 
-## Operating policy
+## Decide whether memory is needed
 
-- Recall only when durable context could materially help; self-contained work may use no memory.
-- Capture is manual/explicit; suggestions are user-triggered. Never auto-store/update post-turn.
-- `CANDIDATE / UNVERIFIED` is never equivalent to `VALIDATED_CURRENT`.
-- Live MCP schema / `factlane --help-tools` is authoritative; never guess fields or enums.
+- A self-contained task needs no recall. Search only when durable context could change the
+  answer or action.
+- Capture is explicit; suggestions are user-triggered. Never perform autonomous post-turn
+  `memory_store` or `memory_update`.
+- A `CANDIDATE` or `UNVERIFIED` record is **not** `VALIDATED_CURRENT`.
+- Inspect the live MCP schema or `factlane --help-tools` for supported fields and enums;
+  never guess.
 
-This Skill describes Public Contract Revision 2.
+This Skill targets **Public Contract Revision 2**.
 
-## Before reading
+## Read within one exact scope
 
-1. Choose one exact scope. `PROJECT` needs `project_id`; `WORKFLOW` needs `project_id` +
-   `workflow_id`; `GLOBAL_USER` carries neither; `TOOL_ENVIRONMENT` needs `agent_id`;
-   `CROSS_PROJECT_WORKFLOW` is cross-project doctrine and requires all identity keys absent.
-   In a trusted bound session omit host-supplied scope IDs; never reconstruct them. Explicit
-   IDs are for unbound/caller-directed contexts and must match any trusted bound value.
-2. Map the need to one `intent_class`: `CURRENT_PROJECT_STATE`,
-   `PROJECT_DESIGN_RATIONALE`, `USER_PREFERENCE_OR_DURABLE_FACT`, `WORKFLOW_RULE`,
-   `TOOL_ENVIRONMENT_STATE`, `HISTORICAL_QUESTION`, or `GENERAL_TASK_NO_MEMORY_REQUIRED`.
-3. Select `EXACT`, `KEYWORD`, `SEMANTIC`, or `HYBRID`; use `CURRENT` normally and
-   `REVIEW_HISTORY` for history.
+Select one scope before searching. `PROJECT` requires an exact `project_id`; `WORKFLOW`
+requires that project ID and `workflow_id`; `GLOBAL_USER` is not project-bound;
+`TOOL_ENVIRONMENT` requires `agent_id`. `CROSS_PROJECT_WORKFLOW` is for cross-project
+workflow doctrine and **forbids** `project_id`, `worktree_id`, `workflow_id`, and
+`agent_id`, including explicit null values.
 
-Compaction can remove vectors from `HISTORICAL` rows. `REVIEW_HISTORY` with `SEMANTIC` or
-`HYBRID` then reports `HISTORY_SEMANTIC_PARTIAL`; use `KEYWORD`/`EXACT` or `memory_get` when
-compacted history must not depend on vectors. If the result budget also truncates output,
-`budget.truncated=true` reports that separately and `HISTORY_SEMANTIC_PARTIAL` remains the
-degradation.
+In a trusted bound session, omit host-supplied scope-owning IDs; do not reconstruct them.
+Explicit scope-owning IDs must match trusted values (`PROJECT.project_id`,
+`WORKFLOW.project_id`/`workflow_id`, `TOOL_ENVIRONMENT.agent_id`). Other permitted
+caller-directed filters remain caller-directed.
 
-For `CROSS_PROJECT_WORKFLOW`, allowed searches are `WORKFLOW_RULE + CURRENT`,
-`WORKFLOW_RULE + REVIEW_HISTORY`, and `HISTORICAL_QUESTION + REVIEW_HISTORY`.
-`GENERAL_TASK_NO_MEMORY_REQUIRED` returns `NO_MEMORY_NEEDED` after shape validation; other
-intent/retrieval combinations fail closed.
+Choose an `intent_class`: `CURRENT_PROJECT_STATE`, `PROJECT_DESIGN_RATIONALE`,
+`USER_PREFERENCE_OR_DURABLE_FACT`, `WORKFLOW_RULE`, `TOOL_ENVIRONMENT_STATE`,
+`HISTORICAL_QUESTION`, or `GENERAL_TASK_NO_MEMORY_REQUIRED`.
 
-Search first. Use `memory_get` with the returned `memory_id` for exact readback/revision/provenance.
+Choose `EXACT`, `KEYWORD`, `SEMANTIC`, or `HYBRID`. Use `CURRENT` for validated current
+facts and `REVIEW_HISTORY` to inspect Candidates or older revisions. Search first; use
+`memory_get` on the returned `memory_id` when exact provenance or revision matters. Do not
+invent routing overrides or request admin-only graph expansion.
 
-For normal search choose scope + intent; do not invent routing overrides or request admin-only
-graph expansion. For normal project stores omit `authority_role`; FactLane derives it.
+For `CROSS_PROJECT_WORKFLOW`, permitted search intent/mode pairs are
+`WORKFLOW_RULE + CURRENT`, `WORKFLOW_RULE + REVIEW_HISTORY`, and
+`HISTORICAL_QUESTION + REVIEW_HISTORY`. `GENERAL_TASK_NO_MEMORY_REQUIRED` returns
+`NO_MEMORY_NEEDED` after request validation. Other combinations fail closed; there is no
+implicit cross-scope fanout.
 
-## Before writing
+Compaction may remove vectors from `HISTORICAL` records. In `REVIEW_HISTORY`, incomplete
+`SEMANTIC`/`HYBRID` coverage reports `HISTORY_SEMANTIC_PARTIAL`. Prefer `KEYWORD`,
+`EXACT`, or `memory_get` when complete compacted history matters. Concurrent result-budget
+loss sets `budget.truncated=true` without erasing the history degradation.
 
-Write only when Owner/host policy authorizes the operation and the trusted launcher permits it.
-Normal agents are `delegated-candidate`: they may contribute Candidates, not claim Owner/current
-authority. User approval cannot elevate launcher/runtime authority. Store one bounded fact with
-`source_provenance`, `freshness_policy`, stable `idempotency_key`, scope, and `memory_type`;
-the field is `source_provenance`, not `provenance`.
+## Write only with trusted authority
 
-`CROSS_PROJECT_WORKFLOW` freshness is `manual` or `on_change`. `manual` has no recheck/fingerprint;
-`on_change` needs `recheck_ref` and `freshness_policy.source_fingerprint ==
-source_provenance.source_hash`. Do not place that fingerprint in `source_provenance`.
+The launcher defaults to read-only. A normal `delegated-candidate` agent may call
+`memory_store` to propose a Candidate, but cannot call `memory_update` or promote itself by
+claiming Owner authority. Chat approval does not elevate launcher/runtime privileges.
 
-For updates, read first; send `expected_revision`, unique `idempotency_key`, and one mode:
-`REVERIFY` or `REPLACE`. Candidate promotion uses trusted `REVERIFY` with its
-`expected_record_id`; inspect Candidates with `REVIEW_HISTORY`. `REPLACE` includes the new fact,
-`source_provenance`, `freshness_policy`, `source_timestamp`, and `verified_by`; omitted
-`last_verified_at` is generated.
+Store one fact with `memory_type`, `source_provenance`, `freshness_policy`, and a stable
+`idempotency_key`. Use **`source_provenance`**, not `provenance`; do not supply a derived
+`authority_role`.
 
-Use live schema/help for supported values. Keep memory small, scoped, provenance-bearing, and
-separate from the task's direct source of truth.
+For `CROSS_PROJECT_WORKFLOW`, freshness is `manual` (no recheck reference or fingerprint)
+or `on_change` (non-empty `recheck_ref` and `freshness_policy.source_fingerprint` equal to
+`source_provenance.source_hash`). Do not put that fingerprint in `source_provenance` for
+this scope.
+
+A separately trusted verifier can use `memory_update`: read first, then provide
+`expected_revision`, a unique `idempotency_key`, and `REVERIFY` or `REPLACE`. Candidate
+promotion requires `REVERIFY` with its exact `expected_record_id`. `REPLACE` needs
+`replacement.fact`, `replacement.source_provenance`, `replacement.freshness_policy`,
+`replacement.source_timestamp`, and `replacement.verified_by`; omitted
+`replacement.last_verified_at` is generated.
+
+Keep each memory small, scoped, and attributable. Recheck the current source of truth before
+relying on it.
