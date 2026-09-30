@@ -6,7 +6,7 @@ import threading
 import time
 from typing import Any
 
-from factlane.adapter import MemoryAdapter
+from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
 from factlane.embeddings import EmbeddingProfile
 
 PROFILE = EmbeddingProfile(
@@ -178,7 +178,9 @@ def _run(coroutine: Any) -> Any:
 def test_concurrent_semantic_queries_overlap_off_event_loop() -> None:
     async def run() -> tuple[ProbeProvider, int]:
         provider = ProbeProvider(query_barrier=threading.Barrier(2, timeout=0.2))
-        adapter = MemoryAdapter(QueryEngine(), provider)  # type: ignore[arg-type]
+        adapter = MemoryAdapter(
+            QueryEngine(), provider, trusted_write_context=trusted_write_context_for_profile("read-only")
+        )  # type: ignore[arg-type]
         loop_thread_id = threading.get_ident()
         await asyncio.gather(
             _semantic_search(adapter, "first query"),
@@ -201,7 +203,9 @@ def test_concurrent_semantic_queries_overlap_off_event_loop() -> None:
 def test_event_loop_progresses_while_query_embedding_is_pending() -> None:
     async def run() -> tuple[ProbeProvider, int, int]:
         provider = ProbeProvider(query_delay=0.15)
-        adapter = MemoryAdapter(QueryEngine(), provider)  # type: ignore[arg-type]
+        adapter = MemoryAdapter(
+            QueryEngine(), provider, trusted_write_context=trusted_write_context_for_profile("read-only")
+        )  # type: ignore[arg-type]
         loop_thread_id = threading.get_ident()
         search_task = asyncio.create_task(_semantic_search(adapter, "slow query"))
         await asyncio.sleep(0)
@@ -220,7 +224,9 @@ def test_event_loop_progresses_while_query_embedding_is_pending() -> None:
 def test_event_loop_progresses_while_document_embedding_is_pending() -> None:
     async def run() -> tuple[ProbeProvider, int, int]:
         provider = ProbeProvider(document_delay=0.15)
-        adapter = MemoryAdapter(MemoryStoreEngine(), provider)  # type: ignore[arg-type]
+        adapter = MemoryAdapter(
+            MemoryStoreEngine(), provider, trusted_write_context=trusted_write_context_for_profile("owner-current")
+        )  # type: ignore[arg-type]
         loop_thread_id = threading.get_ident()
         store_task = asyncio.create_task(
             adapter.store(
@@ -261,7 +267,9 @@ def test_event_loop_progresses_while_document_embedding_is_pending() -> None:
 def test_event_loop_progresses_while_provider_status_is_pending() -> None:
     async def run() -> tuple[ProbeProvider, int, int]:
         provider = ProbeProvider(status_delay=0.15)
-        adapter = MemoryAdapter(QueryEngine(), provider)  # type: ignore[arg-type]
+        adapter = MemoryAdapter(
+            QueryEngine(), provider, trusted_write_context=trusted_write_context_for_profile("read-only")
+        )  # type: ignore[arg-type]
         loop_thread_id = threading.get_ident()
         status_task = asyncio.create_task(adapter.status(scope="PROJECT", project_id="factlane"))
         await asyncio.sleep(0)
@@ -298,7 +306,13 @@ def test_create_provider_status_runs_off_event_loop(monkeypatch: Any) -> None:
 
     async def run() -> tuple[ProbeProvider, int, int]:
         loop_thread_id = threading.get_ident()
-        create_task = asyncio.create_task(MemoryAdapter.create("unused.db", "nomic-256"))
+        create_task = asyncio.create_task(
+            MemoryAdapter.create(
+                "unused.db",
+                "nomic-256",
+                trusted_write_context=trusted_write_context_for_profile("read-only"),
+            )
+        )
         await asyncio.sleep(0)
         assert provider_instance is not None
         active_ticks = await _heartbeat_until(create_task, provider_instance, "status")

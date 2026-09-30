@@ -24,6 +24,31 @@ synthetic reproduction that demonstrates the issue.
 - Retention/capacity observations are read-only; bounded manual housekeeping preserves
   current authority and reuses the accepted atomic compaction path.
 
+## Sensitive-memory incident recovery
+
+- Sensitive-memory recovery is a trusted-operator-only local maintenance surface in
+  `factlane.recovery`, outside FastMCP, `MemoryGateway`, `public_contract`, and
+  `PUBLIC_TOOL_NAMES`. It does not add a public delete, administration, or recovery tool;
+  `memory_update` and normal compaction are not purge mechanisms.
+- Recovery is bound to an explicit frozen target set and exact database/profile state.
+  Maintenance quiescence, an exclusive recovery lease, known schema/materialization,
+  exact target binding, complete propagation, and the unchanged five-tool public contract
+  are hard fail-closed preconditions; if they cannot be proven, recovery does not mutate.
+- Recovery requires the product-wide SQLite 3.42.0+ runtime floor and still probes the
+  actual FTS5 `secure-delete` capability before mutation; version eligibility alone does
+  not bypass the capability check.
+- For a confirmed sensitive-memory incident, the logical purge is atomic. A pre-commit
+  failure rolls back the operation. A post-commit sealing/promotion failure persists
+  `S1_LOGICAL_PURGE_COMMITTED_SEALING_INCOMPLETE`; normal service restart and restoration
+  of the sensitive payload are forbidden until safe idempotent sealing reaches
+  `S1_LOCAL_FACTLANE_PURGE_VERIFIED`.
+- S1 recovery does not create a plaintext pre-mutation backup by default. Any forensic
+  snapshot requires separate explicit authority and containment, and external copies or
+  credential incidents require separate handling; local purge is not a claim of universal
+  or hardware-level erasure.
+- Availability of this operator does not authorize production recovery. Running it against
+  a live/production database remains a separately authorized incident action.
+
 ## Explicit limitations
 
 - Launcher-supplied host binding is not cryptographic or operating-system process
@@ -31,8 +56,10 @@ synthetic reproduction that demonstrates the issue.
 - FactLane is not a distributed coordination system.
 - Housekeeping is not an automatic background retention service, backup system, or
   disaster-recovery subsystem.
-- Authoritative backup/restore acceptance and final real-host production-path acceptance
-  are not yet part of the final production-grade claim.
+- Controlled Codex/Hermes real-host qualification is accepted evidence for the qualified
+  post-R2 identity, but it does not by itself make this checkout/package a deployed or
+  publicly released security baseline. Authoritative backup/restore acceptance is not yet
+  part of the final production-grade claim.
 - Retrieval specificity under Arabic/mixed-language and document-crowding cases remains
   a known quality limitation; it is not treated as an authority or scope bypass.
 

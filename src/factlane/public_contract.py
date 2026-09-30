@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Annotated, Any
 
-from pydantic import Field, TypeAdapter
+from pydantic import ConfigDict, Field, TypeAdapter
 from typing_extensions import NotRequired, Required, TypedDict
 
 from .contract import (
@@ -11,6 +11,7 @@ from .contract import (
     FRESHNESS_KINDS,
     INTENT_CLASSES,
     MEMORY_TYPES,
+    PUBLIC_CONTRACT_REVISION,
     PUBLIC_TOOL_NAMES,
     RETRIEVAL_MODE_KINDS,
     RETRIEVAL_MODES,
@@ -33,10 +34,18 @@ def _enum_field(values: set[str], description: str, *, default: Any = ...) -> An
 
 ScopeValue = _enum_field(
     SCOPES,
-    "Exact memory scope. PROJECT requires project_id; WORKFLOW requires project_id and workflow_id; "
-    "GLOBAL_USER carries no project/workflow identity; TOOL_ENVIRONMENT requires agent_id.",
+    "Exact memory scope. Resolved PROJECT requests require project_id; resolved WORKFLOW requests require project_id and workflow_id; "
+    "GLOBAL_USER carries no project/workflow identity; resolved TOOL_ENVIRONMENT requests require agent_id. "
+    "In a trusted bound session, omit current scope-owning protocol identities when they are already supplied by the host; do not guess them. "
+    "Explicit identities remain valid for genuinely unbound or deliberately caller-directed contexts, while conflicting bound scope-owning identities fail closed; "
+    "CROSS_PROJECT_WORKFLOW forbids project_id, worktree_id, workflow_id, and agent_id.",
 )
-IntentValue = _enum_field(INTENT_CLASSES, "Classify the caller's need before searching; choose one exact value.")
+IntentValue = _enum_field(
+    INTENT_CLASSES,
+    "Classify the caller's need before searching. For CROSS_PROJECT_WORKFLOW: WORKFLOW_RULE supports CURRENT or "
+    "REVIEW_HISTORY; HISTORICAL_QUESTION requires REVIEW_HISTORY; GENERAL_TASK_NO_MEMORY_REQUIRED returns "
+    "NO_MEMORY_NEEDED only after request/scope validation; project/user/tool intents are denied.",
+)
 RetrievalModeValue = _enum_field(
     RETRIEVAL_MODES,
     "CURRENT returns current validated facts; REVIEW_HISTORY is required for historical questions.",
@@ -44,22 +53,36 @@ RetrievalModeValue = _enum_field(
 )
 RetrievalKindValue = _enum_field(
     RETRIEVAL_MODE_KINDS,
-    "Retrieval strategy: EXACT, KEYWORD, SEMANTIC, or HYBRID.",
+    "Retrieval strategy: EXACT, KEYWORD, SEMANTIC, or HYBRID. In REVIEW_HISTORY, compacted HISTORICAL rows no longer carry vectors; SEMANTIC/HYBRID therefore return degradation=HISTORY_SEMANTIC_PARTIAL when semantic history is incomplete. If result-budget truncation also occurs, budget.truncated=true reports that condition while degradation=HISTORY_SEMANTIC_PARTIAL remains. Use KEYWORD/EXACT or memory_get for compacted history that must not depend on vectors.",
     default="SEMANTIC",
 )
 UpdateModeValue = _enum_field(UPDATE_MODES, "REVERIFY preserves the logical memory; REPLACE creates a new logical revision.")
 MemoryTypeValue = _enum_field(MEMORY_TYPES, "Fact category for one bounded memory record.")
 VerifiedByValue = _enum_field(VERIFIED_BY, "Verification source. UNVERIFIED stores a candidate, not a current fact.", default="UNVERIFIED")
-FreshnessKindValue = _enum_field(FRESHNESS_KINDS, "Freshness policy. ttl additionally requires ttl_seconds.")
+FreshnessKindValue = _enum_field(
+    FRESHNESS_KINDS,
+    "Freshness policy. CROSS_PROJECT_WORKFLOW permits manual or on_change only. on_change requires non-empty "
+    "recheck_ref and source_fingerprint, and source_fingerprint must equal source_provenance.source_hash; manual "
+    "must not carry either field. ttl additionally requires ttl_seconds on legacy scopes.",
+)
 
-ProjectId = Annotated[str, Field(description="Exact project identity; required for PROJECT and WORKFLOW scope.")]
-WorktreeId = Annotated[str, Field(description="Optional bounded worktree identity for project-scoped memory.")]
-WorkflowId = Annotated[str, Field(description="Exact workflow identity; required for WORKFLOW scope.")]
-AgentId = Annotated[str, Field(description="Exact tool-environment identity; required for TOOL_ENVIRONMENT scope.")]
+ProjectId = Annotated[str | None, Field(description="Exact project identity. Explicit null remains a present key and is rejected by CROSS_PROJECT_WORKFLOW.")]
+WorktreeId = Annotated[str | None, Field(description="Optional bounded worktree identity. Explicit null remains a present key for raw scope validation.")]
+WorkflowId = Annotated[str | None, Field(description="Exact workflow identity. Explicit null remains a present key and does not satisfy WORKFLOW identity.")]
+AgentId = Annotated[str | None, Field(description="Exact tool-environment identity. Explicit null remains a present key for raw scope validation.")]
 RequestId = Annotated[str, Field(description="Optional caller correlation identifier; generated when omitted.")]
+
+_RAW_REQUEST_CONFIG = ConfigDict(
+    extra="allow",
+    json_schema_extra={
+        "additionalProperties": False,
+        "x-factlane-public-contract-revision": PUBLIC_CONTRACT_REVISION,
+    },
+)
 
 
 class ScopeFields(TypedDict, total=False):
+    __pydantic_config__ = _RAW_REQUEST_CONFIG
     scope: Required[ScopeValue]
     project_id: NotRequired[ProjectId]
     worktree_id: NotRequired[WorktreeId]
@@ -68,6 +91,7 @@ class ScopeFields(TypedDict, total=False):
 
 
 class SourceProvenance(TypedDict, total=False):
+    __pydantic_config__ = _RAW_REQUEST_CONFIG
     source_class: Required[Annotated[str, Field(description="Bounded source classification.")]]
     source_ref: Required[Annotated[str, Field(description="Bounded reference to the source.")]]
     source_hash: Required[Annotated[str, Field(description="SHA-256 digest of the source.")]]
@@ -77,6 +101,7 @@ class SourceProvenance(TypedDict, total=False):
 
 
 class FreshnessPolicy(TypedDict, total=False):
+    __pydantic_config__ = _RAW_REQUEST_CONFIG
     kind: Required[FreshnessKindValue]
     ttl_seconds: NotRequired[Annotated[int | None, Field(default=None, description="Required only when kind=ttl.", ge=1)]]
     recheck_ref: NotRequired[Annotated[str | None, Field(default=None, description="Optional recheck reference.")]]
@@ -84,6 +109,7 @@ class FreshnessPolicy(TypedDict, total=False):
 
 
 class VerificationPayload(TypedDict, total=False):
+    __pydantic_config__ = _RAW_REQUEST_CONFIG
     source_provenance: NotRequired[SourceProvenance]
     freshness_policy: NotRequired[FreshnessPolicy]
     source_timestamp: NotRequired[Annotated[str, Field(description="ISO-8601 timestamp for the checked source.")]]
@@ -137,6 +163,9 @@ class MemoryStoreRequest(ScopeFields, total=False):
 
 class MemoryUpdateRequest(ScopeFields, total=False):
     memory_id: Required[Annotated[str, Field(description="UUID returned by memory_get or memory_search.")]]
+    expected_record_id: NotRequired[
+        Annotated[str, Field(description="Exact parent record UUID; required when promoting a CANDIDATE with REVERIFY.")]
+    ]
     expected_revision: Required[Annotated[int, Field(ge=1, description="Current revision from memory_get; required for CAS protection.")]]
     mode: Required[UpdateModeValue]
     idempotency_key: Required[Annotated[str, Field(description="Unique stable key for this update; safe retries reuse it.")]]
@@ -165,7 +194,7 @@ class MemoryStatusRequest(ScopeFields, total=False):
 TOOL_DESCRIPTIONS = {
     "memory_search": "Search validated supporting memory in one exact scope; inspect this request schema before choosing enums.",
     "memory_get": "Read one logical memory record in one exact scope, optionally including revision history.",
-    "memory_store": "Persist one bounded, provenance-bearing fact only when the active Owner/host policy authorizes a write.",
+    "memory_store": "Persist one bounded, provenance-bearing fact when the trusted launcher profile authorizes a write; normal agent writes are Candidate-only.",
     "memory_update": "Reverify or explicitly replace one logical memory record using expected_revision CAS protection.",
     "memory_status": "Inspect bounded backend and embedding-profile health for one exact scope.",
 }
@@ -242,15 +271,29 @@ def render_tool_help(tool_name: str | None = None) -> str:
         "Public MCP tools (exactly five): " + ", ".join(PUBLIC_TOOL_NAMES),
         "",
         "Exact scope rules:",
-        "  PROJECT -> project_id required; WORKFLOW -> project_id and workflow_id required.",
-        "  GLOBAL_USER -> no project/workflow identity; TOOL_ENVIRONMENT -> agent_id required.",
+        "  Resolved PROJECT -> project_id required; resolved WORKFLOW -> project_id and workflow_id required.",
+        "  GLOBAL_USER -> no project/workflow identity; resolved TOOL_ENVIRONMENT -> agent_id required.",
+        "  Bound session -> omit current scope-owning protocol IDs already supplied by the trusted host; do not reconstruct or guess them.",
+        "  Unbound/caller-directed context -> explicit IDs remain valid; conflicting bound scope-owning IDs fail closed.",
+        "  CROSS_PROJECT_WORKFLOW -> all project/worktree/workflow/agent identity keys must be absent; null/empty/value are still present and denied.",
+        f"Public contract revision: {PUBLIC_CONTRACT_REVISION}.",
+        "",
+        "CROSS_PROJECT_WORKFLOW search matrix:",
+        "  WORKFLOW_RULE -> CURRENT or REVIEW_HISTORY.",
+        "  HISTORICAL_QUESTION -> REVIEW_HISTORY only.",
+        "  GENERAL_TASK_NO_MEMORY_REQUIRED -> NO_MEMORY_NEEDED after scope-shape validation.",
+        "  CURRENT_PROJECT_STATE / PROJECT_DESIGN_RATIONALE / USER_PREFERENCE_OR_DURABLE_FACT / TOOL_ENVIRONMENT_STATE -> denied.",
+        "CROSS_PROJECT_WORKFLOW freshness:",
+        "  manual -> recheck_ref and source_fingerprint absent/null.",
+        "  on_change requires non-empty recheck_ref and source_fingerprint; source_fingerprint must equal source_provenance.source_hash.",
+        "  source_provenance.source_fingerprint is forbidden for this scope.",
         "",
         "Intent classes: " + ", ".join(sorted(INTENT_CLASSES)),
         "Retrieval modes: " + ", ".join(sorted(RETRIEVAL_MODES)) + " (default CURRENT).",
         "Retrieval kinds: " + ", ".join(sorted(RETRIEVAL_MODE_KINDS)) + " (default SEMANTIC).",
-        "Writes require active Owner/host authorization: store a bounded fact with source_provenance, "
-        "freshness_policy, and idempotency_key; update with current expected_revision, idempotency_key, "
-        "and mode REVERIFY or REPLACE.",
+        "Writes require trusted launcher authorization; normal agent profiles are Candidate-only. "
+        "Store a bounded fact with source_provenance, freshness_policy, and idempotency_key; update "
+        "with current expected_revision, idempotency_key, and mode REVERIFY or REPLACE.",
         "Never guess an enum or field name: inspect live MCP schema or this help.",
     ]
     for name in names:

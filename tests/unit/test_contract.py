@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from factlane.adapter import MemoryAdapter
+from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
 from factlane.contract import AdapterError, is_fresh, validate_scope
 from factlane.embeddings import OllamaLocalProvider
 from factlane.router import TruthRouter
@@ -60,7 +60,13 @@ class _StatusProvider:
 
 
 def test_status_token_measurement_preserves_existing_metadata_contract() -> None:
-    response = asyncio.run(MemoryAdapter(_StatusEngine(), _StatusProvider()).status(scope="PROJECT", project_id="p"))  # type: ignore[arg-type]
+    response = asyncio.run(
+        MemoryAdapter(
+            _StatusEngine(),
+            _StatusProvider(),
+            trusted_write_context=trusted_write_context_for_profile("read-only"),
+        ).status(scope="PROJECT", project_id="p")
+    )  # type: ignore[arg-type]
 
     assert response["token_measurement"]["codex_exact_equivalence"] == "UNVERIFIED"
     assert "exact_token_equivalence" not in response["token_measurement"]

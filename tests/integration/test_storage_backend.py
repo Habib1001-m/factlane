@@ -1,10 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sqlite3
+from pathlib import Path
 
+import pytest
+
+from factlane import backend_compat
+from factlane.backend_compat import (
+    PINNED_BACKEND_COMMIT,
+    PINNED_BACKEND_URL,
+    PINNED_BACKEND_VERSION,
+    assert_backend_class_contract,
+    assert_pinned_backend_identity,
+    execute_with_backend_retry,
+)
+from factlane.contract import AdapterError
 from factlane.embeddings import EmbeddingProfile
-from factlane.storage import SQLiteVecEngine
+from factlane.storage import MIN_SQLITE_VERSION, SQLiteVecEngine, assert_supported_sqlite_runtime
 
 
 def profile(dimension: int = 256) -> EmbeddingProfile:
@@ -26,16 +41,131 @@ def profile(dimension: int = 256) -> EmbeddingProfile:
 def test_pinned_backend_exposes_required_sqlite_primitives(tmp_path) -> None:
     from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
 
+    assert_pinned_backend_identity()
+    assert_backend_class_contract(SqliteVecMemoryStorage)
     storage = SqliteVecMemoryStorage(str(tmp_path / "memory.db"))
     assert hasattr(storage, "_conn_lock")
     assert callable(storage._execute_with_retry)
+
+
+def test_declared_backend_pin_matches_runtime_contract() -> None:
+    root = Path(__file__).resolve().parents[2]
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    lock = (root / "uv.lock").read_text(encoding="utf-8")
+
+    assert PINNED_BACKEND_VERSION == "11.10.0"
+    assert f"mcp-memory-service.git@{PINNED_BACKEND_COMMIT}" in pyproject
+    assert f"rev={PINNED_BACKEND_COMMIT}" in lock
+    assert f"#{PINNED_BACKEND_COMMIT}" in lock
+
+
+class FakeDistribution:
+    def __init__(self, *, version: str = PINNED_BACKEND_VERSION, direct_url: dict | None = None) -> None:
+        self.version = version
+        self.direct_url = direct_url or {
+            "url": PINNED_BACKEND_URL,
+            "vcs_info": {
+                "vcs": "git",
+                "commit_id": PINNED_BACKEND_COMMIT,
+                "requested_revision": PINNED_BACKEND_COMMIT,
+            },
+        }
+
+    def read_text(self, name: str) -> str | None:
+        if name != "direct_url.json":
+            return None
+        return json.dumps(self.direct_url)
+
+
+@pytest.mark.parametrize(
+    ("version", "direct_url"),
+    [
+        ("0.0.0", None),
+        (
+            PINNED_BACKEND_VERSION,
+            {
+                "url": "https://example.invalid/backend.git",
+                "vcs_info": {
+                    "vcs": "git",
+                    "commit_id": PINNED_BACKEND_COMMIT,
+                    "requested_revision": PINNED_BACKEND_COMMIT,
+                },
+            },
+        ),
+        (
+            PINNED_BACKEND_VERSION,
+            {
+                "url": PINNED_BACKEND_URL,
+                "vcs_info": {
+                    "vcs": "git",
+                    "commit_id": "0" * 40,
+                    "requested_revision": "0" * 40,
+                },
+            },
+        ),
+    ],
+)
+def test_backend_identity_drift_fails_closed(monkeypatch, version: str, direct_url: dict | None) -> None:
+    monkeypatch.setattr(
+        backend_compat,
+        "distribution",
+        lambda _: FakeDistribution(version=version, direct_url=direct_url),
+    )
+    with pytest.raises(AdapterError) as exc_info:
+        assert_pinned_backend_identity()
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+
+
+def test_backend_malformed_vcs_provenance_fails_closed(monkeypatch) -> None:
+    backend = FakeDistribution()
+    backend.read_text = lambda _: "[]"
+    monkeypatch.setattr(backend_compat, "distribution", lambda _: backend)
+    with pytest.raises(AdapterError) as exc_info:
+        assert_pinned_backend_identity()
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+
+
+def test_embedding_initializer_signature_drift_fails_closed() -> None:
+    class DriftedStorage:
+        async def _initialize_embedding_model(self, unexpected):
+            return None
+
+        async def _execute_with_retry(self, operation, max_retries=5, initial_delay=0.2):
+            return operation()
+
+    with pytest.raises(AdapterError) as exc_info:
+        assert_backend_class_contract(DriftedStorage)
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+
+
+def test_retry_parameter_kind_drift_fails_closed() -> None:
+    class DriftedStorage:
+        async def _initialize_embedding_model(self):
+            return None
+
+        async def _execute_with_retry(self, *, operation, max_retries=5, initial_delay=0.2):
+            return operation()
+
+    with pytest.raises(AdapterError) as exc_info:
+        assert_backend_class_contract(DriftedStorage)
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+
+
+def test_bound_retry_parameter_kind_drift_fails_closed() -> None:
+    class DriftedStorage:
+        async def _execute_with_retry(self, *, operation, max_retries=5, initial_delay=0.2):
+            return operation()
+
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(execute_with_backend_retry(DriftedStorage(), lambda: 42))
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
 
 
 class FakeStorage:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def _execute_with_retry(self, operation):
+    async def _execute_with_retry(self, operation, max_retries=5, initial_delay=0.2):
         self.calls += 1
         return operation()
 
@@ -50,6 +180,48 @@ def test_engine_delegates_db_execution_to_backend_retry() -> None:
         engine.conn.close()
     assert result == 42
     assert engine.storage.calls == 1
+
+
+def test_sqlite_runtime_contract_accepts_declared_floor() -> None:
+    assert MIN_SQLITE_VERSION == (3, 42, 0)
+    assert_supported_sqlite_runtime(MIN_SQLITE_VERSION)
+
+
+def test_sqlite_runtime_contract_rejects_below_floor() -> None:
+    with pytest.raises(AdapterError) as exc_info:
+        assert_supported_sqlite_runtime((3, 41, 9))
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+    assert "SQLite >= 3.42.0" in exc_info.value.safe_message
+
+
+def test_open_rejects_unsupported_sqlite_before_database_creation(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "unsupported-sqlite.db"
+    monkeypatch.delenv("MCP_EXTERNAL_EMBEDDING_URL", raising=False)
+    monkeypatch.delenv("MCP_MEMORY_STORAGE_BACKEND", raising=False)
+    monkeypatch.delenv("MCP_HTTP_ENABLED", raising=False)
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 37, 2))
+    engine = SQLiteVecEngine(str(db_path), profile())
+
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+    assert "linked runtime is 3.37.2" in exc_info.value.safe_message
+    assert not db_path.exists()
+    assert "MCP_MEMORY_STORAGE_BACKEND" not in os.environ
+    assert "MCP_HTTP_ENABLED" not in os.environ
+
+
+def test_external_embedding_denial_precedes_sqlite_runtime_gate(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MCP_EXTERNAL_EMBEDDING_URL", "https://example.invalid/embed")
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 37, 2))
+    engine = SQLiteVecEngine(str(tmp_path / "forbidden-external.db"), profile())
+
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+
+    assert exc_info.value.code == "ADMIN_OPERATION_DENIED"
+    assert not (tmp_path / "forbidden-external.db").exists()
 
 
 def test_open_reuses_backend_wal_and_busy_timeout(tmp_path) -> None:

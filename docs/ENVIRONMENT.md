@@ -7,6 +7,7 @@ not architecture constants.
 
 ```text
 Python >= 3.11
+SQLite >= 3.42.0 (Python sqlite3 linked runtime)
 CPU_ONLY_BASELINE=YES
 GPU_REQUIRED=NO
 DOCKER_REQUIRED=NO
@@ -17,6 +18,12 @@ PERSISTENT_SERVICE_REQUIRED=NO
 
 Python packages are resolved by `uv.lock`. Use a project-owned virtual environment and
 run project tools through that environment.
+
+The SQLite floor is an explicit runtime contract, not a Python-minor proxy. FactLane
+checks `sqlite3.sqlite_version_info` before backend initialization and fails closed on an
+older linked runtime. SQLite 3.42.0 is the product-wide floor because it covers both the
+virtual-table `IN` support required by CURRENT semantic KNN eligibility and the FTS5
+`secure-delete` command required by sensitive-memory recovery.
 
 ## Reuse without hidden coupling
 

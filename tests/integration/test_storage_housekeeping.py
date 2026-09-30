@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from factlane.adapter import MemoryAdapter
+from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
 from factlane.contract import AdapterError
 from factlane.embeddings import EmbeddingProfile
 from factlane.storage import SQLiteVecEngine
@@ -56,7 +56,11 @@ async def _open_adapter(tmp_path, filename: str = "memory.db") -> tuple[SQLiteVe
     embedding_profile = _profile()
     engine = SQLiteVecEngine(str(tmp_path / filename), embedding_profile)
     await engine.open()
-    return engine, MemoryAdapter(engine, _FixedProvider(embedding_profile))  # type: ignore[arg-type]
+    return engine, MemoryAdapter(
+        engine,
+        _FixedProvider(embedding_profile),
+        trusted_write_context=trusted_write_context_for_profile("owner-current"),
+    )  # type: ignore[arg-type]
 
 
 def _scope(adapter: MemoryAdapter, project_id: str = "factlane"):

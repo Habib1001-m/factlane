@@ -8,6 +8,7 @@ without needing to understand the internal campaign history.
 Requirements:
 
 - Python 3.11 or newer;
+- SQLite 3.42.0 or newer as reported by Python's `sqlite3` module;
 - `uv`;
 - a local Ollama runtime for the currently supported embedding-provider path.
 
@@ -22,6 +23,20 @@ uv run factlane --help-tools
 FactLane does not automatically download models. The model required by the selected
 profile must already exist in the local Ollama runtime and match the exact identity
 pinned by that profile. Provider identity or dimension mismatches fail closed.
+
+FactLane also fails closed before opening or creating its database when the linked SQLite
+runtime is older than 3.42.0. The floor covers the virtual-table `IN` behavior required by
+CURRENT semantic KNN eligibility and the FTS5 `secure-delete` capability used by the
+sensitive-memory recovery operator. Python version alone does not guarantee this SQLite
+capability level.
+
+The public distribution also includes the portable `using-factlane` Skill. In a source
+checkout it is at `skills/using-factlane/SKILL.md`; a built wheel carries the same artifact
+under `share/factlane/skills/using-factlane/SKILL.md`. The live MCP schemas remain the
+authoritative request interface, but the Skill is the behavioral baseline for normal
+natural-use operation. MCP-only use is appropriate for protocol/mechanical integration.
+Wheel installation does not auto-register the Skill or change host configuration; expose
+the shipped artifact through the host's supported Skill discovery/installation mechanism.
 
 If you want to reproduce the **current tested FactLane deployment** rather than choose a
 profile for your own workload, install the model used by that deployment:
@@ -51,6 +66,7 @@ A normal launch needs:
 --db <path-to-sqlite-database>
 --profile <profile-id>
 --host-id <stable-non-secret-host-label>
+--write-profile <trusted-launch-profile>
 ```
 
 Example server command shape:
@@ -59,12 +75,15 @@ Example server command shape:
 /path/to/factlane/.venv/bin/factlane \
   --db /path/to/state/factlane.sqlite3 \
   --profile <profile-id> \
-  --host-id <host-id>
+  --host-id <host-id> \
+  --write-profile delegated-candidate
 ```
 
 The MCP client should normally launch this process for you over stdio. Running the
 server command directly is not an interactive application; it waits for an MCP client on
 stdin/stdout.
+
+`delegated-candidate` is the normal agent profile. It can contribute Candidates but cannot create `VALIDATED_CURRENT` records. Use `read-only` for a non-writing connection. `owner-current`, `repo-verifier`, and `automated-verifier` are trusted launcher/operator profiles for explicit verification workflows; they are not request fields an agent can self-assert.
 
 ### Models and profiles we evaluated
 
@@ -83,7 +102,7 @@ Choose a model/profile for **your** language mix, fact shape, latency target, ha
 quality target, and operating cost. A result from this project's data is not a guarantee
 that another user's data will produce the same ranking.
 
-The current release does not accept a remote embedding endpoint. The provider interface
+The current implementation does not accept a remote embedding endpoint. The provider interface
 is an explicit product boundary, so a remote/provider-specific implementation can be
 added in future work, but that is not a supported runtime feature today.
 
@@ -91,6 +110,9 @@ added in future work, but that is not a supported runtime feature today.
 
 Codex is one of the tested FactLane hosts. Configure a stdio MCP server in Codex and use
 a stable host ID such as `codex`.
+
+The public package does not ship the private Codex enhancement plugin used in controlled
+qualification. Normal natural-use guidance comes from the portable `using-factlane` Skill.
 
 Example `~/.codex/config.toml` entry reproducing the current tested profile:
 
@@ -112,6 +134,9 @@ Codex version, then verify that the five FactLane memory tools are visible.
 
 Hermes is the other currently tested FactLane host. Add a command-based stdio MCP server
 to `~/.hermes/config.yaml` and use a stable host ID such as `hermes`.
+
+The public package does not ship the private Hermes enhancement plugin used in controlled
+qualification. Normal natural-use guidance comes from the portable `using-factlane` Skill.
 
 ```yaml
 mcp_servers:
@@ -148,9 +173,9 @@ transport.
 ## 6. Verify the connection before storing anything
 
 The offline `factlane --help-tools` reference describes all five requests, scope rules,
-defaults, provenance, freshness, idempotency, and revision/CAS requirements. The optional
-[using-factlane Agent Skill](../skills/using-factlane/SKILL.md) provides portable guidance;
-clients remain compliant when they use the live MCP schemas without loading the Skill.
+defaults, provenance, freshness, idempotency, and revision/CAS requirements. The portable
+[using-factlane Agent Skill](../skills/using-factlane/SKILL.md) provides the normal-use behavioral baseline;
+live MCP schemas remain authoritative, and MCP-only use remains valid for protocol/mechanical integration.
 
 First verify that the client discovers exactly these normal tools:
 
@@ -170,6 +195,16 @@ Then call `memory_status` with an exact scope. For example, a project-scoped che
   "project_id": "example-project"
 }
 ```
+
+The exact scopes are:
+
+- `GLOBAL_USER` — no project/workflow identity;
+- `PROJECT` — exact `project_id`;
+- `WORKFLOW` — exact `project_id` and `workflow_id`;
+- `TOOL_ENVIRONMENT` — exact `agent_id`;
+- `CROSS_PROJECT_WORKFLOW` — cross-project workflow doctrine with all four identity keys absent.
+
+For `CROSS_PROJECT_WORKFLOW`, normal recall uses `WORKFLOW_RULE + CURRENT`. Candidate or historical review uses `REVIEW_HISTORY`. A trusted verifier promotes a Candidate with `memory_update(mode=REVERIFY)` using both `expected_revision` and `expected_record_id`. The scope does not fan out into `PROJECT` or `WORKFLOW`; callers choose it explicitly.
 
 Do not start by importing a large body of context. FactLane is designed to admit small,
 reviewable facts with explicit scope, provenance, freshness, and authority semantics.
@@ -196,11 +231,15 @@ our controlled small-corpus tests.
 - Codex and Hermes are tested hosts; other stdio MCP clients are not individually
   certified yet.
 - The current embedding runtime is local Ollama over loopback HTTP only.
-- Remote embedding-provider support is not implemented in the current release.
+- Remote embedding-provider support is not implemented in the current implementation.
 - FactLane is a governed fact plane, not a raw transcript, repository dump, or bulk
   document-indexing product.
 - Production retrieval validation remains deferred until a curated real production corpus
   is prepared; historical experimental-corpus evaluation did not justify a ranking-policy
   change.
-- Final real-host production-path acceptance, production-corpus preparation/admission, and
-  authoritative backup/restore acceptance remain open closure items.
+- Controlled Codex/Hermes real-host natural-use qualification has passed for the project's
+  qualified post-R2 product identity. That evidence does not by itself claim that this
+  checkout/package has been merged, publicly released, or deployed.
+- Production-corpus preparation/admission, production retrieval validation,
+  authoritative backup/restore acceptance, and final public package/distribution review
+  remain open closure items.

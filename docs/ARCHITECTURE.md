@@ -15,10 +15,10 @@ The core principle is **share facts, not context**.
 
 ```text
 MCP host / trusted launcher
-  -> HostBinding
+  -> HostBinding + immutable TrustedWriteContext
   -> stdio-only FastMCP boundary
   -> MemoryGateway
-  -> MemoryAdapter / five operations
+  -> MemoryAdapter.dispatch / five operations
        -> TruthRouter for bounded search routing decisions
        -> EmbeddingProvider
        -> SQLiteVecEngine
@@ -51,6 +51,12 @@ protocol compatibility statement, not a claim that every MCP client has been cer
 SSE and streamable HTTP MCP server transports are intentionally rejected by the current
 runtime.
 
+## Scope and write-authority model
+
+Public Contract Revision 2 adds `CROSS_PROJECT_WORKFLOW` for workflow doctrine whose applicability is broader than one project. It is an exact no-identity scope: the raw request must omit `project_id`, `worktree_id`, `workflow_id`, and `agent_id`. Existing `WORKFLOW` semantics are unchanged and require exact project and workflow identities. FactLane never implicitly fans a record into another scope.
+
+Every adapter is constructed with a deeply immutable `TrustedWriteContext`. Request payloads cannot set it or derived authority fields. The normal delegated-agent context is Candidate-only; current verification requires a distinct trusted launcher/operator context. Authorization is checked before idempotency replay, so a previously privileged idempotency key is not a bearer token. All five operations enter through raw `MemoryAdapter.dispatch`, where scope shape and semantic policy are applied before routing or storage access.
+
 ## Ownership boundary
 
 FactLane owns:
@@ -72,6 +78,15 @@ WAL initialization, and `busy_timeout`. FactLane does not duplicate those mechan
 FactLane uses transaction-local parent-current compare-and-swap. A stale independent
 writer receives deterministic `VERSION_CONFLICT`; successor insertion, vector write,
 and parent supersession occur in one transaction.
+
+Storage Contract Version 2 persists `contribution_origin` separately from verification and backfills pre-v2 rows as `LEGACY_UNKNOWN`. Candidate `REVERIFY` promotion performs exact scope + memory + record + revision + lifecycle CAS and contradiction recheck in the same `BEGIN IMMEDIATE` transaction. The promoted revision keeps the Candidate contribution origin; the verifier is recorded separately. Stale v1 writers fail closed on v2 adapter record INSERT/UPDATE/DELETE.
+
+For `CURRENT` retrieval, lifecycle eligibility is applied before SQL limits. Semantic KNN constrains sqlite-vec rowids to exact-scope `VALIDATED_CURRENT` rows inside the KNN query before `k`, preventing closer Candidates from crowding a farther eligible Current record.
+
+That storage contract requires a linked SQLite runtime of at least 3.42.0. Startup checks
+the runtime before backend initialization and fails closed when the floor is not met;
+Python version alone is not treated as proof of SQLite capability. The product-wide floor
+also covers the FTS5 `secure-delete` capability used by sensitive-memory recovery.
 
 ## Embedding boundary
 
