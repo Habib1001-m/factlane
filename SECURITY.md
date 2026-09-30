@@ -1,68 +1,73 @@
-# Security Policy
+# Security policy
 
-FactLane is local-first memory infrastructure. Please report security issues privately
-to the repository owner rather than opening a public issue containing sensitive
-material.
+FactLane stores durable facts that may outlive an agent session. Its security boundary is
+designed to keep unverified contributions separate from current facts and prevent callers
+from granting themselves access or write authority.
 
-Do not include secrets, credentials, raw transcripts, raw user memory, private evidence
-bundles, or identifying local filesystem data in public bug reports. Use the smallest
-synthetic reproduction that demonstrates the issue.
+## Reporting a vulnerability
 
-## Product security boundaries
+Report security issues **privately to the repository owner**. Do not post credentials, raw
+memories, transcripts, private file paths, or evidence bundles in a public issue. Supply the
+smallest synthetic reproduction that demonstrates the behavior, together with the affected
+release/commit and relevant runtime versions.
 
-- Memory is supporting state, not execution authority.
-- The local embedding provider accepts loopback HTTP only and has no external fallback.
-- The selected production embedding profile is exact-digest pinned and runtime identity,
-  capability, native dimension, and input-size mismatches fail closed.
-- The normal agent surface is exactly five tools and excludes delete, administration,
-  configuration mutation, harvesting, distillation, and consolidation operations.
-- Host identity is bound at the trusted launcher/stdio gateway boundary; request-side
-  identity claims are rejected and unsupported transports fail closed.
-- Multi-client lost-update prevention uses transaction-local single-winner CAS.
-- Transaction boundaries provide atomic rollback, post-commit durability, and
-  idempotent replay for the supported operations.
-- Retention/capacity observations are read-only; bounded manual housekeeping preserves
-  current authority and reuses the accepted atomic compaction path.
+## Trust boundaries
 
-## Sensitive-memory incident recovery
+- **Host identity:** A trusted launcher binds a stable host identity to the local `stdio`
+  MCP gateway. Caller-supplied transport identity and conflicting host-bound scope
+  identities are rejected. Launcher binding is not cryptographic process attestation; the
+  host and its launch configuration are part of the trusted environment.
+- **Write authority:** A connection is read-only unless the launcher explicitly selects a
+  write profile. Delegated agents may contribute `CANDIDATE` records but cannot validate
+  them by changing request fields or reusing a privileged idempotency key. Current
+  verification requires an independently trusted launcher/operator context.
+- **Scope isolation:** Reads and writes operate in an exact scope. `CROSS_PROJECT_WORKFLOW`
+  accepts no project, worktree, workflow, or agent identity keys and does not implicitly
+  copy records into another scope.
+- **Storage consistency:** Revision updates use transaction-local compare-and-swap. The
+  storage v2 contract rejects raw legacy writes to adapter records, and supported operations
+  have atomic rollback and idempotent retry behavior at the documented transaction
+  boundaries.
+- **Local providers:** The shipped embedding provider connects to Ollama on loopback;
+  non-local embedding endpoints and automatic remote fallbacks are not supported. Embedding
+  model identity, capabilities, dimensions, and input limits are checked against the
+  selected profile.
 
-- Sensitive-memory recovery is a trusted-operator-only local maintenance surface in
-  `factlane.recovery`, outside FastMCP, `MemoryGateway`, `public_contract`, and
-  `PUBLIC_TOOL_NAMES`. It does not add a public delete, administration, or recovery tool;
-  `memory_update` and normal compaction are not purge mechanisms.
-- Recovery is bound to an explicit frozen target set and exact database/profile state.
-  Maintenance quiescence, an exclusive recovery lease, known schema/materialization,
-  exact target binding, complete propagation, and the unchanged five-tool public contract
-  are hard fail-closed preconditions; if they cannot be proven, recovery does not mutate.
-- Recovery requires the product-wide SQLite 3.42.0+ runtime floor and still probes the
-  actual FTS5 `secure-delete` capability before mutation; version eligibility alone does
-  not bypass the capability check.
-- For a confirmed sensitive-memory incident, the logical purge is atomic. A pre-commit
-  failure rolls back the operation. A post-commit sealing/promotion failure persists
-  `S1_LOGICAL_PURGE_COMMITTED_SEALING_INCOMPLETE`; normal service restart and restoration
-  of the sensitive payload are forbidden until safe idempotent sealing reaches
-  `S1_LOCAL_FACTLANE_PURGE_VERIFIED`.
-- S1 recovery does not create a plaintext pre-mutation backup by default. Any forensic
-  snapshot requires separate explicit authority and containment, and external copies or
-  credential incidents require separate handling; local purge is not a claim of universal
-  or hardware-level erasure.
-- Availability of this operator does not authorize production recovery. Running it against
-  a live/production database remains a separately authorized incident action.
+The public MCP surface is limited to `memory_search`, `memory_get`, `memory_store`,
+`memory_update`, and `memory_status`. There is no normal-agent delete, recovery,
+administration, background harvesting, or autonomous consolidation tool.
 
-## Explicit limitations
+## Sensitive-memory recovery
 
-- Launcher-supplied host binding is not cryptographic or operating-system process
-  attestation.
-- FactLane is not a distributed coordination system.
-- Housekeeping is not an automatic background retention service, backup system, or
-  disaster-recovery subsystem.
-- Controlled Codex/Hermes real-host qualification is accepted evidence for the qualified
-  post-R2 identity, but it does not by itself make this checkout/package a deployed or
-  publicly released security baseline. Authoritative backup/restore acceptance is not yet
-  part of the final production-grade claim.
-- Retrieval specificity under Arabic/mixed-language and document-crowding cases remains
-  a known quality limitation; it is not treated as an authority or scope bypass.
+The local maintenance operator in `factlane.recovery` is separate from MCP and requires
+explicit operator authorization. It is intended for a confirmed sensitive-memory incident,
+not routine history maintenance.
 
-If a vulnerability could expose memory across scopes, bypass provenance or authority
-checks, mutate durable state without authorization, leak secrets, or turn memory into
-execution authority, treat it as high priority.
+Before modifying a database, recovery checks the exact target set and database/profile
+binding, the supported schema and materialized state, the absence of competing database use,
+and the required storage/FTS capabilities. An unsupported linked SQLite runtime (below
+**3.42.0**) stops the operation before it acquires a maintenance lease or creates recovery
+state or receipts. The operator separately verifies FTS5 `secure-delete`; the version
+number alone is not considered sufficient.
+
+A pre-commit failure rolls back the logical purge. If logical purge commits but subsequent
+sealing fails, the database must not be reopened for normal service or restored from a copy
+containing the sensitive payload until safe recovery completes. The operation does not
+create a plaintext backup by default. Any forensic snapshot, handling of external copies, or
+live production recovery requires its own authorization and containment plan.
+
+**Local recovery is not a guarantee of physical erasure or removal from backups, snapshots,
+logs, or external systems.** Normal `memory_update`, superseded-record compaction, and
+manual housekeeping are not substitutes for incident recovery.
+
+## Known limits
+
+FactLane is a local service, not a distributed consensus system. Manual housekeeping does
+not replace backups or disaster recovery. Authoritative backup/restore acceptance and
+broader production qualification remain open; passing unit/integration tests is not a claim
+that this checkout is deployed or production-ready. Arabic/mixed-language retrieval
+specificity and document crowding are known quality constraints, not permission to bypass
+scope or verification policy.
+
+See the [architecture](docs/ARCHITECTURE.md) and
+[environment requirements](docs/ENVIRONMENT.md) for implementation and runtime details.
