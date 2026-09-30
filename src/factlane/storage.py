@@ -17,6 +17,7 @@ from .contract import AdapterError, ScopeContext, canonical_json, parse_iso
 from .embeddings import EmbeddingProfile
 
 STORAGE_CONTRACT_VERSION = 2
+MIN_SQLITE_VERSION = (3, 42, 0)
 _WRITER_FUNCTION = "factlane_contract_v2_writer"
 _LEGACY_ORIGIN_JSON = canonical_json({"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None})
 
@@ -32,6 +33,18 @@ class RecordUniquenessConflict(RuntimeError):
 def register_storage_v2_writer(conn: sqlite3.Connection) -> None:
     """Mark one trusted FactLane connection as an authorized storage-v2 writer."""
     conn.create_function(_WRITER_FUNCTION, 0, lambda: 1)
+
+
+def assert_supported_sqlite_runtime(version_info: tuple[int, int, int] | None = None) -> None:
+    """Fail closed when the linked SQLite runtime cannot satisfy FactLane's storage contract."""
+    actual = tuple(version_info or sqlite3.sqlite_version_info)
+    if actual < MIN_SQLITE_VERSION:
+        required = ".".join(str(value) for value in MIN_SQLITE_VERSION)
+        detected = ".".join(str(value) for value in actual)
+        raise AdapterError(
+            "BACKEND_COMPATIBILITY_MISMATCH",
+            f"FactLane requires SQLite >= {required}; linked runtime is {detected}",
+        )
 
 
 _RECORD_COLUMNS = (
@@ -83,6 +96,7 @@ class SQLiteVecEngine:
     async def open(self) -> None:
         if os.environ.get("MCP_EXTERNAL_EMBEDDING_URL", "").strip():
             raise AdapterError("ADMIN_OPERATION_DENIED", "external embedding providers are disabled")
+        assert_supported_sqlite_runtime()
         os.environ["MCP_MEMORY_STORAGE_BACKEND"] = "sqlite_vec"
         os.environ["MCP_MEMORY_USE_ONNX"] = "0"
         os.environ["MCP_EXTERNAL_EMBEDDING_URL"] = ""

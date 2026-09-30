@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -113,6 +114,45 @@ def test_unknown_propagation_is_u1_and_cannot_construct_mutating_plan(tmp_path: 
     target = RecoveryTarget(record_id="r1", memory_id="m1", revision=0, scope=RecoveryScope("PROJECT", project_id="factlane"), expected_lifecycle="VALIDATED_CURRENT", expected_materialization=PM1, expected_native_hash="a" * 64)
     with pytest.raises(ValueError, match="U1"):
         RecoveryPlan(operation_id="unknown-propagation", db_path=str(tmp_path / "memory.db"), profile=profile(), targets=(target,), propagation_state="UNKNOWN")
+
+
+def test_recovery_rejects_unsupported_sqlite_before_lock_or_state(tmp_path: Path, monkeypatch) -> None:
+    db = tmp_path / "memory.db"
+    receipt = tmp_path / "runtime-floor.receipt.json"
+    state = receipt.with_suffix(receipt.suffix + ".state.json")
+    lock = Path(str(db) + ".recovery.lock")
+
+    async def prepare() -> dict[str, Any]:
+        engine, adapter = await _open_adapter(tmp_path)
+        item = await _store(
+            adapter,
+            key="runtime-floor",
+            fact="Runtime floor recovery target remains unchanged.",
+            marker="f",
+        )
+        row = await _target_row(engine, item["memory_id"])
+        await adapter.close()
+        return row
+
+    row = asyncio.run(prepare())
+    before_hash = hashlib.sha256(db.read_bytes()).hexdigest()
+    plan = _plan(db, row, operation="runtime-floor-op")
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 37, 2))
+
+    with pytest.raises(RecoveryHold) as exc_info:
+        asyncio.run(
+            SensitiveMemoryRecoveryOperator(foreign_handle_provider=lambda _: []).execute(
+                plan,
+                receipt_path=str(receipt),
+            )
+        )
+
+    assert exc_info.value.code == "HOLD_SQLITE_RUNTIME_UNSUPPORTED_NO_MUTATION"
+    assert db.exists()
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before_hash
+    assert not lock.exists()
+    assert not receipt.exists()
+    assert not state.exists()
 
 
 def test_nonquiescent_handle_inventory_holds_before_mutation(tmp_path: Path) -> None:

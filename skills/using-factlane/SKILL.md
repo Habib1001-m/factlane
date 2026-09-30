@@ -33,7 +33,9 @@ This Skill describes Public Contract Revision 2.
 
 Compaction can remove vectors from `HISTORICAL` rows. `REVIEW_HISTORY` with `SEMANTIC` or
 `HYBRID` then reports `HISTORY_SEMANTIC_PARTIAL`; use `KEYWORD`/`EXACT` or `memory_get` when
-compacted history must not depend on vectors.
+compacted history must not depend on vectors. If the result budget also truncates output,
+`budget.truncated=true` reports that separately and `HISTORY_SEMANTIC_PARTIAL` remains the
+degradation.
 
 For `CROSS_PROJECT_WORKFLOW`, allowed searches are `WORKFLOW_RULE + CURRENT`,
 `WORKFLOW_RULE + REVIEW_HISTORY`, and `HISTORICAL_QUESTION + REVIEW_HISTORY`.

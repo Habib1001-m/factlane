@@ -258,6 +258,15 @@ def test_public_docs_discover_offline_help_and_optional_skill() -> None:
     assert "using-factlane" in quickstart
 
 
+def test_public_docs_declare_sqlite_runtime_floor() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    quickstart = Path("docs/QUICKSTART.md").read_text(encoding="utf-8")
+    environment = Path("docs/ENVIRONMENT.md").read_text(encoding="utf-8")
+    provenance = Path("environment-provenance.json").read_text(encoding="utf-8")
+    for text in (readme, quickstart, environment, provenance):
+        assert "3.42.0" in text
+
+
 def test_invalid_intent_error_lists_safe_supported_choices() -> None:
     with pytest.raises(AdapterError) as error:
         TruthRouter().decide(

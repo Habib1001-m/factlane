@@ -142,7 +142,9 @@ public release complete. Final publication/release review is a separate gate.
 
 ## Development
 
-Requirements: Python 3.11+ and `uv`.
+Requirements: Python 3.11+, linked SQLite 3.42.0+, and `uv`. FactLane checks the
+SQLite runtime at startup and fails closed before opening or creating the database when
+the linked runtime is below the supported floor.
 
 ```bash
 uv sync --frozen --dev

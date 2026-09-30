@@ -83,6 +83,11 @@ Storage Contract Version 2 persists `contribution_origin` separately from verifi
 
 For `CURRENT` retrieval, lifecycle eligibility is applied before SQL limits. Semantic KNN constrains sqlite-vec rowids to exact-scope `VALIDATED_CURRENT` rows inside the KNN query before `k`, preventing closer Candidates from crowding a farther eligible Current record.
 
+That storage contract requires a linked SQLite runtime of at least 3.42.0. Startup checks
+the runtime before backend initialization and fails closed when the floor is not met;
+Python version alone is not treated as proof of SQLite capability. The product-wide floor
+also covers the FTS5 `secure-delete` capability used by sensitive-memory recovery.
+
 ## Embedding boundary
 
 The adapter depends on an `EmbeddingProvider` contract, while the current shipped

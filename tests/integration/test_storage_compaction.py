@@ -241,6 +241,20 @@ async def _verify_compaction_and_restart(tmp_path) -> None:
         assert old["record_id"] not in {row["record_id"] for row in semantic_history["results"]}
         assert current["record_id"] in {row["record_id"] for row in semantic_history["results"]}
 
+        semantic_history_tiny_budget = await adapter.search(
+            query=old["fact"],
+            intent_class="HISTORICAL_QUESTION",
+            scope="PROJECT",
+            project_id="factlane",
+            retrieval_mode="REVIEW_HISTORY",
+            retrieval_mode_kind="SEMANTIC",
+            max_bytes=2,
+        )
+        assert semantic_history_tiny_budget["status"] == "DEGRADED"
+        assert semantic_history_tiny_budget["degradation"] == "HISTORY_SEMANTIC_PARTIAL"
+        assert semantic_history_tiny_budget["results"] == []
+        assert semantic_history_tiny_budget["budget"]["truncated"] is True
+
         hybrid_history = await adapter.search(
             query=old["fact"],
             intent_class="HISTORICAL_QUESTION",
@@ -253,6 +267,20 @@ async def _verify_compaction_and_restart(tmp_path) -> None:
         assert hybrid_history["degradation"] == "HISTORY_SEMANTIC_PARTIAL"
         assert old["record_id"] in {row["record_id"] for row in hybrid_history["results"]}
 
+        hybrid_history_tiny_budget = await adapter.search(
+            query=old["fact"],
+            intent_class="HISTORICAL_QUESTION",
+            scope="PROJECT",
+            project_id="factlane",
+            retrieval_mode="REVIEW_HISTORY",
+            retrieval_mode_kind="HYBRID",
+            max_bytes=2,
+        )
+        assert hybrid_history_tiny_budget["status"] == "DEGRADED"
+        assert hybrid_history_tiny_budget["degradation"] == "HISTORY_SEMANTIC_PARTIAL"
+        assert hybrid_history_tiny_budget["results"] == []
+        assert hybrid_history_tiny_budget["budget"]["truncated"] is True
+
         current_get = await adapter.get(
             memory_id=current["memory_id"],
             scope="PROJECT",
@@ -261,6 +289,19 @@ async def _verify_compaction_and_restart(tmp_path) -> None:
         assert [row["record_id"] for row in current_get["results"]] == [current["record_id"]]
         assert current_get["results"][0]["authority_role"] == current["authority_role"]
         assert current_get["results"][0]["lifecycle_state"] == "VALIDATED_CURRENT"
+        budget_only = await adapter.search(
+            query=current["fact"],
+            intent_class="CURRENT_PROJECT_STATE",
+            scope="PROJECT",
+            project_id="factlane",
+            retrieval_mode="CURRENT",
+            retrieval_mode_kind="KEYWORD",
+            max_bytes=2,
+        )
+        assert budget_only["status"] == "DEGRADED"
+        assert budget_only["degradation"] == "BUDGET_EXCEEDED"
+        assert budget_only["results"] == []
+        assert budget_only["budget"]["truncated"] is True
         assert engine.conn is not None
         assert engine.conn.execute(
             "SELECT COUNT(*) FROM memory_graph WHERE source_hash = ? OR target_hash = ?",

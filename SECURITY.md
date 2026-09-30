@@ -34,6 +34,9 @@ synthetic reproduction that demonstrates the issue.
   Maintenance quiescence, an exclusive recovery lease, known schema/materialization,
   exact target binding, complete propagation, and the unchanged five-tool public contract
   are hard fail-closed preconditions; if they cannot be proven, recovery does not mutate.
+- Recovery requires the product-wide SQLite 3.42.0+ runtime floor and still probes the
+  actual FTS5 `secure-delete` capability before mutation; version eligibility alone does
+  not bypass the capability check.
 - For a confirmed sensitive-memory incident, the logical purge is atomic. A pre-commit
   failure rolls back the operation. A post-commit sealing/promotion failure persists
   `S1_LOGICAL_PURGE_COMMITTED_SEALING_INCOMPLETE`; normal service restart and restoration

@@ -53,7 +53,7 @@ RetrievalModeValue = _enum_field(
 )
 RetrievalKindValue = _enum_field(
     RETRIEVAL_MODE_KINDS,
-    "Retrieval strategy: EXACT, KEYWORD, SEMANTIC, or HYBRID. In REVIEW_HISTORY, compacted HISTORICAL rows no longer carry vectors; SEMANTIC/HYBRID therefore return degradation=HISTORY_SEMANTIC_PARTIAL when semantic history is incomplete. Use KEYWORD/EXACT or memory_get for compacted history that must not depend on vectors.",
+    "Retrieval strategy: EXACT, KEYWORD, SEMANTIC, or HYBRID. In REVIEW_HISTORY, compacted HISTORICAL rows no longer carry vectors; SEMANTIC/HYBRID therefore return degradation=HISTORY_SEMANTIC_PARTIAL when semantic history is incomplete. If result-budget truncation also occurs, budget.truncated=true reports that condition while degradation=HISTORY_SEMANTIC_PARTIAL remains. Use KEYWORD/EXACT or memory_get for compacted history that must not depend on vectors.",
     default="SEMANTIC",
 )
 UpdateModeValue = _enum_field(UPDATE_MODES, "REVERIFY preserves the logical memory; REPLACE creates a new logical revision.")

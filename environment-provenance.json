@@ -6,6 +6,10 @@
       "requirement": "CPython >=3.11",
       "reacquire_method": "Use a compatible CPython runtime through the project environment."
     },
+    "sqlite": {
+      "requirement": "SQLite >=3.42.0 linked through Python sqlite3",
+      "reacquire_method": "Use a CPython/runtime build linked against SQLite >=3.42.0 and verify sqlite3.sqlite_version_info before FactLane startup."
+    },
     "uv": {
       "requirement": "uv compatible with lockfile version 1",
       "reacquire_method": "Install a compatible uv release, then verify uv.lock without dependency drift."

@@ -1066,7 +1066,8 @@ class MemoryAdapter:
         envelope["budget"]["returned"] = 0
         if envelope["budget"]["truncated"]:
             envelope["status"] = "DEGRADED"
-            envelope["degradation"] = "BUDGET_EXCEEDED"
+            if envelope["degradation"] is None:
+                envelope["degradation"] = "BUDGET_EXCEEDED"
         return envelope
 
     async def _search(

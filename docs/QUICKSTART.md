@@ -8,6 +8,7 @@ without needing to understand the internal campaign history.
 Requirements:
 
 - Python 3.11 or newer;
+- SQLite 3.42.0 or newer as reported by Python's `sqlite3` module;
 - `uv`;
 - a local Ollama runtime for the currently supported embedding-provider path.
 
@@ -22,6 +23,12 @@ uv run factlane --help-tools
 FactLane does not automatically download models. The model required by the selected
 profile must already exist in the local Ollama runtime and match the exact identity
 pinned by that profile. Provider identity or dimension mismatches fail closed.
+
+FactLane also fails closed before opening or creating its database when the linked SQLite
+runtime is older than 3.42.0. The floor covers the virtual-table `IN` behavior required by
+CURRENT semantic KNN eligibility and the FTS5 `secure-delete` capability used by the
+sensitive-memory recovery operator. Python version alone does not guarantee this SQLite
+capability level.
 
 The public distribution also includes the portable `using-factlane` Skill. In a source
 checkout it is at `skills/using-factlane/SKILL.md`; a built wheel carries the same artifact

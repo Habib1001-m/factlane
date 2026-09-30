@@ -11,9 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .contract import PUBLIC_TOOL_NAMES, canonical_json
+from .contract import PUBLIC_TOOL_NAMES, AdapterError, canonical_json
 from .embeddings import EmbeddingProfile
-from .storage import SQLiteVecEngine, register_storage_v2_writer
+from .storage import SQLiteVecEngine, assert_supported_sqlite_runtime, register_storage_v2_writer
 
 
 _SAFE_OPERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -294,6 +294,13 @@ class SensitiveMemoryRecoveryOperator:
         state = Path(state_path).absolute() if state_path else receipt.with_suffix(receipt.suffix + ".state.json")
         if os.path.realpath(receipt) == os.path.realpath(db_path) or os.path.realpath(state) == os.path.realpath(db_path):
             raise ValueError("receipt/state must be outside the primary memory DB")
+        try:
+            assert_supported_sqlite_runtime()
+        except AdapterError as exc:
+            raise RecoveryHold(
+                "HOLD_SQLITE_RUNTIME_UNSUPPORTED_NO_MUTATION",
+                exc.safe_message,
+            ) from exc
         with MaintenanceLease(db_path, plan.operation_id):
             self._require_quiescent(db_path)
             persisted = self._read_state(state, plan)

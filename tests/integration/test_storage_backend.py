@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from factlane.backend_compat import (
 )
 from factlane.contract import AdapterError
 from factlane.embeddings import EmbeddingProfile
-from factlane.storage import SQLiteVecEngine
+from factlane.storage import MIN_SQLITE_VERSION, SQLiteVecEngine, assert_supported_sqlite_runtime
 
 
 def profile(dimension: int = 256) -> EmbeddingProfile:
@@ -179,6 +180,48 @@ def test_engine_delegates_db_execution_to_backend_retry() -> None:
         engine.conn.close()
     assert result == 42
     assert engine.storage.calls == 1
+
+
+def test_sqlite_runtime_contract_accepts_declared_floor() -> None:
+    assert MIN_SQLITE_VERSION == (3, 42, 0)
+    assert_supported_sqlite_runtime(MIN_SQLITE_VERSION)
+
+
+def test_sqlite_runtime_contract_rejects_below_floor() -> None:
+    with pytest.raises(AdapterError) as exc_info:
+        assert_supported_sqlite_runtime((3, 41, 9))
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+    assert "SQLite >= 3.42.0" in exc_info.value.safe_message
+
+
+def test_open_rejects_unsupported_sqlite_before_database_creation(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "unsupported-sqlite.db"
+    monkeypatch.delenv("MCP_EXTERNAL_EMBEDDING_URL", raising=False)
+    monkeypatch.delenv("MCP_MEMORY_STORAGE_BACKEND", raising=False)
+    monkeypatch.delenv("MCP_HTTP_ENABLED", raising=False)
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 37, 2))
+    engine = SQLiteVecEngine(str(db_path), profile())
+
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+    assert "linked runtime is 3.37.2" in exc_info.value.safe_message
+    assert not db_path.exists()
+    assert "MCP_MEMORY_STORAGE_BACKEND" not in os.environ
+    assert "MCP_HTTP_ENABLED" not in os.environ
+
+
+def test_external_embedding_denial_precedes_sqlite_runtime_gate(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MCP_EXTERNAL_EMBEDDING_URL", "https://example.invalid/embed")
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 37, 2))
+    engine = SQLiteVecEngine(str(tmp_path / "forbidden-external.db"), profile())
+
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+
+    assert exc_info.value.code == "ADMIN_OPERATION_DENIED"
+    assert not (tmp_path / "forbidden-external.db").exists()
 
 
 def test_open_reuses_backend_wal_and_busy_timeout(tmp_path) -> None:
