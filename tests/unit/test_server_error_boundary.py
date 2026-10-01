@@ -171,6 +171,7 @@ def test_e03_valid_request_id_is_preserved_and_unbounded_id_is_not_echoed() -> N
     [
         ("BACKEND_BUSY", True),
         ("BACKEND_UNAVAILABLE", True),
+        ("MAINTENANCE_IN_PROGRESS", True),
         ("TIMEOUT", True),
         ("VERSION_CONFLICT", False),
         ("WRITE_AUTHORIZATION_DENIED", False),

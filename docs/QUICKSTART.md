@@ -192,6 +192,9 @@ Facts are limited to 2,000 UTF-8 bytes. FactLane is not a raw-corpus indexer, ba
 service, or remote embedding gateway. Reproduction on this example profile does not
 establish language quality or production-scale throughput for your data. Sensitive-memory
 recovery is a separate, operator-authorized procedure, **not** a public MCP tool.
+Normal runtime engines and that recovery operator share a maintenance exclusion lease; a
+runtime starting while recovery owns the database returns `MAINTENANCE_IN_PROGRESS` rather
+than attaching through the final database-promotion window.
 
 See the [README](../README.md) for product orientation, [Architecture](ARCHITECTURE.md) for
 exact data flow, [Environment](ENVIRONMENT.md) for runtime and profiles, and

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import sqlite3
@@ -243,5 +244,61 @@ def test_open_reuses_backend_wal_and_busy_timeout(tmp_path) -> None:
             assert "adapter_meta" in tables
         finally:
             await engine.close()
+
+    asyncio.run(run())
+
+
+def test_maintenance_lock_noncontention_os_error_is_backend_unavailable(tmp_path, monkeypatch) -> None:
+    import fcntl
+
+    def fail_flock(*args, **kwargs) -> None:
+        del args, kwargs
+        raise OSError(errno.EIO, "synthetic lock I/O failure")
+
+    monkeypatch.setattr(fcntl, "flock", fail_flock)
+    engine = SQLiteVecEngine(str(tmp_path / "lock-io.db"), profile())
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+    assert exc_info.value.code == "BACKEND_UNAVAILABLE"
+    assert "maintenance coordination" in exc_info.value.safe_message
+    assert not (tmp_path / "lock-io.db").exists()
+
+
+def test_maintenance_lock_setup_permission_error_is_not_mislabeled_as_contention(
+    tmp_path, monkeypatch
+) -> None:
+    import builtins
+    import factlane.storage as storage_module
+
+    original_open = builtins.open
+    expected_lock = storage_module._maintenance_lock_path(str(tmp_path / "permission.db"))
+
+    def fail_lock_open(path, *args, **kwargs):
+        if Path(path) == expected_lock:
+            raise PermissionError(errno.EACCES, "synthetic lockfile permission failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fail_lock_open)
+    engine = SQLiteVecEngine(str(tmp_path / "permission.db"), profile())
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+    assert exc_info.value.code == "BACKEND_UNAVAILABLE"
+    assert exc_info.value.envelope()["audit"]["retryable"] is True
+    assert not (tmp_path / "permission.db").exists()
+
+
+def test_engine_lifecycle_rejects_double_open_and_reopen_after_close(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "single-use.db"), profile())
+        await engine.open()
+        with pytest.raises(AdapterError) as already_open:
+            await engine.open()
+        assert already_open.value.code == "BACKEND_UNAVAILABLE"
+        assert engine.conn is not None
+
+        await engine.close()
+        with pytest.raises(AdapterError) as already_closed:
+            await engine.open()
+        assert already_closed.value.code == "BACKEND_UNAVAILABLE"
 
     asyncio.run(run())

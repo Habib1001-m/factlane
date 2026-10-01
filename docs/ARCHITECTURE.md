@@ -134,6 +134,17 @@ SQLite and verified FTS5 capabilities. A pre-commit failure rolls back; post-com
 failure leaves normal service blocked until recovery completes. Local purge does not prove
 erasure from external copies or physical media. See [Security](../SECURITY.md).
 
+Runtime/recovery exclusion is cooperative and process-independent on supported POSIX hosts:
+ordinary `SQLiteVecEngine` instances acquire a shared advisory `flock` on
+`<db>.recovery.lock` before backend initialization and retain it until `close()`. Recovery
+acquires the corresponding exclusive lock before its first quiescence check and retains it
+through logical purge, sealing, `os.replace()` promotion, and the operator-owned postflight.
+This closes the attach-after-last-quiescence TOCTOU window; a new runtime attach during recovery
+receives `MAINTENANCE_IN_PROGRESS`. The operator's own postflight engine uses an internal-only
+maintenance path while the exclusive lease remains held.
+The exclusion guarantee is bounded to supported local POSIX filesystems with reliable `flock`
+semantics; it does not extend to Windows or unvalidated network/FUSE locking behavior.
+
 ## Qualification boundary
 
 Controlled local/host evidence establishes behavior for the tested configurations. It does

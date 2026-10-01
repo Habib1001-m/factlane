@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import errno
 import json
 import os
 import shutil
 import sqlite3
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from .backend_compat import (
@@ -20,6 +23,97 @@ STORAGE_CONTRACT_VERSION = 2
 MIN_SQLITE_VERSION = (3, 42, 0)
 _WRITER_FUNCTION = "factlane_contract_v2_writer"
 _LEGACY_ORIGIN_JSON = canonical_json({"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None})
+_MAINTENANCE_CAPABILITY_SECRET = object()
+
+
+class _MaintenanceCapability:
+    __slots__ = ("db_path", "handle", "_secret")
+
+    def __init__(self, db_path: str, handle: Any, secret: object) -> None:
+        self.db_path = os.path.realpath(os.path.abspath(db_path))
+        self.handle = handle
+        self._secret = secret
+
+
+def _make_maintenance_capability(db_path: str, handle: Any) -> _MaintenanceCapability:
+    """Create the internal capability proving recovery still owns its lease handle."""
+    return _MaintenanceCapability(db_path, handle, _MAINTENANCE_CAPABILITY_SECRET)
+
+
+def _validate_maintenance_capability(db_path: str, capability: _MaintenanceCapability) -> None:
+    canonical = os.path.realpath(os.path.abspath(db_path))
+    if (
+        not isinstance(capability, _MaintenanceCapability)
+        or capability._secret is not _MAINTENANCE_CAPABILITY_SECRET
+        or capability.db_path != canonical
+        or capability.handle is None
+        or capability.handle.closed
+    ):
+        raise AdapterError(
+            "WRITE_AUTHORIZATION_DENIED",
+            "maintenance engine requires an active recovery lease for the exact database",
+        )
+
+
+def _maintenance_lock_path(db_path: str) -> Path:
+    """Return one canonical lock namespace for aliases of the same database path."""
+    return Path(os.path.realpath(os.path.abspath(db_path)) + ".recovery.lock")
+
+
+def _acquire_runtime_maintenance_lease(db_path: str) -> Any:
+    """Hold a shared lease while a normal runtime engine is attached to one DB."""
+    try:
+        import fcntl
+    except ImportError:
+        # Sensitive-memory recovery is POSIX-only today as well. Do not make the
+        # ordinary storage module unimportable on platforms without fcntl.
+        return None
+
+    lock_path = _maintenance_lock_path(db_path)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+", encoding="utf-8")
+        os.chmod(lock_path, 0o600)
+    except OSError as exc:
+        raise AdapterError(
+            "BACKEND_UNAVAILABLE",
+            "database maintenance coordination is unavailable",
+        ) from exc
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise AdapterError(
+            "MAINTENANCE_IN_PROGRESS",
+            "database maintenance is in progress; retry after maintenance completes",
+        ) from exc
+    except OSError as exc:
+        handle.close()
+        if exc.errno in {errno.EACCES, errno.EAGAIN}:
+            raise AdapterError(
+                "MAINTENANCE_IN_PROGRESS",
+                "database maintenance is in progress; retry after maintenance completes",
+            ) from exc
+        raise AdapterError(
+            "BACKEND_UNAVAILABLE",
+            "database maintenance coordination is unavailable",
+        ) from exc
+    return handle
+
+
+def _release_runtime_maintenance_lease(handle: Any) -> None:
+    if handle is None:
+        return
+    try:
+        import fcntl
+    except ImportError:
+        handle.close()
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 class RecordUniquenessConflict(RuntimeError):
@@ -92,33 +186,57 @@ class SQLiteVecEngine:
         self.conn: sqlite3.Connection | None = None
         self.native_columns: set[str] = set()
         self._closed = False
+        self._maintenance_lease_handle: Any = None
+        self._maintenance_capability: _MaintenanceCapability | None = None
+
+    @classmethod
+    def _for_maintenance(
+        cls,
+        db_path: str,
+        profile: EmbeddingProfile,
+        capability: _MaintenanceCapability,
+    ) -> "SQLiteVecEngine":
+        """Create the operator-owned engine used while recovery holds the exclusive lease."""
+        _validate_maintenance_capability(db_path, capability)
+        engine = cls(db_path, profile)
+        engine._maintenance_capability = capability
+        return engine
 
     async def open(self) -> None:
+        if self._closed:
+            raise AdapterError("BACKEND_UNAVAILABLE", "backend engine is already closed")
+        if self.storage is not None or self.conn is not None or self._maintenance_lease_handle is not None:
+            raise AdapterError("BACKEND_UNAVAILABLE", "backend engine is already open")
         if os.environ.get("MCP_EXTERNAL_EMBEDDING_URL", "").strip():
             raise AdapterError("ADMIN_OPERATION_DENIED", "external embedding providers are disabled")
         assert_supported_sqlite_runtime()
-        os.environ["MCP_MEMORY_STORAGE_BACKEND"] = "sqlite_vec"
-        os.environ["MCP_MEMORY_USE_ONNX"] = "0"
-        os.environ["MCP_EXTERNAL_EMBEDDING_URL"] = ""
-        os.environ["MCP_SEMANTIC_DEDUP_ENABLED"] = "false"
-        os.environ["MCP_MEMORY_ALLOW_HASH_EMBEDDINGS"] = "0"
-        os.environ["MCP_HTTP_ENABLED"] = "false"
-        os.environ["MCP_SSE_MODE"] = "0"
-        os.environ["MCP_STREAMABLE_HTTP_MODE"] = "0"
-        os.environ["MCP_MDNS_ENABLED"] = "false"
-        os.environ["MCP_BACKUP_ENABLED"] = "false"
-        os.environ["MCP_CONSOLIDATION_ENABLED"] = "false"
-        os.environ["MCP_AUTO_EXTRACT_DEFAULT"] = "false"
-        os.environ["MCP_QUALITY_SYSTEM_ENABLED"] = "false"
-        os.environ["MCP_QUALITY_BOOST_ENABLED"] = "false"
-        os.environ["MCP_INSIGHT_CARDS_ENABLED"] = "false"
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        if self._maintenance_capability is None:
+            self._maintenance_lease_handle = _acquire_runtime_maintenance_lease(self.db_path)
+        else:
+            _validate_maintenance_capability(self.db_path, self._maintenance_capability)
         try:
+            os.environ["MCP_MEMORY_STORAGE_BACKEND"] = "sqlite_vec"
+            os.environ["MCP_MEMORY_USE_ONNX"] = "0"
+            os.environ["MCP_EXTERNAL_EMBEDDING_URL"] = ""
+            os.environ["MCP_SEMANTIC_DEDUP_ENABLED"] = "false"
+            os.environ["MCP_MEMORY_ALLOW_HASH_EMBEDDINGS"] = "0"
+            os.environ["MCP_HTTP_ENABLED"] = "false"
+            os.environ["MCP_SSE_MODE"] = "0"
+            os.environ["MCP_STREAMABLE_HTTP_MODE"] = "0"
+            os.environ["MCP_MDNS_ENABLED"] = "false"
+            os.environ["MCP_BACKUP_ENABLED"] = "false"
+            os.environ["MCP_CONSOLIDATION_ENABLED"] = "false"
+            os.environ["MCP_AUTO_EXTRACT_DEFAULT"] = "false"
+            os.environ["MCP_QUALITY_SYSTEM_ENABLED"] = "false"
+            os.environ["MCP_QUALITY_BOOST_ENABLED"] = "false"
+            os.environ["MCP_INSIGHT_CARDS_ENABLED"] = "false"
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             SqliteVecMemoryStorage = load_pinned_sqlite_vec_storage()
             storage = SqliteVecMemoryStorage(
                 self.db_path,
                 embedding_model=self.profile.base_model_identity,
             )
+            self.storage = storage
             # Native startup receives the profile dimension; adapter code binds
             # the real provider before any memory operation.
             storage.embedding_dimension = self.profile.output_dimension
@@ -133,7 +251,6 @@ class SQLiteVecEngine:
 
             bind_deferred_embedding_initializer(storage, defer_native_embedding)
             await storage.initialize(strict_dimension_check=True)
-            self.storage = storage
             self.conn = storage.conn
             if self.conn is None:
                 raise AdapterError("BACKEND_UNAVAILABLE", "SQLite-vec backend did not expose a connection")
@@ -149,7 +266,11 @@ class SQLiteVecEngine:
                 raise AdapterError("SCHEMA_MISMATCH", "pinned backend schema is missing required columns")
             await self._run(self._create_adapter_schema)
             await self._run(self._check_profile)
+        except asyncio.CancelledError:
+            await self.close()
+            raise
         except AdapterError:
+            await self.close()
             raise
         except sqlite3.Error as exc:
             await self.close()
@@ -1162,11 +1283,20 @@ class SQLiteVecEngine:
     async def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         if self.storage is not None:
             try:
                 await self.storage.close()
-            except Exception:
-                pass
+            except asyncio.CancelledError:
+                # The backend may still own SQLite handles. Keep the shared lease.
+                raise
+            except Exception as exc:
+                # Never make recovery eligible while backend handle closure is uncertain.
+                raise AdapterError(
+                    "BACKEND_UNAVAILABLE",
+                    "backend could not be closed cleanly; maintenance exclusion remains active",
+                ) from exc
         self.conn = None
         self.storage = None
+        _release_runtime_maintenance_lease(self._maintenance_lease_handle)
+        self._maintenance_lease_handle = None
+        self._closed = True

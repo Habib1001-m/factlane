@@ -13,7 +13,14 @@ from typing import Any, Callable, Iterable
 
 from .contract import PUBLIC_TOOL_NAMES, AdapterError, canonical_json
 from .embeddings import EmbeddingProfile
-from .storage import SQLiteVecEngine, assert_supported_sqlite_runtime, register_storage_v2_writer
+from .storage import (
+    SQLiteVecEngine,
+    _MaintenanceCapability,
+    _make_maintenance_capability,
+    _maintenance_lock_path,
+    assert_supported_sqlite_runtime,
+    register_storage_v2_writer,
+)
 
 
 _SAFE_OPERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -208,9 +215,11 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 class MaintenanceLease:
     def __init__(self, db_path: str, operation_id: str) -> None:
-        self.path = Path(os.path.abspath(db_path) + ".recovery.lock")
+        self.path = _maintenance_lock_path(db_path)
+        self.db_path = os.path.realpath(os.path.abspath(db_path))
         self.operation_id = operation_id
         self._handle: Any = None
+        self.capability: _MaintenanceCapability | None = None
 
     def __enter__(self) -> "MaintenanceLease":
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -225,6 +234,7 @@ class MaintenanceLease:
         handle.write(f"operation_id={self.operation_id}\npid={os.getpid()}\n")
         handle.flush(); os.fsync(handle.fileno())
         self._handle = handle
+        self.capability = _make_maintenance_capability(self.db_path, handle)
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -233,7 +243,7 @@ class MaintenanceLease:
         try:
             fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
         finally:
-            self._handle.close(); self._handle = None
+            self._handle.close(); self._handle = None; self.capability = None
 
 
 def linux_foreign_db_handles(db_path: str) -> list[dict[str, Any]]:
@@ -301,7 +311,7 @@ class SensitiveMemoryRecoveryOperator:
                 "HOLD_SQLITE_RUNTIME_UNSUPPORTED_NO_MUTATION",
                 exc.safe_message,
             ) from exc
-        with MaintenanceLease(db_path, plan.operation_id):
+        with MaintenanceLease(db_path, plan.operation_id) as maintenance_lease:
             self._require_quiescent(db_path)
             persisted = self._read_state(state, plan)
             if persisted is None:
@@ -345,7 +355,12 @@ class SensitiveMemoryRecoveryOperator:
                 self._require_quiescent(db_path)
                 self._seal_and_promote(conn, plan, survivor_snapshot)
                 conn = None
-                await self._real_engine_postflight(plan, survivor_snapshot)
+                assert maintenance_lease.capability is not None
+                await self._real_engine_postflight(
+                    plan,
+                    survivor_snapshot,
+                    maintenance_lease.capability,
+                )
                 self._write_state(state, plan, _LOCAL_PURGE_VERIFIED)
                 _atomic_json(receipt, self._receipt(plan, inspections))
                 return RecoveryResult(plan.operation_id, _LOCAL_PURGE_VERIFIED, True, True, str(receipt), str(state), len(plan.targets))
@@ -979,9 +994,16 @@ class SensitiveMemoryRecoveryOperator:
             verify.close()
 
     async def _real_engine_postflight(
-        self, plan: RecoveryPlan, survivor_snapshot: SurvivorSnapshot
+        self,
+        plan: RecoveryPlan,
+        survivor_snapshot: SurvivorSnapshot,
+        maintenance_capability: _MaintenanceCapability,
     ) -> None:
-        engine = SQLiteVecEngine(os.path.abspath(plan.db_path), plan.profile)
+        engine = SQLiteVecEngine._for_maintenance(
+            os.path.abspath(plan.db_path),
+            plan.profile,
+            maintenance_capability,
+        )
         await engine.open()
         try:
             if engine.conn is None:
