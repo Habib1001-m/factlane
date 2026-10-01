@@ -85,6 +85,15 @@ sqlite-vec KNN constrains eligible row IDs **inside the vector query before `k` 
 Otherwise, many closer unverified Candidates could fill the top results and conceal a
 farther validated fact.
 
+After CURRENT semantic/hybrid candidates pass lifecycle and freshness checks, the adapter
+selects the highest-ranked candidate from distinct stored provenance sources before filling
+remaining slots with repeated-source candidates. This reduces same-document crowding without
+changing stored scores: the top eligible result is preserved, and the selected set is emitted
+in its original relevance order. After the top result, an unseen source can therefore occupy a
+slot ahead of a higher-scored repeat from the same source; this is the deliberate diversity
+tradeoff rather than a score rewrite. Exact, keyword-only, and `REVIEW_HISTORY` retrieval
+bypass this diversity step.
+
 `REVIEW_HISTORY` exposes past revisions and Candidates for explicit inspection. Atomic
 compaction can retain a historical record without its original vector. If semantic or hybrid
 history is consequently incomplete, the result reports
@@ -129,6 +138,7 @@ erasure from external copies or physical media. See [Security](../SECURITY.md).
 
 Controlled local/host evidence establishes behavior for the tested configurations. It does
 not establish support for every MCP client, production-scale ingestion, disaster recovery,
-or every language mix. Arabic/mixed-language retrieval specificity and document crowding
-still need workload-specific validation. FactLane is a fact store, not a transcript archive
-or raw document crawler.
+or every language mix. Source-diverse CURRENT semantic/hybrid selection reduces one known
+document-crowding mechanism, but Arabic/mixed-language retrieval specificity still needs
+workload-specific validation. FactLane is a fact store, not a transcript archive or raw
+document crawler.

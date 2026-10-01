@@ -1042,6 +1042,41 @@ class MemoryAdapter:
             json.loads(record["source_provenance"]),
         )
 
+    @staticmethod
+    def _source_identity(record: dict[str, Any]) -> tuple[str, str, str]:
+        provenance = json.loads(record["source_provenance"])
+        return (
+            provenance["source_class"],
+            provenance["source_ref"],
+            provenance["source_hash"],
+        )
+
+    @classmethod
+    def _source_diverse_selection(
+        cls,
+        scored: list[tuple[dict[str, Any], float]],
+        limit: int,
+    ) -> list[tuple[dict[str, Any], float]]:
+        if len(scored) <= limit:
+            return scored
+
+        selected_indexes: list[int] = []
+        deferred_indexes: list[int] = []
+        seen_sources: set[tuple[str, str, str]] = set()
+        for index, (row, _score) in enumerate(scored):
+            source = cls._source_identity(row)
+            if source not in seen_sources and len(selected_indexes) < limit:
+                seen_sources.add(source)
+                selected_indexes.append(index)
+            else:
+                deferred_indexes.append(index)
+
+        if len(selected_indexes) < limit:
+            selected_indexes.extend(deferred_indexes[: limit - len(selected_indexes)])
+
+        selected_indexes.sort()
+        return [scored[index] for index in selected_indexes]
+
     def _fit_budget(self, envelope: dict[str, Any]) -> dict[str, Any]:
         def encoded() -> bytes:
             return canonical_json(envelope["results"]).encode("utf-8")
@@ -1173,7 +1208,10 @@ class MemoryAdapter:
                 if not self._current_record(row):
                     continue
             safe.append((row, score))
-        safe = safe[:max_memories]
+        if not history and retrieval_mode_kind in {"SEMANTIC", "HYBRID"}:
+            safe = self._source_diverse_selection(safe, max_memories)
+        else:
+            safe = safe[:max_memories]
         envelope["results"] = [self._public(row, relevance_score=round(score, 6), retrieval_rank=index) for index, (row, score) in enumerate(safe, start=1)]
         envelope["contradictions"] = await self.engine.contradiction_summary(scope_context)
         if not envelope["results"] and stale_count:
