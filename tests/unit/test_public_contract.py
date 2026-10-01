@@ -10,8 +10,6 @@ from typing import Any
 
 import pytest
 
-from mcp.server.fastmcp.exceptions import ToolError
-
 from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
 from factlane.contract import (
     INTENT_CLASSES,
@@ -53,6 +51,14 @@ def _request_schema(tool_name: str) -> dict[str, Any]:
     parameters = _server()._tool_manager._tools[tool_name].parameters  # type: ignore[attr-defined]
     request = parameters["properties"]["request"]
     return parameters["$defs"][request["$ref"].rsplit("/", 1)[-1]]
+
+
+def _structured_tool_result(server: Any, tool_name: str, request: dict[str, Any]) -> dict[str, Any]:
+    content, structured = asyncio.run(server.call_tool(tool_name, {"request": request}))
+    assert isinstance(structured, dict)
+    assert len(content) == 1
+    assert json.loads(content[0].text) == structured
+    return structured
 
 
 def test_mcp_contract_exposes_exactly_five_typed_request_envelopes() -> None:
@@ -114,17 +120,19 @@ def test_public_mcp_preserves_unknown_fields_for_policy_rejection() -> None:
             transport_kind="stdio",
         )
     )
-    with pytest.raises(ToolError):
-        asyncio.run(server.call_tool(
-            "memory_search",
-            {"request": {
-                "query": "lifecycle policy",
-                "intent_class": "WORKFLOW_RULE",
-                "scope": "PROJECT",
-                "project_id": "factlane",
-                "unknown_extra": "must-not-be-stripped",
-            }},
-        ))
+    result = _structured_tool_result(
+        server,
+        "memory_search",
+        {
+            "query": "lifecycle policy",
+            "intent_class": "WORKFLOW_RULE",
+            "scope": "PROJECT",
+            "project_id": "factlane",
+            "unknown_extra": "must-not-be-stripped",
+        },
+    )
+    assert result["status"] == "BLOCKED"
+    assert result["error_code"] == "INVALID_ENVELOPE"
     assert len(adapter.calls) == 1
     assert adapter.calls[0]["unknown_extra"] == "must-not-be-stripped"
 
@@ -148,11 +156,13 @@ def test_public_mcp_reserved_claims_are_rejected_before_adapter(claim: str) -> N
             transport_kind="stdio",
         )
     )
-    with pytest.raises(ToolError):
-        asyncio.run(server.call_tool(
-            "memory_status",
-            {"request": {"scope": "PROJECT", "project_id": "factlane", claim: "spoofed"}},
-        ))
+    result = _structured_tool_result(
+        server,
+        "memory_status",
+        {"scope": "PROJECT", "project_id": "factlane", claim: "spoofed"},
+    )
+    assert result["status"] == "BLOCKED"
+    assert result["error_code"] == "WRITE_AUTHORIZATION_DENIED"
     assert adapter.calls == []
 
 
@@ -174,13 +184,14 @@ def test_public_mcp_preserves_explicit_null_identity_for_cross_scope_policy_erro
             transport_kind="stdio",
         )
     )
-    with pytest.raises(ToolError, match="explicit null identity key"):
-        asyncio.run(
-            server.call_tool(
-                "memory_status",
-                {"request": {"scope": "CROSS_PROJECT_WORKFLOW", "project_id": None}},
-            )
-        )
+    result = _structured_tool_result(
+        server,
+        "memory_status",
+        {"scope": "CROSS_PROJECT_WORKFLOW", "project_id": None},
+    )
+    assert result["status"] == "BLOCKED"
+    assert result["error_code"] == "CROSS_SCOPE_DENIED"
+    assert result["message"] == "explicit null identity key is still present"
     assert adapter.calls == [{"scope": "CROSS_PROJECT_WORKFLOW", "project_id": None}]
 
 
@@ -197,6 +208,9 @@ def test_help_documents_cross_project_search_and_freshness_matrix() -> None:
     assert "GENERAL_TASK_NO_MEMORY_REQUIRED -> NO_MEMORY_NEEDED after scope-shape validation" in help_text
     assert "on_change requires non-empty recheck_ref and source_fingerprint" in help_text
     assert "source_fingerprint must equal source_provenance.source_hash" in help_text
+    assert "status=BLOCKED" in help_text
+    assert "stable error_code" in help_text
+    assert "Unexpected internal exceptions remain transport errors" in help_text
 
 
 def test_store_and_update_contracts_explain_governed_write_fields() -> None:

@@ -166,6 +166,11 @@ conflicting explicit ID with `BOUND_CONTEXT_IDENTITY_MISMATCH`. `CROSS_PROJECT_W
 different: it forbids the presence of *all* project, worktree, workflow, and agent identity
 keys and does not query all projects automatically.
 
+Governed FactLane failures use the same MCP result channel as successful calls and return
+`status=BLOCKED` with a stable `error_code`, a safe `message`, empty `results`, and
+`audit.retryable`. Branch on `error_code`; do not scrape exception prose. Unexpected internal
+exceptions are still transport errors rather than governed FactLane results.
+
 If search returns no result, do not treat that as permission to invent a fact. To contribute
 an actual Candidate, consult `factlane --help-tools` or the live MCP schema for the complete
 required `source_provenance`, `freshness_policy`, `memory_type`, and `idempotency_key`

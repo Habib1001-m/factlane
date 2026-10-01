@@ -23,6 +23,12 @@ freshness, permissions, contradiction handling, retrieval budgets, and revision 
 `TruthRouter` selects bounded search behavior inside the adapter. The backend supplies
 SQLite connections and SQLite-vec primitives, not FactLane's authorization decisions.
 
+The public server boundary converts governed `AdapterError` failures into the ordinary MCP
+result shape with `status=BLOCKED`, stable `error_code`, safe `message`, empty `results`, and
+trusted audit metadata. This conversion exists only at the public server boundary; direct
+gateway/adapter callers still receive `AdapterError`, and unexpected exceptions remain MCP
+transport errors rather than being relabeled as governed outcomes.
+
 The server supports **local stdio only**. Codex and Hermes are tested host integrations, but
 the dispatch path is not specific to either. Another client that supports command-launched
 stdio MCP may use the same executable; it is not automatically a separately qualified host.

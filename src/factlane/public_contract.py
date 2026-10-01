@@ -294,6 +294,8 @@ def render_tool_help(tool_name: str | None = None) -> str:
         "Writes require trusted launcher authorization; normal agent profiles are Candidate-only. "
         "Store a bounded fact with source_provenance, freshness_policy, and idempotency_key; update "
         "with current expected_revision, idempotency_key, and mode REVERIFY or REPLACE.",
+        "Governed FactLane errors return the normal MCP result shape with status=BLOCKED, a stable error_code, "
+        "a safe message, empty results, and audit.retryable. Unexpected internal exceptions remain transport errors.",
         "Never guess an enum or field name: inspect live MCP schema or this help.",
     ]
     for name in names:
