@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -121,7 +122,7 @@ def test_recovery_rejects_unsupported_sqlite_before_lock_or_state(tmp_path: Path
     db = tmp_path / "memory.db"
     receipt = tmp_path / "runtime-floor.receipt.json"
     state = receipt.with_suffix(receipt.suffix + ".state.json")
-    lock = Path(str(db) + ".recovery.lock")
+    obsolete_sidecar = Path(str(db) + ".recovery.lock")
 
     async def prepare() -> dict[str, Any]:
         engine, adapter = await _open_adapter(tmp_path)
@@ -137,8 +138,6 @@ def test_recovery_rejects_unsupported_sqlite_before_lock_or_state(tmp_path: Path
 
     row = asyncio.run(prepare())
     before_hash = hashlib.sha256(db.read_bytes()).hexdigest()
-    lock_before = lock.read_bytes() if lock.exists() else None
-    lock_mtime_before = lock.stat().st_mtime_ns if lock.exists() else None
     plan = _plan(db, row, operation="runtime-floor-op")
     monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 37, 2))
 
@@ -153,8 +152,7 @@ def test_recovery_rejects_unsupported_sqlite_before_lock_or_state(tmp_path: Path
     assert exc_info.value.code == "HOLD_SQLITE_RUNTIME_UNSUPPORTED_NO_MUTATION"
     assert db.exists()
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before_hash
-    assert (lock.read_bytes() if lock.exists() else None) == lock_before
-    assert (lock.stat().st_mtime_ns if lock.exists() else None) == lock_mtime_before
+    assert not obsolete_sidecar.exists()
     assert not receipt.exists()
     assert not state.exists()
 
@@ -675,7 +673,8 @@ def test_r33_nested_parent_first_create_keeps_runtime_lease_contract(tmp_path: P
             await engine.close()
 
     asyncio.run(exercise())
-    assert Path(str(nested_db.resolve()) + ".recovery.lock").exists()
+    assert nested_db.exists()
+    assert not Path(str(nested_db.resolve()) + ".recovery.lock").exists()
     with MaintenanceLease(str(nested_db), "r33-after-close"):
         pass
 
@@ -683,6 +682,8 @@ def test_r33_nested_parent_first_create_keeps_runtime_lease_contract(tmp_path: P
 def test_r34_maintenance_postflight_capability_expires_and_is_db_bound(tmp_path: Path) -> None:
     db = tmp_path / "memory.db"
     other_db = tmp_path / "other.db"
+    sqlite3.connect(db).close()
+    sqlite3.connect(other_db).close()
     capability = None
     with MaintenanceLease(str(db), "r34-capability") as lease:
         capability = lease.capability
@@ -695,6 +696,265 @@ def test_r34_maintenance_postflight_capability_expires_and_is_db_bound(tmp_path:
     with pytest.raises(AdapterError) as expired:
         SQLiteVecEngine._for_maintenance(str(db), profile(), capability)
     assert expired.value.code == "WRITE_AUTHORIZATION_DENIED"
+
+
+def test_r35_hardlink_alias_shares_database_inode_lease(tmp_path: Path) -> None:
+    async def prepare() -> tuple[SQLiteVecEngine, MemoryAdapter]:
+        return await _open_adapter(tmp_path)
+
+    engine, adapter = asyncio.run(prepare())
+    db = tmp_path / "memory.db"
+    alias = tmp_path / "memory-hardlink.db"
+    os.link(db, alias)
+    try:
+        with pytest.raises(RecoveryHold) as blocked:
+            with MaintenanceLease(str(alias), "r35-hardlink"):
+                pass
+        assert blocked.value.code == "HOLD_NONQUIESCENT_NO_MUTATION"
+    finally:
+        asyncio.run(adapter.close())
+        assert engine.conn is None
+
+
+def test_r36_retargeted_directory_alias_same_inode_cannot_split_lease(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir(); second.mkdir()
+    alias_dir = tmp_path / "active"
+    alias_dir.symlink_to(first, target_is_directory=True)
+
+    async def prepare() -> tuple[SQLiteVecEngine, MemoryAdapter]:
+        return await _open_adapter(alias_dir)
+
+    engine, adapter = asyncio.run(prepare())
+    first_db = first / "memory.db"
+    second_db = second / "memory.db"
+    os.link(first_db, second_db)
+    alias_dir.unlink()
+    alias_dir.symlink_to(second, target_is_directory=True)
+    try:
+        with pytest.raises(RecoveryHold) as blocked:
+            with MaintenanceLease(str(alias_dir / "memory.db"), "r36-retarget"):
+                pass
+        assert blocked.value.code == "HOLD_NONQUIESCENT_NO_MUTATION"
+    finally:
+        asyncio.run(adapter.close())
+        assert engine.conn is None
+
+
+def test_r37_promoted_new_inode_is_exclusive_before_canonical_replace_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def prepare() -> dict[str, Any]:
+        engine, adapter = await _open_adapter(tmp_path)
+        target = await _store(
+            adapter, key="r37-target", fact="R37 promotion target.", marker="f"
+        )
+        row = await _target_row(engine, target["memory_id"])
+        await adapter.close()
+        return row
+
+    target_row = asyncio.run(prepare())
+    db = tmp_path / "memory.db"
+    plan = _plan(db, target_row, operation="r37-new-inode-lock")
+    import factlane.recovery as recovery_module
+    original_replace = recovery_module.os.replace
+    checked = {"value": False}
+
+    def replace_then_probe(src: str | Path, dst: str | Path) -> None:
+        original_replace(src, dst)
+        if str(dst) == str(db) and str(src).endswith(".sanitized"):
+            import factlane.storage as storage_module
+            with pytest.raises(AdapterError) as blocked:
+                storage_module._acquire_runtime_maintenance_lease(str(db))
+            assert blocked.value.code == "MAINTENANCE_IN_PROGRESS"
+            checked["value"] = True
+
+    monkeypatch.setattr(recovery_module.os, "replace", replace_then_probe)
+    result = _run(plan, tmp_path)
+    assert result.promoted is True
+    assert checked["value"] is True
+
+
+def test_r38_postflight_close_failure_retains_all_exclusion_inodes_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def prepare() -> dict[str, Any]:
+        engine, adapter = await _open_adapter(tmp_path)
+        target = await _store(
+            adapter, key="r38-target", fact="R38 postflight cleanup target.", marker="1"
+        )
+        row = await _target_row(engine, target["memory_id"])
+        await adapter.close()
+        return row
+
+    target_row = asyncio.run(prepare())
+    db = tmp_path / "memory.db"
+    old_alias = tmp_path / "old-inode.db"
+    os.link(db, old_alias)
+    plan = _plan(db, target_row, operation="r38-close-failure")
+    original_close = SQLiteVecEngine.close
+    captured: dict[str, SQLiteVecEngine] = {}
+
+    async def fail_maintenance_close(engine: SQLiteVecEngine) -> None:
+        if engine._maintenance_capability is not None:
+            captured["engine"] = engine
+            raise RuntimeError("synthetic postflight close failure")
+        await original_close(engine)
+
+    monkeypatch.setattr(SQLiteVecEngine, "close", fail_maintenance_close)
+    operator = SensitiveMemoryRecoveryOperator(foreign_handle_provider=lambda _: [])
+    try:
+        with pytest.raises(RecoveryHold) as caught:
+            _run(plan, tmp_path, operator=operator)
+        assert caught.value.code == "S1_LOGICAL_PURGE_COMMITTED_SEALING_INCOMPLETE"
+        assert captured["engine"].conn is not None
+
+        for path in (db, old_alias):
+            contender = SQLiteVecEngine(str(path), profile())
+            with pytest.raises(AdapterError) as blocked:
+                asyncio.run(contender.open())
+            assert blocked.value.code == "MAINTENANCE_IN_PROGRESS"
+
+        with pytest.raises(RecoveryHold):
+            with MaintenanceLease(str(db), "r38-second-recovery"):
+                pass
+    finally:
+        monkeypatch.setattr(SQLiteVecEngine, "close", original_close)
+        engine = captured.get("engine")
+        if engine is not None and engine.conn is not None:
+            engine.conn.close()
+            if engine.storage is not None and hasattr(engine.storage, "conn"):
+                engine.storage.conn = None
+        import factlane.recovery as recovery_module
+        handles = recovery_module._RETAINED_MAINTENANCE_EXCLUSIONS.pop(str(db.resolve()), [])
+        import fcntl
+        for handle in handles:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+
+def test_r39_cancelled_postflight_close_retains_exclusion_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def prepare() -> dict[str, Any]:
+        engine, adapter = await _open_adapter(tmp_path)
+        target = await _store(
+            adapter, key="r39-target", fact="R39 cancellation target.", marker="2"
+        )
+        row = await _target_row(engine, target["memory_id"])
+        await adapter.close()
+        return row
+
+    target_row = asyncio.run(prepare())
+    db = tmp_path / "memory.db"
+    plan = _plan(db, target_row, operation="r39-close-cancel")
+    original_close = SQLiteVecEngine.close
+    captured: dict[str, SQLiteVecEngine] = {}
+
+    async def cancel_maintenance_close(engine: SQLiteVecEngine) -> None:
+        if engine._maintenance_capability is not None:
+            captured["engine"] = engine
+            raise asyncio.CancelledError
+        await original_close(engine)
+
+    monkeypatch.setattr(SQLiteVecEngine, "close", cancel_maintenance_close)
+    operator = SensitiveMemoryRecoveryOperator(foreign_handle_provider=lambda _: [])
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            _run(plan, tmp_path, operator=operator)
+        contender = SQLiteVecEngine(str(db), profile())
+        with pytest.raises(AdapterError) as blocked:
+            asyncio.run(contender.open())
+        assert blocked.value.code == "MAINTENANCE_IN_PROGRESS"
+    finally:
+        monkeypatch.setattr(SQLiteVecEngine, "close", original_close)
+        engine = captured.get("engine")
+        if engine is not None and engine.conn is not None:
+            engine.conn.close()
+            if engine.storage is not None and hasattr(engine.storage, "conn"):
+                engine.storage.conn = None
+        import factlane.recovery as recovery_module
+        handles = recovery_module._RETAINED_MAINTENANCE_EXCLUSIONS.pop(str(db.resolve()), [])
+        import fcntl
+        for handle in handles:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+
+def test_r40_postflight_open_failure_retains_exclusion_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def prepare() -> dict[str, Any]:
+        engine, adapter = await _open_adapter(tmp_path)
+        target = await _store(
+            adapter, key="r40-target", fact="R40 postflight-open target.", marker="3"
+        )
+        row = await _target_row(engine, target["memory_id"])
+        await adapter.close()
+        return row
+
+    target_row = asyncio.run(prepare())
+    db = tmp_path / "memory.db"
+    plan = _plan(db, target_row, operation="r40-open-failure")
+    original_open = SQLiteVecEngine.open
+    captured: dict[str, SQLiteVecEngine] = {}
+
+    async def fail_maintenance_open(engine: SQLiteVecEngine) -> None:
+        if engine._maintenance_capability is not None:
+            captured["engine"] = engine
+            engine.conn = sqlite3.connect(engine.db_path)
+            raise RuntimeError("synthetic postflight open failure after SQLite attach")
+        await original_open(engine)
+
+    monkeypatch.setattr(SQLiteVecEngine, "open", fail_maintenance_open)
+    operator = SensitiveMemoryRecoveryOperator(foreign_handle_provider=lambda _: [])
+    try:
+        with pytest.raises(RecoveryHold) as caught:
+            _run(plan, tmp_path, operator=operator)
+        assert caught.value.code == "S1_LOGICAL_PURGE_COMMITTED_SEALING_INCOMPLETE"
+        assert captured["engine"].conn is not None
+
+        contender = SQLiteVecEngine(str(db), profile())
+        with pytest.raises(AdapterError) as blocked:
+            asyncio.run(contender.open())
+        assert blocked.value.code == "MAINTENANCE_IN_PROGRESS"
+    finally:
+        monkeypatch.setattr(SQLiteVecEngine, "open", original_open)
+        engine = captured.get("engine")
+        if engine is not None and engine.conn is not None:
+            engine.conn.close()
+            engine.conn = None
+        import factlane.recovery as recovery_module
+        handles = recovery_module._RETAINED_MAINTENANCE_EXCLUSIONS.pop(str(db.resolve()), [])
+        import fcntl
+        for handle in handles:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+
+def test_r41_fail_closed_retained_exclusion_revokes_maintenance_capability(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "memory.db"
+    sqlite3.connect(db).close()
+    capability = None
+    with MaintenanceLease(str(db), "r41-capability-revoke") as lease:
+        capability = lease.capability
+        assert capability is not None
+        lease.retain_fail_closed()
+
+    assert capability is not None
+    with pytest.raises(AdapterError) as expired:
+        SQLiteVecEngine._for_maintenance(str(db), profile(), capability)
+    assert expired.value.code == "WRITE_AUTHORIZATION_DENIED"
+
+    import factlane.recovery as recovery_module
+    handles = recovery_module._RETAINED_MAINTENANCE_EXCLUSIONS.pop(str(db.resolve()), [])
+    import fcntl
+    for handle in handles:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def test_r09_r11_tombstone_allowlist_preserves_only_safe_identity_and_replaces_sensitive_fields(tmp_path: Path) -> None:

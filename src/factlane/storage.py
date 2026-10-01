@@ -8,7 +8,6 @@ import shutil
 import sqlite3
 import time
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 from .backend_compat import (
@@ -27,11 +26,14 @@ _MAINTENANCE_CAPABILITY_SECRET = object()
 
 
 class _MaintenanceCapability:
-    __slots__ = ("db_path", "handle", "_secret")
+    __slots__ = ("db_path", "db_identity", "handle", "active", "_secret")
 
     def __init__(self, db_path: str, handle: Any, secret: object) -> None:
         self.db_path = os.path.realpath(os.path.abspath(db_path))
+        stat = os.fstat(handle.fileno())
+        self.db_identity = (int(stat.st_dev), int(stat.st_ino))
         self.handle = handle
+        self.active = True
         self._secret = secret
 
 
@@ -45,7 +47,7 @@ def _validate_maintenance_capability(db_path: str, capability: _MaintenanceCapab
     if (
         not isinstance(capability, _MaintenanceCapability)
         or capability._secret is not _MAINTENANCE_CAPABILITY_SECRET
-        or capability.db_path != canonical
+        or not capability.active
         or capability.handle is None
         or capability.handle.closed
     ):
@@ -53,11 +55,73 @@ def _validate_maintenance_capability(db_path: str, capability: _MaintenanceCapab
             "WRITE_AUTHORIZATION_DENIED",
             "maintenance engine requires an active recovery lease for the exact database",
         )
+    try:
+        path_stat = os.stat(canonical)
+        path_identity = (int(path_stat.st_dev), int(path_stat.st_ino))
+        handle_stat = os.fstat(capability.handle.fileno())
+        handle_identity = (int(handle_stat.st_dev), int(handle_stat.st_ino))
+    except (OSError, ValueError):
+        path_identity = None
+        handle_identity = None
+    if (
+        capability.db_path != canonical
+        or capability.db_identity != path_identity
+        or capability.db_identity != handle_identity
+    ):
+        raise AdapterError(
+            "WRITE_AUTHORIZATION_DENIED",
+            "maintenance engine requires an active recovery lease for the exact database",
+        )
 
 
-def _maintenance_lock_path(db_path: str) -> Path:
-    """Return one canonical lock namespace for aliases of the same database path."""
-    return Path(os.path.realpath(os.path.abspath(db_path)) + ".recovery.lock")
+def _same_inode(path: str, handle: Any) -> bool:
+    try:
+        path_stat = os.stat(path)
+        handle_stat = os.fstat(handle.fileno())
+    except OSError:
+        return False
+    return (int(path_stat.st_dev), int(path_stat.st_ino)) == (
+        int(handle_stat.st_dev),
+        int(handle_stat.st_ino),
+    )
+
+
+def _open_database_lease_handle(db_path: str, *, create: bool) -> tuple[Any, bool]:
+    """Open the database inode itself as the maintenance coordination object."""
+    canonical = os.path.realpath(os.path.abspath(db_path))
+    parent = os.path.dirname(canonical)
+    if create:
+        os.makedirs(parent, exist_ok=True)
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    created = False
+    fd: int | None = None
+    try:
+        if create:
+            try:
+                fd = os.open(canonical, flags | os.O_CREAT | os.O_EXCL, 0o600)
+                created = True
+            except FileExistsError:
+                fd = os.open(canonical, flags)
+        else:
+            fd = os.open(canonical, flags)
+        try:
+            return os.fdopen(fd, "r+b", buffering=0), created
+        except BaseException:
+            os.close(fd)
+            raise
+    except OSError:
+        raise
+
+
+def _cleanup_new_lease_anchor(db_path: str, handle: Any, *, created: bool) -> None:
+    if not created:
+        return
+    canonical = os.path.realpath(os.path.abspath(db_path))
+    try:
+        if _same_inode(canonical, handle) and os.fstat(handle.fileno()).st_size == 0:
+            os.unlink(canonical)
+    except OSError:
+        pass
 
 
 def _acquire_runtime_maintenance_lease(db_path: str) -> Any:
@@ -69,11 +133,8 @@ def _acquire_runtime_maintenance_lease(db_path: str) -> Any:
         # ordinary storage module unimportable on platforms without fcntl.
         return None
 
-    lock_path = _maintenance_lock_path(db_path)
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(lock_path, "a+", encoding="utf-8")
-        os.chmod(lock_path, 0o600)
+        handle, created = _open_database_lease_handle(db_path, create=True)
     except OSError as exc:
         raise AdapterError(
             "BACKEND_UNAVAILABLE",
@@ -83,12 +144,14 @@ def _acquire_runtime_maintenance_lease(db_path: str) -> Any:
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
     except BlockingIOError as exc:
+        _cleanup_new_lease_anchor(db_path, handle, created=created)
         handle.close()
         raise AdapterError(
             "MAINTENANCE_IN_PROGRESS",
             "database maintenance is in progress; retry after maintenance completes",
         ) from exc
     except OSError as exc:
+        _cleanup_new_lease_anchor(db_path, handle, created=created)
         handle.close()
         if exc.errno in {errno.EACCES, errno.EAGAIN}:
             raise AdapterError(
@@ -99,6 +162,15 @@ def _acquire_runtime_maintenance_lease(db_path: str) -> Any:
             "BACKEND_UNAVAILABLE",
             "database maintenance coordination is unavailable",
         ) from exc
+    if not _same_inode(db_path, handle):
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+        raise AdapterError(
+            "BACKEND_UNAVAILABLE",
+            "database path changed during maintenance coordination",
+        )
     return handle
 
 
@@ -180,7 +252,8 @@ class SQLiteVecEngine:
     """Small adapter-owned repository over the pinned SQLite-vec schema."""
 
     def __init__(self, db_path: str, profile: EmbeddingProfile) -> None:
-        self.db_path = os.path.abspath(db_path)
+        # Resolve aliases once so the lease and backend always open the same path.
+        self.db_path = os.path.realpath(os.path.abspath(db_path))
         self.profile = profile
         self.storage: Any = None
         self.conn: sqlite3.Connection | None = None

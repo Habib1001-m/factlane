@@ -50,16 +50,29 @@ and the required storage/FTS capabilities. An unsupported linked SQLite runtime 
 state or receipts. The operator separately verifies FTS5 `secure-delete`; the version
 number alone is not considered sufficient.
 
-Normal `SQLiteVecEngine` runtime attachments hold a shared advisory lock on the database's
-`.recovery.lock` file for the lifetime of the engine. Sensitive-memory recovery holds an
-exclusive lock on the same file for the full recovery operation, including final sanitized-image
-promotion and real-engine postflight. A normal runtime attachment attempted during recovery
-fails closed with `MAINTENANCE_IN_PROGRESS`; recovery attempted while a normal runtime engine
-is still attached fails before mutation. The lock file may remain on disk after release: lock
-ownership is the OS `flock` state, not the file's existence or contents.
+Normal `SQLiteVecEngine` runtime attachments hold a shared advisory `flock` on the resolved
+database **inode itself** for the lifetime of the engine. Sensitive-memory recovery takes an
+exclusive lock on the current database inode before its first quiescence check. Before replacing
+that database with the sanitized image, recovery also takes an exclusive lock on the sanitized
+replacement inode; `os.replace()` then runs while both old and new database inodes remain locked.
+The old-inode and promoted-inode locks are retained through real-engine postflight. This prevents
+ordinary FactLane runtimes from splitting the exclusion through hard-link aliases or through a
+pathname-derived sidecar lock. A normal runtime attachment attempted against either protected
+inode fails closed with `MAINTENANCE_IN_PROGRESS`; recovery attempted while a normal runtime
+engine is still attached fails before mutation.
+
+If postflight database cleanup fails or is cancelled while a SQLite handle may remain live,
+FactLane deliberately retains the process-owned exclusive inode locks fail-closed instead of
+reopening normal service. Process exit closes those retained descriptors together with remaining
+process-owned SQLite handles; the incident still requires operator reconciliation before service
+is restarted.
+
 This exclusion guarantee is scoped to supported local POSIX filesystems with reliable `flock`
 semantics. It is not a claim about Windows or unvalidated NFS/SMB/FUSE locking behavior; live
 recovery on such storage remains outside the accepted recovery contract.
+It is also a cooperative FactLane runtime contract, not protection against an arbitrary privileged
+process replacing database paths or bypassing FactLane with raw filesystem/database writes; the
+existing quiescence inventory and full-stop incident procedure remain required for those cases.
 
 A pre-commit failure rolls back the logical purge. If logical purge commits but subsequent
 sealing fails, the database must not be reopened for normal service or restored from a copy

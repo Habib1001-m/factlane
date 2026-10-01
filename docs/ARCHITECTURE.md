@@ -135,15 +135,26 @@ failure leaves normal service blocked until recovery completes. Local purge does
 erasure from external copies or physical media. See [Security](../SECURITY.md).
 
 Runtime/recovery exclusion is cooperative and process-independent on supported POSIX hosts:
-ordinary `SQLiteVecEngine` instances acquire a shared advisory `flock` on
-`<db>.recovery.lock` before backend initialization and retain it until `close()`. Recovery
-acquires the corresponding exclusive lock before its first quiescence check and retains it
-through logical purge, sealing, `os.replace()` promotion, and the operator-owned postflight.
-This closes the attach-after-last-quiescence TOCTOU window; a new runtime attach during recovery
-receives `MAINTENANCE_IN_PROGRESS`. The operator's own postflight engine uses an internal-only
-maintenance path while the exclusive lease remains held.
+ordinary `SQLiteVecEngine` instances resolve their database path once, acquire a shared advisory
+`flock` on that database inode before backend initialization, and retain it until backend closure
+is proven. Recovery acquires the corresponding exclusive inode lock before its first quiescence
+check. During sealing it also locks the sanitized replacement inode **before** `os.replace()`,
+then retains both the retired old-inode lock and the promoted new-inode lock through the
+operator-owned postflight. Hard-link aliases therefore converge on the same kernel lock identity,
+and promotion never exposes an unlocked replacement inode. A new runtime attach during recovery
+receives `MAINTENANCE_IN_PROGRESS`. The operator's own postflight engine uses an internal,
+exact-inode capability derived from the still-live exclusive lease.
+
+If postflight cleanup cannot prove its SQLite handle closed, including task cancellation, recovery
+keeps all process-owned exclusive inode leases retained fail-closed instead of reopening normal
+service. Process exit releases those descriptors; the sealing-incomplete state still requires
+operator reconciliation.
+
 The exclusion guarantee is bounded to supported local POSIX filesystems with reliable `flock`
-semantics; it does not extend to Windows or unvalidated network/FUSE locking behavior.
+semantics; it does not extend to Windows or unvalidated network/FUSE locking behavior. It is a
+cooperative FactLane-runtime boundary, not a defense against arbitrary raw filesystem replacement
+by a privileged external process, so the independent quiescence inventory/full-stop procedure is
+still part of recovery.
 
 ## Qualification boundary
 

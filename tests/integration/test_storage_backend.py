@@ -267,18 +267,17 @@ def test_maintenance_lock_noncontention_os_error_is_backend_unavailable(tmp_path
 def test_maintenance_lock_setup_permission_error_is_not_mislabeled_as_contention(
     tmp_path, monkeypatch
 ) -> None:
-    import builtins
     import factlane.storage as storage_module
 
-    original_open = builtins.open
-    expected_lock = storage_module._maintenance_lock_path(str(tmp_path / "permission.db"))
+    original_open = storage_module.os.open
+    expected_db = storage_module.os.path.realpath(str(tmp_path / "permission.db"))
 
     def fail_lock_open(path, *args, **kwargs):
-        if Path(path) == expected_lock:
+        if storage_module.os.path.realpath(path) == expected_db:
             raise PermissionError(errno.EACCES, "synthetic lockfile permission failure")
         return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "open", fail_lock_open)
+    monkeypatch.setattr(storage_module.os, "open", fail_lock_open)
     engine = SQLiteVecEngine(str(tmp_path / "permission.db"), profile())
     with pytest.raises(AdapterError) as exc_info:
         asyncio.run(engine.open())
