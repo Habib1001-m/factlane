@@ -15,7 +15,14 @@ from .backend_compat import (
     execute_with_backend_retry,
     load_pinned_sqlite_vec_storage,
 )
-from .contract import AdapterError, ScopeContext, canonical_json, parse_iso, validate_scope
+from .contract import (
+    AdapterError,
+    ScopeContext,
+    canonical_json,
+    parse_iso,
+    validate_freshness,
+    validate_scope,
+)
 from .embeddings import EmbeddingProfile
 
 STORAGE_CONTRACT_VERSION = 2
@@ -31,6 +38,7 @@ _CURRENT_AUTHORITY_BY_SCOPE = {
     "TOOL_ENVIRONMENT": "TOOL_ENV_CURRENT",
 }
 _CURRENT_VERIFICATIONS = frozenset({"OWNER", "CURRENT_REPO_CHECK", "AUTOMATED_CHECK"})
+_CROSS_PROJECT_MEMORY_TYPES = frozenset({"WORKFLOW_RULE", "DECISION_RATIONALE"})
 
 
 def _validate_current_authority_metadata(record: dict[str, Any]) -> None:
@@ -57,6 +65,39 @@ def _validate_current_authority_metadata(record: dict[str, Any]) -> None:
         )
     parse_iso(record.get("source_timestamp"), required=True)
     parse_iso(record.get("last_verified_at"), required=True)
+
+
+def _validate_cross_project_storage_semantics(record: dict[str, Any]) -> None:
+    """Keep direct storage admission aligned with CROSS_PROJECT_WORKFLOW semantics."""
+    if record.get("scope") != "CROSS_PROJECT_WORKFLOW":
+        return
+    if record.get("memory_type") not in _CROSS_PROJECT_MEMORY_TYPES:
+        raise AdapterError("SCOPE_TYPE_MISMATCH", "memory_type is incompatible with CROSS_PROJECT_WORKFLOW")
+
+    provenance = record.get("source_provenance")
+    if isinstance(provenance, dict) and "source_fingerprint" in provenance:
+        raise AdapterError(
+            "SCOPE_FRESHNESS_MISMATCH",
+            "CROSS_PROJECT_WORKFLOW uses freshness_policy.source_fingerprint as the sole fingerprint authority",
+        )
+    freshness = validate_freshness(record.get("freshness_policy"))
+    kind = freshness["kind"]
+    if kind not in {"on_change", "manual"}:
+        raise AdapterError("INVALID_FRESHNESS", "CROSS_PROJECT_WORKFLOW freshness must be on_change or manual")
+    if kind == "on_change":
+        recheck_ref = freshness.get("recheck_ref")
+        fingerprint = freshness.get("source_fingerprint")
+        source_hash = provenance.get("source_hash") if isinstance(provenance, dict) else None
+        if not isinstance(recheck_ref, str) or not recheck_ref.strip() or fingerprint != source_hash:
+            raise AdapterError(
+                "INVALID_FRESHNESS",
+                "on_change freshness_policy requires a recheck_ref and source_fingerprint matching source_provenance.source_hash",
+            )
+    elif freshness.get("recheck_ref") is not None or freshness.get("source_fingerprint") is not None:
+        raise AdapterError(
+            "INVALID_FRESHNESS",
+            "manual CROSS_PROJECT_WORKFLOW freshness cannot carry recheck_ref or source_fingerprint",
+        )
 
 
 class _MaintenanceCapability:
@@ -677,6 +718,7 @@ class SQLiteVecEngine:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 _validate_current_authority_metadata(record)
+                _validate_cross_project_storage_semantics(record)
                 if supersede_record_id is None and (
                     record.get("revision") != 1
                     or record.get("parent_record_id") is not None
@@ -868,6 +910,7 @@ class SQLiteVecEngine:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 _validate_current_authority_metadata(record)
+                _validate_cross_project_storage_semantics(record)
                 parent_row = self.conn.execute(
                     self._select_sql(
                         f"WHERE a.memory_id=? AND a.record_id=? AND a.revision=? "

@@ -1421,6 +1421,151 @@ def test_storage_candidate_promotion_rejects_invalid_current_scope_identity(tmp_
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    ("lifecycle", "case", "expected_code"),
+    [
+        ("VALIDATED_CURRENT", "memory-type", "SCOPE_TYPE_MISMATCH"),
+        ("VALIDATED_CURRENT", "ttl-freshness", "INVALID_FRESHNESS"),
+        ("CANDIDATE", "provenance-fingerprint", "SCOPE_FRESHNESS_MISMATCH"),
+        ("CANDIDATE", "manual-recheck", "INVALID_FRESHNESS"),
+    ],
+)
+def test_write_record_rejects_invalid_cross_project_semantics(
+    tmp_path,
+    lifecycle: str,
+    case: str,
+    expected_code: str,
+) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / f"cross-project-semantics-{case}.db"), _profile())
+        await engine.open()
+        try:
+            marker = {"memory-type": "a", "ttl-freshness": "b", "provenance-fingerprint": "c", "manual-recheck": "d"}[case]
+            record = _record(
+                lifecycle=lifecycle,
+                marker=marker,
+                fact=f"Cross-project storage semantic admission case: {case}.",
+                created_at="2026-10-03T00:00:00Z",
+            )
+            if case == "memory-type":
+                record["memory_type"] = "USER_FACT"
+            elif case == "ttl-freshness":
+                record["freshness_policy"] = {
+                    "kind": "ttl",
+                    "ttl_seconds": 60,
+                    "recheck_ref": None,
+                    "source_fingerprint": None,
+                }
+            elif case == "provenance-fingerprint":
+                provenance = dict(record["source_provenance"])
+                provenance["source_fingerprint"] = marker * 64
+                record["source_provenance"] = provenance
+            else:
+                record["freshness_policy"] = {
+                    "kind": "manual",
+                    "ttl_seconds": None,
+                    "recheck_ref": "repo-state",
+                    "source_fingerprint": None,
+                }
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(record, [1.0] + [0.0] * 255)
+            assert error.value.code == expected_code
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_storage_candidate_promotion_rejects_invalid_cross_project_freshness(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "promotion-cross-project-freshness.db"), _profile())
+        await engine.open()
+        try:
+            candidate = _record(
+                lifecycle="CANDIDATE",
+                marker="e",
+                fact="Candidate promotion preserves cross-project semantic admission invariants.",
+                created_at="2026-10-03T00:00:00Z",
+            )
+            await engine.write_record(candidate, [1.0] + [0.0] * 255)
+
+            successor = deepcopy(candidate)
+            successor.update({
+                "record_id": str(uuid.uuid4()),
+                "revision": 2,
+                "parent_record_id": candidate["record_id"],
+                "source_timestamp": "2026-10-03T01:00:00Z",
+                "created_at": "2026-10-03T01:00:00Z",
+                "last_verified_at": "2026-10-03T01:00:00Z",
+                "verified_by": "OWNER",
+                "authority_role": "WORKFLOW_CURRENT",
+                "freshness_policy": {
+                    "kind": "ttl",
+                    "ttl_seconds": 60,
+                    "recheck_ref": None,
+                    "source_fingerprint": None,
+                },
+                "lifecycle_state": "VALIDATED_CURRENT",
+                "native_content_hash": "f" * 64,
+                "payload_fingerprint": "1" * 64,
+                "idempotency_key": "promotion-cross-project-invalid-freshness",
+            })
+
+            with pytest.raises(AdapterError) as error:
+                await engine.promote_candidate(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    validate_scope("CROSS_PROJECT_WORKFLOW"),
+                    expected_record_id=str(candidate["record_id"]),
+                    expected_revision=1,
+                )
+            assert error.value.code == "INVALID_FRESHNESS"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records WHERE lifecycle_state='CANDIDATE'").fetchone()[0] == 1
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records WHERE lifecycle_state='VALIDATED_CURRENT'").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_write_record_accepts_valid_cross_project_on_change_semantics(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "cross-project-valid-on-change.db"), _profile())
+        await engine.open()
+        try:
+            current = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="f",
+                fact="Valid cross-project on-change freshness remains admissible at the storage boundary.",
+                created_at="2026-10-03T02:00:00Z",
+            )
+            current["freshness_policy"] = {
+                "kind": "on_change",
+                "ttl_seconds": None,
+                "recheck_ref": "repo-state",
+                "source_fingerprint": "f" * 64,
+            }
+
+            await engine.write_record(current, [1.0] + [0.0] * 255)
+            rows = await engine.get_record(
+                str(current["memory_id"]),
+                validate_scope("CROSS_PROJECT_WORKFLOW"),
+                history=False,
+            )
+            assert len(rows) == 1
+            assert json.loads(rows[0]["freshness_policy"]) == current["freshness_policy"]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_equivalent_current_returns_already_current_without_promoting_candidate(tmp_path) -> None:
     async def run() -> None:
         engine = SQLiteVecEngine(str(tmp_path / "promotion-equivalent.db"), _profile())
