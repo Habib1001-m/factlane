@@ -645,7 +645,8 @@ class SQLiteVecEngine:
                 superseded_native_hash: str | None = None
                 if supersede_record_id:
                     old = self.conn.execute(
-                        "SELECT native_content_hash, lifecycle_state,scope,project_id,worktree_id,workflow_id,agent_id "
+                        "SELECT native_content_hash, lifecycle_state,scope,project_id,worktree_id,workflow_id,agent_id,"
+                        "memory_id,revision "
                         "FROM adapter_records WHERE record_id = ?",
                         (supersede_record_id,),
                     ).fetchone()
@@ -669,6 +670,22 @@ class SQLiteVecEngine:
                         raise AdapterError(
                             "INVALID_ENVELOPE",
                             "update successor cannot change scope identity or leave validated-current lifecycle",
+                        )
+                    parent_memory_id = str(old[7])
+                    parent_revision = int(old[8])
+                    successor_memory_id = str(record["memory_id"])
+                    successor_revision = int(record["revision"])
+                    if successor_memory_id == parent_memory_id:
+                        valid_lineage_shape = successor_revision == parent_revision + 1
+                    else:
+                        valid_lineage_shape = (
+                            successor_revision == 1
+                            and record.get("supersedes") == [parent_memory_id]
+                        )
+                    if not valid_lineage_shape:
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "update successor has an invalid memory lineage shape",
                         )
                     superseded_native_hash = str(old[0])
 
