@@ -1413,6 +1413,35 @@ def test_write_record_rejects_invalid_candidate_scope_identity(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "lifecycle",
+    ["SUPERSEDED", "STALE", "QUARANTINED", "HISTORICAL", "BOGUS_TERMINAL"],
+)
+def test_write_record_rejects_nonadmissible_initial_lifecycle(tmp_path, lifecycle: str) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / f"invalid-root-lifecycle-{lifecycle.lower()}.db"), _profile())
+        await engine.open()
+        try:
+            record = _record(
+                lifecycle=lifecycle,
+                marker="r",
+                fact=f"Initial storage admission cannot materialize lifecycle {lifecycle} directly.",
+                created_at="2026-10-03T06:00:00Z",
+            )
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(record, [1.0] + [0.0] * 255)
+            assert error.value.code == "INVALID_ENVELOPE"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_storage_candidate_promotion_rejects_invalid_current_scope_identity(tmp_path) -> None:
     async def run() -> None:
         engine = SQLiteVecEngine(str(tmp_path / "promotion-invalid-current-scope.db"), _profile())

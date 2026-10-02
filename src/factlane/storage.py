@@ -784,6 +784,15 @@ class SQLiteVecEngine:
 
                 _validate_cross_project_storage_semantics(record)
 
+                if supersede_record_id is None and record.get("lifecycle_state") not in {
+                    "CANDIDATE",
+                    "VALIDATED_CURRENT",
+                }:
+                    raise AdapterError(
+                        "INVALID_ENVELOPE",
+                        "initial storage record lifecycle must be CANDIDATE or VALIDATED_CURRENT",
+                    )
+
                 if record["lifecycle_state"] == "VALIDATED_CURRENT":
                     exact_scope = ScopeContext(record["scope"], record.get("project_id"), record.get("worktree_id"), record.get("workflow_id"), record.get("agent_id"))
                     where, params = self._scope_where(exact_scope)
