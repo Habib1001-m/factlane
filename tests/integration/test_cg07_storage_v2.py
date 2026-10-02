@@ -219,6 +219,73 @@ def test_open_establishes_storage_contract_v2_and_contribution_origin(tmp_path) 
     asyncio.run(run())
 
 
+def test_current_get_excludes_expired_ttl_but_review_history_returns_it(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "current-get-freshness.db"), _profile())
+        await engine.open()
+        try:
+            adapter = MemoryAdapter(
+                engine,
+                _Provider(),
+                trusted_write_context=trusted_write_context_for_profile("owner-current"),
+            )
+            stored = await adapter.store(
+                fact="The deployment target is stale.example.",
+                scope="PROJECT",
+                project_id="project-a",
+                memory_type="PROJECT_LEARNED_FACT",
+                source_provenance={
+                    "source_class": "TEST",
+                    "source_ref": "current-get-freshness",
+                    "source_hash": "a" * 64,
+                    "review_ref": "current-get-freshness",
+                    "extraction_method": "test",
+                },
+                freshness_policy={"kind": "ttl", "ttl_seconds": 1},
+                idempotency_key="current-get-freshness-store",
+                source_timestamp="2020-01-01T00:00:00Z",
+                last_verified_at="2020-01-01T00:00:00Z",
+                verified_by="OWNER",
+                requested_lifecycle_state="VALIDATED_CURRENT",
+            )
+            memory_id = stored["results"][0]["memory_id"]
+
+            searched = await adapter.search(
+                query="deployment target",
+                intent_class="CURRENT_PROJECT_STATE",
+                scope="PROJECT",
+                project_id="project-a",
+                retrieval_mode="CURRENT",
+                retrieval_mode_kind="KEYWORD",
+            )
+            assert searched["status"] == "DEGRADED"
+            assert searched["degradation"] == "STALE_ONLY"
+            assert searched["results"] == []
+
+            current = await adapter.get(
+                memory_id=memory_id,
+                scope="PROJECT",
+                project_id="project-a",
+                retrieval_mode="CURRENT",
+            )
+            assert current["status"] == "DEGRADED"
+            assert current["degradation"] == "STALE_ONLY"
+            assert current["results"] == []
+
+            history = await adapter.get(
+                memory_id=memory_id,
+                scope="PROJECT",
+                project_id="project-a",
+                retrieval_mode="REVIEW_HISTORY",
+            )
+            assert history["status"] == "OK"
+            assert [row["memory_id"] for row in history["results"]] == [memory_id]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_current_keyword_limit_is_applied_after_candidate_exclusion(tmp_path) -> None:
     async def run() -> None:
         engine = SQLiteVecEngine(str(tmp_path / "keyword-current.db"), _profile())

@@ -1049,8 +1049,16 @@ class MemoryAdapter:
             if await self.engine.memory_exists_outside_scope(memory_id, scope_context):
                 raise AdapterError("CROSS_SCOPE_DENIED", "memory_id exists outside the requested scope")
             raise AdapterError("NOT_FOUND", "memory_id was not found in the requested scope")
+        stale_only = False
+        if retrieval_mode == "CURRENT":
+            fresh_rows = [row for row in rows if self._fresh_current(row)]
+            stale_only = not fresh_rows
+            rows = fresh_rows
         envelope = self._base_envelope(request_id, "memory_get", scope_context)
         envelope["results"] = [self._public(row) for row in rows[: self.limits.max_memories_hard_max]]
+        if stale_only:
+            envelope["status"] = "DEGRADED"
+            envelope["degradation"] = "STALE_ONLY"
         envelope["budget"]["returned"] = len(envelope["results"])
         return self._fit_budget(envelope)
 
