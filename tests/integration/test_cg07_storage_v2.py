@@ -745,10 +745,20 @@ def test_reverify_preserves_legacy_non_authoritative_subject_tag_during_unrelate
         {"contradiction_key": "9" * 64},
         {"scope": "PROJECT", "project_id": "wrong-scope"},
         {"lifecycle_state": "CANDIDATE"},
+        {"authority_role": "UNRESOLVED"},
+        {"verified_by": "UNVERIFIED"},
     ],
-    ids=["memory-type", "fact", "contradiction-key", "scope", "lifecycle"],
+    ids=[
+        "memory-type",
+        "fact",
+        "contradiction-key",
+        "scope",
+        "lifecycle",
+        "authority-role",
+        "verified-by",
+    ],
 )
-def test_storage_candidate_promotion_rejects_identity_drift_from_parent(
+def test_storage_candidate_promotion_rejects_invalid_current_successor_metadata(
     tmp_path,
     mutation: dict[str, object],
 ) -> None:
@@ -1177,6 +1187,78 @@ def test_write_record_rejects_invalid_superseding_lineage_shape(tmp_path, mutati
             )
             assert [(row["revision"], row["lifecycle_state"]) for row in history] == [
                 (1, "VALIDATED_CURRENT")
+            ]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["authority_role", "verified_by", "last_verified_at", "source_timestamp"],
+)
+def test_write_record_rejects_invalid_current_authority_metadata(tmp_path, mutation: str) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / f"write-authority-{mutation}.db"), _profile())
+        await engine.open()
+        try:
+            parent = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="e",
+                fact="Validated current storage requires structurally valid authority metadata.",
+                created_at="2026-09-26T00:00:00Z",
+            )
+            await engine.write_record(parent, [1.0] + [0.0] * 255)
+
+            successor = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="f",
+                fact=parent["fact"],
+                created_at="2026-09-26T01:00:00Z",
+            )
+            successor.update(
+                {
+                    "memory_id": parent["memory_id"],
+                    "revision": 2,
+                    "parent_record_id": parent["record_id"],
+                    "memory_type": parent["memory_type"],
+                    "fact": parent["fact"],
+                    "contradiction_key": parent["contradiction_key"],
+                }
+            )
+            if mutation == "authority_role":
+                successor["authority_role"] = "UNRESOLVED"
+            elif mutation == "verified_by":
+                successor["verified_by"] = "UNVERIFIED"
+            elif mutation == "last_verified_at":
+                successor["last_verified_at"] = None
+            else:
+                successor["source_timestamp"] = None
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    supersede_record_id=str(parent["record_id"]),
+                )
+            expected_code = (
+                "INVALID_ENVELOPE"
+                if mutation in {"authority_role", "verified_by"}
+                else "INVALID_TIMESTAMP"
+            )
+            assert error.value.code == expected_code
+
+            history = await engine.get_record(
+                str(parent["memory_id"]),
+                validate_scope("CROSS_PROJECT_WORKFLOW"),
+                history=True,
+            )
+            assert [
+                (row["revision"], row["lifecycle_state"], row["authority_role"], row["verified_by"])
+                for row in history
+            ] == [
+                (1, "VALIDATED_CURRENT", "WORKFLOW_CURRENT", "AUTOMATED_CHECK")
             ]
         finally:
             await engine.close()

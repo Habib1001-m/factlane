@@ -23,6 +23,33 @@ MIN_SQLITE_VERSION = (3, 42, 0)
 _WRITER_FUNCTION = "factlane_contract_v2_writer"
 _LEGACY_ORIGIN_JSON = canonical_json({"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None})
 _MAINTENANCE_CAPABILITY_SECRET = object()
+_CURRENT_AUTHORITY_BY_SCOPE = {
+    "GLOBAL_USER": "OWNER_CURRENT",
+    "PROJECT": "PROJECT_CURRENT",
+    "WORKFLOW": "WORKFLOW_CURRENT",
+    "CROSS_PROJECT_WORKFLOW": "WORKFLOW_CURRENT",
+    "TOOL_ENVIRONMENT": "TOOL_ENV_CURRENT",
+}
+_CURRENT_VERIFICATIONS = frozenset({"OWNER", "CURRENT_REPO_CHECK", "AUTOMATED_CHECK"})
+
+
+def _validate_current_authority_metadata(record: dict[str, Any]) -> None:
+    """Fail closed if a direct storage caller fabricates current authority."""
+    if record.get("lifecycle_state") != "VALIDATED_CURRENT":
+        return
+    expected_authority = _CURRENT_AUTHORITY_BY_SCOPE.get(str(record.get("scope")))
+    if expected_authority is None or record.get("authority_role") != expected_authority:
+        raise AdapterError(
+            "INVALID_ENVELOPE",
+            "validated current authority_role does not match exact scope",
+        )
+    if record.get("verified_by") not in _CURRENT_VERIFICATIONS:
+        raise AdapterError(
+            "INVALID_ENVELOPE",
+            "validated current requires an admissible verification basis",
+        )
+    parse_iso(record.get("source_timestamp"), required=True)
+    parse_iso(record.get("last_verified_at"), required=True)
 
 
 class _MaintenanceCapability:
@@ -642,6 +669,7 @@ class SQLiteVecEngine:
             now = time.time()
             self.conn.execute("BEGIN IMMEDIATE")
             try:
+                _validate_current_authority_metadata(record)
                 superseded_native_hash: str | None = None
                 if supersede_record_id:
                     old = self.conn.execute(
@@ -823,6 +851,7 @@ class SQLiteVecEngine:
             assert self.conn is not None
             self.conn.execute("BEGIN IMMEDIATE")
             try:
+                _validate_current_authority_metadata(record)
                 parent_row = self.conn.execute(
                     self._select_sql(
                         f"WHERE a.memory_id=? AND a.record_id=? AND a.revision=? "
