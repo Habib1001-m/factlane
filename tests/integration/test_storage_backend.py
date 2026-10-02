@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import factlane.storage as storage_module
 from factlane import backend_compat
 from factlane.backend_compat import (
     PINNED_BACKEND_COMMIT,
@@ -21,6 +22,25 @@ from factlane.backend_compat import (
 from factlane.contract import AdapterError
 from factlane.embeddings import EmbeddingProfile
 from factlane.storage import MIN_SQLITE_VERSION, SQLiteVecEngine, assert_supported_sqlite_runtime
+
+
+_FACTLANE_BACKEND_ENV_KEYS = (
+    "MCP_MEMORY_STORAGE_BACKEND",
+    "MCP_MEMORY_USE_ONNX",
+    "MCP_EXTERNAL_EMBEDDING_URL",
+    "MCP_SEMANTIC_DEDUP_ENABLED",
+    "MCP_MEMORY_ALLOW_HASH_EMBEDDINGS",
+    "MCP_HTTP_ENABLED",
+    "MCP_SSE_MODE",
+    "MCP_STREAMABLE_HTTP_MODE",
+    "MCP_MDNS_ENABLED",
+    "MCP_BACKUP_ENABLED",
+    "MCP_CONSOLIDATION_ENABLED",
+    "MCP_AUTO_EXTRACT_DEFAULT",
+    "MCP_QUALITY_SYSTEM_ENABLED",
+    "MCP_QUALITY_BOOST_ENABLED",
+    "MCP_INSIGHT_CARDS_ENABLED",
+)
 
 
 def profile(dimension: int = 256) -> EmbeddingProfile:
@@ -223,6 +243,103 @@ def test_external_embedding_denial_precedes_sqlite_runtime_gate(tmp_path, monkey
 
     assert exc_info.value.code == "ADMIN_OPERATION_DENIED"
     assert not (tmp_path / "forbidden-external.db").exists()
+
+
+def test_open_close_preserves_absent_backend_environment(tmp_path, monkeypatch) -> None:
+    for key in _FACTLANE_BACKEND_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "preserve-absent.db"), profile())
+        await engine.open()
+        try:
+            assert engine.storage is not None
+            assert engine.storage.semantic_dedup_enabled is False
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+    assert all(key not in os.environ for key in _FACTLANE_BACKEND_ENV_KEYS)
+
+
+def test_open_close_preserves_preexisting_backend_environment(tmp_path, monkeypatch) -> None:
+    hostile = {
+        "MCP_MEMORY_STORAGE_BACKEND": "cloudflare",
+        "MCP_MEMORY_USE_ONNX": "1",
+        "MCP_EXTERNAL_EMBEDDING_URL": "",
+        "MCP_SEMANTIC_DEDUP_ENABLED": "true",
+        "MCP_MEMORY_ALLOW_HASH_EMBEDDINGS": "1",
+        "MCP_HTTP_ENABLED": "true",
+        "MCP_SSE_MODE": "1",
+        "MCP_STREAMABLE_HTTP_MODE": "1",
+        "MCP_MDNS_ENABLED": "true",
+        "MCP_BACKUP_ENABLED": "true",
+        "MCP_CONSOLIDATION_ENABLED": "true",
+        "MCP_AUTO_EXTRACT_DEFAULT": "true",
+        "MCP_QUALITY_SYSTEM_ENABLED": "true",
+        "MCP_QUALITY_BOOST_ENABLED": "true",
+        "MCP_INSIGHT_CARDS_ENABLED": "true",
+    }
+    for key, value in hostile.items():
+        monkeypatch.setenv(key, value)
+
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "preserve-existing.db"), profile())
+        await engine.open()
+        try:
+            assert engine.storage is not None
+            assert engine.storage.semantic_dedup_enabled is False
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+    assert {key: os.environ.get(key) for key in hostile} == hostile
+
+
+def test_concurrent_engines_preserve_backend_environment(tmp_path, monkeypatch) -> None:
+    hostile = {
+        "MCP_MEMORY_STORAGE_BACKEND": "cloudflare",
+        "MCP_MEMORY_USE_ONNX": "1",
+        "MCP_EXTERNAL_EMBEDDING_URL": "",
+        "MCP_SEMANTIC_DEDUP_ENABLED": "true",
+        "MCP_HTTP_ENABLED": "true",
+    }
+    for key, value in hostile.items():
+        monkeypatch.setenv(key, value)
+
+    async def run_one(name: str) -> None:
+        engine = SQLiteVecEngine(str(tmp_path / f"{name}.db"), profile())
+        await engine.open()
+        try:
+            assert engine.storage is not None
+            assert engine.storage.semantic_dedup_enabled is False
+        finally:
+            await engine.close()
+
+    async def run() -> None:
+        await asyncio.gather(run_one("concurrent-a"), run_one("concurrent-b"))
+
+    asyncio.run(run())
+    assert {key: os.environ.get(key) for key in hostile} == hostile
+
+
+def test_failed_open_preserves_backend_environment(tmp_path, monkeypatch) -> None:
+    for key in _FACTLANE_BACKEND_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MCP_MEMORY_STORAGE_BACKEND", "sentinel-backend")
+    monkeypatch.setenv("MCP_HTTP_ENABLED", "sentinel-http")
+    before = {key: os.environ.get(key) for key in _FACTLANE_BACKEND_ENV_KEYS}
+
+    def fail_backend_load():
+        raise RuntimeError("forced backend load failure")
+
+    monkeypatch.setattr(storage_module, "load_pinned_sqlite_vec_storage", fail_backend_load)
+    engine = SQLiteVecEngine(str(tmp_path / "failed-open.db"), profile())
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+
+    assert exc_info.value.code == "BACKEND_UNAVAILABLE"
+    assert {key: os.environ.get(key) for key in _FACTLANE_BACKEND_ENV_KEYS} == before
 
 
 def test_open_reuses_backend_wal_and_busy_timeout(tmp_path) -> None:

@@ -288,21 +288,9 @@ class SQLiteVecEngine:
         else:
             _validate_maintenance_capability(self.db_path, self._maintenance_capability)
         try:
-            os.environ["MCP_MEMORY_STORAGE_BACKEND"] = "sqlite_vec"
-            os.environ["MCP_MEMORY_USE_ONNX"] = "0"
-            os.environ["MCP_EXTERNAL_EMBEDDING_URL"] = ""
-            os.environ["MCP_SEMANTIC_DEDUP_ENABLED"] = "false"
-            os.environ["MCP_MEMORY_ALLOW_HASH_EMBEDDINGS"] = "0"
-            os.environ["MCP_HTTP_ENABLED"] = "false"
-            os.environ["MCP_SSE_MODE"] = "0"
-            os.environ["MCP_STREAMABLE_HTTP_MODE"] = "0"
-            os.environ["MCP_MDNS_ENABLED"] = "false"
-            os.environ["MCP_BACKUP_ENABLED"] = "false"
-            os.environ["MCP_CONSOLIDATION_ENABLED"] = "false"
-            os.environ["MCP_AUTO_EXTRACT_DEFAULT"] = "false"
-            os.environ["MCP_QUALITY_SYSTEM_ENABLED"] = "false"
-            os.environ["MCP_QUALITY_BOOST_ENABLED"] = "false"
-            os.environ["MCP_INSIGHT_CARDS_ENABLED"] = "false"
+            # Do not write MCP_* process environment here. The pinned backend
+            # caches environment-backed config at import time; FactLane binds
+            # the storage class and the behavior it uses explicitly below.
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             SqliteVecMemoryStorage = load_pinned_sqlite_vec_storage()
             storage = SqliteVecMemoryStorage(
