@@ -1079,6 +1079,55 @@ def test_candidate_promotion_rechecks_current_contradiction_inside_transaction(t
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("mutation", ["scope", "lifecycle"])
+def test_write_record_rejects_invalid_superseding_successor_boundary(tmp_path, mutation: str) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / f"write-successor-{mutation}.db"), _profile())
+        await engine.open()
+        try:
+            parent = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="a",
+                fact="The existing current record remains authoritative.",
+                created_at="2026-09-26T00:00:00Z",
+            )
+            await engine.write_record(parent, [1.0] + [0.0] * 255)
+
+            successor = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="b",
+                fact="A direct storage successor must preserve scope and current lifecycle.",
+                created_at="2026-09-26T01:00:00Z",
+            )
+            successor["parent_record_id"] = parent["record_id"]
+            if mutation == "scope":
+                successor["scope"] = "PROJECT"
+                successor["project_id"] = "other-project"
+            else:
+                successor["lifecycle_state"] = "CANDIDATE"
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    supersede_record_id=str(parent["record_id"]),
+                )
+            assert error.value.code == "INVALID_ENVELOPE"
+
+            history = await engine.get_record(
+                str(parent["memory_id"]),
+                validate_scope("CROSS_PROJECT_WORKFLOW"),
+                history=True,
+            )
+            assert [(row["record_id"], row["lifecycle_state"]) for row in history] == [
+                (parent["record_id"], "VALIDATED_CURRENT")
+            ]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_equivalent_current_returns_already_current_without_promoting_candidate(tmp_path) -> None:
     async def run() -> None:
         engine = SQLiteVecEngine(str(tmp_path / "promotion-equivalent.db"), _profile())

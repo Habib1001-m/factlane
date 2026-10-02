@@ -645,7 +645,8 @@ class SQLiteVecEngine:
                 superseded_native_hash: str | None = None
                 if supersede_record_id:
                     old = self.conn.execute(
-                        "SELECT native_content_hash, lifecycle_state FROM adapter_records WHERE record_id = ?",
+                        "SELECT native_content_hash, lifecycle_state,scope,project_id,worktree_id,workflow_id,agent_id "
+                        "FROM adapter_records WHERE record_id = ?",
                         (supersede_record_id,),
                     ).fetchone()
                     if not old or old[1] != "VALIDATED_CURRENT":
@@ -655,6 +656,20 @@ class SQLiteVecEngine:
                         )
                     if record.get("parent_record_id") != supersede_record_id:
                         raise AdapterError("VERSION_CONFLICT", "update lineage parent does not match expected revision")
+                    if (
+                        any(
+                            record.get(field) != old[index]
+                            for index, field in enumerate(
+                                ("scope", "project_id", "worktree_id", "workflow_id", "agent_id"),
+                                start=2,
+                            )
+                        )
+                        or record.get("lifecycle_state") != "VALIDATED_CURRENT"
+                    ):
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "update successor cannot change scope identity or leave validated-current lifecycle",
+                        )
                     superseded_native_hash = str(old[0])
 
                 if record["lifecycle_state"] == "VALIDATED_CURRENT":
