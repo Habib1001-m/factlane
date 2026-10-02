@@ -1373,6 +1373,46 @@ def test_write_record_rejects_invalid_current_scope_identity(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ({"scope": "PROJECT", "project_id": None}, "UNKNOWN_PROJECT_ID"),
+        ({"scope": "WORKFLOW", "project_id": "project-a", "workflow_id": None}, "UNKNOWN_PROJECT_ID"),
+        ({"scope": "TOOL_ENVIRONMENT", "agent_id": None}, "UNKNOWN_AGENT"),
+        ({"scope": "CROSS_PROJECT_WORKFLOW", "project_id": "project-a"}, "CROSS_SCOPE_DENIED"),
+    ],
+    ids=["project-missing-id", "workflow-missing-id", "tool-environment-missing-agent", "cross-project-carries-id"],
+)
+def test_write_record_rejects_invalid_candidate_scope_identity(
+    tmp_path,
+    mutation: dict[str, object],
+    expected_code: str,
+) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "write-invalid-candidate-scope.db"), _profile())
+        await engine.open()
+        try:
+            candidate = _record(
+                lifecycle="CANDIDATE",
+                marker="q",
+                fact="Candidate storage requires a valid exact scope identity tuple.",
+                created_at="2026-10-03T05:00:00Z",
+            )
+            candidate.update(mutation)
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(candidate, [1.0] + [0.0] * 255)
+            assert error.value.code == expected_code
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_storage_candidate_promotion_rejects_invalid_current_scope_identity(tmp_path) -> None:
     async def run() -> None:
         engine = SQLiteVecEngine(str(tmp_path / "promotion-invalid-current-scope.db"), _profile())
@@ -1385,7 +1425,18 @@ def test_storage_candidate_promotion_rejects_invalid_current_scope_identity(tmp_
                 created_at="2026-09-26T03:00:00Z",
             )
             candidate.update({"scope": "PROJECT", "project_id": None})
-            await engine.write_record(candidate, [1.0] + [0.0] * 255)
+
+            def seed_legacy_invalid_candidate() -> None:
+                assert engine.conn is not None
+                engine.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    engine._insert_materialized_record(candidate, [1.0] + [0.0] * 255)
+                    engine.conn.commit()
+                except Exception:
+                    engine.conn.rollback()
+                    raise
+
+            await engine._run(seed_legacy_invalid_candidate)
 
             successor = deepcopy(candidate)
             successor.update({

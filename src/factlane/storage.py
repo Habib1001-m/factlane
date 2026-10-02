@@ -727,6 +727,14 @@ class SQLiteVecEngine:
                         "INVALID_ENVELOPE",
                         "initial storage record must have a root lineage shape",
                     )
+                if supersede_record_id is None and record.get("lifecycle_state") != "VALIDATED_CURRENT":
+                    validate_scope(
+                        record.get("scope"),
+                        record.get("project_id"),
+                        record.get("worktree_id"),
+                        record.get("workflow_id"),
+                        record.get("agent_id"),
+                    )
                 superseded_native_hash: str | None = None
                 if supersede_record_id is not None:
                     old = self.conn.execute(
