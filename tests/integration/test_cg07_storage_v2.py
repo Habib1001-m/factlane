@@ -1227,6 +1227,36 @@ def test_write_record_rejects_invalid_initial_lineage_shape(tmp_path, mutation: 
     asyncio.run(run())
 
 
+def test_write_record_rejects_empty_supersede_record_id_boundary(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "write-empty-supersede-id.db"), _profile())
+        await engine.open()
+        try:
+            record = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="j",
+                fact="An empty supersede identifier cannot bypass root or successor lineage validation.",
+                created_at="2026-10-02T05:30:00Z",
+            )
+            record["revision"] = 7
+            record["parent_record_id"] = str(uuid.uuid4())
+            record["supersedes"] = [str(uuid.uuid4())]
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(
+                    record,
+                    [1.0] + [0.0] * 255,
+                    supersede_record_id="",
+                )
+            assert error.value.code == "VERSION_CONFLICT"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["authority_role", "verified_by", "last_verified_at", "source_timestamp"],

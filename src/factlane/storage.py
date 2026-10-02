@@ -687,7 +687,7 @@ class SQLiteVecEngine:
                         "initial storage record must have a root lineage shape",
                     )
                 superseded_native_hash: str | None = None
-                if supersede_record_id:
+                if supersede_record_id is not None:
                     old = self.conn.execute(
                         "SELECT native_content_hash, lifecycle_state,scope,project_id,worktree_id,workflow_id,agent_id,"
                         "memory_id,revision "
@@ -740,7 +740,7 @@ class SQLiteVecEngine:
                     incoming_fact = " ".join(str(record["fact"]).casefold().split())
                     for current_row in current_rows:
                         current = self._row_to_dict(current_row)
-                        if supersede_record_id and current["record_id"] == supersede_record_id:
+                        if supersede_record_id is not None and current["record_id"] == supersede_record_id:
                             continue
                         if " ".join(str(current["fact"]).casefold().split()) != incoming_fact:
                             raise AdapterError("CONTRADICTION", "a different validated current fact already exists for this contradiction key")
@@ -825,7 +825,7 @@ class SQLiteVecEngine:
                     "INSERT INTO memory_embeddings (rowid, content_embedding, store) VALUES (?, ?, ?)",
                     (rowid, serialize_float32(embedding), self.profile.profile_id),
                 )
-                if supersede_record_id:
+                if supersede_record_id is not None:
                     self.conn.execute(
                         "UPDATE adapter_records SET lifecycle_state='SUPERSEDED' WHERE record_id = ?",
                         (supersede_record_id,),
