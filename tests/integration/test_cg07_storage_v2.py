@@ -1566,6 +1566,91 @@ def test_write_record_accepts_valid_cross_project_on_change_semantics(tmp_path) 
     asyncio.run(run())
 
 
+def test_cross_project_semantics_do_not_override_write_record_version_conflict(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "cross-project-version-precedence.db"), _profile())
+        await engine.open()
+        try:
+            successor = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="a",
+                fact="A stale successor must fail CAS before semantic admission checks.",
+                created_at="2026-10-03T03:00:00Z",
+            )
+            successor.update({
+                "memory_type": "USER_FACT",
+                "revision": 2,
+                "parent_record_id": str(uuid.uuid4()),
+            })
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(
+                    successor,
+                    [1.0] + [0.0] * 255,
+                    supersede_record_id=str(successor["parent_record_id"]),
+                )
+            assert error.value.code == "VERSION_CONFLICT"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_cross_project_semantics_do_not_override_promotion_version_conflict(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "cross-project-promotion-version-precedence.db"), _profile())
+        await engine.open()
+        try:
+            candidate = _record(
+                lifecycle="CANDIDATE",
+                marker="b",
+                fact="Candidate promotion keeps stale-parent CAS precedence over semantic checks.",
+                created_at="2026-10-03T03:00:00Z",
+            )
+            await engine.write_record(candidate, [1.0] + [0.0] * 255)
+            stale_parent = str(uuid.uuid4())
+            successor = deepcopy(candidate)
+            successor.update({
+                "record_id": str(uuid.uuid4()),
+                "revision": 2,
+                "parent_record_id": stale_parent,
+                "source_timestamp": "2026-10-03T04:00:00Z",
+                "created_at": "2026-10-03T04:00:00Z",
+                "last_verified_at": "2026-10-03T04:00:00Z",
+                "verified_by": "OWNER",
+                "authority_role": "WORKFLOW_CURRENT",
+                "freshness_policy": {
+                    "kind": "ttl",
+                    "ttl_seconds": 60,
+                    "recheck_ref": None,
+                    "source_fingerprint": None,
+                },
+                "lifecycle_state": "VALIDATED_CURRENT",
+                "native_content_hash": "c" * 64,
+                "payload_fingerprint": "d" * 64,
+                "idempotency_key": "cross-project-promotion-stale-parent",
+            })
+
+            with pytest.raises(AdapterError) as error:
+                await engine.promote_candidate(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    validate_scope("CROSS_PROJECT_WORKFLOW"),
+                    expected_record_id=stale_parent,
+                    expected_revision=1,
+                )
+            assert error.value.code == "VERSION_CONFLICT"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records WHERE lifecycle_state='CANDIDATE'").fetchone()[0] == 1
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records WHERE lifecycle_state='VALIDATED_CURRENT'").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_equivalent_current_returns_already_current_without_promoting_candidate(tmp_path) -> None:
     async def run() -> None:
         engine = SQLiteVecEngine(str(tmp_path / "promotion-equivalent.db"), _profile())

@@ -718,7 +718,6 @@ class SQLiteVecEngine:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 _validate_current_authority_metadata(record)
-                _validate_cross_project_storage_semantics(record)
                 if supersede_record_id is None and (
                     record.get("revision") != 1
                     or record.get("parent_record_id") is not None
@@ -774,6 +773,8 @@ class SQLiteVecEngine:
                             "update successor has an invalid memory lineage shape",
                         )
                     superseded_native_hash = str(old[0])
+
+                _validate_cross_project_storage_semantics(record)
 
                 if record["lifecycle_state"] == "VALIDATED_CURRENT":
                     exact_scope = ScopeContext(record["scope"], record.get("project_id"), record.get("worktree_id"), record.get("workflow_id"), record.get("agent_id"))
@@ -910,7 +911,6 @@ class SQLiteVecEngine:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 _validate_current_authority_metadata(record)
-                _validate_cross_project_storage_semantics(record)
                 parent_row = self.conn.execute(
                     self._select_sql(
                         f"WHERE a.memory_id=? AND a.record_id=? AND a.revision=? "
@@ -939,6 +939,8 @@ class SQLiteVecEngine:
                         "INVALID_ENVELOPE",
                         "candidate REVERIFY successor cannot change logical or contradiction identity",
                     )
+
+                _validate_cross_project_storage_semantics(record)
 
                 current_rows = self.conn.execute(
                     self._select_sql(
