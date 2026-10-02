@@ -10,7 +10,7 @@ import uuid
 import pytest
 
 from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
-from factlane.contract import AdapterError, validate_scope
+from factlane.contract import AdapterError, ScopeContext, validate_scope
 from factlane.embeddings import EmbeddingProfile
 from factlane.storage import SQLiteVecEngine
 
@@ -1260,6 +1260,98 @@ def test_write_record_rejects_invalid_current_authority_metadata(tmp_path, mutat
             ] == [
                 (1, "VALIDATED_CURRENT", "WORKFLOW_CURRENT", "AUTOMATED_CHECK")
             ]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ({"scope": "PROJECT", "project_id": None, "authority_role": "PROJECT_CURRENT"}, "UNKNOWN_PROJECT_ID"),
+        (
+            {"scope": "WORKFLOW", "project_id": "project-a", "workflow_id": None, "authority_role": "WORKFLOW_CURRENT"},
+            "UNKNOWN_PROJECT_ID",
+        ),
+        ({"scope": "TOOL_ENVIRONMENT", "agent_id": None, "authority_role": "TOOL_ENV_CURRENT"}, "UNKNOWN_AGENT"),
+        (
+            {"scope": "CROSS_PROJECT_WORKFLOW", "project_id": "project-a", "authority_role": "WORKFLOW_CURRENT"},
+            "CROSS_SCOPE_DENIED",
+        ),
+    ],
+    ids=["project-missing-id", "workflow-missing-id", "tool-environment-missing-agent", "cross-project-carries-id"],
+)
+def test_write_record_rejects_invalid_current_scope_identity(
+    tmp_path,
+    mutation: dict[str, object],
+    expected_code: str,
+) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "write-invalid-current-scope.db"), _profile())
+        await engine.open()
+        try:
+            current = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="g",
+                fact="Validated current storage requires a valid exact scope identity tuple.",
+                created_at="2026-09-26T02:00:00Z",
+            )
+            current.update(mutation)
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(current, [1.0] + [0.0] * 255)
+            assert error.value.code == expected_code
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_storage_candidate_promotion_rejects_invalid_current_scope_identity(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "promotion-invalid-current-scope.db"), _profile())
+        await engine.open()
+        try:
+            candidate = _record(
+                lifecycle="CANDIDATE",
+                marker="h",
+                fact="Candidate promotion requires a valid exact current scope identity tuple.",
+                created_at="2026-09-26T03:00:00Z",
+            )
+            candidate.update({"scope": "PROJECT", "project_id": None})
+            await engine.write_record(candidate, [1.0] + [0.0] * 255)
+
+            successor = deepcopy(candidate)
+            successor.update({
+                "record_id": str(uuid.uuid4()),
+                "revision": 2,
+                "parent_record_id": candidate["record_id"],
+                "source_timestamp": "2026-09-26T04:00:00Z",
+                "created_at": "2026-09-26T04:00:00Z",
+                "last_verified_at": "2026-09-26T04:00:00Z",
+                "verified_by": "OWNER",
+                "authority_role": "PROJECT_CURRENT",
+                "lifecycle_state": "VALIDATED_CURRENT",
+                "native_content_hash": "9" * 64,
+                "payload_fingerprint": "a" * 64,
+                "idempotency_key": "promotion-invalid-current-scope-successor",
+            })
+
+            with pytest.raises(AdapterError) as error:
+                await engine.promote_candidate(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    ScopeContext("PROJECT"),
+                    expected_record_id=str(candidate["record_id"]),
+                    expected_revision=1,
+                )
+            assert error.value.code == "UNKNOWN_PROJECT_ID"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records WHERE lifecycle_state='VALIDATED_CURRENT'").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records WHERE lifecycle_state='CANDIDATE'").fetchone()[0] == 1
         finally:
             await engine.close()
 

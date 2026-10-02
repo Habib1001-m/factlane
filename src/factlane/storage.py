@@ -15,7 +15,7 @@ from .backend_compat import (
     execute_with_backend_retry,
     load_pinned_sqlite_vec_storage,
 )
-from .contract import AdapterError, ScopeContext, canonical_json, parse_iso
+from .contract import AdapterError, ScopeContext, canonical_json, parse_iso, validate_scope
 from .embeddings import EmbeddingProfile
 
 STORAGE_CONTRACT_VERSION = 2
@@ -37,8 +37,15 @@ def _validate_current_authority_metadata(record: dict[str, Any]) -> None:
     """Fail closed if a direct storage caller fabricates current authority."""
     if record.get("lifecycle_state") != "VALIDATED_CURRENT":
         return
-    expected_authority = _CURRENT_AUTHORITY_BY_SCOPE.get(str(record.get("scope")))
-    if expected_authority is None or record.get("authority_role") != expected_authority:
+    scope = validate_scope(
+        record.get("scope"),
+        record.get("project_id"),
+        record.get("worktree_id"),
+        record.get("workflow_id"),
+        record.get("agent_id"),
+    )
+    expected_authority = _CURRENT_AUTHORITY_BY_SCOPE[scope.scope]
+    if record.get("authority_role") != expected_authority:
         raise AdapterError(
             "INVALID_ENVELOPE",
             "validated current authority_role does not match exact scope",
