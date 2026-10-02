@@ -1274,31 +1274,37 @@ class SQLiteVecEngine:
             for state, count in rows:
                 if state in counts:
                     counts[state] = int(count)
-            inventory = self.conn.execute(
-                f"SELECT lifecycle_state, native_content_hash FROM adapter_records a {suffix}",
-                params,
-            ).fetchall()
-            compaction_ready = 0
-            compaction_blocked_partial = 0
-            for lifecycle_state, content_hash in inventory:
-                if lifecycle_state != "SUPERSEDED":
-                    continue
-                native = self.conn.execute(
-                    "SELECT id, deleted_at FROM memories WHERE content_hash = ?",
-                    (content_hash,),
-                ).fetchone()
-                vector = (
-                    self.conn.execute(
-                        "SELECT 1 FROM memory_embeddings WHERE rowid = ? AND store = ?",
-                        (native[0], self.profile.profile_id),
-                    ).fetchone()
-                    if native is not None and native[1] is None
-                    else None
-                )
-                if vector is not None:
-                    compaction_ready += 1
-                else:
-                    compaction_blocked_partial += 1
+            superseded_suffix = (
+                f"WHERE {where} AND a.lifecycle_state = 'SUPERSEDED'"
+                if scope
+                else "WHERE a.lifecycle_state = 'SUPERSEDED'"
+            )
+            superseded_total, compaction_ready = self.conn.execute(
+                f"""
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(
+                        CASE WHEN EXISTS (
+                            SELECT 1
+                            FROM memories m
+                            WHERE m.content_hash = a.native_content_hash
+                              AND m.deleted_at IS NULL
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM memory_embeddings e
+                                  WHERE e.rowid = m.id
+                                    AND e.store = ?
+                              )
+                        ) THEN 1 ELSE 0 END
+                    ), 0)
+                FROM adapter_records a
+                {superseded_suffix}
+                """,
+                [self.profile.profile_id, *params],
+            ).fetchone()
+            superseded_total = int(superseded_total)
+            compaction_ready = int(compaction_ready)
+            compaction_blocked_partial = superseded_total - compaction_ready
 
             def file_size(path: str) -> int | None:
                 try:

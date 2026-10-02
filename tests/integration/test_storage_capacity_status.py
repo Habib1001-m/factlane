@@ -305,6 +305,82 @@ def test_partial_superseded_record_is_blocked_and_status_does_not_mutate(tmp_pat
     asyncio.run(run())
 
 
+def test_status_compaction_inventory_uses_bounded_selects_for_mixed_superseded_rows(tmp_path) -> None:
+    async def run() -> None:
+        engine, adapter = await _open_adapter(tmp_path)
+        try:
+            async def make_superseded(key: str, marker_old: str, marker_new: str) -> dict[str, Any]:
+                old_result = await adapter.store(
+                    fact=f"{key} old fact.",
+                    scope="PROJECT",
+                    memory_type="PROJECT_LEARNED_FACT",
+                    source_provenance=_provenance(f"{key}-old", marker_old),
+                    freshness_policy={"kind": "manual"},
+                    idempotency_key=f"{key}-old",
+                    project_id="factlane",
+                    source_timestamp="2026-08-30T00:00:00Z",
+                    last_verified_at="2026-08-30T00:00:00Z",
+                    verified_by="OWNER",
+                    requested_lifecycle_state="VALIDATED_CURRENT",
+                    confidence=0.95,
+                    tags=[f"subject:{key}"],
+                )
+                old = old_result["results"][0]
+                await adapter.update(
+                    memory_id=old["memory_id"],
+                    scope="PROJECT",
+                    project_id="factlane",
+                    expected_revision=old["revision"],
+                    mode="REPLACE",
+                    idempotency_key=f"{key}-new",
+                    replacement={
+                        "fact": f"{key} replacement fact.",
+                        "memory_type": "PROJECT_LEARNED_FACT",
+                        "source_provenance": _provenance(f"{key}-new", marker_new),
+                        "freshness_policy": {"kind": "manual"},
+                        "source_timestamp": "2026-08-30T00:00:00Z",
+                        "verified_by": "OWNER",
+                        "tags": [f"subject:{key}"],
+                    },
+                )
+                return old
+
+            await make_superseded("bounded-ready", "c", "d")
+            partial = await make_superseded("bounded-partial", "e", "f")
+            assert engine.conn is not None
+            partial_hash = engine.conn.execute(
+                "SELECT native_content_hash FROM adapter_records WHERE record_id = ?",
+                (partial["record_id"],),
+            ).fetchone()[0]
+            partial_native_id = engine.conn.execute(
+                "SELECT id FROM memories WHERE content_hash = ?",
+                (partial_hash,),
+            ).fetchone()[0]
+            engine.conn.execute("DELETE FROM memory_embeddings WHERE rowid = ?", (partial_native_id,))
+            engine.conn.commit()
+
+            statements: list[str] = []
+            engine.conn.set_trace_callback(statements.append)
+            try:
+                retention = (await engine.status(_scope(adapter)))["retention"]
+            finally:
+                engine.conn.set_trace_callback(None)
+
+            selects = [
+                statement
+                for statement in statements
+                if statement.lstrip().upper().startswith("SELECT")
+            ]
+            assert retention["superseded_total"] == 2
+            assert retention["compaction_ready"] == 1
+            assert retention["compaction_blocked_partial"] == 1
+            assert len(selects) <= 2
+        finally:
+            await adapter.close()
+
+    asyncio.run(run())
+
+
 def test_current_authority_is_counted_and_never_eligible(tmp_path) -> None:
     async def run() -> None:
         engine, adapter = await _open_adapter(tmp_path)
