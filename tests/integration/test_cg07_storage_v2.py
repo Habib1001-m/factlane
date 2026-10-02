@@ -1196,6 +1196,39 @@ def test_write_record_rejects_invalid_superseding_lineage_shape(tmp_path, mutati
 
 @pytest.mark.parametrize(
     "mutation",
+    ["revision", "parent_record_id", "supersedes"],
+)
+def test_write_record_rejects_invalid_initial_lineage_shape(tmp_path, mutation: str) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / f"write-initial-lineage-{mutation}.db"), _profile())
+        await engine.open()
+        try:
+            record = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="i",
+                fact="An initial storage record must have a root lineage shape.",
+                created_at="2026-10-02T05:00:00Z",
+            )
+            if mutation == "revision":
+                record["revision"] = 7
+            elif mutation == "parent_record_id":
+                record["parent_record_id"] = str(uuid.uuid4())
+            else:
+                record["supersedes"] = [str(uuid.uuid4())]
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(record, [1.0] + [0.0] * 255)
+            assert error.value.code == "INVALID_ENVELOPE"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "mutation",
     ["authority_role", "verified_by", "last_verified_at", "source_timestamp"],
 )
 def test_write_record_rejects_invalid_current_authority_metadata(tmp_path, mutation: str) -> None:

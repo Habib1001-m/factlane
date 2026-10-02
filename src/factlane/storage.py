@@ -677,6 +677,15 @@ class SQLiteVecEngine:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 _validate_current_authority_metadata(record)
+                if supersede_record_id is None and (
+                    record.get("revision") != 1
+                    or record.get("parent_record_id") is not None
+                    or record.get("supersedes", []) != []
+                ):
+                    raise AdapterError(
+                        "INVALID_ENVELOPE",
+                        "initial storage record must have a root lineage shape",
+                    )
                 superseded_native_hash: str | None = None
                 if supersede_record_id:
                     old = self.conn.execute(
