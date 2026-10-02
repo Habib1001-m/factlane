@@ -731,14 +731,15 @@ class MemoryAdapter:
         return value
 
     @staticmethod
-    def _subject_tag(tags: list[str]) -> str | None:
-        subject_tag = next((tag for tag in tags if tag.startswith("subject:")), None)
-        if subject_tag is None:
-            return None
-        value = subject_tag.split(":", 1)[1].strip().casefold()
-        if not value or contains_sensitive(value):
-            raise AdapterError("INVALID_ENVELOPE", "subject tag is invalid")
-        return value
+    def _subject_tags(tags: list[str]) -> list[str]:
+        values: list[str] = []
+        for subject_tag in (tag for tag in tags if tag.startswith("subject:")):
+            value = subject_tag.split(":", 1)[1].strip().casefold()
+            if not value or contains_sensitive(value):
+                raise AdapterError("INVALID_ENVELOPE", "subject tag is invalid")
+            if value not in values:
+                values.append(value)
+        return values
 
     @staticmethod
     def _contradiction_identity_key(
@@ -1375,51 +1376,43 @@ class MemoryAdapter:
                     )
             if "tags" in data:
                 refreshed_tags = self._tags(data.get("tags"))
-                old_subject_tag = self._subject_tag(old_tags)
-                refreshed_subject_tag = self._subject_tag(refreshed_tags)
-                old_subject_tag_is_identity = (
-                    old_subject_tag is not None
-                    and self._contradiction_identity_key(
-                        scope_context,
-                        old["memory_type"],
-                        old_subject_tag,
+                old_subject_tags = self._subject_tags(old_tags)
+                refreshed_subject_tags = self._subject_tags(refreshed_tags)
+
+                def subject_tag_is_identity(value: str) -> bool:
+                    return (
+                        self._contradiction_identity_key(
+                            scope_context,
+                            old["memory_type"],
+                            value,
+                        )
+                        == contradiction_key
                     )
-                    == contradiction_key
-                )
-                if old_subject_tag_is_identity:
-                    refreshed_subject = (
-                        refreshed_subject_tag
-                        if refreshed_subject_tag is not None
-                        else self._subject(None, refreshed_tags, fact)
+
+                old_identity_tags = {
+                    value for value in old_subject_tags if subject_tag_is_identity(value)
+                }
+                old_legacy_tags = set(old_subject_tags) - old_identity_tags
+                refreshed_identity_tags = {
+                    value for value in refreshed_subject_tags if subject_tag_is_identity(value)
+                }
+                refreshed_legacy_tags = set(refreshed_subject_tags) - refreshed_identity_tags
+
+                if refreshed_legacy_tags - old_legacy_tags:
+                    raise AdapterError(
+                        "INVALID_ENVELOPE",
+                        "REVERIFY cannot introduce new subject metadata with a different contradiction identity",
                     )
+                if old_identity_tags and not refreshed_identity_tags:
+                    fallback_subject = self._subject(None, refreshed_tags, fact)
                     if self._contradiction_identity_key(
                         scope_context,
                         old["memory_type"],
-                        refreshed_subject,
+                        fallback_subject,
                     ) != contradiction_key:
                         raise AdapterError(
                             "INVALID_ENVELOPE",
-                            "REVERIFY cannot change the subject tag that defines contradiction identity",
-                        )
-                elif old_subject_tag is None:
-                    if refreshed_subject_tag is not None and self._contradiction_identity_key(
-                        scope_context,
-                        old["memory_type"],
-                        refreshed_subject_tag,
-                    ) != contradiction_key:
-                        raise AdapterError(
-                            "INVALID_ENVELOPE",
-                            "REVERIFY cannot introduce a subject tag with a different contradiction identity",
-                        )
-                elif refreshed_subject_tag not in {None, old_subject_tag}:
-                    if self._contradiction_identity_key(
-                        scope_context,
-                        old["memory_type"],
-                        refreshed_subject_tag,
-                    ) != contradiction_key:
-                        raise AdapterError(
-                            "INVALID_ENVELOPE",
-                            "REVERIFY cannot replace legacy subject metadata with a different contradiction identity",
+                            "REVERIFY cannot remove the subject tag that defines contradiction identity",
                         )
         else:
             data = replacement or {}

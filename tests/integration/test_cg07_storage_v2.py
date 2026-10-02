@@ -591,6 +591,28 @@ def test_reverify_preserves_legacy_non_authoritative_subject_tag_during_unrelate
             assert refreshed["tags"] == ["subject:display-alias", "new-tag"]
             assert refreshed["revision"] == current["revision"] + 1
 
+            with pytest.raises(AdapterError) as error:
+                await owner.dispatch("memory_update", {
+                    "memory_id": refreshed["memory_id"],
+                    "expected_record_id": refreshed["record_id"],
+                    "scope": "PROJECT",
+                    "project_id": "factlane",
+                    "expected_revision": refreshed["revision"],
+                    "mode": "REVERIFY",
+                    "idempotency_key": "reverify-legacy-subject-tag-second-mismatch",
+                    "verification": {
+                        "source_timestamp": "2026-10-02T01:30:00Z",
+                        "last_verified_at": "2026-10-02T01:30:00Z",
+                        "verified_by": "OWNER",
+                        "tags": [
+                            "subject:display-alias",
+                            "subject:different-display-alias",
+                            "new-tag",
+                        ],
+                    },
+                })
+            assert error.value.code == "INVALID_ENVELOPE"
+
             removed = (await owner.dispatch("memory_update", {
                 "memory_id": refreshed["memory_id"],
                 "expected_record_id": refreshed["record_id"],
