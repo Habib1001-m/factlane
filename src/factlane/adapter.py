@@ -1473,6 +1473,18 @@ class MemoryAdapter:
         if not 0 <= confidence <= 1:
             raise AdapterError("INVALID_ENVELOPE", "confidence must be between 0 and 1")
         fingerprint = update_request_fingerprint
+
+        async def reconcile_concurrent_idempotent_update() -> dict[str, Any] | None:
+            concurrent = await self.engine.find_idempotency(idempotency_key)
+            if concurrent is None:
+                return None
+            if concurrent["payload_fingerprint"] != fingerprint:
+                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different update")
+            envelope = self._base_envelope(request_id, "memory_update", scope_context)
+            envelope["results"] = [self._public(concurrent)]
+            envelope["idempotent_replay"] = True
+            return envelope
+
         async with self._get_write_lock():
             existing = await self.engine.find_idempotency(idempotency_key)
             if existing:
@@ -1528,32 +1540,34 @@ class MemoryAdapter:
                 "embedding_output_dimension": self.provider.profile.output_dimension,
             }
             embedding = (await asyncio.to_thread(self.provider.embed_documents, [fact]))[0]
-            if candidate_promotion:
-                equivalent = await self.engine.promote_candidate(
-                    record,
-                    embedding,
-                    scope_context,
-                    expected_record_id=old["record_id"],
-                    expected_revision=expected_revision,
-                )
-                if equivalent is not None:
-                    envelope = self._base_envelope(request_id, "memory_update", scope_context)
-                    envelope["status"] = "ALREADY_CURRENT"
-                    envelope["results"] = [self._public(equivalent)]
-                    return self._fit_budget(envelope)
-            else:
-                try:
-                    await self.engine.write_record(record, embedding, supersede_record_id=old["record_id"])
-                except RecordUniquenessConflict:
-                    concurrent_idempotent = await self.engine.find_idempotency(idempotency_key)
-                    if concurrent_idempotent:
-                        if concurrent_idempotent["payload_fingerprint"] != fingerprint:
-                            raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different update")
+            try:
+                if candidate_promotion:
+                    equivalent = await self.engine.promote_candidate(
+                        record,
+                        embedding,
+                        scope_context,
+                        expected_record_id=old["record_id"],
+                        expected_revision=expected_revision,
+                    )
+                    if equivalent is not None:
                         envelope = self._base_envelope(request_id, "memory_update", scope_context)
-                        envelope["results"] = [self._public(concurrent_idempotent)]
-                        envelope["idempotent_replay"] = True
-                        return envelope
-                    raise AdapterError("WRITE_UNCONFIRMED", "concurrent update conflict could not be reconciled")
+                        envelope["status"] = "ALREADY_CURRENT"
+                        envelope["results"] = [self._public(equivalent)]
+                        return self._fit_budget(envelope)
+                else:
+                    await self.engine.write_record(record, embedding, supersede_record_id=old["record_id"])
+            except RecordUniquenessConflict:
+                concurrent_replay = await reconcile_concurrent_idempotent_update()
+                if concurrent_replay is not None:
+                    return concurrent_replay
+                raise AdapterError("WRITE_UNCONFIRMED", "concurrent update conflict could not be reconciled")
+            except AdapterError as exc:
+                if exc.code != "VERSION_CONFLICT":
+                    raise
+                concurrent_replay = await reconcile_concurrent_idempotent_update()
+                if concurrent_replay is not None:
+                    return concurrent_replay
+                raise
             readback_rows = await self.engine.get_record(new_memory_id, scope_context, history=True)
             readback = next((row for row in readback_rows if row["record_id"] == record_id), None)
             if not readback or not self._fresh_current(readback):
