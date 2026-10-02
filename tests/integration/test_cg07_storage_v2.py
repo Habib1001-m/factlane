@@ -747,6 +747,7 @@ def test_reverify_preserves_legacy_non_authoritative_subject_tag_during_unrelate
         {"lifecycle_state": "CANDIDATE"},
         {"authority_role": "UNRESOLVED"},
         {"verified_by": "UNVERIFIED"},
+        {"contradiction_state": "UNRESOLVED"},
     ],
     ids=[
         "memory-type",
@@ -756,6 +757,7 @@ def test_reverify_preserves_legacy_non_authoritative_subject_tag_during_unrelate
         "lifecycle",
         "authority-role",
         "verified-by",
+        "contradiction-state",
     ],
 )
 def test_storage_candidate_promotion_rejects_invalid_current_successor_metadata(
@@ -1323,6 +1325,67 @@ def test_write_record_rejects_invalid_current_authority_metadata(tmp_path, mutat
             ] == [
                 (1, "VALIDATED_CURRENT", "WORKFLOW_CURRENT", "AUTOMATED_CHECK")
             ]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "contradiction_state",
+    ["UNRESOLVED", "QUARANTINED", "BOGUS_STATE"],
+)
+def test_write_record_rejects_invalid_current_contradiction_state(
+    tmp_path,
+    contradiction_state: str,
+) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(
+            str(tmp_path / f"write-current-contradiction-state-{contradiction_state}.db"),
+            _profile(),
+        )
+        await engine.open()
+        try:
+            record = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="q",
+                fact="Validated current storage cannot carry an unresolved contradiction state.",
+                created_at="2026-10-03T00:00:00Z",
+            )
+            record["contradiction_state"] = contradiction_state
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(record, [1.0] + [0.0] * 255)
+            assert error.value.code == "INVALID_ENVELOPE"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_write_record_candidate_contradiction_state_behavior_is_unchanged(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "write-candidate-contradiction-state.db"), _profile())
+        await engine.open()
+        try:
+            record = _record(
+                lifecycle="CANDIDATE",
+                marker="r",
+                fact="Candidate storage may retain unresolved contradiction state.",
+                created_at="2026-10-03T00:05:00Z",
+            )
+            record["contradiction_state"] = "UNRESOLVED"
+            await engine.write_record(record, [1.0] + [0.0] * 255)
+            assert engine.conn is not None
+            row = engine.conn.execute(
+                "SELECT lifecycle_state, contradiction_state FROM adapter_records WHERE record_id = ?",
+                (record["record_id"],),
+            ).fetchone()
+            assert row == ("CANDIDATE", "UNRESOLVED")
         finally:
             await engine.close()
 

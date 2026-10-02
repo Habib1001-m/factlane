@@ -63,6 +63,11 @@ def _validate_current_authority_metadata(record: dict[str, Any]) -> None:
             "INVALID_ENVELOPE",
             "validated current requires an admissible verification basis",
         )
+    if record.get("contradiction_state") not in {"NONE", "RESOLVED"}:
+        raise AdapterError(
+            "INVALID_ENVELOPE",
+            "validated current contradiction_state must be NONE or RESOLVED",
+        )
     parse_iso(record.get("source_timestamp"), required=True)
     parse_iso(record.get("last_verified_at"), required=True)
 
