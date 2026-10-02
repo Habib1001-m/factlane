@@ -23,7 +23,7 @@ from factlane.contract import (
     validate_scope,
 )
 from factlane.gateway import HostBinding, MemoryGateway
-from factlane.public_contract import TOOL_REQUEST_TYPES, render_tool_help
+from factlane.public_contract import TOOL_REQUEST_TYPES, render_tool_help, request_schema as public_request_schema
 from factlane.router import TruthRouter
 from factlane.server import build_mcp_server
 
@@ -224,6 +224,13 @@ def test_store_and_update_contracts_explain_governed_write_fields() -> None:
     assert "expected_revision" in update["required"]
     assert set(update["properties"]["mode"]["enum"]) == {"REVERIFY", "REPLACE"}
     assert "required for replace" in update["properties"]["replacement"]["description"].casefold()
+    raw_update = public_request_schema("memory_update")
+    verification = raw_update["$defs"]["VerificationPayload"]["properties"]
+    replacement = raw_update["$defs"]["ReplacementPayload"]["properties"]
+    assert "cannot change the existing memory type" in verification["memory_type"]["description"]
+    assert "cannot change the existing subject" in verification["subject"]["description"]
+    assert "cannot change" not in replacement["memory_type"]["description"].casefold()
+    assert "for the replacement" in replacement["subject"]["description"].casefold()
 
 
 def test_runtime_constants_cli_help_and_mcp_schema_stay_in_parity() -> None:

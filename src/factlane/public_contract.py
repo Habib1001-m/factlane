@@ -115,14 +115,26 @@ class VerificationPayload(TypedDict, total=False):
     source_timestamp: NotRequired[Annotated[str, Field(description="ISO-8601 timestamp for the checked source.")]]
     last_verified_at: NotRequired[Annotated[str, Field(description="ISO-8601 timestamp for this verification.")]]
     verified_by: NotRequired[VerifiedByValue]
-    memory_type: NotRequired[MemoryTypeValue]
+    memory_type: NotRequired[
+        Annotated[
+            MemoryTypeValue,
+            Field(description="Optional identity assertion; REVERIFY cannot change the existing memory type."),
+        ]
+    ]
     confidence: NotRequired[Annotated[float, Field(ge=0, le=1, description="Confidence from 0 to 1.")]]
     tags: NotRequired[Annotated[list[str], Field(max_length=12, description="At most 12 bounded tags.")]]
-    subject: NotRequired[Annotated[str, Field(description="Optional bounded contradiction subject.")]]
+    subject: NotRequired[
+        Annotated[
+            str,
+            Field(description="Optional contradiction-identity assertion; REVERIFY cannot change the existing subject."),
+        ]
+    ]
 
 
 class ReplacementPayload(VerificationPayload, total=False):
     fact: NotRequired[Annotated[str, Field(description="Replacement bounded fact; required for REPLACE.")]]
+    memory_type: NotRequired[MemoryTypeValue]
+    subject: NotRequired[Annotated[str, Field(description="Optional bounded contradiction subject for the replacement.")]]
 
 
 class MemorySearchRequest(ScopeFields, total=False):

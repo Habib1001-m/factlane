@@ -64,7 +64,9 @@ Promotion is a distinct `memory_update` operation: a trusted verifier uses `REVE
 expected revision, and the exact Candidate `expected_record_id`. Storage contract v2 keeps
 `contribution_origin` separate from verification and preserves it on promotion. The verifier
 is recorded separately; an older record is not silently rewritten as if it had been
-contributed by the verifier.
+contributed by the verifier. `REVERIFY` also preserves contradiction identity: the fact,
+scope, memory type, and subject remain the same logical memory. Identity-bearing assertions
+must match the existing record; semantic reclassification uses `REPLACE`.
 
 Revision changes use transaction-local compare-and-swap. A stale independent writer receives
 `VERSION_CONFLICT`. For a Candidate promotion, exact scope, logical memory, parent record,

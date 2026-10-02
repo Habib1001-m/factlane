@@ -184,7 +184,9 @@ fields. Use one bounded, attributable fact, not a transcript or an arbitrary dir
 A trusted verifier reviewing a Candidate uses `REVIEW_HISTORY` to inspect it and
 `memory_update` with `mode=REVERIFY`, `expected_revision`, and the Candidate's
 `expected_record_id` to promote it. A delegated agent has no verifier grant, even with user
-approval in chat.
+approval in chat. `REVERIFY` refreshes verification without changing the memory's
+contradiction identity; use `REPLACE` rather than changing `memory_type` or subject when a
+semantic reclassification is intended.
 
 ## Limits and next references
 

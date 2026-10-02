@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 import sqlite3
 import threading
@@ -331,6 +332,382 @@ def test_owner_reverify_promotes_candidate_same_memory_and_preserves_origin(tmp_
             assert sorted((row["revision"], row["lifecycle_state"]) for row in history) == [(1, "SUPERSEDED"), (2, "VALIDATED_CURRENT")]
         finally:
             await owner.close()
+    asyncio.run(run())
+
+
+def test_candidate_reverify_rejects_memory_type_reclassification_before_promotion(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "reverify-type-identity.db"), _profile())
+        await engine.open()
+        delegated = MemoryAdapter(
+            engine,
+            _Provider(),
+            trusted_write_context=trusted_write_context_for_profile("delegated-candidate"),
+        )
+        owner = MemoryAdapter(
+            engine,
+            _Provider(),
+            trusted_write_context=trusted_write_context_for_profile("owner-current"),
+        )
+        try:
+            current = (await owner.dispatch("memory_store", {
+                "fact": "The existing preference says blue.",
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "memory_type": "PREFERENCE",
+                "source_provenance": {
+                    "source_class": "OWNER_INPUT",
+                    "source_ref": "reverify-type-current",
+                    "source_hash": "1" * 64,
+                    "review_ref": "reverify-type-current",
+                    "extraction_method": "direct-input",
+                },
+                "freshness_policy": {"kind": "manual"},
+                "idempotency_key": "reverify-type-current",
+                "requested_lifecycle_state": "VALIDATED_CURRENT",
+                "source_timestamp": "2026-10-02T00:00:00Z",
+                "last_verified_at": "2026-10-02T00:00:00Z",
+                "verified_by": "OWNER",
+                "subject": "same-subject",
+            }))["results"][0]
+            candidate = (await delegated.dispatch("memory_store", {
+                "fact": "The candidate user fact says red.",
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "memory_type": "USER_FACT",
+                "source_provenance": {
+                    "source_class": "OWNER_INPUT",
+                    "source_ref": "reverify-type-candidate",
+                    "source_hash": "2" * 64,
+                    "review_ref": "reverify-type-candidate",
+                    "extraction_method": "direct-input",
+                },
+                "freshness_policy": {"kind": "manual"},
+                "idempotency_key": "reverify-type-candidate",
+                "subject": "same-subject",
+            }))["results"][0]
+
+            with pytest.raises(AdapterError) as error:
+                await owner.dispatch("memory_update", {
+                    "memory_id": candidate["memory_id"],
+                    "expected_record_id": candidate["record_id"],
+                    "scope": "PROJECT",
+                    "project_id": "factlane",
+                    "expected_revision": candidate["revision"],
+                    "mode": "REVERIFY",
+                    "idempotency_key": "reverify-type-promote",
+                    "verification": {
+                        "source_timestamp": "2026-10-02T01:00:00Z",
+                        "last_verified_at": "2026-10-02T01:00:00Z",
+                        "verified_by": "OWNER",
+                        "memory_type": "PREFERENCE",
+                        "subject": "same-subject",
+                    },
+                })
+            assert error.value.code == "INVALID_ENVELOPE"
+
+            scope = validate_scope("PROJECT", project_id="factlane")
+            current_rows = await engine.find_contradictions(
+                (await engine.get_record(current["memory_id"], scope, history=False))[0]["contradiction_key"],
+                scope,
+            )
+            assert [row["record_id"] for row in current_rows] == [current["record_id"]]
+            candidate_history = await engine.get_record(candidate["memory_id"], scope, history=True)
+            assert [(row["revision"], row["lifecycle_state"]) for row in candidate_history] == [(1, "CANDIDATE")]
+        finally:
+            await owner.close()
+
+    asyncio.run(run())
+
+
+def test_reverify_subject_and_subject_tag_cannot_change_contradiction_identity(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "reverify-subject-identity.db"), _profile())
+        await engine.open()
+        owner = MemoryAdapter(
+            engine,
+            _Provider(),
+            trusted_write_context=trusted_write_context_for_profile("owner-current"),
+        )
+        try:
+            current = (await owner.dispatch("memory_store", {
+                "fact": "The subject identity stays stable across verification refresh.",
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "memory_type": "PROJECT_LEARNED_FACT",
+                "source_provenance": {
+                    "source_class": "CURRENT_REPO",
+                    "source_ref": "reverify-subject",
+                    "source_hash": "3" * 64,
+                    "review_ref": "reverify-subject",
+                    "extraction_method": "AUTOMATED_CHECK",
+                },
+                "freshness_policy": {"kind": "manual"},
+                "idempotency_key": "reverify-subject-current",
+                "requested_lifecycle_state": "VALIDATED_CURRENT",
+                "source_timestamp": "2026-10-02T00:00:00Z",
+                "last_verified_at": "2026-10-02T00:00:00Z",
+                "verified_by": "OWNER",
+                "tags": ["subject:stable-subject", "keep"],
+                "subject": "stable-subject",
+            }))["results"][0]
+
+            for suffix, verification in (
+                ("explicit", {"subject": "different-subject"}),
+                ("tag", {"tags": ["subject:different-subject", "keep"]}),
+                ("removed-tag", {"tags": ["keep"]}),
+            ):
+                with pytest.raises(AdapterError) as error:
+                    await owner.dispatch("memory_update", {
+                        "memory_id": current["memory_id"],
+                        "expected_record_id": current["record_id"],
+                        "scope": "PROJECT",
+                        "project_id": "factlane",
+                        "expected_revision": current["revision"],
+                        "mode": "REVERIFY",
+                        "idempotency_key": f"reverify-subject-{suffix}",
+                        "verification": {
+                            "source_timestamp": "2026-10-02T01:00:00Z",
+                            "last_verified_at": "2026-10-02T01:00:00Z",
+                            "verified_by": "OWNER",
+                            **verification,
+                        },
+                    })
+                assert error.value.code == "INVALID_ENVELOPE"
+
+            scope = validate_scope("PROJECT", project_id="factlane")
+            history = await engine.get_record(current["memory_id"], scope, history=True)
+            assert [(row["revision"], row["lifecycle_state"]) for row in history] == [(1, "VALIDATED_CURRENT")]
+        finally:
+            await owner.close()
+
+    asyncio.run(run())
+
+
+def test_reverify_accepts_same_identity_assertions_and_unrelated_tag_refresh(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "reverify-same-identity.db"), _profile())
+        await engine.open()
+        owner = MemoryAdapter(
+            engine,
+            _Provider(),
+            trusted_write_context=trusted_write_context_for_profile("owner-current"),
+        )
+        try:
+            current = (await owner.dispatch("memory_store", {
+                "fact": "Same identity assertions remain backward compatible.",
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "memory_type": "PROJECT_LEARNED_FACT",
+                "source_provenance": {
+                    "source_class": "CURRENT_REPO",
+                    "source_ref": "reverify-same",
+                    "source_hash": "4" * 64,
+                    "review_ref": "reverify-same",
+                    "extraction_method": "AUTOMATED_CHECK",
+                },
+                "freshness_policy": {"kind": "manual"},
+                "idempotency_key": "reverify-same-current",
+                "requested_lifecycle_state": "VALIDATED_CURRENT",
+                "source_timestamp": "2026-10-02T00:00:00Z",
+                "last_verified_at": "2026-10-02T00:00:00Z",
+                "verified_by": "OWNER",
+                "tags": ["old-tag"],
+                "subject": "stable-subject",
+            }))["results"][0]
+            refreshed = (await owner.dispatch("memory_update", {
+                "memory_id": current["memory_id"],
+                "expected_record_id": current["record_id"],
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": current["revision"],
+                "mode": "REVERIFY",
+                "idempotency_key": "reverify-same-refresh",
+                "verification": {
+                    "source_timestamp": "2026-10-02T01:00:00Z",
+                    "last_verified_at": "2026-10-02T01:00:00Z",
+                    "verified_by": "OWNER",
+                    "memory_type": "PROJECT_LEARNED_FACT",
+                    "subject": "stable-subject",
+                    "tags": ["subject:stable-subject", "new-tag"],
+                },
+            }))["results"][0]
+            assert refreshed["memory_type"] == current["memory_type"]
+            assert refreshed["tags"] == ["subject:stable-subject", "new-tag"]
+            assert refreshed["revision"] == current["revision"] + 1
+        finally:
+            await owner.close()
+
+    asyncio.run(run())
+
+
+def test_reverify_preserves_legacy_non_authoritative_subject_tag_during_unrelated_tag_refresh(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "reverify-legacy-subject-tag.db"), _profile())
+        await engine.open()
+        owner = MemoryAdapter(
+            engine,
+            _Provider(),
+            trusted_write_context=trusted_write_context_for_profile("owner-current"),
+        )
+        try:
+            current = (await owner.dispatch("memory_store", {
+                "fact": "Legacy explicit subject remains the contradiction identity.",
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "memory_type": "PROJECT_LEARNED_FACT",
+                "source_provenance": {
+                    "source_class": "CURRENT_REPO",
+                    "source_ref": "reverify-legacy-subject-tag",
+                    "source_hash": "5" * 64,
+                    "review_ref": "reverify-legacy-subject-tag",
+                    "extraction_method": "AUTOMATED_CHECK",
+                },
+                "freshness_policy": {"kind": "manual"},
+                "idempotency_key": "reverify-legacy-subject-tag-current",
+                "requested_lifecycle_state": "VALIDATED_CURRENT",
+                "source_timestamp": "2026-10-02T00:00:00Z",
+                "last_verified_at": "2026-10-02T00:00:00Z",
+                "verified_by": "OWNER",
+                "tags": ["subject:display-alias", "old-tag"],
+                "subject": "canonical-subject",
+            }))["results"][0]
+
+            refreshed = (await owner.dispatch("memory_update", {
+                "memory_id": current["memory_id"],
+                "expected_record_id": current["record_id"],
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": current["revision"],
+                "mode": "REVERIFY",
+                "idempotency_key": "reverify-legacy-subject-tag-refresh",
+                "verification": {
+                    "source_timestamp": "2026-10-02T01:00:00Z",
+                    "last_verified_at": "2026-10-02T01:00:00Z",
+                    "verified_by": "OWNER",
+                    "tags": ["subject:display-alias", "new-tag"],
+                },
+            }))["results"][0]
+            assert refreshed["tags"] == ["subject:display-alias", "new-tag"]
+            assert refreshed["revision"] == current["revision"] + 1
+
+            removed = (await owner.dispatch("memory_update", {
+                "memory_id": refreshed["memory_id"],
+                "expected_record_id": refreshed["record_id"],
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": refreshed["revision"],
+                "mode": "REVERIFY",
+                "idempotency_key": "reverify-legacy-subject-tag-remove",
+                "verification": {
+                    "source_timestamp": "2026-10-02T02:00:00Z",
+                    "last_verified_at": "2026-10-02T02:00:00Z",
+                    "verified_by": "OWNER",
+                    "tags": ["new-tag"],
+                },
+            }))["results"][0]
+            assert removed["tags"] == ["new-tag"]
+
+            corrected = (await owner.dispatch("memory_update", {
+                "memory_id": removed["memory_id"],
+                "expected_record_id": removed["record_id"],
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": removed["revision"],
+                "mode": "REVERIFY",
+                "idempotency_key": "reverify-legacy-subject-tag-correct",
+                "verification": {
+                    "source_timestamp": "2026-10-02T03:00:00Z",
+                    "last_verified_at": "2026-10-02T03:00:00Z",
+                    "verified_by": "OWNER",
+                    "tags": ["subject:canonical-subject", "new-tag"],
+                },
+            }))["results"][0]
+            assert corrected["tags"] == ["subject:canonical-subject", "new-tag"]
+
+            with pytest.raises(AdapterError) as error:
+                await owner.dispatch("memory_update", {
+                    "memory_id": corrected["memory_id"],
+                    "expected_record_id": corrected["record_id"],
+                    "scope": "PROJECT",
+                    "project_id": "factlane",
+                    "expected_revision": corrected["revision"],
+                    "mode": "REVERIFY",
+                    "idempotency_key": "reverify-legacy-subject-tag-drift",
+                    "verification": {
+                        "source_timestamp": "2026-10-02T04:00:00Z",
+                        "last_verified_at": "2026-10-02T04:00:00Z",
+                        "verified_by": "OWNER",
+                        "tags": ["subject:different-display-alias", "new-tag"],
+                    },
+                })
+            assert error.value.code == "INVALID_ENVELOPE"
+        finally:
+            await owner.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"memory_type": "DECISION_RATIONALE"},
+        {"fact": "A different fact cannot be promoted by REVERIFY."},
+        {"contradiction_key": "9" * 64},
+        {"scope": "PROJECT", "project_id": "wrong-scope"},
+        {"lifecycle_state": "CANDIDATE"},
+    ],
+    ids=["memory-type", "fact", "contradiction-key", "scope", "lifecycle"],
+)
+def test_storage_candidate_promotion_rejects_identity_drift_from_parent(
+    tmp_path,
+    mutation: dict[str, object],
+) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "promotion-identity-defense.db"), _profile())
+        await engine.open()
+        try:
+            candidate = _record(
+                lifecycle="CANDIDATE",
+                marker="6",
+                fact="Candidate identity is immutable during promotion.",
+                created_at="2026-10-02T00:00:00Z",
+            )
+            await engine.write_record(candidate, [0.0, 1.0] + [0.0] * 254)
+            successor = deepcopy(candidate)
+            successor.update({
+                "record_id": str(uuid.uuid4()),
+                "revision": 2,
+                "parent_record_id": candidate["record_id"],
+                "source_timestamp": "2026-10-02T01:00:00Z",
+                "created_at": "2026-10-02T01:00:00Z",
+                "last_verified_at": "2026-10-02T01:00:00Z",
+                "verified_by": "OWNER",
+                "authority_role": "WORKFLOW_CURRENT",
+                "lifecycle_state": "VALIDATED_CURRENT",
+                "native_content_hash": "7" * 64,
+                "payload_fingerprint": "8" * 64,
+                "idempotency_key": "promotion-identity-defense-successor",
+            })
+            successor.update(mutation)
+            with pytest.raises(AdapterError) as error:
+                await engine.promote_candidate(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    validate_scope("CROSS_PROJECT_WORKFLOW"),
+                    expected_record_id=str(candidate["record_id"]),
+                    expected_revision=1,
+                )
+            assert error.value.code == "INVALID_ENVELOPE"
+            history = await engine.get_record(
+                str(candidate["memory_id"]),
+                validate_scope("CROSS_PROJECT_WORKFLOW"),
+                history=True,
+            )
+            assert [(row["revision"], row["lifecycle_state"]) for row in history] == [(1, "CANDIDATE")]
+        finally:
+            await engine.close()
+
     asyncio.run(run())
 
 

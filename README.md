@@ -69,7 +69,9 @@ worktree, workflow, and agent ID keys. Records never fan out implicitly to other
 
 The normal write profile, `delegated-candidate`, cannot promote its own contribution by
 supplying a privileged claim. Trusted promotion uses `memory_update` with `REVERIFY`,
-`expected_revision`, and the Candidate's `expected_record_id`. `CURRENT` retrieval only
+`expected_revision`, and the Candidate's `expected_record_id`. `REVERIFY` preserves the
+logical contradiction identity: it may refresh verification metadata but cannot reclassify
+the memory type or subject; use `REPLACE` for a semantic identity change. `CURRENT` retrieval only
 admits eligible, validated, fresh facts; review of historical records is explicit.
 
 For normal agent use, the distribution includes the portable

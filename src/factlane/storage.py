@@ -817,6 +817,20 @@ class SQLiteVecEngine:
                     raise AdapterError("CONTRADICTION", "candidate has an unresolved contradiction and cannot be promoted")
                 if record.get("parent_record_id") != expected_record_id or record.get("revision") != expected_revision + 1:
                     raise AdapterError("VERSION_CONFLICT", "promotion successor does not match candidate lineage")
+                if (
+                    any(
+                        record.get(field) != parent[field]
+                        for field in ("scope", "project_id", "worktree_id", "workflow_id", "agent_id")
+                    )
+                    or record.get("memory_type") != parent["memory_type"]
+                    or record.get("fact") != parent["fact"]
+                    or record.get("contradiction_key") != parent["contradiction_key"]
+                    or record.get("lifecycle_state") != "VALIDATED_CURRENT"
+                ):
+                    raise AdapterError(
+                        "INVALID_ENVELOPE",
+                        "candidate REVERIFY successor cannot change logical or contradiction identity",
+                    )
 
                 current_rows = self.conn.execute(
                     self._select_sql(

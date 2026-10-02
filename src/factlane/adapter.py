@@ -731,6 +731,30 @@ class MemoryAdapter:
         return value
 
     @staticmethod
+    def _subject_tag(tags: list[str]) -> str | None:
+        subject_tag = next((tag for tag in tags if tag.startswith("subject:")), None)
+        if subject_tag is None:
+            return None
+        value = subject_tag.split(":", 1)[1].strip().casefold()
+        if not value or contains_sensitive(value):
+            raise AdapterError("INVALID_ENVELOPE", "subject tag is invalid")
+        return value
+
+    @staticmethod
+    def _contradiction_identity_key(
+        scope_context: ScopeContext,
+        memory_type: str,
+        subject_value: str,
+    ) -> str:
+        return digest(
+            {
+                "scope": scope_context.to_dict(),
+                "memory_type": memory_type,
+                "subject": subject_value,
+            }
+        )
+
+    @staticmethod
     def _public(record: dict[str, Any], *, relevance_score: float | None = None, retrieval_rank: int | None = None) -> dict[str, Any]:
         provenance = json.loads(record["source_provenance"])
         origin_value = record.get("contribution_origin")
@@ -916,7 +940,7 @@ class MemoryAdapter:
                 envelope["results"] = [self._public(exact)]
                 envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
                 return envelope
-            contradiction_key = digest({"scope": scope_context.to_dict(), "memory_type": memory_type, "subject": subject_value})
+            contradiction_key = self._contradiction_identity_key(scope_context, memory_type, subject_value)
             conflicts = await self.engine.find_contradictions(contradiction_key, scope_context)
             contradiction_state = "UNRESOLVED" if any(
                 existing_row["fact"].casefold() != fact.casefold() for existing_row in conflicts
@@ -1315,6 +1339,7 @@ class MemoryAdapter:
             )
         old_provenance = json.loads(old["source_provenance"])
         old_freshness = json.loads(old["freshness_policy"])
+        old_tags = json.loads(old["tags"])
         if mode == "REVERIFY":
             data = verification or {}
             fact = validate_fact(old["fact"])
@@ -1326,6 +1351,76 @@ class MemoryAdapter:
             new_memory_id = memory_id
             supersedes: list[str] = []
             contradiction_key = old["contradiction_key"]
+            asserted_memory_type = data.get("memory_type")
+            if asserted_memory_type is not None and asserted_memory_type not in MEMORY_TYPES:
+                raise AdapterError("INVALID_ENUM", "memory_type is not supported")
+            if asserted_memory_type is not None and asserted_memory_type != old["memory_type"]:
+                raise AdapterError(
+                    "INVALID_ENVELOPE",
+                    "REVERIFY cannot change memory_type; use REPLACE for semantic reclassification",
+                )
+            asserted_subject = data.get("subject")
+            if asserted_subject is not None:
+                asserted_tags = self._tags(data.get("tags", old_tags))
+                asserted_subject_value = self._subject(asserted_subject, asserted_tags, fact)
+                asserted_key = self._contradiction_identity_key(
+                    scope_context,
+                    old["memory_type"],
+                    asserted_subject_value,
+                )
+                if asserted_key != contradiction_key:
+                    raise AdapterError(
+                        "INVALID_ENVELOPE",
+                        "REVERIFY cannot change subject identity; use REPLACE for semantic reclassification",
+                    )
+            if "tags" in data:
+                refreshed_tags = self._tags(data.get("tags"))
+                old_subject_tag = self._subject_tag(old_tags)
+                refreshed_subject_tag = self._subject_tag(refreshed_tags)
+                old_subject_tag_is_identity = (
+                    old_subject_tag is not None
+                    and self._contradiction_identity_key(
+                        scope_context,
+                        old["memory_type"],
+                        old_subject_tag,
+                    )
+                    == contradiction_key
+                )
+                if old_subject_tag_is_identity:
+                    refreshed_subject = (
+                        refreshed_subject_tag
+                        if refreshed_subject_tag is not None
+                        else self._subject(None, refreshed_tags, fact)
+                    )
+                    if self._contradiction_identity_key(
+                        scope_context,
+                        old["memory_type"],
+                        refreshed_subject,
+                    ) != contradiction_key:
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "REVERIFY cannot change the subject tag that defines contradiction identity",
+                        )
+                elif old_subject_tag is None:
+                    if refreshed_subject_tag is not None and self._contradiction_identity_key(
+                        scope_context,
+                        old["memory_type"],
+                        refreshed_subject_tag,
+                    ) != contradiction_key:
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "REVERIFY cannot introduce a subject tag with a different contradiction identity",
+                        )
+                elif refreshed_subject_tag not in {None, old_subject_tag}:
+                    if self._contradiction_identity_key(
+                        scope_context,
+                        old["memory_type"],
+                        refreshed_subject_tag,
+                    ) != contradiction_key:
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "REVERIFY cannot replace legacy subject metadata with a different contradiction identity",
+                        )
         else:
             data = replacement or {}
             required_replacement = (
@@ -1350,7 +1445,11 @@ class MemoryAdapter:
             new_memory_id = str(uuid.uuid4())
             supersedes = [memory_id]
             subject_value = self._subject(data.get("subject"), self._tags(data.get("tags", json.loads(old["tags"]))), fact)
-            contradiction_key = digest({"scope": scope_context.to_dict(), "memory_type": data.get("memory_type", old["memory_type"]), "subject": subject_value})
+            contradiction_key = self._contradiction_identity_key(
+                scope_context,
+                data.get("memory_type", old["memory_type"]),
+                subject_value,
+            )
             authority = self._authority_for(scope_context)
         if not source_timestamp:
             raise AdapterError("PROVENANCE_REQUIRED", "updated current record requires source_timestamp")
@@ -1360,7 +1459,7 @@ class MemoryAdapter:
                 "update requires explicit current verification; verified_by must be OWNER, CURRENT_REPO_CHECK, or AUTOMATED_CHECK",
             )
         last_verified_at = self._normalize_timestamp(data.get("last_verified_at", iso_now()), required=True)
-        memory_type = data.get("memory_type", old["memory_type"])
+        memory_type = old["memory_type"] if mode == "REVERIFY" else data.get("memory_type", old["memory_type"])
         if memory_type not in MEMORY_TYPES:
             raise AdapterError("INVALID_ENUM", "memory_type is not supported")
         self._validate_on_change_freshness(provenance, freshness)
@@ -1368,7 +1467,7 @@ class MemoryAdapter:
             if memory_type not in {"WORKFLOW_RULE", "DECISION_RATIONALE"}:
                 raise AdapterError("SCOPE_TYPE_MISMATCH", "memory_type is incompatible with CROSS_PROJECT_WORKFLOW")
             self._validate_cross_project_freshness(provenance, freshness)
-        tags_value = self._tags(data.get("tags", json.loads(old["tags"])))
+        tags_value = self._tags(data.get("tags", old_tags))
         confidence = float(data.get("confidence", old["confidence"]))
         if not 0 <= confidence <= 1:
             raise AdapterError("INVALID_ENVELOPE", "confidence must be between 0 and 1")
