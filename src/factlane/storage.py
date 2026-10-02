@@ -63,13 +63,19 @@ def _validate_current_authority_metadata(record: dict[str, Any]) -> None:
             "INVALID_ENVELOPE",
             "validated current requires an admissible verification basis",
         )
+    parse_iso(record.get("source_timestamp"), required=True)
+    parse_iso(record.get("last_verified_at"), required=True)
+
+
+def _validate_current_contradiction_state(record: dict[str, Any]) -> None:
+    """Fail closed on impossible validated-current contradiction state."""
+    if record.get("lifecycle_state") != "VALIDATED_CURRENT":
+        return
     if record.get("contradiction_state") not in {"NONE", "RESOLVED"}:
         raise AdapterError(
             "INVALID_ENVELOPE",
             "validated current contradiction_state must be NONE or RESOLVED",
         )
-    parse_iso(record.get("source_timestamp"), required=True)
-    parse_iso(record.get("last_verified_at"), required=True)
 
 
 def _validate_cross_project_storage_semantics(record: dict[str, Any]) -> None:
@@ -798,6 +804,8 @@ class SQLiteVecEngine:
                         "initial storage record lifecycle must be CANDIDATE or VALIDATED_CURRENT",
                     )
 
+                _validate_current_contradiction_state(record)
+
                 if record["lifecycle_state"] == "VALIDATED_CURRENT":
                     exact_scope = ScopeContext(record["scope"], record.get("project_id"), record.get("worktree_id"), record.get("workflow_id"), record.get("agent_id"))
                     where, params = self._scope_where(exact_scope)
@@ -963,6 +971,7 @@ class SQLiteVecEngine:
                     )
 
                 _validate_cross_project_storage_semantics(record)
+                _validate_current_contradiction_state(record)
 
                 current_rows = self.conn.execute(
                     self._select_sql(
