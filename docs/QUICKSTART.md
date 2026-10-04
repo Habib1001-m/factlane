@@ -197,7 +197,9 @@ recovery is a separate, operator-authorized procedure, **not** a public MCP tool
 Normal runtime engines and that recovery operator coordinate through shared/exclusive locks on
 the database inodes themselves. Recovery locks both the old and replacement database inodes
 through promotion/postflight, so a normal runtime starting during recovery returns
-`MAINTENANCE_IN_PROGRESS` instead of attaching through the final promotion window.
+`MAINTENANCE_IN_PROGRESS` instead of attaching through the final promotion window. If the logical
+purge has committed but sealing is still incomplete, a durable interlock stored in the database
+continues returning `MAINTENANCE_IN_PROGRESS` across process restart until verified recovery clears it.
 
 See the [README](../README.md) for product orientation, [Architecture](ARCHITECTURE.md) for
 exact data flow, [Environment](ENVIRONMENT.md) for runtime and profiles, and

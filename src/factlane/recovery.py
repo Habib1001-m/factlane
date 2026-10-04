@@ -16,6 +16,7 @@ from .embeddings import EmbeddingProfile
 from .storage import (
     SQLiteVecEngine,
     _MaintenanceCapability,
+    _SENSITIVE_RECOVERY_INTERLOCK_KEY,
     _make_maintenance_capability,
     _open_database_lease_handle,
     _same_inode,
@@ -399,6 +400,7 @@ class SensitiveMemoryRecoveryOperator:
             inspections: list[TargetInspection] = []
             try:
                 self._preflight_database(conn, plan)
+                self._validate_recovery_interlock(conn, plan, persisted_phase)
                 inspections = self._inspect_targets(conn, plan)
                 if all(item.already_purged for item in inspections):
                     if persisted_phase not in {
@@ -410,6 +412,7 @@ class SensitiveMemoryRecoveryOperator:
                             "HOLD_RECOVERY_STATE_MISMATCH",
                             "purged targets are not backed by resumable persisted recovery state",
                         )
+                    self._ensure_recovery_interlock(conn, plan)
                     logical_committed = True
                     if persisted_phase == _LOGICAL_PURGE_IN_PROGRESS:
                         self._write_state(state, plan, _SEALING_INCOMPLETE)
@@ -436,6 +439,7 @@ class SensitiveMemoryRecoveryOperator:
                     survivor_snapshot,
                     maintenance_lease,
                 )
+                self._clear_recovery_interlock(db_path, plan)
                 self._write_state(state, plan, _LOCAL_PURGE_VERIFIED)
                 _atomic_json(receipt, self._receipt(plan, inspections))
                 return RecoveryResult(plan.operation_id, _LOCAL_PURGE_VERIFIED, True, True, str(receipt), str(state), len(plan.targets))
@@ -531,6 +535,72 @@ class SensitiveMemoryRecoveryOperator:
             "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
             (name,),
         ).fetchone() is not None
+
+    @staticmethod
+    def _recovery_interlock_operation(conn: sqlite3.Connection) -> str | None:
+        if not SensitiveMemoryRecoveryOperator._table_exists(conn, "adapter_meta"):
+            return None
+        row = conn.execute(
+            "SELECT value FROM adapter_meta WHERE key = ?",
+            (_SENSITIVE_RECOVERY_INTERLOCK_KEY,),
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    @classmethod
+    def _validate_recovery_interlock(
+        cls,
+        conn: sqlite3.Connection,
+        plan: RecoveryPlan,
+        persisted_phase: str,
+    ) -> None:
+        operation_id = cls._recovery_interlock_operation(conn)
+        if operation_id is None:
+            return
+        if operation_id != plan.operation_id or persisted_phase not in {
+            _LOGICAL_PURGE_IN_PROGRESS,
+            _SEALING_INCOMPLETE,
+        }:
+            raise RecoveryHold(
+                "HOLD_RECOVERY_STATE_MISMATCH",
+                "database recovery interlock does not match the persisted recovery state",
+            )
+
+    @classmethod
+    def _ensure_recovery_interlock(cls, conn: sqlite3.Connection, plan: RecoveryPlan) -> None:
+        operation_id = cls._recovery_interlock_operation(conn)
+        if operation_id is not None and operation_id != plan.operation_id:
+            raise RecoveryHold(
+                "HOLD_RECOVERY_STATE_MISMATCH",
+                "database recovery interlock belongs to a different recovery operation",
+            )
+        conn.execute(
+            "INSERT INTO adapter_meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_SENSITIVE_RECOVERY_INTERLOCK_KEY, plan.operation_id),
+        )
+
+    @classmethod
+    def _clear_recovery_interlock(cls, db_path: str, plan: RecoveryPlan) -> None:
+        conn = cls._open_maintenance_connection(db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            operation_id = cls._recovery_interlock_operation(conn)
+            if operation_id != plan.operation_id:
+                raise RecoveryHold(
+                    _SEALING_INCOMPLETE,
+                    "database recovery interlock changed before recovery completion",
+                )
+            conn.execute(
+                "DELETE FROM adapter_meta WHERE key = ? AND value = ?",
+                (_SENSITIVE_RECOVERY_INTERLOCK_KEY, plan.operation_id),
+            )
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     @staticmethod
     def _require_known_recovery_schema(conn: sqlite3.Connection) -> None:
@@ -871,6 +941,7 @@ class SensitiveMemoryRecoveryOperator:
                 "INSERT INTO memory_content_fts(memory_content_fts, rank) VALUES('integrity-check', 1)"
             )
             self._verify_logical_absence(conn, current)
+            self._ensure_recovery_interlock(conn, plan)
             conn.commit()
         except Exception:
             conn.rollback()

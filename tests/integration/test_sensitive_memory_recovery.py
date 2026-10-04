@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -342,7 +344,7 @@ def test_multi_record_target_set_gets_unique_tombstone_fields(tmp_path: Path) ->
 
 def test_postcommit_sealing_failure_keeps_payload_purged_and_reruns(tmp_path: Path) -> None:
     class FailSealOnce(SensitiveMemoryRecoveryOperator):
-        def _seal_and_promote(self, conn, plan, survivor_snapshot):
+        def _seal_and_promote(self, conn, plan, survivor_snapshot, maintenance_lease):
             raise RecoveryHold("S1_LOGICAL_PURGE_COMMITTED_SEALING_INCOMPLETE", "synthetic sealing failure")
     async def prepare() -> dict[str, Any]:
         engine, adapter = await _open_adapter(tmp_path)
@@ -359,9 +361,72 @@ def test_postcommit_sealing_failure_keeps_payload_purged_and_reruns(tmp_path: Pa
     assert _fact(tmp_path / "memory.db", row["record_id"]) == "[purged-sensitive-memory]"
     state = json.loads((tmp_path / "seal-op.receipt.json.state.json").read_text())
     assert state["phase"] == "S1_LOGICAL_PURGE_COMMITTED_SEALING_INCOMPLETE"
+
+    async def normal_runtime_is_blocked() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "memory.db"), profile())
+        with pytest.raises(AdapterError) as blocked:
+            await engine.open()
+        assert blocked.value.code == "MAINTENANCE_IN_PROGRESS"
+
+    asyncio.run(normal_runtime_is_blocked())
+
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import asyncio
+import sys
+
+from factlane.contract import AdapterError
+from factlane.embeddings import EmbeddingProfile
+from factlane.storage import SQLiteVecEngine
+
+p = EmbeddingProfile(
+    profile_id="test-256",
+    provider_kind="OLLAMA_LOCAL",
+    base_model_identity="nomic-embed-text:latest",
+    model_digest="0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+    source_dimension=768,
+    output_dimension=256,
+    normalization_policy="OLLAMA_API_NORMALIZED_AFTER_DIMENSION_PROJECTION",
+    distance_metric="cosine",
+    projection_version="ollama-dimensions-v1",
+    document_prefix="search_document: ",
+    query_prefix="search_query: ",
+)
+e = SQLiteVecEngine(sys.argv[1], p)
+
+async def run():
+    try:
+        await e.open()
+    except AdapterError as exc:
+        print(exc.code)
+        return
+    raise SystemExit("runtime unexpectedly opened")
+
+asyncio.run(run())
+""",
+            str(tmp_path / "memory.db"),
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert child.returncode == 0, child.stderr
+    assert child.stdout.strip() == "MAINTENANCE_IN_PROGRESS"
+
     result = _run(plan, tmp_path)
     assert result.state == "S1_LOCAL_FACTLANE_PURGE_VERIFIED"
     assert _fact(tmp_path / "memory.db", row["record_id"]) == "[purged-sensitive-memory]"
+
+    async def normal_runtime_reopens_after_recovery() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "memory.db"), profile())
+        await engine.open()
+        await engine.close()
+
+    asyncio.run(normal_runtime_reopens_after_recovery())
 
 
 

@@ -67,6 +67,13 @@ reopening normal service. Process exit closes those retained descriptors togethe
 process-owned SQLite handles; the incident still requires operator reconciliation before service
 is restarted.
 
+After a sensitive logical purge commits, FactLane also records a recovery interlock inside the
+database itself. Ordinary runtime startup checks that durable interlock before backend service and
+returns `MAINTENANCE_IN_PROGRESS` while sealing/recovery remains incomplete. Because the marker is
+stored in the database, it survives process exit/restart and follows the database inode through
+hard-link aliases and the sanitized-image promotion path. Recovery maintenance access is the only
+startup path allowed to bypass it, and successful verified recovery clears it.
+
 This exclusion guarantee is scoped to supported local POSIX filesystems with reliable `flock`
 semantics. It is not a claim about Windows or unvalidated NFS/SMB/FUSE locking behavior; live
 recovery on such storage remains outside the accepted recovery contract.

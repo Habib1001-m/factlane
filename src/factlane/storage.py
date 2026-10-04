@@ -30,6 +30,7 @@ MIN_SQLITE_VERSION = (3, 42, 0)
 _WRITER_FUNCTION = "factlane_contract_v2_writer"
 _LEGACY_ORIGIN_JSON = canonical_json({"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None})
 _MAINTENANCE_CAPABILITY_SECRET = object()
+_SENSITIVE_RECOVERY_INTERLOCK_KEY = "sensitive_recovery_interlock"
 _CURRENT_AUTHORITY_BY_SCOPE = {
     "GLOBAL_USER": "OWNER_CURRENT",
     "PROJECT": "PROJECT_CURRENT",
@@ -39,6 +40,59 @@ _CURRENT_AUTHORITY_BY_SCOPE = {
 }
 _CURRENT_VERIFICATIONS = frozenset({"OWNER", "CURRENT_REPO_CHECK", "AUTOMATED_CHECK"})
 _CROSS_PROJECT_MEMORY_TYPES = frozenset({"WORKFLOW_RULE", "DECISION_RATIONALE"})
+_MIN_BUSY_TIMEOUT_MS = 5000
+
+
+def _sqlite_pragma_compatibility_error() -> AdapterError:
+    return AdapterError(
+        "BACKEND_COMPATIBILITY_MISMATCH",
+        "backend SQLite pragma configuration conflicts with FactLane requirements",
+    )
+
+
+def _assert_required_sqlite_pragma_environment() -> None:
+    """Reject backend env overrides that weaken FactLane's SQLite posture."""
+    raw_pragmas = os.environ.get("MCP_MEMORY_SQLITE_PRAGMAS", "")
+    if not raw_pragmas:
+        return
+
+    for pragma_pair in raw_pragmas.split(","):
+        if "=" not in pragma_pair:
+            continue
+        raw_name, raw_value = pragma_pair.split("=", 1)
+        name = raw_name.strip().lower()
+        value = raw_value.strip().lower()
+        if name == "journal_mode" and value != "wal":
+            raise _sqlite_pragma_compatibility_error()
+        if name == "synchronous":
+            synchronous_levels = {
+                "off": 0,
+                "0": 0,
+                "normal": 1,
+                "1": 1,
+                "full": 2,
+                "2": 2,
+                "extra": 3,
+                "3": 3,
+            }
+            if synchronous_levels.get(value, -1) < 1:
+                raise _sqlite_pragma_compatibility_error()
+        if name == "busy_timeout":
+            try:
+                busy_timeout_ms = int(value)
+            except ValueError as exc:
+                raise _sqlite_pragma_compatibility_error() from exc
+            if busy_timeout_ms < _MIN_BUSY_TIMEOUT_MS:
+                raise _sqlite_pragma_compatibility_error()
+
+
+def _assert_required_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    """Verify the pinned backend actually established FactLane's required pragmas."""
+    journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    synchronous = int(conn.execute("PRAGMA synchronous").fetchone()[0])
+    busy_timeout_ms = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+    if journal_mode != "wal" or synchronous < 1 or busy_timeout_ms < _MIN_BUSY_TIMEOUT_MS:
+        raise _sqlite_pragma_compatibility_error()
 
 
 def _validate_current_authority_metadata(record: dict[str, Any]) -> None:
@@ -274,6 +328,35 @@ def _release_runtime_maintenance_lease(handle: Any) -> None:
         handle.close()
 
 
+def _assert_sensitive_recovery_interlock_clear(db_path: str) -> None:
+    """Block ordinary service while a committed sensitive recovery is incomplete."""
+    if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
+        return
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        try:
+            row = conn.execute(
+                "SELECT value FROM adapter_meta WHERE key = ?",
+                (_SENSITIVE_RECOVERY_INTERLOCK_KEY,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return
+            raise AdapterError(
+                "BACKEND_UNAVAILABLE",
+                "database recovery interlock could not be checked",
+            ) from exc
+        if row is not None:
+            raise AdapterError(
+                "MAINTENANCE_IN_PROGRESS",
+                "sensitive-memory recovery is incomplete; operator reconciliation is required",
+            )
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 class RecordUniquenessConflict(RuntimeError):
     """Internal signal for an adapter-record UNIQUE race that must be reconciled above storage."""
 
@@ -368,12 +451,15 @@ class SQLiteVecEngine:
             raise AdapterError("BACKEND_UNAVAILABLE", "backend engine is already open")
         if os.environ.get("MCP_EXTERNAL_EMBEDDING_URL", "").strip():
             raise AdapterError("ADMIN_OPERATION_DENIED", "external embedding providers are disabled")
+        _assert_required_sqlite_pragma_environment()
         assert_supported_sqlite_runtime()
         if self._maintenance_capability is None:
             self._maintenance_lease_handle = _acquire_runtime_maintenance_lease(self.db_path)
         else:
             _validate_maintenance_capability(self.db_path, self._maintenance_capability)
         try:
+            if self._maintenance_capability is None:
+                _assert_sensitive_recovery_interlock_clear(self.db_path)
             # Do not write MCP_* process environment here. The pinned backend
             # caches environment-backed config at import time; FactLane binds
             # the storage class and the behavior it uses explicitly below.
@@ -401,6 +487,7 @@ class SQLiteVecEngine:
             self.conn = storage.conn
             if self.conn is None:
                 raise AdapterError("BACKEND_UNAVAILABLE", "SQLite-vec backend did not expose a connection")
+            _assert_required_sqlite_pragmas(self.conn)
             register_storage_v2_writer(self.conn)
             actual_dimension = await self._run(self._read_dimension)
             if actual_dimension != self.profile.output_dimension:

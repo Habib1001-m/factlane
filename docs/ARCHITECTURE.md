@@ -133,7 +133,8 @@ Sensitive-memory incident recovery lives in a **trusted local operator**, outsid
 `MemoryGateway` and the five MCP tools. It requires explicit authorization, exact
 target/database binding, maintenance quiescence, known schema and propagation, supported
 SQLite and verified FTS5 capabilities. A pre-commit failure rolls back; post-commit sealing
-failure leaves normal service blocked until recovery completes. Local purge does not prove
+failure leaves a durable database-resident recovery interlock that blocks ordinary runtime
+startup across process restarts until verified recovery completes. Local purge does not prove
 erasure from external copies or physical media. See [Security](../SECURITY.md).
 
 Runtime/recovery exclusion is cooperative and process-independent on supported POSIX hosts:

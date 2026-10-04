@@ -5,6 +5,8 @@ import errno
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,13 @@ _FACTLANE_BACKEND_ENV_KEYS = (
     "MCP_QUALITY_SYSTEM_ENABLED",
     "MCP_QUALITY_BOOST_ENABLED",
     "MCP_INSIGHT_CARDS_ENABLED",
+)
+
+_CLOUDFLARE_CREDENTIAL_KEYS = (
+    "CLOUDFLARE_API_TOKEN",
+    "CLOUDFLARE_ACCOUNT_ID",
+    "CLOUDFLARE_VECTORIZE_INDEX",
+    "CLOUDFLARE_D1_DATABASE_ID",
 )
 
 
@@ -144,6 +153,37 @@ def test_backend_malformed_vcs_provenance_fails_closed(monkeypatch) -> None:
     with pytest.raises(AdapterError) as exc_info:
         assert_pinned_backend_identity()
     assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+
+
+@pytest.mark.parametrize("backend", ["cloudflare", "hybrid"])
+def test_fresh_backend_import_wraps_cloudflare_configuration_exit(backend: str) -> None:
+    env = os.environ.copy()
+    env["MCP_MEMORY_STORAGE_BACKEND"] = backend
+    for key in _CLOUDFLARE_CREDENTIAL_KEYS:
+        env.pop(key, None)
+
+    script = """
+from factlane.backend_compat import load_pinned_sqlite_vec_storage
+from factlane.contract import AdapterError
+
+try:
+    load_pinned_sqlite_vec_storage()
+except AdapterError as exc:
+    print(f"ADAPTER_ERROR:{exc.code}")
+else:
+    raise SystemExit("expected governed backend configuration failure")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ADAPTER_ERROR:BACKEND_COMPATIBILITY_MISMATCH" in result.stdout
 
 
 def test_embedding_initializer_signature_drift_fails_closed() -> None:
@@ -349,6 +389,7 @@ def test_open_reuses_backend_wal_and_busy_timeout(tmp_path) -> None:
         try:
             assert engine.conn is not None
             assert engine.conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+            assert engine.conn.execute("PRAGMA synchronous").fetchone()[0] == 1
             assert engine.conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 5000
             assert engine._read_dimension() == 256
             tables = {
@@ -363,6 +404,22 @@ def test_open_reuses_backend_wal_and_busy_timeout(tmp_path) -> None:
             await engine.close()
 
     asyncio.run(run())
+
+
+def test_open_rejects_hostile_required_sqlite_pragma_overrides(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "hostile-pragmas.db"
+    monkeypatch.setenv(
+        "MCP_MEMORY_SQLITE_PRAGMAS",
+        "journal_mode=DELETE,synchronous=OFF,busy_timeout=1",
+    )
+    engine = SQLiteVecEngine(str(db_path), profile())
+
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+    assert "SQLite pragma" in exc_info.value.safe_message
+    assert not db_path.exists()
 
 
 def test_maintenance_lock_noncontention_os_error_is_backend_unavailable(tmp_path, monkeypatch) -> None:

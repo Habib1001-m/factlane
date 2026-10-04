@@ -78,6 +78,13 @@ FactLane supplies scope policy and revision/CAS transactions. Avoid introducing 
 host-specific duplicate dependency or a second locking layer when reproducing the
 installation.
 
+Ambient backend environment must not weaken that storage posture. FactLane converts a pinned
+backend first-import configuration exit into `BACKEND_COMPATIBILITY_MISMATCH` instead of letting
+the process terminate outside the governed boundary. `MCP_MEMORY_SQLITE_PRAGMAS` may not change
+`journal_mode` away from `WAL`, reduce `synchronous` below `NORMAL`, or reduce `busy_timeout`
+below 5000 ms; startup rejects such overrides and verifies the effective pragmas after backend
+initialization.
+
 FactLane's source package and wheel also carry the portable
 [`using-factlane` Skill](../skills/using-factlane/SKILL.md). Installing the package does
 not configure a particular host or auto-register that Skill.
