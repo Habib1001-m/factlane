@@ -164,9 +164,15 @@ still part of recovery.
 
 ## Qualification boundary
 
-Controlled local/host evidence establishes behavior for the tested configurations. It does
-not establish support for every MCP client, production-scale ingestion, disaster recovery,
-or every language mix. Source-diverse CURRENT semantic/hybrid selection reduces one known
-document-crowding mechanism, but Arabic/mixed-language retrieval specificity still needs
-workload-specific validation. FactLane is a fact store, not a transcript archive or raw
-document crawler.
+FactLane 0.1.3 is production-qualified for the documented local configuration: the packaged
+Python runtime, linked SQLite/SQLite-vec storage contract, stdio MCP surface, supported local
+embedding profile, and configured local host integrations. The qualification exercised
+backup/restore compatibility, bounded concurrent operation, crash/restart rollback,
+production-derived retrieval, and fail-closed SQLite capacity behavior.
+
+That evidence does not establish support for every MCP client, arbitrary filesystem,
+production-scale ingestion pattern, unlimited-duration load, or every language mix.
+Source-diverse CURRENT semantic/hybrid selection reduces one known document-crowding
+mechanism, but semantic relevance — including Arabic/mixed-language ranking — remains
+workload-specific. FactLane is a fact store, not a transcript archive or raw document
+crawler.

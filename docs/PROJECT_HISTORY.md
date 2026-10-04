@@ -20,10 +20,16 @@ The project also introduced an operator-only path for sensitive-memory incident 
 explicit compatibility checks for the pinned SQLite backend, and a linked SQLite **3.42.0+**
 floor. These controls do not enlarge the five-tool MCP surface.
 
-FactLane remains local-first and under continued qualification. The source repository and
-package build are available for technical review, but authoritative backup/restore
-acceptance, a curated production-corpus evaluation, and broader workload validation are
-separate from the implemented features described here.
+The 0.1.3 line completed the project's first production-readiness qualification for its
+supported local deployment profile. That work covered package/install parity, authoritative
+backup/restore compatibility, bounded concurrent operation, crash/restart behavior, configured
+stdio host integration, production-derived retrieval, and fail-closed SQLite capacity
+handling. The release remains local-first and keeps the five-tool public MCP contract at
+revision 2.
+
+Qualification does not turn FactLane into a universal retrieval or deployment platform.
+Language and semantic-ranking quality remain workload-specific, and operators remain
+responsible for deployment-specific backup retention, monitoring, and recovery procedures.
 
 For present-day behavior rather than the project timeline, start with the
 [README](../README.md), [architecture](ARCHITECTURE.md), or [quick start](QUICKSTART.md).

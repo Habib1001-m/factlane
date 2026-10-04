@@ -99,12 +99,18 @@ uses local Ollama only. FactLane is a fact store, not a raw transcript archive, 
 document search engine, or bulk file crawler; a separate ingestion layer should decide what
 becomes a durable fact.
 
-This repository is still being qualified for broader production use. Passing local
-regression tests and controlled host checks does not establish authoritative backup/restore
-acceptance, production-corpus retrieval quality, or suitability for every language and
-workload. In particular, Arabic/mixed-language retrieval and document crowding are known
-quality constraints. No public package release or production deployment is implied by the
-source checkout.
+FactLane 0.1.3 is production-qualified for the supported local deployment profile: Python
+3.11+, linked SQLite 3.42.0+, command-launched stdio MCP, local Ollama embeddings, and the
+documented local POSIX storage/recovery contract. Qualification covered package installation,
+backup/restore compatibility, bounded concurrent operation, crash/restart rollback, configured
+host startup, production-derived corpus retrieval, and fail-closed SQLite capacity errors.
+
+That qualification is deliberately scoped. It is not a claim for every MCP client,
+filesystem, language mix, embedding workload, or deployment scale. Arabic/mixed-language
+semantic ranking remains workload-specific and should be validated against the intended data;
+the release does not promise universal semantic relevance. A source checkout also does not
+by itself publish a package, deploy a service, or replace an operator's backup and recovery
+plan.
 
 See [Architecture](docs/ARCHITECTURE.md),
 [Environment and supported profiles](docs/ENVIRONMENT.md), and [Security](SECURITY.md) for

@@ -55,8 +55,10 @@ uv run factlane --help
 
 The profile name must match the selected model and storage configuration. No universal
 ranking follows from one project's test data. Assess your own language mix, fact sizes,
-hardware, latency, and quality needs; Arabic/mixed-language retrieval and document crowding
-remain known qualification gaps.
+hardware, latency, and quality needs. Arabic/mixed-language EXACT and KEYWORD behavior is
+supported by the same Unicode handling as other text, while semantic relevance remains
+workload-specific and must be validated against the intended corpus. Source-diverse selection
+reduces one document-crowding mechanism but is not a universal ranking guarantee.
 
 The only shipped embedding-provider implementation communicates with Ollama on a **loopback
 URL** (by default `http://127.0.0.1:11434`). The provider interface permits future
@@ -97,7 +99,14 @@ crawler, transcript repository, or bulk document index. Very large source collec
 separate ingestion/extraction stage, which may have different throughput and provider
 requirements; no terabyte-scale ingestion rate is claimed here.
 
-Controlled local checks do not constitute authoritative backup/restore acceptance or a
-public-production-readiness claim. Keep production data and backup operations under their
-own authorization and validation procedures. See [Security](../SECURITY.md),
-[Architecture](ARCHITECTURE.md), and the [Quick Start](QUICKSTART.md).
+FactLane 0.1.3 is production-qualified for the documented local profile: Python 3.11+,
+linked SQLite 3.42.0+, command-launched stdio MCP, supported local Ollama embeddings, and
+the documented local POSIX storage/recovery contract. Qualification includes backup/restore
+compatibility, bounded concurrent operation, crash/restart rollback, configured host startup,
+production-derived retrieval, and fail-closed SQLite capacity behavior.
+
+This is a bounded support statement, not a universal deployment claim. Validate your own
+language/ranking workload and operational scale, and keep production data, backup retention,
+monitoring, and recovery operations under their own authorization and runbooks. See
+[Security](../SECURITY.md), [Architecture](ARCHITECTURE.md), and the
+[Quick Start](QUICKSTART.md).

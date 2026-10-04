@@ -31,7 +31,9 @@ release/commit and relevant runtime versions.
   connection-local `factlane_contract_v2_writer` authorization function; SQLite therefore
   reports `no such function: factlane_contract_v2_writer` rather than the trigger's internal
   `FACTLANE_STORAGE_V2_WRITER_REQUIRED` marker. That diagnostic difference does not grant a
-  write path.
+  write path. SQLite capacity exhaustion reported as `SQLITE_FULL` is translated at the
+  FactLane boundary to retryable `BACKEND_UNAVAILABLE`; the failed mutation remains
+  transactional and does not leave a partial durable record.
 - **Local providers:** The shipped embedding provider connects to Ollama on loopback;
   non-local embedding endpoints and automatic remote fallbacks are not supported. Embedding
   model identity, capabilities, dimensions, and input limits are checked against the
@@ -97,12 +99,18 @@ manual housekeeping are not substitutes for incident recovery.
 
 ## Known limits
 
-FactLane is a local service, not a distributed consensus system. Manual housekeeping does
-not replace backups or disaster recovery. Authoritative backup/restore acceptance and
-broader production qualification remain open; passing unit/integration tests is not a claim
-that this checkout is deployed or production-ready. Arabic/mixed-language retrieval
-specificity and document crowding are known quality constraints, not permission to bypass
-scope or verification policy.
+FactLane is a local service, not a distributed consensus system. Version 0.1.3 is
+production-qualified for the documented local deployment profile, including authoritative
+backup/restore compatibility, bounded concurrent operation, crash/restart rollback, configured
+stdio host integration, and production-derived retrieval checks. Operators still need their
+own backup retention, restore procedures, monitoring, and deployment-specific recovery plan.
+
+The qualification does not establish universal behavior for arbitrary network/FUSE
+filesystems, every MCP client, unlimited-duration load, or every language and ranking
+workload. Deterministic SQLite capacity exhaustion and permission-read-only behavior were
+exercised; a true kernel ENOSPC condition and a true EROFS mount are outside that evidence.
+Arabic/mixed-language semantic specificity remains workload-specific. None of these
+limitations permits bypassing scope, authority, freshness, or verification policy.
 
 See the [architecture](docs/ARCHITECTURE.md) and
 [environment requirements](docs/ENVIRONMENT.md) for implementation and runtime details.
