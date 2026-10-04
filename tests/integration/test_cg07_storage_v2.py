@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 import sqlite3
 import threading
@@ -9,7 +10,7 @@ import uuid
 import pytest
 
 from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
-from factlane.contract import AdapterError, validate_scope
+from factlane.contract import AdapterError, ScopeContext, validate_scope
 from factlane.embeddings import EmbeddingProfile
 from factlane.storage import SQLiteVecEngine
 
@@ -218,6 +219,73 @@ def test_open_establishes_storage_contract_v2_and_contribution_origin(tmp_path) 
     asyncio.run(run())
 
 
+def test_current_get_excludes_expired_ttl_but_review_history_returns_it(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "current-get-freshness.db"), _profile())
+        await engine.open()
+        try:
+            adapter = MemoryAdapter(
+                engine,
+                _Provider(),
+                trusted_write_context=trusted_write_context_for_profile("owner-current"),
+            )
+            stored = await adapter.store(
+                fact="The deployment target is stale.example.",
+                scope="PROJECT",
+                project_id="project-a",
+                memory_type="PROJECT_LEARNED_FACT",
+                source_provenance={
+                    "source_class": "TEST",
+                    "source_ref": "current-get-freshness",
+                    "source_hash": "a" * 64,
+                    "review_ref": "current-get-freshness",
+                    "extraction_method": "test",
+                },
+                freshness_policy={"kind": "ttl", "ttl_seconds": 1},
+                idempotency_key="current-get-freshness-store",
+                source_timestamp="2020-01-01T00:00:00Z",
+                last_verified_at="2020-01-01T00:00:00Z",
+                verified_by="OWNER",
+                requested_lifecycle_state="VALIDATED_CURRENT",
+            )
+            memory_id = stored["results"][0]["memory_id"]
+
+            searched = await adapter.search(
+                query="deployment target",
+                intent_class="CURRENT_PROJECT_STATE",
+                scope="PROJECT",
+                project_id="project-a",
+                retrieval_mode="CURRENT",
+                retrieval_mode_kind="KEYWORD",
+            )
+            assert searched["status"] == "DEGRADED"
+            assert searched["degradation"] == "STALE_ONLY"
+            assert searched["results"] == []
+
+            current = await adapter.get(
+                memory_id=memory_id,
+                scope="PROJECT",
+                project_id="project-a",
+                retrieval_mode="CURRENT",
+            )
+            assert current["status"] == "DEGRADED"
+            assert current["degradation"] == "STALE_ONLY"
+            assert current["results"] == []
+
+            history = await adapter.get(
+                memory_id=memory_id,
+                scope="PROJECT",
+                project_id="project-a",
+                retrieval_mode="REVIEW_HISTORY",
+            )
+            assert history["status"] == "OK"
+            assert [row["memory_id"] for row in history["results"]] == [memory_id]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_current_keyword_limit_is_applied_after_candidate_exclusion(tmp_path) -> None:
     async def run() -> None:
         engine = SQLiteVecEngine(str(tmp_path / "keyword-current.db"), _profile())
@@ -281,19 +349,167 @@ def test_storage_v2_raw_legacy_writer_cannot_mutate_adapter_records(tmp_path) ->
                 insert_values.append("'raw-insert-idempotency'")
             else:
                 insert_values.append(column)
-        with pytest.raises(sqlite3.OperationalError, match="factlane_contract_v2_writer"):
+        with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v2_writer"):
             raw.execute(
                 f"INSERT INTO adapter_records ({','.join(columns)}) SELECT {','.join(insert_values)} "
                 "FROM adapter_records WHERE record_id=?",
                 (record_id,),
             )
         for sql, params in (("UPDATE adapter_records SET fact='stale-writer' WHERE record_id=?", (record_id,)), ("DELETE FROM adapter_records WHERE record_id=?", (record_id,))):
-            with pytest.raises(sqlite3.OperationalError, match="factlane_contract_v2_writer"):
+            with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v2_writer"):
                 raw.execute(sql, params)
     finally:
         raw.close()
     after = _database_snapshot(db_path)
     assert after == before
+
+
+def test_exact_and_keyword_search_use_consistent_unicode_casefolding(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "unicode-casefold.db"), _profile())
+        await engine.open()
+        try:
+            current = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="u",
+                fact="Der Termin liegt an der Straße",
+                created_at="2026-10-04T00:00:00Z",
+            )
+            await engine.write_record(current, [1.0] + [0.0] * 255)
+            scope = validate_scope("CROSS_PROJECT_WORKFLOW")
+
+            exact = await engine.keyword_candidates(
+                "DER TERMIN LIEGT AN DER STRASSE",
+                scope,
+                limit=4,
+                history=False,
+                exact=True,
+            )
+            keyword = await engine.keyword_candidates(
+                "STRASSE",
+                scope,
+                limit=4,
+                history=False,
+                exact=False,
+            )
+            assert [row["record_id"] for row in exact] == [current["record_id"]]
+            assert [row["record_id"] for row in keyword] == [current["record_id"]]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_reverify_rejects_malformed_current_predecessor_contradiction_state_after_cas(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "malformed-current-predecessor.db"), _profile())
+        await engine.open()
+        try:
+            current = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="v",
+                fact="Malformed current predecessors cannot be laundered by REVERIFY.",
+                created_at="2026-10-04T00:00:00Z",
+            )
+            await engine.write_record(current, [1.0] + [0.0] * 255)
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_records SET contradiction_state='UNRESOLVED' WHERE record_id=?",
+                (current["record_id"],),
+            )
+            engine.conn.commit()
+
+            successor = deepcopy(current)
+            successor.update(
+                {
+                    "record_id": str(uuid.uuid4()),
+                    "revision": 2,
+                    "parent_record_id": current["record_id"],
+                    "contradiction_state": "NONE",
+                    "native_content_hash": "e" * 64,
+                    "payload_fingerprint": "f" * 64,
+                    "idempotency_key": "malformed-current-predecessor-reverify",
+                }
+            )
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    supersede_record_id=current["record_id"],
+                )
+            assert error.value.code == "INVALID_ENVELOPE"
+            rows = engine.conn.execute(
+                "SELECT revision,lifecycle_state,contradiction_state FROM adapter_records "
+                "WHERE memory_id=? ORDER BY revision",
+                (current["memory_id"],),
+            ).fetchall()
+            assert rows == [(1, "VALIDATED_CURRENT", "UNRESOLVED")]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_owner_reverify_rejects_malformed_current_predecessor_through_adapter(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "malformed-current-predecessor-adapter.db"), _profile())
+        await engine.open()
+        try:
+            owner = MemoryAdapter(
+                engine,
+                _Provider(),
+                trusted_write_context=trusted_write_context_for_profile("owner-current"),
+            )
+            stored = await owner.store(
+                fact="Malformed current predecessors must fail at the public update path.",
+                scope="PROJECT",
+                project_id="project-a",
+                memory_type="PROJECT_LEARNED_FACT",
+                source_provenance={
+                    "source_class": "TEST",
+                    "source_ref": "malformed-predecessor-adapter",
+                    "source_hash": "a" * 64,
+                    "review_ref": "malformed-predecessor-adapter",
+                    "extraction_method": "test",
+                },
+                freshness_policy={"kind": "manual"},
+                idempotency_key="malformed-predecessor-adapter-store",
+                source_timestamp="2026-10-04T00:00:00Z",
+                last_verified_at="2026-10-04T00:00:00Z",
+                verified_by="OWNER",
+                requested_lifecycle_state="VALIDATED_CURRENT",
+            )
+            current = stored["results"][0]
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_records SET contradiction_state='UNRESOLVED' WHERE record_id=?",
+                (current["record_id"],),
+            )
+            engine.conn.commit()
+
+            with pytest.raises(AdapterError) as error:
+                await owner.update(
+                    memory_id=current["memory_id"],
+                    scope="PROJECT",
+                    project_id="project-a",
+                    expected_record_id=current["record_id"],
+                    expected_revision=current["revision"],
+                    mode="REVERIFY",
+                    idempotency_key="malformed-predecessor-adapter-reverify",
+                    verification={"verified_by": "OWNER"},
+                )
+            assert error.value.code == "INVALID_ENVELOPE"
+            rows = engine.conn.execute(
+                "SELECT revision,lifecycle_state,contradiction_state FROM adapter_records "
+                "WHERE memory_id=? ORDER BY revision",
+                (current["memory_id"],),
+            ).fetchall()
+            assert rows == [(1, "VALIDATED_CURRENT", "UNRESOLVED")]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
 
 
 def test_owner_reverify_promotes_candidate_same_memory_and_preserves_origin(tmp_path) -> None:
@@ -331,6 +547,416 @@ def test_owner_reverify_promotes_candidate_same_memory_and_preserves_origin(tmp_
             assert sorted((row["revision"], row["lifecycle_state"]) for row in history) == [(1, "SUPERSEDED"), (2, "VALIDATED_CURRENT")]
         finally:
             await owner.close()
+    asyncio.run(run())
+
+
+def test_candidate_reverify_rejects_memory_type_reclassification_before_promotion(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "reverify-type-identity.db"), _profile())
+        await engine.open()
+        delegated = MemoryAdapter(
+            engine,
+            _Provider(),
+            trusted_write_context=trusted_write_context_for_profile("delegated-candidate"),
+        )
+        owner = MemoryAdapter(
+            engine,
+            _Provider(),
+            trusted_write_context=trusted_write_context_for_profile("owner-current"),
+        )
+        try:
+            current = (await owner.dispatch("memory_store", {
+                "fact": "The existing preference says blue.",
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "memory_type": "PREFERENCE",
+                "source_provenance": {
+                    "source_class": "OWNER_INPUT",
+                    "source_ref": "reverify-type-current",
+                    "source_hash": "1" * 64,
+                    "review_ref": "reverify-type-current",
+                    "extraction_method": "direct-input",
+                },
+                "freshness_policy": {"kind": "manual"},
+                "idempotency_key": "reverify-type-current",
+                "requested_lifecycle_state": "VALIDATED_CURRENT",
+                "source_timestamp": "2026-10-02T00:00:00Z",
+                "last_verified_at": "2026-10-02T00:00:00Z",
+                "verified_by": "OWNER",
+                "subject": "same-subject",
+            }))["results"][0]
+            candidate = (await delegated.dispatch("memory_store", {
+                "fact": "The candidate user fact says red.",
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "memory_type": "USER_FACT",
+                "source_provenance": {
+                    "source_class": "OWNER_INPUT",
+                    "source_ref": "reverify-type-candidate",
+                    "source_hash": "2" * 64,
+                    "review_ref": "reverify-type-candidate",
+                    "extraction_method": "direct-input",
+                },
+                "freshness_policy": {"kind": "manual"},
+                "idempotency_key": "reverify-type-candidate",
+                "subject": "same-subject",
+            }))["results"][0]
+
+            with pytest.raises(AdapterError) as error:
+                await owner.dispatch("memory_update", {
+                    "memory_id": candidate["memory_id"],
+                    "expected_record_id": candidate["record_id"],
+                    "scope": "PROJECT",
+                    "project_id": "factlane",
+                    "expected_revision": candidate["revision"],
+                    "mode": "REVERIFY",
+                    "idempotency_key": "reverify-type-promote",
+                    "verification": {
+                        "source_timestamp": "2026-10-02T01:00:00Z",
+                        "last_verified_at": "2026-10-02T01:00:00Z",
+                        "verified_by": "OWNER",
+                        "memory_type": "PREFERENCE",
+                        "subject": "same-subject",
+                    },
+                })
+            assert error.value.code == "INVALID_ENVELOPE"
+
+            scope = validate_scope("PROJECT", project_id="factlane")
+            current_rows = await engine.find_contradictions(
+                (await engine.get_record(current["memory_id"], scope, history=False))[0]["contradiction_key"],
+                scope,
+            )
+            assert [row["record_id"] for row in current_rows] == [current["record_id"]]
+            candidate_history = await engine.get_record(candidate["memory_id"], scope, history=True)
+            assert [(row["revision"], row["lifecycle_state"]) for row in candidate_history] == [(1, "CANDIDATE")]
+        finally:
+            await owner.close()
+
+    asyncio.run(run())
+
+
+def test_reverify_subject_and_subject_tag_cannot_change_contradiction_identity(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "reverify-subject-identity.db"), _profile())
+        await engine.open()
+        owner = MemoryAdapter(
+            engine,
+            _Provider(),
+            trusted_write_context=trusted_write_context_for_profile("owner-current"),
+        )
+        try:
+            current = (await owner.dispatch("memory_store", {
+                "fact": "The subject identity stays stable across verification refresh.",
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "memory_type": "PROJECT_LEARNED_FACT",
+                "source_provenance": {
+                    "source_class": "CURRENT_REPO",
+                    "source_ref": "reverify-subject",
+                    "source_hash": "3" * 64,
+                    "review_ref": "reverify-subject",
+                    "extraction_method": "AUTOMATED_CHECK",
+                },
+                "freshness_policy": {"kind": "manual"},
+                "idempotency_key": "reverify-subject-current",
+                "requested_lifecycle_state": "VALIDATED_CURRENT",
+                "source_timestamp": "2026-10-02T00:00:00Z",
+                "last_verified_at": "2026-10-02T00:00:00Z",
+                "verified_by": "OWNER",
+                "tags": ["subject:stable-subject", "keep"],
+                "subject": "stable-subject",
+            }))["results"][0]
+
+            for suffix, verification in (
+                ("explicit", {"subject": "different-subject"}),
+                ("tag", {"tags": ["subject:different-subject", "keep"]}),
+                ("removed-tag", {"tags": ["keep"]}),
+            ):
+                with pytest.raises(AdapterError) as error:
+                    await owner.dispatch("memory_update", {
+                        "memory_id": current["memory_id"],
+                        "expected_record_id": current["record_id"],
+                        "scope": "PROJECT",
+                        "project_id": "factlane",
+                        "expected_revision": current["revision"],
+                        "mode": "REVERIFY",
+                        "idempotency_key": f"reverify-subject-{suffix}",
+                        "verification": {
+                            "source_timestamp": "2026-10-02T01:00:00Z",
+                            "last_verified_at": "2026-10-02T01:00:00Z",
+                            "verified_by": "OWNER",
+                            **verification,
+                        },
+                    })
+                assert error.value.code == "INVALID_ENVELOPE"
+
+            scope = validate_scope("PROJECT", project_id="factlane")
+            history = await engine.get_record(current["memory_id"], scope, history=True)
+            assert [(row["revision"], row["lifecycle_state"]) for row in history] == [(1, "VALIDATED_CURRENT")]
+        finally:
+            await owner.close()
+
+    asyncio.run(run())
+
+
+def test_reverify_accepts_same_identity_assertions_and_unrelated_tag_refresh(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "reverify-same-identity.db"), _profile())
+        await engine.open()
+        owner = MemoryAdapter(
+            engine,
+            _Provider(),
+            trusted_write_context=trusted_write_context_for_profile("owner-current"),
+        )
+        try:
+            current = (await owner.dispatch("memory_store", {
+                "fact": "Same identity assertions remain backward compatible.",
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "memory_type": "PROJECT_LEARNED_FACT",
+                "source_provenance": {
+                    "source_class": "CURRENT_REPO",
+                    "source_ref": "reverify-same",
+                    "source_hash": "4" * 64,
+                    "review_ref": "reverify-same",
+                    "extraction_method": "AUTOMATED_CHECK",
+                },
+                "freshness_policy": {"kind": "manual"},
+                "idempotency_key": "reverify-same-current",
+                "requested_lifecycle_state": "VALIDATED_CURRENT",
+                "source_timestamp": "2026-10-02T00:00:00Z",
+                "last_verified_at": "2026-10-02T00:00:00Z",
+                "verified_by": "OWNER",
+                "tags": ["old-tag"],
+                "subject": "stable-subject",
+            }))["results"][0]
+            refreshed = (await owner.dispatch("memory_update", {
+                "memory_id": current["memory_id"],
+                "expected_record_id": current["record_id"],
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": current["revision"],
+                "mode": "REVERIFY",
+                "idempotency_key": "reverify-same-refresh",
+                "verification": {
+                    "source_timestamp": "2026-10-02T01:00:00Z",
+                    "last_verified_at": "2026-10-02T01:00:00Z",
+                    "verified_by": "OWNER",
+                    "memory_type": "PROJECT_LEARNED_FACT",
+                    "subject": "stable-subject",
+                    "tags": ["subject:stable-subject", "new-tag"],
+                },
+            }))["results"][0]
+            assert refreshed["memory_type"] == current["memory_type"]
+            assert refreshed["tags"] == ["subject:stable-subject", "new-tag"]
+            assert refreshed["revision"] == current["revision"] + 1
+        finally:
+            await owner.close()
+
+    asyncio.run(run())
+
+
+def test_reverify_preserves_legacy_non_authoritative_subject_tag_during_unrelated_tag_refresh(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "reverify-legacy-subject-tag.db"), _profile())
+        await engine.open()
+        owner = MemoryAdapter(
+            engine,
+            _Provider(),
+            trusted_write_context=trusted_write_context_for_profile("owner-current"),
+        )
+        try:
+            current = (await owner.dispatch("memory_store", {
+                "fact": "Legacy explicit subject remains the contradiction identity.",
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "memory_type": "PROJECT_LEARNED_FACT",
+                "source_provenance": {
+                    "source_class": "CURRENT_REPO",
+                    "source_ref": "reverify-legacy-subject-tag",
+                    "source_hash": "5" * 64,
+                    "review_ref": "reverify-legacy-subject-tag",
+                    "extraction_method": "AUTOMATED_CHECK",
+                },
+                "freshness_policy": {"kind": "manual"},
+                "idempotency_key": "reverify-legacy-subject-tag-current",
+                "requested_lifecycle_state": "VALIDATED_CURRENT",
+                "source_timestamp": "2026-10-02T00:00:00Z",
+                "last_verified_at": "2026-10-02T00:00:00Z",
+                "verified_by": "OWNER",
+                "tags": ["subject:display-alias", "old-tag"],
+                "subject": "canonical-subject",
+            }))["results"][0]
+
+            refreshed = (await owner.dispatch("memory_update", {
+                "memory_id": current["memory_id"],
+                "expected_record_id": current["record_id"],
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": current["revision"],
+                "mode": "REVERIFY",
+                "idempotency_key": "reverify-legacy-subject-tag-refresh",
+                "verification": {
+                    "source_timestamp": "2026-10-02T01:00:00Z",
+                    "last_verified_at": "2026-10-02T01:00:00Z",
+                    "verified_by": "OWNER",
+                    "tags": ["subject:display-alias", "new-tag"],
+                },
+            }))["results"][0]
+            assert refreshed["tags"] == ["subject:display-alias", "new-tag"]
+            assert refreshed["revision"] == current["revision"] + 1
+
+            with pytest.raises(AdapterError) as error:
+                await owner.dispatch("memory_update", {
+                    "memory_id": refreshed["memory_id"],
+                    "expected_record_id": refreshed["record_id"],
+                    "scope": "PROJECT",
+                    "project_id": "factlane",
+                    "expected_revision": refreshed["revision"],
+                    "mode": "REVERIFY",
+                    "idempotency_key": "reverify-legacy-subject-tag-second-mismatch",
+                    "verification": {
+                        "source_timestamp": "2026-10-02T01:30:00Z",
+                        "last_verified_at": "2026-10-02T01:30:00Z",
+                        "verified_by": "OWNER",
+                        "tags": [
+                            "subject:display-alias",
+                            "subject:different-display-alias",
+                            "new-tag",
+                        ],
+                    },
+                })
+            assert error.value.code == "INVALID_ENVELOPE"
+
+            removed = (await owner.dispatch("memory_update", {
+                "memory_id": refreshed["memory_id"],
+                "expected_record_id": refreshed["record_id"],
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": refreshed["revision"],
+                "mode": "REVERIFY",
+                "idempotency_key": "reverify-legacy-subject-tag-remove",
+                "verification": {
+                    "source_timestamp": "2026-10-02T02:00:00Z",
+                    "last_verified_at": "2026-10-02T02:00:00Z",
+                    "verified_by": "OWNER",
+                    "tags": ["new-tag"],
+                },
+            }))["results"][0]
+            assert removed["tags"] == ["new-tag"]
+
+            corrected = (await owner.dispatch("memory_update", {
+                "memory_id": removed["memory_id"],
+                "expected_record_id": removed["record_id"],
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": removed["revision"],
+                "mode": "REVERIFY",
+                "idempotency_key": "reverify-legacy-subject-tag-correct",
+                "verification": {
+                    "source_timestamp": "2026-10-02T03:00:00Z",
+                    "last_verified_at": "2026-10-02T03:00:00Z",
+                    "verified_by": "OWNER",
+                    "tags": ["subject:canonical-subject", "new-tag"],
+                },
+            }))["results"][0]
+            assert corrected["tags"] == ["subject:canonical-subject", "new-tag"]
+
+            with pytest.raises(AdapterError) as error:
+                await owner.dispatch("memory_update", {
+                    "memory_id": corrected["memory_id"],
+                    "expected_record_id": corrected["record_id"],
+                    "scope": "PROJECT",
+                    "project_id": "factlane",
+                    "expected_revision": corrected["revision"],
+                    "mode": "REVERIFY",
+                    "idempotency_key": "reverify-legacy-subject-tag-drift",
+                    "verification": {
+                        "source_timestamp": "2026-10-02T04:00:00Z",
+                        "last_verified_at": "2026-10-02T04:00:00Z",
+                        "verified_by": "OWNER",
+                        "tags": ["subject:different-display-alias", "new-tag"],
+                    },
+                })
+            assert error.value.code == "INVALID_ENVELOPE"
+        finally:
+            await owner.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"memory_type": "DECISION_RATIONALE"},
+        {"fact": "A different fact cannot be promoted by REVERIFY."},
+        {"contradiction_key": "9" * 64},
+        {"scope": "PROJECT", "project_id": "wrong-scope"},
+        {"lifecycle_state": "CANDIDATE"},
+        {"authority_role": "UNRESOLVED"},
+        {"verified_by": "UNVERIFIED"},
+        {"contradiction_state": "UNRESOLVED"},
+    ],
+    ids=[
+        "memory-type",
+        "fact",
+        "contradiction-key",
+        "scope",
+        "lifecycle",
+        "authority-role",
+        "verified-by",
+        "contradiction-state",
+    ],
+)
+def test_storage_candidate_promotion_rejects_invalid_current_successor_metadata(
+    tmp_path,
+    mutation: dict[str, object],
+) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "promotion-identity-defense.db"), _profile())
+        await engine.open()
+        try:
+            candidate = _record(
+                lifecycle="CANDIDATE",
+                marker="6",
+                fact="Candidate identity is immutable during promotion.",
+                created_at="2026-10-02T00:00:00Z",
+            )
+            await engine.write_record(candidate, [0.0, 1.0] + [0.0] * 254)
+            successor = deepcopy(candidate)
+            successor.update({
+                "record_id": str(uuid.uuid4()),
+                "revision": 2,
+                "parent_record_id": candidate["record_id"],
+                "source_timestamp": "2026-10-02T01:00:00Z",
+                "created_at": "2026-10-02T01:00:00Z",
+                "last_verified_at": "2026-10-02T01:00:00Z",
+                "verified_by": "OWNER",
+                "authority_role": "WORKFLOW_CURRENT",
+                "lifecycle_state": "VALIDATED_CURRENT",
+                "native_content_hash": "7" * 64,
+                "payload_fingerprint": "8" * 64,
+                "idempotency_key": "promotion-identity-defense-successor",
+            })
+            successor.update(mutation)
+            with pytest.raises(AdapterError) as error:
+                await engine.promote_candidate(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    validate_scope("CROSS_PROJECT_WORKFLOW"),
+                    expected_record_id=str(candidate["record_id"]),
+                    expected_revision=1,
+                )
+            assert error.value.code == "INVALID_ENVELOPE"
+            history = await engine.get_record(
+                str(candidate["memory_id"]),
+                validate_scope("CROSS_PROJECT_WORKFLOW"),
+                history=True,
+            )
+            assert [(row["revision"], row["lifecycle_state"]) for row in history] == [(1, "CANDIDATE")]
+        finally:
+            await engine.close()
+
     asyncio.run(run())
 
 
@@ -610,6 +1236,793 @@ def test_candidate_promotion_rechecks_current_contradiction_inside_transaction(t
             assert [(row["revision"], row["lifecycle_state"]) for row in history] == [(1, "CANDIDATE")]
         finally:
             await owner.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mutation", ["scope", "lifecycle"])
+def test_write_record_rejects_invalid_superseding_successor_boundary(tmp_path, mutation: str) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / f"write-successor-{mutation}.db"), _profile())
+        await engine.open()
+        try:
+            parent = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="a",
+                fact="The existing current record remains authoritative.",
+                created_at="2026-09-26T00:00:00Z",
+            )
+            await engine.write_record(parent, [1.0] + [0.0] * 255)
+
+            successor = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="b",
+                fact="A direct storage successor must preserve scope and current lifecycle.",
+                created_at="2026-09-26T01:00:00Z",
+            )
+            successor["parent_record_id"] = parent["record_id"]
+            if mutation == "scope":
+                successor["scope"] = "PROJECT"
+                successor["project_id"] = "other-project"
+            else:
+                successor["lifecycle_state"] = "CANDIDATE"
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    supersede_record_id=str(parent["record_id"]),
+                )
+            assert error.value.code == "INVALID_ENVELOPE"
+
+            history = await engine.get_record(
+                str(parent["memory_id"]),
+                validate_scope("CROSS_PROJECT_WORKFLOW"),
+                history=True,
+            )
+            assert [(row["record_id"], row["lifecycle_state"]) for row in history] == [
+                (parent["record_id"], "VALIDATED_CURRENT")
+            ]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["same_memory_bad_revision", "replacement_bad_revision", "replacement_missing_supersedes"],
+)
+def test_write_record_rejects_invalid_superseding_lineage_shape(tmp_path, mutation: str) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / f"write-lineage-{mutation}.db"), _profile())
+        await engine.open()
+        try:
+            parent = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="c",
+                fact="The current lineage parent has a valid revision shape.",
+                created_at="2026-09-26T00:00:00Z",
+            )
+            await engine.write_record(parent, [1.0] + [0.0] * 255)
+
+            successor = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="d",
+                fact="A direct storage successor must preserve a valid lineage shape.",
+                created_at="2026-09-26T01:00:00Z",
+            )
+            successor["parent_record_id"] = parent["record_id"]
+            if mutation == "same_memory_bad_revision":
+                successor["memory_id"] = parent["memory_id"]
+                successor["revision"] = 99
+            elif mutation == "replacement_bad_revision":
+                successor["revision"] = 2
+                successor["supersedes"] = [parent["memory_id"]]
+            else:
+                successor["revision"] = 1
+                successor["supersedes"] = []
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    supersede_record_id=str(parent["record_id"]),
+                )
+            assert error.value.code == "INVALID_ENVELOPE"
+
+            history = await engine.get_record(
+                str(parent["memory_id"]),
+                validate_scope("CROSS_PROJECT_WORKFLOW"),
+                history=True,
+            )
+            assert [(row["revision"], row["lifecycle_state"]) for row in history] == [
+                (1, "VALIDATED_CURRENT")
+            ]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["revision", "parent_record_id", "supersedes"],
+)
+def test_write_record_rejects_invalid_initial_lineage_shape(tmp_path, mutation: str) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / f"write-initial-lineage-{mutation}.db"), _profile())
+        await engine.open()
+        try:
+            record = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="i",
+                fact="An initial storage record must have a root lineage shape.",
+                created_at="2026-10-02T05:00:00Z",
+            )
+            if mutation == "revision":
+                record["revision"] = 7
+            elif mutation == "parent_record_id":
+                record["parent_record_id"] = str(uuid.uuid4())
+            else:
+                record["supersedes"] = [str(uuid.uuid4())]
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(record, [1.0] + [0.0] * 255)
+            assert error.value.code == "INVALID_ENVELOPE"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_write_record_rejects_empty_supersede_record_id_boundary(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "write-empty-supersede-id.db"), _profile())
+        await engine.open()
+        try:
+            record = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="j",
+                fact="An empty supersede identifier cannot bypass root or successor lineage validation.",
+                created_at="2026-10-02T05:30:00Z",
+            )
+            record["revision"] = 7
+            record["parent_record_id"] = str(uuid.uuid4())
+            record["supersedes"] = [str(uuid.uuid4())]
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(
+                    record,
+                    [1.0] + [0.0] * 255,
+                    supersede_record_id="",
+                )
+            assert error.value.code == "VERSION_CONFLICT"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["authority_role", "verified_by", "last_verified_at", "source_timestamp"],
+)
+def test_write_record_rejects_invalid_current_authority_metadata(tmp_path, mutation: str) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / f"write-authority-{mutation}.db"), _profile())
+        await engine.open()
+        try:
+            parent = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="e",
+                fact="Validated current storage requires structurally valid authority metadata.",
+                created_at="2026-09-26T00:00:00Z",
+            )
+            await engine.write_record(parent, [1.0] + [0.0] * 255)
+
+            successor = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="f",
+                fact=parent["fact"],
+                created_at="2026-09-26T01:00:00Z",
+            )
+            successor.update(
+                {
+                    "memory_id": parent["memory_id"],
+                    "revision": 2,
+                    "parent_record_id": parent["record_id"],
+                    "memory_type": parent["memory_type"],
+                    "fact": parent["fact"],
+                    "contradiction_key": parent["contradiction_key"],
+                }
+            )
+            if mutation == "authority_role":
+                successor["authority_role"] = "UNRESOLVED"
+            elif mutation == "verified_by":
+                successor["verified_by"] = "UNVERIFIED"
+            elif mutation == "last_verified_at":
+                successor["last_verified_at"] = None
+            else:
+                successor["source_timestamp"] = None
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    supersede_record_id=str(parent["record_id"]),
+                )
+            expected_code = (
+                "INVALID_ENVELOPE"
+                if mutation in {"authority_role", "verified_by"}
+                else "INVALID_TIMESTAMP"
+            )
+            assert error.value.code == expected_code
+
+            history = await engine.get_record(
+                str(parent["memory_id"]),
+                validate_scope("CROSS_PROJECT_WORKFLOW"),
+                history=True,
+            )
+            assert [
+                (row["revision"], row["lifecycle_state"], row["authority_role"], row["verified_by"])
+                for row in history
+            ] == [
+                (1, "VALIDATED_CURRENT", "WORKFLOW_CURRENT", "AUTOMATED_CHECK")
+            ]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "contradiction_state",
+    ["UNRESOLVED", "QUARANTINED", "BOGUS_STATE"],
+)
+def test_write_record_rejects_invalid_current_contradiction_state(
+    tmp_path,
+    contradiction_state: str,
+) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(
+            str(tmp_path / f"write-current-contradiction-state-{contradiction_state}.db"),
+            _profile(),
+        )
+        await engine.open()
+        try:
+            record = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="q",
+                fact="Validated current storage cannot carry an unresolved contradiction state.",
+                created_at="2026-10-03T00:00:00Z",
+            )
+            record["contradiction_state"] = contradiction_state
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(record, [1.0] + [0.0] * 255)
+            assert error.value.code == "INVALID_ENVELOPE"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_write_record_candidate_contradiction_state_behavior_is_unchanged(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "write-candidate-contradiction-state.db"), _profile())
+        await engine.open()
+        try:
+            record = _record(
+                lifecycle="CANDIDATE",
+                marker="r",
+                fact="Candidate storage may retain unresolved contradiction state.",
+                created_at="2026-10-03T00:05:00Z",
+            )
+            record["contradiction_state"] = "UNRESOLVED"
+            await engine.write_record(record, [1.0] + [0.0] * 255)
+            assert engine.conn is not None
+            row = engine.conn.execute(
+                "SELECT lifecycle_state, contradiction_state FROM adapter_records WHERE record_id = ?",
+                (record["record_id"],),
+            ).fetchone()
+            assert row == ("CANDIDATE", "UNRESOLVED")
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ({"scope": "PROJECT", "project_id": None, "authority_role": "PROJECT_CURRENT"}, "UNKNOWN_PROJECT_ID"),
+        (
+            {"scope": "WORKFLOW", "project_id": "project-a", "workflow_id": None, "authority_role": "WORKFLOW_CURRENT"},
+            "UNKNOWN_PROJECT_ID",
+        ),
+        ({"scope": "TOOL_ENVIRONMENT", "agent_id": None, "authority_role": "TOOL_ENV_CURRENT"}, "UNKNOWN_AGENT"),
+        (
+            {"scope": "CROSS_PROJECT_WORKFLOW", "project_id": "project-a", "authority_role": "WORKFLOW_CURRENT"},
+            "CROSS_SCOPE_DENIED",
+        ),
+    ],
+    ids=["project-missing-id", "workflow-missing-id", "tool-environment-missing-agent", "cross-project-carries-id"],
+)
+def test_write_record_rejects_invalid_current_scope_identity(
+    tmp_path,
+    mutation: dict[str, object],
+    expected_code: str,
+) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "write-invalid-current-scope.db"), _profile())
+        await engine.open()
+        try:
+            current = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="g",
+                fact="Validated current storage requires a valid exact scope identity tuple.",
+                created_at="2026-09-26T02:00:00Z",
+            )
+            current.update(mutation)
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(current, [1.0] + [0.0] * 255)
+            assert error.value.code == expected_code
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ({"scope": "PROJECT", "project_id": None}, "UNKNOWN_PROJECT_ID"),
+        ({"scope": "WORKFLOW", "project_id": "project-a", "workflow_id": None}, "UNKNOWN_PROJECT_ID"),
+        ({"scope": "TOOL_ENVIRONMENT", "agent_id": None}, "UNKNOWN_AGENT"),
+        ({"scope": "CROSS_PROJECT_WORKFLOW", "project_id": "project-a"}, "CROSS_SCOPE_DENIED"),
+    ],
+    ids=["project-missing-id", "workflow-missing-id", "tool-environment-missing-agent", "cross-project-carries-id"],
+)
+def test_write_record_rejects_invalid_candidate_scope_identity(
+    tmp_path,
+    mutation: dict[str, object],
+    expected_code: str,
+) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "write-invalid-candidate-scope.db"), _profile())
+        await engine.open()
+        try:
+            candidate = _record(
+                lifecycle="CANDIDATE",
+                marker="q",
+                fact="Candidate storage requires a valid exact scope identity tuple.",
+                created_at="2026-10-03T05:00:00Z",
+            )
+            candidate.update(mutation)
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(candidate, [1.0] + [0.0] * 255)
+            assert error.value.code == expected_code
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "lifecycle",
+    ["SUPERSEDED", "STALE", "QUARANTINED", "HISTORICAL", "BOGUS_TERMINAL"],
+)
+def test_write_record_rejects_nonadmissible_initial_lifecycle(tmp_path, lifecycle: str) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / f"invalid-root-lifecycle-{lifecycle.lower()}.db"), _profile())
+        await engine.open()
+        try:
+            record = _record(
+                lifecycle=lifecycle,
+                marker="r",
+                fact=f"Initial storage admission cannot materialize lifecycle {lifecycle} directly.",
+                created_at="2026-10-03T06:00:00Z",
+            )
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(record, [1.0] + [0.0] * 255)
+            assert error.value.code == "INVALID_ENVELOPE"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_storage_candidate_promotion_rejects_invalid_current_scope_identity(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "promotion-invalid-current-scope.db"), _profile())
+        await engine.open()
+        try:
+            candidate = _record(
+                lifecycle="CANDIDATE",
+                marker="h",
+                fact="Candidate promotion requires a valid exact current scope identity tuple.",
+                created_at="2026-09-26T03:00:00Z",
+            )
+            candidate.update({"scope": "PROJECT", "project_id": None})
+
+            def seed_legacy_invalid_candidate() -> None:
+                assert engine.conn is not None
+                engine.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    engine._insert_materialized_record(candidate, [1.0] + [0.0] * 255)
+                    engine.conn.commit()
+                except Exception:
+                    engine.conn.rollback()
+                    raise
+
+            await engine._run(seed_legacy_invalid_candidate)
+
+            successor = deepcopy(candidate)
+            successor.update({
+                "record_id": str(uuid.uuid4()),
+                "revision": 2,
+                "parent_record_id": candidate["record_id"],
+                "source_timestamp": "2026-09-26T04:00:00Z",
+                "created_at": "2026-09-26T04:00:00Z",
+                "last_verified_at": "2026-09-26T04:00:00Z",
+                "verified_by": "OWNER",
+                "authority_role": "PROJECT_CURRENT",
+                "lifecycle_state": "VALIDATED_CURRENT",
+                "native_content_hash": "9" * 64,
+                "payload_fingerprint": "a" * 64,
+                "idempotency_key": "promotion-invalid-current-scope-successor",
+            })
+
+            with pytest.raises(AdapterError) as error:
+                await engine.promote_candidate(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    ScopeContext("PROJECT"),
+                    expected_record_id=str(candidate["record_id"]),
+                    expected_revision=1,
+                )
+            assert error.value.code == "UNKNOWN_PROJECT_ID"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records WHERE lifecycle_state='VALIDATED_CURRENT'").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records WHERE lifecycle_state='CANDIDATE'").fetchone()[0] == 1
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "case", "expected_code"),
+    [
+        ("VALIDATED_CURRENT", "memory-type", "SCOPE_TYPE_MISMATCH"),
+        ("VALIDATED_CURRENT", "ttl-freshness", "INVALID_FRESHNESS"),
+        ("CANDIDATE", "provenance-fingerprint", "SCOPE_FRESHNESS_MISMATCH"),
+        ("CANDIDATE", "manual-recheck", "INVALID_FRESHNESS"),
+    ],
+)
+def test_write_record_rejects_invalid_cross_project_semantics(
+    tmp_path,
+    lifecycle: str,
+    case: str,
+    expected_code: str,
+) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / f"cross-project-semantics-{case}.db"), _profile())
+        await engine.open()
+        try:
+            marker = {"memory-type": "a", "ttl-freshness": "b", "provenance-fingerprint": "c", "manual-recheck": "d"}[case]
+            record = _record(
+                lifecycle=lifecycle,
+                marker=marker,
+                fact=f"Cross-project storage semantic admission case: {case}.",
+                created_at="2026-10-03T00:00:00Z",
+            )
+            if case == "memory-type":
+                record["memory_type"] = "USER_FACT"
+            elif case == "ttl-freshness":
+                record["freshness_policy"] = {
+                    "kind": "ttl",
+                    "ttl_seconds": 60,
+                    "recheck_ref": None,
+                    "source_fingerprint": None,
+                }
+            elif case == "provenance-fingerprint":
+                provenance = dict(record["source_provenance"])
+                provenance["source_fingerprint"] = marker * 64
+                record["source_provenance"] = provenance
+            else:
+                record["freshness_policy"] = {
+                    "kind": "manual",
+                    "ttl_seconds": None,
+                    "recheck_ref": "repo-state",
+                    "source_fingerprint": None,
+                }
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(record, [1.0] + [0.0] * 255)
+            assert error.value.code == expected_code
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_storage_candidate_promotion_rejects_invalid_cross_project_freshness(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "promotion-cross-project-freshness.db"), _profile())
+        await engine.open()
+        try:
+            candidate = _record(
+                lifecycle="CANDIDATE",
+                marker="e",
+                fact="Candidate promotion preserves cross-project semantic admission invariants.",
+                created_at="2026-10-03T00:00:00Z",
+            )
+            await engine.write_record(candidate, [1.0] + [0.0] * 255)
+
+            successor = deepcopy(candidate)
+            successor.update({
+                "record_id": str(uuid.uuid4()),
+                "revision": 2,
+                "parent_record_id": candidate["record_id"],
+                "source_timestamp": "2026-10-03T01:00:00Z",
+                "created_at": "2026-10-03T01:00:00Z",
+                "last_verified_at": "2026-10-03T01:00:00Z",
+                "verified_by": "OWNER",
+                "authority_role": "WORKFLOW_CURRENT",
+                "freshness_policy": {
+                    "kind": "ttl",
+                    "ttl_seconds": 60,
+                    "recheck_ref": None,
+                    "source_fingerprint": None,
+                },
+                "lifecycle_state": "VALIDATED_CURRENT",
+                "native_content_hash": "f" * 64,
+                "payload_fingerprint": "1" * 64,
+                "idempotency_key": "promotion-cross-project-invalid-freshness",
+            })
+
+            with pytest.raises(AdapterError) as error:
+                await engine.promote_candidate(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    validate_scope("CROSS_PROJECT_WORKFLOW"),
+                    expected_record_id=str(candidate["record_id"]),
+                    expected_revision=1,
+                )
+            assert error.value.code == "INVALID_FRESHNESS"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records WHERE lifecycle_state='CANDIDATE'").fetchone()[0] == 1
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records WHERE lifecycle_state='VALIDATED_CURRENT'").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_write_record_accepts_valid_cross_project_on_change_semantics(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "cross-project-valid-on-change.db"), _profile())
+        await engine.open()
+        try:
+            current = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="f",
+                fact="Valid cross-project on-change freshness remains admissible at the storage boundary.",
+                created_at="2026-10-03T02:00:00Z",
+            )
+            current["freshness_policy"] = {
+                "kind": "on_change",
+                "ttl_seconds": None,
+                "recheck_ref": "repo-state",
+                "source_fingerprint": "f" * 64,
+            }
+
+            await engine.write_record(current, [1.0] + [0.0] * 255)
+            rows = await engine.get_record(
+                str(current["memory_id"]),
+                validate_scope("CROSS_PROJECT_WORKFLOW"),
+                history=False,
+            )
+            assert len(rows) == 1
+            assert json.loads(rows[0]["freshness_policy"]) == current["freshness_policy"]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_cross_project_semantics_do_not_override_write_record_version_conflict(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "cross-project-version-precedence.db"), _profile())
+        await engine.open()
+        try:
+            successor = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="a",
+                fact="A stale successor must fail CAS before semantic admission checks.",
+                created_at="2026-10-03T03:00:00Z",
+            )
+            successor.update({
+                "memory_type": "USER_FACT",
+                "revision": 2,
+                "parent_record_id": str(uuid.uuid4()),
+            })
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(
+                    successor,
+                    [1.0] + [0.0] * 255,
+                    supersede_record_id=str(successor["parent_record_id"]),
+                )
+            assert error.value.code == "VERSION_CONFLICT"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_current_contradiction_state_does_not_override_write_record_version_conflict(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "current-contradiction-version-precedence.db"), _profile())
+        await engine.open()
+        try:
+            stale_parent = str(uuid.uuid4())
+            successor = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="s",
+                fact="A stale successor must fail CAS before current contradiction-state admission checks.",
+                created_at="2026-10-03T03:30:00Z",
+            )
+            successor.update({
+                "revision": 2,
+                "parent_record_id": stale_parent,
+                "contradiction_state": "UNRESOLVED",
+            })
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(
+                    successor,
+                    [1.0] + [0.0] * 255,
+                    supersede_record_id=stale_parent,
+                )
+            assert error.value.code == "VERSION_CONFLICT"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_cross_project_semantics_do_not_override_promotion_version_conflict(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "cross-project-promotion-version-precedence.db"), _profile())
+        await engine.open()
+        try:
+            candidate = _record(
+                lifecycle="CANDIDATE",
+                marker="b",
+                fact="Candidate promotion keeps stale-parent CAS precedence over semantic checks.",
+                created_at="2026-10-03T03:00:00Z",
+            )
+            await engine.write_record(candidate, [1.0] + [0.0] * 255)
+            stale_parent = str(uuid.uuid4())
+            successor = deepcopy(candidate)
+            successor.update({
+                "record_id": str(uuid.uuid4()),
+                "revision": 2,
+                "parent_record_id": stale_parent,
+                "source_timestamp": "2026-10-03T04:00:00Z",
+                "created_at": "2026-10-03T04:00:00Z",
+                "last_verified_at": "2026-10-03T04:00:00Z",
+                "verified_by": "OWNER",
+                "authority_role": "WORKFLOW_CURRENT",
+                "freshness_policy": {
+                    "kind": "ttl",
+                    "ttl_seconds": 60,
+                    "recheck_ref": None,
+                    "source_fingerprint": None,
+                },
+                "lifecycle_state": "VALIDATED_CURRENT",
+                "native_content_hash": "c" * 64,
+                "payload_fingerprint": "d" * 64,
+                "idempotency_key": "cross-project-promotion-stale-parent",
+            })
+
+            with pytest.raises(AdapterError) as error:
+                await engine.promote_candidate(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    validate_scope("CROSS_PROJECT_WORKFLOW"),
+                    expected_record_id=stale_parent,
+                    expected_revision=1,
+                )
+            assert error.value.code == "VERSION_CONFLICT"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records WHERE lifecycle_state='CANDIDATE'").fetchone()[0] == 1
+            assert engine.conn.execute("SELECT COUNT(*) FROM adapter_records WHERE lifecycle_state='VALIDATED_CURRENT'").fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_current_contradiction_state_does_not_override_promotion_version_conflict(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "current-contradiction-promotion-version-precedence.db"), _profile())
+        await engine.open()
+        try:
+            candidate = _record(
+                lifecycle="CANDIDATE",
+                marker="t",
+                fact="Candidate promotion keeps stale-parent CAS precedence over contradiction-state checks.",
+                created_at="2026-10-03T03:30:00Z",
+            )
+            await engine.write_record(candidate, [1.0] + [0.0] * 255)
+            stale_parent = str(uuid.uuid4())
+            successor = deepcopy(candidate)
+            successor.update({
+                "record_id": str(uuid.uuid4()),
+                "revision": 2,
+                "parent_record_id": stale_parent,
+                "source_timestamp": "2026-10-03T04:30:00Z",
+                "created_at": "2026-10-03T04:30:00Z",
+                "last_verified_at": "2026-10-03T04:30:00Z",
+                "verified_by": "OWNER",
+                "authority_role": "WORKFLOW_CURRENT",
+                "lifecycle_state": "VALIDATED_CURRENT",
+                "contradiction_state": "UNRESOLVED",
+                "native_content_hash": "e" * 64,
+                "payload_fingerprint": "f" * 64,
+                "idempotency_key": "current-contradiction-promotion-stale-parent",
+            })
+
+            with pytest.raises(AdapterError) as error:
+                await engine.promote_candidate(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    validate_scope("CROSS_PROJECT_WORKFLOW"),
+                    expected_record_id=stale_parent,
+                    expected_revision=1,
+                )
+            assert error.value.code == "VERSION_CONFLICT"
+            assert engine.conn is not None
+            row = engine.conn.execute(
+                "SELECT lifecycle_state FROM adapter_records WHERE record_id = ?",
+                (candidate["record_id"],),
+            ).fetchone()
+            assert row == ("CANDIDATE",)
+        finally:
+            await engine.close()
+
     asyncio.run(run())
 
 

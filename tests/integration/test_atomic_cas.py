@@ -66,6 +66,29 @@ def _install_write_barrier(engine_a: SQLiteVecEngine, engine_b: SQLiteVecEngine)
     engine_b.write_record = gated(original_write_b)  # type: ignore[method-assign]
 
 
+def _install_promotion_barrier(engine_a: SQLiteVecEngine, engine_b: SQLiteVecEngine) -> None:
+    original_promote_a = engine_a.promote_candidate
+    original_promote_b = engine_b.promote_candidate
+    both_ready = asyncio.Event()
+    ready_lock = asyncio.Lock()
+    ready_count = 0
+
+    def gated(original):
+        async def promote(*args: Any, **kwargs: Any) -> Any:
+            nonlocal ready_count
+            async with ready_lock:
+                ready_count += 1
+                if ready_count == 2:
+                    both_ready.set()
+            await asyncio.wait_for(both_ready.wait(), timeout=5)
+            return await original(*args, **kwargs)
+
+        return promote
+
+    engine_a.promote_candidate = gated(original_promote_a)  # type: ignore[method-assign]
+    engine_b.promote_candidate = gated(original_promote_b)  # type: ignore[method-assign]
+
+
 async def _open_clients(tmp_path, filename: str):
     db_path = str(tmp_path / filename)
     embedding_profile = profile()
@@ -245,6 +268,191 @@ def test_two_independent_clients_have_single_winner_for_same_revision(tmp_path) 
 
 def test_two_independent_replace_clients_cannot_fork_current_lineage(tmp_path) -> None:
     asyncio.run(_race_two_replace_updates(tmp_path))
+
+
+def test_two_independent_clients_converge_same_update_idempotency_key(tmp_path) -> None:
+    async def run() -> None:
+        engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "same-key-update.db")
+        scope = adapter_a._safe_scope("PROJECT", "factlane", None, None, None)
+        try:
+            seed = await _seed_current(
+                adapter_a,
+                key="same-key-update-seed",
+                fact="Identical concurrent updates must converge on one durable idempotent result.",
+            )
+            memory_id = seed["results"][0]["memory_id"]
+            _install_write_barrier(engine_a, engine_b)
+            request = {
+                "memory_id": memory_id,
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": 1,
+                "mode": "REVERIFY",
+                "idempotency_key": "same-key-update-replay",
+                "verification": {
+                    "source_provenance": {
+                        "source_class": "CURRENT_REPO",
+                        "source_ref": "same-key-update-replay",
+                        "source_hash": "b" * 64,
+                        "review_ref": "atomic-cas",
+                        "extraction_method": "AUTOMATED_CHECK",
+                    },
+                    "source_timestamp": "2026-08-30T00:00:00Z",
+                    "verified_by": "AUTOMATED_CHECK",
+                },
+            }
+
+            outcomes = await asyncio.gather(
+                adapter_a.update(**request),
+                adapter_b.update(**request),
+                return_exceptions=True,
+            )
+
+            assert all(isinstance(outcome, dict) for outcome in outcomes), outcomes
+            responses = [outcome for outcome in outcomes if isinstance(outcome, dict)]
+            assert len(responses) == 2
+            assert len({response["results"][0]["record_id"] for response in responses}) == 1
+            assert sorted(bool(response.get("idempotent_replay")) for response in responses) == [False, True]
+
+            current = await engine_a.get_record(memory_id, scope, history=False)
+            history = await engine_a.get_record(memory_id, scope, history=True)
+            assert len(current) == 1
+            assert current[0]["revision"] == 2
+            assert len(history) == 2
+            assert sorted(row["revision"] for row in history) == [1, 2]
+        finally:
+            await adapter_a.close()
+            await adapter_b.close()
+
+    asyncio.run(run())
+
+
+def test_two_independent_clients_same_update_key_different_payload_conflicts(tmp_path) -> None:
+    async def run() -> None:
+        engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "same-key-update-conflict.db")
+        try:
+            seed = await _seed_current(
+                adapter_a,
+                key="same-key-update-conflict-seed",
+                fact="A shared update idempotency key is bound to exactly one request payload.",
+            )
+            memory_id = seed["results"][0]["memory_id"]
+            _install_write_barrier(engine_a, engine_b)
+
+            async def update(adapter: MemoryAdapter, marker: str) -> dict[str, Any]:
+                return await adapter.update(
+                    memory_id=memory_id,
+                    scope="PROJECT",
+                    project_id="factlane",
+                    expected_revision=1,
+                    mode="REVERIFY",
+                    idempotency_key="same-key-update-conflict",
+                    verification={
+                        "source_provenance": {
+                            "source_class": "CURRENT_REPO",
+                            "source_ref": f"same-key-update-{marker}",
+                            "source_hash": marker * 64,
+                            "review_ref": "atomic-cas",
+                            "extraction_method": "AUTOMATED_CHECK",
+                        },
+                        "source_timestamp": "2026-08-30T00:00:00Z",
+                        "verified_by": "AUTOMATED_CHECK",
+                    },
+                )
+
+            outcomes = await asyncio.gather(
+                update(adapter_a, "b"),
+                update(adapter_b, "c"),
+                return_exceptions=True,
+            )
+            successes = [outcome for outcome in outcomes if isinstance(outcome, dict)]
+            conflicts = [
+                outcome
+                for outcome in outcomes
+                if isinstance(outcome, AdapterError) and outcome.code == "IDEMPOTENCY_CONFLICT"
+            ]
+            assert len(successes) == 1
+            assert len(conflicts) == 1
+        finally:
+            await adapter_a.close()
+            await adapter_b.close()
+
+    asyncio.run(run())
+
+
+def test_two_independent_clients_converge_candidate_promotion_idempotency_key(tmp_path) -> None:
+    async def run() -> None:
+        db_path = str(tmp_path / "same-key-candidate-promotion.db")
+        embedding_profile = profile()
+        engine_a = SQLiteVecEngine(db_path, embedding_profile)
+        engine_b = SQLiteVecEngine(db_path, embedding_profile)
+        engine_seed = SQLiteVecEngine(db_path, embedding_profile)
+        await engine_a.open()
+        await engine_b.open()
+        await engine_seed.open()
+        context = trusted_write_context_for_profile("automated-verifier")
+        adapter_a = MemoryAdapter(engine_a, FakeProvider(embedding_profile), trusted_write_context=context)  # type: ignore[arg-type]
+        adapter_b = MemoryAdapter(engine_b, FakeProvider(embedding_profile), trusted_write_context=context)  # type: ignore[arg-type]
+        delegated = MemoryAdapter(
+            engine_seed,
+            FakeProvider(embedding_profile),  # type: ignore[arg-type]
+            trusted_write_context=trusted_write_context_for_profile("delegated-candidate"),
+        )
+        scope = adapter_a._safe_scope("PROJECT", "factlane", None, None, None)
+        try:
+            candidate = await delegated.store(
+                fact="Concurrent Candidate promotion must converge on one durable idempotent result.",
+                scope="PROJECT",
+                project_id="factlane",
+                memory_type="PROJECT_LEARNED_FACT",
+                source_provenance={
+                    "source_class": "CURRENT_REPO",
+                    "source_ref": "same-key-candidate-seed",
+                    "source_hash": "d" * 64,
+                    "review_ref": "atomic-cas",
+                    "extraction_method": "AUTOMATED_CHECK",
+                },
+                freshness_policy={"kind": "manual"},
+                idempotency_key="same-key-candidate-seed",
+                tags=["subject:same-key-candidate"],
+            )
+            parent = candidate["results"][0]
+            _install_promotion_barrier(engine_a, engine_b)
+            request = {
+                "memory_id": parent["memory_id"],
+                "expected_record_id": parent["record_id"],
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": parent["revision"],
+                "mode": "REVERIFY",
+                "idempotency_key": "same-key-candidate-promote",
+                "verification": {
+                    "source_timestamp": "2026-08-30T00:00:00Z",
+                    "verified_by": "AUTOMATED_CHECK",
+                },
+            }
+
+            outcomes = await asyncio.gather(
+                adapter_a.update(**request),
+                adapter_b.update(**request),
+                return_exceptions=True,
+            )
+            assert all(isinstance(outcome, dict) for outcome in outcomes), outcomes
+            responses = [outcome for outcome in outcomes if isinstance(outcome, dict)]
+            assert len({response["results"][0]["record_id"] for response in responses}) == 1
+            assert sorted(bool(response.get("idempotent_replay")) for response in responses) == [False, True]
+
+            history = await engine_a.get_record(parent["memory_id"], scope, history=True)
+            assert [(row["revision"], row["lifecycle_state"]) for row in history] == [
+                (2, "VALIDATED_CURRENT"),
+                (1, "SUPERSEDED"),
+            ]
+        finally:
+            await adapter_a.close()
+            await adapter_b.close()
+            await delegated.close()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("mode", ["REVERIFY", "REPLACE"])

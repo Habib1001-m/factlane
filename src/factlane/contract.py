@@ -83,7 +83,12 @@ class AdapterError(Exception):
             "degradation": None,
             "audit": {
                 "request_id": request_id,
-                "retryable": self.code in {"BACKEND_BUSY", "BACKEND_UNAVAILABLE", "TIMEOUT"},
+                "retryable": self.code in {
+                    "BACKEND_BUSY",
+                    "BACKEND_UNAVAILABLE",
+                    "MAINTENANCE_IN_PROGRESS",
+                    "TIMEOUT",
+                },
                 "raw_content_logged": False,
             },
         }

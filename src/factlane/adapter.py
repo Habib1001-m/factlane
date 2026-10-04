@@ -731,6 +731,31 @@ class MemoryAdapter:
         return value
 
     @staticmethod
+    def _subject_tags(tags: list[str]) -> list[str]:
+        values: list[str] = []
+        for subject_tag in (tag for tag in tags if tag.startswith("subject:")):
+            value = subject_tag.split(":", 1)[1].strip().casefold()
+            if not value or contains_sensitive(value):
+                raise AdapterError("INVALID_ENVELOPE", "subject tag is invalid")
+            if value not in values:
+                values.append(value)
+        return values
+
+    @staticmethod
+    def _contradiction_identity_key(
+        scope_context: ScopeContext,
+        memory_type: str,
+        subject_value: str,
+    ) -> str:
+        return digest(
+            {
+                "scope": scope_context.to_dict(),
+                "memory_type": memory_type,
+                "subject": subject_value,
+            }
+        )
+
+    @staticmethod
     def _public(record: dict[str, Any], *, relevance_score: float | None = None, retrieval_rank: int | None = None) -> dict[str, Any]:
         provenance = json.loads(record["source_provenance"])
         origin_value = record.get("contribution_origin")
@@ -916,7 +941,7 @@ class MemoryAdapter:
                 envelope["results"] = [self._public(exact)]
                 envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
                 return envelope
-            contradiction_key = digest({"scope": scope_context.to_dict(), "memory_type": memory_type, "subject": subject_value})
+            contradiction_key = self._contradiction_identity_key(scope_context, memory_type, subject_value)
             conflicts = await self.engine.find_contradictions(contradiction_key, scope_context)
             contradiction_state = "UNRESOLVED" if any(
                 existing_row["fact"].casefold() != fact.casefold() for existing_row in conflicts
@@ -1024,8 +1049,16 @@ class MemoryAdapter:
             if await self.engine.memory_exists_outside_scope(memory_id, scope_context):
                 raise AdapterError("CROSS_SCOPE_DENIED", "memory_id exists outside the requested scope")
             raise AdapterError("NOT_FOUND", "memory_id was not found in the requested scope")
+        stale_only = False
+        if retrieval_mode == "CURRENT":
+            fresh_rows = [row for row in rows if self._fresh_current(row)]
+            stale_only = not fresh_rows
+            rows = fresh_rows
         envelope = self._base_envelope(request_id, "memory_get", scope_context)
         envelope["results"] = [self._public(row) for row in rows[: self.limits.max_memories_hard_max]]
+        if stale_only:
+            envelope["status"] = "DEGRADED"
+            envelope["degradation"] = "STALE_ONLY"
         envelope["budget"]["returned"] = len(envelope["results"])
         return self._fit_budget(envelope)
 
@@ -1041,6 +1074,41 @@ class MemoryAdapter:
             record["last_verified_at"],
             json.loads(record["source_provenance"]),
         )
+
+    @staticmethod
+    def _source_identity(record: dict[str, Any]) -> tuple[str, str, str]:
+        provenance = json.loads(record["source_provenance"])
+        return (
+            provenance["source_class"],
+            provenance["source_ref"],
+            provenance["source_hash"],
+        )
+
+    @classmethod
+    def _source_diverse_selection(
+        cls,
+        scored: list[tuple[dict[str, Any], float]],
+        limit: int,
+    ) -> list[tuple[dict[str, Any], float]]:
+        if len(scored) <= limit:
+            return scored
+
+        selected_indexes: list[int] = []
+        deferred_indexes: list[int] = []
+        seen_sources: set[tuple[str, str, str]] = set()
+        for index, (row, _score) in enumerate(scored):
+            source = cls._source_identity(row)
+            if source not in seen_sources and len(selected_indexes) < limit:
+                seen_sources.add(source)
+                selected_indexes.append(index)
+            else:
+                deferred_indexes.append(index)
+
+        if len(selected_indexes) < limit:
+            selected_indexes.extend(deferred_indexes[: limit - len(selected_indexes)])
+
+        selected_indexes.sort()
+        return [scored[index] for index in selected_indexes]
 
     def _fit_budget(self, envelope: dict[str, Any]) -> dict[str, Any]:
         def encoded() -> bytes:
@@ -1173,7 +1241,10 @@ class MemoryAdapter:
                 if not self._current_record(row):
                     continue
             safe.append((row, score))
-        safe = safe[:max_memories]
+        if not history and retrieval_mode_kind in {"SEMANTIC", "HYBRID"}:
+            safe = self._source_diverse_selection(safe, max_memories)
+        else:
+            safe = safe[:max_memories]
         envelope["results"] = [self._public(row, relevance_score=round(score, 6), retrieval_rank=index) for index, (row, score) in enumerate(safe, start=1)]
         envelope["contradictions"] = await self.engine.contradiction_summary(scope_context)
         if not envelope["results"] and stale_count:
@@ -1277,6 +1348,7 @@ class MemoryAdapter:
             )
         old_provenance = json.loads(old["source_provenance"])
         old_freshness = json.loads(old["freshness_policy"])
+        old_tags = json.loads(old["tags"])
         if mode == "REVERIFY":
             data = verification or {}
             fact = validate_fact(old["fact"])
@@ -1288,6 +1360,68 @@ class MemoryAdapter:
             new_memory_id = memory_id
             supersedes: list[str] = []
             contradiction_key = old["contradiction_key"]
+            asserted_memory_type = data.get("memory_type")
+            if asserted_memory_type is not None and asserted_memory_type not in MEMORY_TYPES:
+                raise AdapterError("INVALID_ENUM", "memory_type is not supported")
+            if asserted_memory_type is not None and asserted_memory_type != old["memory_type"]:
+                raise AdapterError(
+                    "INVALID_ENVELOPE",
+                    "REVERIFY cannot change memory_type; use REPLACE for semantic reclassification",
+                )
+            asserted_subject = data.get("subject")
+            if asserted_subject is not None:
+                asserted_tags = self._tags(data.get("tags", old_tags))
+                asserted_subject_value = self._subject(asserted_subject, asserted_tags, fact)
+                asserted_key = self._contradiction_identity_key(
+                    scope_context,
+                    old["memory_type"],
+                    asserted_subject_value,
+                )
+                if asserted_key != contradiction_key:
+                    raise AdapterError(
+                        "INVALID_ENVELOPE",
+                        "REVERIFY cannot change subject identity; use REPLACE for semantic reclassification",
+                    )
+            if "tags" in data:
+                refreshed_tags = self._tags(data.get("tags"))
+                old_subject_tags = self._subject_tags(old_tags)
+                refreshed_subject_tags = self._subject_tags(refreshed_tags)
+
+                def subject_tag_is_identity(value: str) -> bool:
+                    return (
+                        self._contradiction_identity_key(
+                            scope_context,
+                            old["memory_type"],
+                            value,
+                        )
+                        == contradiction_key
+                    )
+
+                old_identity_tags = {
+                    value for value in old_subject_tags if subject_tag_is_identity(value)
+                }
+                old_legacy_tags = set(old_subject_tags) - old_identity_tags
+                refreshed_identity_tags = {
+                    value for value in refreshed_subject_tags if subject_tag_is_identity(value)
+                }
+                refreshed_legacy_tags = set(refreshed_subject_tags) - refreshed_identity_tags
+
+                if refreshed_legacy_tags - old_legacy_tags:
+                    raise AdapterError(
+                        "INVALID_ENVELOPE",
+                        "REVERIFY cannot introduce new subject metadata with a different contradiction identity",
+                    )
+                if old_identity_tags and not refreshed_identity_tags:
+                    fallback_subject = self._subject(None, refreshed_tags, fact)
+                    if self._contradiction_identity_key(
+                        scope_context,
+                        old["memory_type"],
+                        fallback_subject,
+                    ) != contradiction_key:
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "REVERIFY cannot remove the subject tag that defines contradiction identity",
+                        )
         else:
             data = replacement or {}
             required_replacement = (
@@ -1312,7 +1446,11 @@ class MemoryAdapter:
             new_memory_id = str(uuid.uuid4())
             supersedes = [memory_id]
             subject_value = self._subject(data.get("subject"), self._tags(data.get("tags", json.loads(old["tags"]))), fact)
-            contradiction_key = digest({"scope": scope_context.to_dict(), "memory_type": data.get("memory_type", old["memory_type"]), "subject": subject_value})
+            contradiction_key = self._contradiction_identity_key(
+                scope_context,
+                data.get("memory_type", old["memory_type"]),
+                subject_value,
+            )
             authority = self._authority_for(scope_context)
         if not source_timestamp:
             raise AdapterError("PROVENANCE_REQUIRED", "updated current record requires source_timestamp")
@@ -1322,7 +1460,7 @@ class MemoryAdapter:
                 "update requires explicit current verification; verified_by must be OWNER, CURRENT_REPO_CHECK, or AUTOMATED_CHECK",
             )
         last_verified_at = self._normalize_timestamp(data.get("last_verified_at", iso_now()), required=True)
-        memory_type = data.get("memory_type", old["memory_type"])
+        memory_type = old["memory_type"] if mode == "REVERIFY" else data.get("memory_type", old["memory_type"])
         if memory_type not in MEMORY_TYPES:
             raise AdapterError("INVALID_ENUM", "memory_type is not supported")
         self._validate_on_change_freshness(provenance, freshness)
@@ -1330,11 +1468,23 @@ class MemoryAdapter:
             if memory_type not in {"WORKFLOW_RULE", "DECISION_RATIONALE"}:
                 raise AdapterError("SCOPE_TYPE_MISMATCH", "memory_type is incompatible with CROSS_PROJECT_WORKFLOW")
             self._validate_cross_project_freshness(provenance, freshness)
-        tags_value = self._tags(data.get("tags", json.loads(old["tags"])))
+        tags_value = self._tags(data.get("tags", old_tags))
         confidence = float(data.get("confidence", old["confidence"]))
         if not 0 <= confidence <= 1:
             raise AdapterError("INVALID_ENVELOPE", "confidence must be between 0 and 1")
         fingerprint = update_request_fingerprint
+
+        async def reconcile_concurrent_idempotent_update() -> dict[str, Any] | None:
+            concurrent = await self.engine.find_idempotency(idempotency_key)
+            if concurrent is None:
+                return None
+            if concurrent["payload_fingerprint"] != fingerprint:
+                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different update")
+            envelope = self._base_envelope(request_id, "memory_update", scope_context)
+            envelope["results"] = [self._public(concurrent)]
+            envelope["idempotent_replay"] = True
+            return envelope
+
         async with self._get_write_lock():
             existing = await self.engine.find_idempotency(idempotency_key)
             if existing:
@@ -1390,32 +1540,34 @@ class MemoryAdapter:
                 "embedding_output_dimension": self.provider.profile.output_dimension,
             }
             embedding = (await asyncio.to_thread(self.provider.embed_documents, [fact]))[0]
-            if candidate_promotion:
-                equivalent = await self.engine.promote_candidate(
-                    record,
-                    embedding,
-                    scope_context,
-                    expected_record_id=old["record_id"],
-                    expected_revision=expected_revision,
-                )
-                if equivalent is not None:
-                    envelope = self._base_envelope(request_id, "memory_update", scope_context)
-                    envelope["status"] = "ALREADY_CURRENT"
-                    envelope["results"] = [self._public(equivalent)]
-                    return self._fit_budget(envelope)
-            else:
-                try:
-                    await self.engine.write_record(record, embedding, supersede_record_id=old["record_id"])
-                except RecordUniquenessConflict:
-                    concurrent_idempotent = await self.engine.find_idempotency(idempotency_key)
-                    if concurrent_idempotent:
-                        if concurrent_idempotent["payload_fingerprint"] != fingerprint:
-                            raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different update")
+            try:
+                if candidate_promotion:
+                    equivalent = await self.engine.promote_candidate(
+                        record,
+                        embedding,
+                        scope_context,
+                        expected_record_id=old["record_id"],
+                        expected_revision=expected_revision,
+                    )
+                    if equivalent is not None:
                         envelope = self._base_envelope(request_id, "memory_update", scope_context)
-                        envelope["results"] = [self._public(concurrent_idempotent)]
-                        envelope["idempotent_replay"] = True
-                        return envelope
-                    raise AdapterError("WRITE_UNCONFIRMED", "concurrent update conflict could not be reconciled")
+                        envelope["status"] = "ALREADY_CURRENT"
+                        envelope["results"] = [self._public(equivalent)]
+                        return self._fit_budget(envelope)
+                else:
+                    await self.engine.write_record(record, embedding, supersede_record_id=old["record_id"])
+            except RecordUniquenessConflict:
+                concurrent_replay = await reconcile_concurrent_idempotent_update()
+                if concurrent_replay is not None:
+                    return concurrent_replay
+                raise AdapterError("WRITE_UNCONFIRMED", "concurrent update conflict could not be reconciled")
+            except AdapterError as exc:
+                if exc.code != "VERSION_CONFLICT":
+                    raise
+                concurrent_replay = await reconcile_concurrent_idempotent_update()
+                if concurrent_replay is not None:
+                    return concurrent_replay
+                raise
             readback_rows = await self.engine.get_record(new_memory_id, scope_context, history=True)
             readback = next((row for row in readback_rows if row["record_id"] == record_id), None)
             if not readback or not self._fresh_current(readback):

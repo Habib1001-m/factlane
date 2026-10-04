@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import errno
 import json
 import os
 import shutil
 import sqlite3
 import time
+import urllib.parse
 from collections.abc import Callable
 from typing import Any
 
@@ -13,13 +16,349 @@ from .backend_compat import (
     execute_with_backend_retry,
     load_pinned_sqlite_vec_storage,
 )
-from .contract import AdapterError, ScopeContext, canonical_json, parse_iso
+from .contract import (
+    AdapterError,
+    ScopeContext,
+    canonical_json,
+    parse_iso,
+    validate_freshness,
+    validate_scope,
+)
 from .embeddings import EmbeddingProfile
 
 STORAGE_CONTRACT_VERSION = 2
 MIN_SQLITE_VERSION = (3, 42, 0)
 _WRITER_FUNCTION = "factlane_contract_v2_writer"
+_CASEFOLD_FUNCTION = "factlane_unicode_casefold"
 _LEGACY_ORIGIN_JSON = canonical_json({"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None})
+_MAINTENANCE_CAPABILITY_SECRET = object()
+_SENSITIVE_RECOVERY_INTERLOCK_KEY = "sensitive_recovery_interlock"
+_CURRENT_AUTHORITY_BY_SCOPE = {
+    "GLOBAL_USER": "OWNER_CURRENT",
+    "PROJECT": "PROJECT_CURRENT",
+    "WORKFLOW": "WORKFLOW_CURRENT",
+    "CROSS_PROJECT_WORKFLOW": "WORKFLOW_CURRENT",
+    "TOOL_ENVIRONMENT": "TOOL_ENV_CURRENT",
+}
+_CURRENT_VERIFICATIONS = frozenset({"OWNER", "CURRENT_REPO_CHECK", "AUTOMATED_CHECK"})
+_CROSS_PROJECT_MEMORY_TYPES = frozenset({"WORKFLOW_RULE", "DECISION_RATIONALE"})
+_MIN_BUSY_TIMEOUT_MS = 5000
+_SQLITE_FULL_CODE = getattr(sqlite3, "SQLITE_FULL", 13)
+
+
+def _sqlite_pragma_compatibility_error() -> AdapterError:
+    return AdapterError(
+        "BACKEND_COMPATIBILITY_MISMATCH",
+        "backend SQLite pragma configuration conflicts with FactLane requirements",
+    )
+
+
+def _assert_required_sqlite_pragma_environment() -> None:
+    """Reject backend env overrides that weaken FactLane's SQLite posture."""
+    raw_pragmas = os.environ.get("MCP_MEMORY_SQLITE_PRAGMAS", "")
+    if not raw_pragmas:
+        return
+
+    for pragma_pair in raw_pragmas.split(","):
+        if "=" not in pragma_pair:
+            continue
+        raw_name, raw_value = pragma_pair.split("=", 1)
+        name = raw_name.strip().lower().rsplit(".", 1)[-1]
+        value = raw_value.strip().lower()
+        if name == "journal_mode" and value != "wal":
+            raise _sqlite_pragma_compatibility_error()
+        if name == "synchronous":
+            synchronous_levels = {
+                "off": 0,
+                "0": 0,
+                "normal": 1,
+                "1": 1,
+                "full": 2,
+                "2": 2,
+                "extra": 3,
+                "3": 3,
+            }
+            if synchronous_levels.get(value, -1) < 1:
+                raise _sqlite_pragma_compatibility_error()
+        if name == "busy_timeout":
+            try:
+                busy_timeout_ms = int(value)
+            except ValueError as exc:
+                raise _sqlite_pragma_compatibility_error() from exc
+            if busy_timeout_ms < _MIN_BUSY_TIMEOUT_MS:
+                raise _sqlite_pragma_compatibility_error()
+
+
+def _assert_required_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    """Verify the pinned backend actually established FactLane's required pragmas."""
+    journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    synchronous = int(conn.execute("PRAGMA synchronous").fetchone()[0])
+    busy_timeout_ms = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+    if journal_mode != "wal" or synchronous < 1 or busy_timeout_ms < _MIN_BUSY_TIMEOUT_MS:
+        raise _sqlite_pragma_compatibility_error()
+
+
+def _validate_current_authority_metadata(record: dict[str, Any]) -> None:
+    """Fail closed if a direct storage caller fabricates current authority."""
+    if record.get("lifecycle_state") != "VALIDATED_CURRENT":
+        return
+    scope = validate_scope(
+        record.get("scope"),
+        record.get("project_id"),
+        record.get("worktree_id"),
+        record.get("workflow_id"),
+        record.get("agent_id"),
+    )
+    expected_authority = _CURRENT_AUTHORITY_BY_SCOPE[scope.scope]
+    if record.get("authority_role") != expected_authority:
+        raise AdapterError(
+            "INVALID_ENVELOPE",
+            "validated current authority_role does not match exact scope",
+        )
+    if record.get("verified_by") not in _CURRENT_VERIFICATIONS:
+        raise AdapterError(
+            "INVALID_ENVELOPE",
+            "validated current requires an admissible verification basis",
+        )
+    parse_iso(record.get("source_timestamp"), required=True)
+    parse_iso(record.get("last_verified_at"), required=True)
+
+
+def _validate_current_contradiction_state(record: dict[str, Any]) -> None:
+    """Fail closed on impossible validated-current contradiction state."""
+    if record.get("lifecycle_state") != "VALIDATED_CURRENT":
+        return
+    if record.get("contradiction_state") not in {"NONE", "RESOLVED"}:
+        raise AdapterError(
+            "INVALID_ENVELOPE",
+            "validated current contradiction_state must be NONE or RESOLVED",
+        )
+
+
+def _validate_cross_project_storage_semantics(record: dict[str, Any]) -> None:
+    """Keep direct storage admission aligned with CROSS_PROJECT_WORKFLOW semantics."""
+    if record.get("scope") != "CROSS_PROJECT_WORKFLOW":
+        return
+    if record.get("memory_type") not in _CROSS_PROJECT_MEMORY_TYPES:
+        raise AdapterError("SCOPE_TYPE_MISMATCH", "memory_type is incompatible with CROSS_PROJECT_WORKFLOW")
+
+    provenance = record.get("source_provenance")
+    if isinstance(provenance, dict) and "source_fingerprint" in provenance:
+        raise AdapterError(
+            "SCOPE_FRESHNESS_MISMATCH",
+            "CROSS_PROJECT_WORKFLOW uses freshness_policy.source_fingerprint as the sole fingerprint authority",
+        )
+    freshness = validate_freshness(record.get("freshness_policy"))
+    kind = freshness["kind"]
+    if kind not in {"on_change", "manual"}:
+        raise AdapterError("INVALID_FRESHNESS", "CROSS_PROJECT_WORKFLOW freshness must be on_change or manual")
+    if kind == "on_change":
+        recheck_ref = freshness.get("recheck_ref")
+        fingerprint = freshness.get("source_fingerprint")
+        source_hash = provenance.get("source_hash") if isinstance(provenance, dict) else None
+        if not isinstance(recheck_ref, str) or not recheck_ref.strip() or fingerprint != source_hash:
+            raise AdapterError(
+                "INVALID_FRESHNESS",
+                "on_change freshness_policy requires a recheck_ref and source_fingerprint matching source_provenance.source_hash",
+            )
+    elif freshness.get("recheck_ref") is not None or freshness.get("source_fingerprint") is not None:
+        raise AdapterError(
+            "INVALID_FRESHNESS",
+            "manual CROSS_PROJECT_WORKFLOW freshness cannot carry recheck_ref or source_fingerprint",
+        )
+
+
+class _MaintenanceCapability:
+    __slots__ = ("db_path", "db_identity", "handle", "active", "_secret")
+
+    def __init__(self, db_path: str, handle: Any, secret: object) -> None:
+        self.db_path = os.path.realpath(os.path.abspath(db_path))
+        stat = os.fstat(handle.fileno())
+        self.db_identity = (int(stat.st_dev), int(stat.st_ino))
+        self.handle = handle
+        self.active = True
+        self._secret = secret
+
+
+def _make_maintenance_capability(db_path: str, handle: Any) -> _MaintenanceCapability:
+    """Create the internal capability proving recovery still owns its lease handle."""
+    return _MaintenanceCapability(db_path, handle, _MAINTENANCE_CAPABILITY_SECRET)
+
+
+def _validate_maintenance_capability(db_path: str, capability: _MaintenanceCapability) -> None:
+    canonical = os.path.realpath(os.path.abspath(db_path))
+    if (
+        not isinstance(capability, _MaintenanceCapability)
+        or capability._secret is not _MAINTENANCE_CAPABILITY_SECRET
+        or not capability.active
+        or capability.handle is None
+        or capability.handle.closed
+    ):
+        raise AdapterError(
+            "WRITE_AUTHORIZATION_DENIED",
+            "maintenance engine requires an active recovery lease for the exact database",
+        )
+    try:
+        path_stat = os.stat(canonical)
+        path_identity = (int(path_stat.st_dev), int(path_stat.st_ino))
+        handle_stat = os.fstat(capability.handle.fileno())
+        handle_identity = (int(handle_stat.st_dev), int(handle_stat.st_ino))
+    except (OSError, ValueError):
+        path_identity = None
+        handle_identity = None
+    if (
+        capability.db_path != canonical
+        or capability.db_identity != path_identity
+        or capability.db_identity != handle_identity
+    ):
+        raise AdapterError(
+            "WRITE_AUTHORIZATION_DENIED",
+            "maintenance engine requires an active recovery lease for the exact database",
+        )
+
+
+def _same_inode(path: str, handle: Any) -> bool:
+    try:
+        path_stat = os.stat(path)
+        handle_stat = os.fstat(handle.fileno())
+    except OSError:
+        return False
+    return (int(path_stat.st_dev), int(path_stat.st_ino)) == (
+        int(handle_stat.st_dev),
+        int(handle_stat.st_ino),
+    )
+
+
+def _open_database_lease_handle(db_path: str, *, create: bool) -> tuple[Any, bool]:
+    """Open the database inode itself as the maintenance coordination object."""
+    canonical = os.path.realpath(os.path.abspath(db_path))
+    parent = os.path.dirname(canonical)
+    if create:
+        os.makedirs(parent, exist_ok=True)
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    created = False
+    fd: int | None = None
+    try:
+        if create:
+            try:
+                fd = os.open(canonical, flags | os.O_CREAT | os.O_EXCL, 0o600)
+                created = True
+            except FileExistsError:
+                fd = os.open(canonical, flags)
+        else:
+            fd = os.open(canonical, flags)
+        try:
+            return os.fdopen(fd, "r+b", buffering=0), created
+        except BaseException:
+            os.close(fd)
+            raise
+    except OSError:
+        raise
+
+
+def _cleanup_new_lease_anchor(db_path: str, handle: Any, *, created: bool) -> None:
+    if not created:
+        return
+    canonical = os.path.realpath(os.path.abspath(db_path))
+    try:
+        if _same_inode(canonical, handle) and os.fstat(handle.fileno()).st_size == 0:
+            os.unlink(canonical)
+    except OSError:
+        pass
+
+
+def _acquire_runtime_maintenance_lease(db_path: str) -> Any:
+    """Hold a shared lease while a normal runtime engine is attached to one DB."""
+    try:
+        import fcntl
+    except ImportError:
+        # Sensitive-memory recovery is POSIX-only today as well. Do not make the
+        # ordinary storage module unimportable on platforms without fcntl.
+        return None
+
+    try:
+        handle, created = _open_database_lease_handle(db_path, create=True)
+    except OSError as exc:
+        raise AdapterError(
+            "BACKEND_UNAVAILABLE",
+            "database maintenance coordination is unavailable",
+        ) from exc
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        _cleanup_new_lease_anchor(db_path, handle, created=created)
+        handle.close()
+        raise AdapterError(
+            "MAINTENANCE_IN_PROGRESS",
+            "database maintenance is in progress; retry after maintenance completes",
+        ) from exc
+    except OSError as exc:
+        _cleanup_new_lease_anchor(db_path, handle, created=created)
+        handle.close()
+        if exc.errno in {errno.EACCES, errno.EAGAIN}:
+            raise AdapterError(
+                "MAINTENANCE_IN_PROGRESS",
+                "database maintenance is in progress; retry after maintenance completes",
+            ) from exc
+        raise AdapterError(
+            "BACKEND_UNAVAILABLE",
+            "database maintenance coordination is unavailable",
+        ) from exc
+    if not _same_inode(db_path, handle):
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+        raise AdapterError(
+            "BACKEND_UNAVAILABLE",
+            "database path changed during maintenance coordination",
+        )
+    return handle
+
+
+def _release_runtime_maintenance_lease(handle: Any) -> None:
+    if handle is None:
+        return
+    try:
+        import fcntl
+    except ImportError:
+        handle.close()
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _assert_sensitive_recovery_interlock_clear(db_path: str) -> None:
+    """Block ordinary service while a committed sensitive recovery is incomplete."""
+    if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
+        return
+    conn: sqlite3.Connection | None = None
+    try:
+        ro_uri = "file:" + urllib.parse.quote(os.path.abspath(db_path), safe="/") + "?mode=ro"
+        conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0)
+        try:
+            row = conn.execute(
+                "SELECT value FROM adapter_meta WHERE key = ?",
+                (_SENSITIVE_RECOVERY_INTERLOCK_KEY,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return
+            raise AdapterError(
+                "BACKEND_UNAVAILABLE",
+                "database recovery interlock could not be checked",
+            ) from exc
+        if row is not None:
+            raise AdapterError(
+                "MAINTENANCE_IN_PROGRESS",
+                "sensitive-memory recovery is incomplete; operator reconciliation is required",
+            )
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 class RecordUniquenessConflict(RuntimeError):
@@ -33,6 +372,7 @@ class RecordUniquenessConflict(RuntimeError):
 def register_storage_v2_writer(conn: sqlite3.Connection) -> None:
     """Mark one trusted FactLane connection as an authorized storage-v2 writer."""
     conn.create_function(_WRITER_FUNCTION, 0, lambda: 1)
+    conn.create_function(_CASEFOLD_FUNCTION, 1, lambda value: str(value).casefold(), deterministic=True)
 
 
 def assert_supported_sqlite_runtime(version_info: tuple[int, int, int] | None = None) -> None:
@@ -86,39 +426,55 @@ class SQLiteVecEngine:
     """Small adapter-owned repository over the pinned SQLite-vec schema."""
 
     def __init__(self, db_path: str, profile: EmbeddingProfile) -> None:
-        self.db_path = os.path.abspath(db_path)
+        # Resolve aliases once so the lease and backend always open the same path.
+        self.db_path = os.path.realpath(os.path.abspath(db_path))
         self.profile = profile
         self.storage: Any = None
         self.conn: sqlite3.Connection | None = None
         self.native_columns: set[str] = set()
         self._closed = False
+        self._maintenance_lease_handle: Any = None
+        self._maintenance_capability: _MaintenanceCapability | None = None
+
+    @classmethod
+    def _for_maintenance(
+        cls,
+        db_path: str,
+        profile: EmbeddingProfile,
+        capability: _MaintenanceCapability,
+    ) -> "SQLiteVecEngine":
+        """Create the operator-owned engine used while recovery holds the exclusive lease."""
+        _validate_maintenance_capability(db_path, capability)
+        engine = cls(db_path, profile)
+        engine._maintenance_capability = capability
+        return engine
 
     async def open(self) -> None:
+        if self._closed:
+            raise AdapterError("BACKEND_UNAVAILABLE", "backend engine is already closed")
+        if self.storage is not None or self.conn is not None or self._maintenance_lease_handle is not None:
+            raise AdapterError("BACKEND_UNAVAILABLE", "backend engine is already open")
         if os.environ.get("MCP_EXTERNAL_EMBEDDING_URL", "").strip():
             raise AdapterError("ADMIN_OPERATION_DENIED", "external embedding providers are disabled")
+        _assert_required_sqlite_pragma_environment()
         assert_supported_sqlite_runtime()
-        os.environ["MCP_MEMORY_STORAGE_BACKEND"] = "sqlite_vec"
-        os.environ["MCP_MEMORY_USE_ONNX"] = "0"
-        os.environ["MCP_EXTERNAL_EMBEDDING_URL"] = ""
-        os.environ["MCP_SEMANTIC_DEDUP_ENABLED"] = "false"
-        os.environ["MCP_MEMORY_ALLOW_HASH_EMBEDDINGS"] = "0"
-        os.environ["MCP_HTTP_ENABLED"] = "false"
-        os.environ["MCP_SSE_MODE"] = "0"
-        os.environ["MCP_STREAMABLE_HTTP_MODE"] = "0"
-        os.environ["MCP_MDNS_ENABLED"] = "false"
-        os.environ["MCP_BACKUP_ENABLED"] = "false"
-        os.environ["MCP_CONSOLIDATION_ENABLED"] = "false"
-        os.environ["MCP_AUTO_EXTRACT_DEFAULT"] = "false"
-        os.environ["MCP_QUALITY_SYSTEM_ENABLED"] = "false"
-        os.environ["MCP_QUALITY_BOOST_ENABLED"] = "false"
-        os.environ["MCP_INSIGHT_CARDS_ENABLED"] = "false"
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        if self._maintenance_capability is None:
+            self._maintenance_lease_handle = _acquire_runtime_maintenance_lease(self.db_path)
+        else:
+            _validate_maintenance_capability(self.db_path, self._maintenance_capability)
         try:
+            if self._maintenance_capability is None:
+                _assert_sensitive_recovery_interlock_clear(self.db_path)
+            # Do not write MCP_* process environment here. The pinned backend
+            # caches environment-backed config at import time; FactLane binds
+            # the storage class and the behavior it uses explicitly below.
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             SqliteVecMemoryStorage = load_pinned_sqlite_vec_storage()
             storage = SqliteVecMemoryStorage(
                 self.db_path,
                 embedding_model=self.profile.base_model_identity,
             )
+            self.storage = storage
             # Native startup receives the profile dimension; adapter code binds
             # the real provider before any memory operation.
             storage.embedding_dimension = self.profile.output_dimension
@@ -133,10 +489,10 @@ class SQLiteVecEngine:
 
             bind_deferred_embedding_initializer(storage, defer_native_embedding)
             await storage.initialize(strict_dimension_check=True)
-            self.storage = storage
             self.conn = storage.conn
             if self.conn is None:
                 raise AdapterError("BACKEND_UNAVAILABLE", "SQLite-vec backend did not expose a connection")
+            _assert_required_sqlite_pragmas(self.conn)
             register_storage_v2_writer(self.conn)
             actual_dimension = await self._run(self._read_dimension)
             if actual_dimension != self.profile.output_dimension:
@@ -149,7 +505,11 @@ class SQLiteVecEngine:
                 raise AdapterError("SCHEMA_MISMATCH", "pinned backend schema is missing required columns")
             await self._run(self._create_adapter_schema)
             await self._run(self._check_profile)
+        except asyncio.CancelledError:
+            await self.close()
+            raise
         except AdapterError:
+            await self.close()
             raise
         except sqlite3.Error as exc:
             await self.close()
@@ -167,6 +527,13 @@ class SQLiteVecEngine:
         except sqlite3.OperationalError as exc:
             if "locked" in str(exc).lower() or "busy" in str(exc).lower():
                 raise AdapterError("BACKEND_BUSY", "backend remained busy after bounded retry") from exc
+            error_code = getattr(exc, "sqlite_errorcode", None)
+            base_error_code = error_code & 0xFF if isinstance(error_code, int) else None
+            if base_error_code == _SQLITE_FULL_CODE:
+                raise AdapterError(
+                    "BACKEND_UNAVAILABLE",
+                    "backend storage is temporarily unavailable",
+                ) from exc
             raise
 
     def _read_dimension(self) -> int | None:
@@ -460,10 +827,30 @@ class SQLiteVecEngine:
             now = time.time()
             self.conn.execute("BEGIN IMMEDIATE")
             try:
+                _validate_current_authority_metadata(record)
+                if supersede_record_id is None and (
+                    record.get("revision") != 1
+                    or record.get("parent_record_id") is not None
+                    or record.get("supersedes", []) != []
+                ):
+                    raise AdapterError(
+                        "INVALID_ENVELOPE",
+                        "initial storage record must have a root lineage shape",
+                    )
+                if supersede_record_id is None and record.get("lifecycle_state") != "VALIDATED_CURRENT":
+                    validate_scope(
+                        record.get("scope"),
+                        record.get("project_id"),
+                        record.get("worktree_id"),
+                        record.get("workflow_id"),
+                        record.get("agent_id"),
+                    )
                 superseded_native_hash: str | None = None
-                if supersede_record_id:
+                if supersede_record_id is not None:
                     old = self.conn.execute(
-                        "SELECT native_content_hash, lifecycle_state FROM adapter_records WHERE record_id = ?",
+                        "SELECT native_content_hash, lifecycle_state,scope,project_id,worktree_id,workflow_id,agent_id,"
+                        "memory_id,revision,contradiction_state "
+                        "FROM adapter_records WHERE record_id = ?",
                         (supersede_record_id,),
                     ).fetchone()
                     if not old or old[1] != "VALIDATED_CURRENT":
@@ -473,7 +860,55 @@ class SQLiteVecEngine:
                         )
                     if record.get("parent_record_id") != supersede_record_id:
                         raise AdapterError("VERSION_CONFLICT", "update lineage parent does not match expected revision")
+                    if (
+                        any(
+                            record.get(field) != old[index]
+                            for index, field in enumerate(
+                                ("scope", "project_id", "worktree_id", "workflow_id", "agent_id"),
+                                start=2,
+                            )
+                        )
+                        or record.get("lifecycle_state") != "VALIDATED_CURRENT"
+                    ):
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "update successor cannot change scope identity or leave validated-current lifecycle",
+                        )
+                    parent_memory_id = str(old[7])
+                    parent_revision = int(old[8])
+                    successor_memory_id = str(record["memory_id"])
+                    successor_revision = int(record["revision"])
+                    if successor_memory_id == parent_memory_id:
+                        valid_lineage_shape = successor_revision == parent_revision + 1
+                    else:
+                        valid_lineage_shape = (
+                            successor_revision == 1
+                            and record.get("supersedes") == [parent_memory_id]
+                        )
+                    if not valid_lineage_shape:
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "update successor has an invalid memory lineage shape",
+                        )
+                    if str(old[9]) not in {"NONE", "RESOLVED"}:
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "validated-current predecessor has an invalid contradiction state",
+                        )
                     superseded_native_hash = str(old[0])
+
+                _validate_cross_project_storage_semantics(record)
+
+                if supersede_record_id is None and record.get("lifecycle_state") not in {
+                    "CANDIDATE",
+                    "VALIDATED_CURRENT",
+                }:
+                    raise AdapterError(
+                        "INVALID_ENVELOPE",
+                        "initial storage record lifecycle must be CANDIDATE or VALIDATED_CURRENT",
+                    )
+
+                _validate_current_contradiction_state(record)
 
                 if record["lifecycle_state"] == "VALIDATED_CURRENT":
                     exact_scope = ScopeContext(record["scope"], record.get("project_id"), record.get("worktree_id"), record.get("workflow_id"), record.get("agent_id"))
@@ -482,7 +917,7 @@ class SQLiteVecEngine:
                     incoming_fact = " ".join(str(record["fact"]).casefold().split())
                     for current_row in current_rows:
                         current = self._row_to_dict(current_row)
-                        if supersede_record_id and current["record_id"] == supersede_record_id:
+                        if supersede_record_id is not None and current["record_id"] == supersede_record_id:
                             continue
                         if " ".join(str(current["fact"]).casefold().split()) != incoming_fact:
                             raise AdapterError("CONTRADICTION", "a different validated current fact already exists for this contradiction key")
@@ -567,7 +1002,7 @@ class SQLiteVecEngine:
                     "INSERT INTO memory_embeddings (rowid, content_embedding, store) VALUES (?, ?, ?)",
                     (rowid, serialize_float32(embedding), self.profile.profile_id),
                 )
-                if supersede_record_id:
+                if supersede_record_id is not None:
                     self.conn.execute(
                         "UPDATE adapter_records SET lifecycle_state='SUPERSEDED' WHERE record_id = ?",
                         (supersede_record_id,),
@@ -609,6 +1044,7 @@ class SQLiteVecEngine:
             assert self.conn is not None
             self.conn.execute("BEGIN IMMEDIATE")
             try:
+                _validate_current_authority_metadata(record)
                 parent_row = self.conn.execute(
                     self._select_sql(
                         f"WHERE a.memory_id=? AND a.record_id=? AND a.revision=? "
@@ -623,6 +1059,23 @@ class SQLiteVecEngine:
                     raise AdapterError("CONTRADICTION", "candidate has an unresolved contradiction and cannot be promoted")
                 if record.get("parent_record_id") != expected_record_id or record.get("revision") != expected_revision + 1:
                     raise AdapterError("VERSION_CONFLICT", "promotion successor does not match candidate lineage")
+                if (
+                    any(
+                        record.get(field) != parent[field]
+                        for field in ("scope", "project_id", "worktree_id", "workflow_id", "agent_id")
+                    )
+                    or record.get("memory_type") != parent["memory_type"]
+                    or record.get("fact") != parent["fact"]
+                    or record.get("contradiction_key") != parent["contradiction_key"]
+                    or record.get("lifecycle_state") != "VALIDATED_CURRENT"
+                ):
+                    raise AdapterError(
+                        "INVALID_ENVELOPE",
+                        "candidate REVERIFY successor cannot change logical or contradiction identity",
+                    )
+
+                _validate_cross_project_storage_semantics(record)
+                _validate_current_contradiction_state(record)
 
                 current_rows = self.conn.execute(
                     self._select_sql(
@@ -995,7 +1448,7 @@ class SQLiteVecEngine:
             assert self.conn is not None
             rows = self.conn.execute(
                 self._select_sql(
-                    f"WHERE lower(a.fact) {operator} ? AND {where}{lifecycle} "
+                    f"WHERE {_CASEFOLD_FUNCTION}(a.fact) {operator} ? AND {where}{lifecycle} "
                     "ORDER BY a.created_at DESC, a.record_id LIMIT ?"
                 ),
                 [value, *params, limit],
@@ -1066,31 +1519,37 @@ class SQLiteVecEngine:
             for state, count in rows:
                 if state in counts:
                     counts[state] = int(count)
-            inventory = self.conn.execute(
-                f"SELECT lifecycle_state, native_content_hash FROM adapter_records a {suffix}",
-                params,
-            ).fetchall()
-            compaction_ready = 0
-            compaction_blocked_partial = 0
-            for lifecycle_state, content_hash in inventory:
-                if lifecycle_state != "SUPERSEDED":
-                    continue
-                native = self.conn.execute(
-                    "SELECT id, deleted_at FROM memories WHERE content_hash = ?",
-                    (content_hash,),
-                ).fetchone()
-                vector = (
-                    self.conn.execute(
-                        "SELECT 1 FROM memory_embeddings WHERE rowid = ? AND store = ?",
-                        (native[0], self.profile.profile_id),
-                    ).fetchone()
-                    if native is not None and native[1] is None
-                    else None
-                )
-                if vector is not None:
-                    compaction_ready += 1
-                else:
-                    compaction_blocked_partial += 1
+            superseded_suffix = (
+                f"WHERE {where} AND a.lifecycle_state = 'SUPERSEDED'"
+                if scope
+                else "WHERE a.lifecycle_state = 'SUPERSEDED'"
+            )
+            superseded_total, compaction_ready = self.conn.execute(
+                f"""
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(
+                        CASE WHEN EXISTS (
+                            SELECT 1
+                            FROM memories m
+                            WHERE m.content_hash = a.native_content_hash
+                              AND m.deleted_at IS NULL
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM memory_embeddings e
+                                  WHERE e.rowid = m.id
+                                    AND e.store = ?
+                              )
+                        ) THEN 1 ELSE 0 END
+                    ), 0)
+                FROM adapter_records a
+                {superseded_suffix}
+                """,
+                [self.profile.profile_id, *params],
+            ).fetchone()
+            superseded_total = int(superseded_total)
+            compaction_ready = int(compaction_ready)
+            compaction_blocked_partial = superseded_total - compaction_ready
 
             def file_size(path: str) -> int | None:
                 try:
@@ -1162,11 +1621,20 @@ class SQLiteVecEngine:
     async def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         if self.storage is not None:
             try:
                 await self.storage.close()
-            except Exception:
-                pass
+            except asyncio.CancelledError:
+                # The backend may still own SQLite handles. Keep the shared lease.
+                raise
+            except Exception as exc:
+                # Never make recovery eligible while backend handle closure is uncertain.
+                raise AdapterError(
+                    "BACKEND_UNAVAILABLE",
+                    "backend could not be closed cleanly; maintenance exclusion remains active",
+                ) from exc
         self.conn = None
         self.storage = None
+        _release_runtime_maintenance_lease(self._maintenance_lease_handle)
+        self._maintenance_lease_handle = None
+        self._closed = True

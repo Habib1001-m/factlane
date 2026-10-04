@@ -13,7 +13,16 @@ from typing import Any, Callable, Iterable
 
 from .contract import PUBLIC_TOOL_NAMES, AdapterError, canonical_json
 from .embeddings import EmbeddingProfile
-from .storage import SQLiteVecEngine, assert_supported_sqlite_runtime, register_storage_v2_writer
+from .storage import (
+    SQLiteVecEngine,
+    _MaintenanceCapability,
+    _SENSITIVE_RECOVERY_INTERLOCK_KEY,
+    _make_maintenance_capability,
+    _open_database_lease_handle,
+    _same_inode,
+    assert_supported_sqlite_runtime,
+    register_storage_v2_writer,
+)
 
 
 _SAFE_OPERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -28,6 +37,7 @@ _RECOVERY_SENTINEL = "[purged-sensitive-memory]"
 _LOGICAL_PURGE_IN_PROGRESS = "S1_LOGICAL_PURGE_IN_PROGRESS"
 _SEALING_INCOMPLETE = "S1_LOGICAL_PURGE_COMMITTED_SEALING_INCOMPLETE"
 _LOCAL_PURGE_VERIFIED = "S1_LOCAL_FACTLANE_PURGE_VERIFIED"
+_RETAINED_MAINTENANCE_EXCLUSIONS: dict[str, list[Any]] = {}
 _STATE_PHASE_RANK = {
     "PREPARED_NO_MUTATION": 0,
     _LOGICAL_PURGE_IN_PROGRESS: 1,
@@ -159,7 +169,7 @@ def _safe_digest(*parts: str) -> str:
 
 
 def _db_identity(db_path: str) -> str:
-    return _safe_digest("factlane-db-path", os.path.abspath(db_path))
+    return _safe_digest("factlane-db-path", os.path.realpath(os.path.abspath(db_path)))
 
 
 def _profile_projection(profile: EmbeddingProfile) -> dict[str, Any]:
@@ -208,32 +218,108 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 class MaintenanceLease:
     def __init__(self, db_path: str, operation_id: str) -> None:
-        self.path = Path(os.path.abspath(db_path) + ".recovery.lock")
+        self.db_path = os.path.realpath(os.path.abspath(db_path))
         self.operation_id = operation_id
         self._handle: Any = None
+        self._retired_handles: list[Any] = []
+        self._retain_fail_closed = False
+        self.capability: _MaintenanceCapability | None = None
 
     def __enter__(self) -> "MaintenanceLease":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(self.path, "a+", encoding="utf-8")
-        os.chmod(self.path, 0o600)
+        try:
+            handle, _ = _open_database_lease_handle(self.db_path, create=False)
+        except FileNotFoundError as exc:
+            raise RecoveryHold("HOLD_DB_NOT_FOUND_NO_MUTATION", "target database was not found") from exc
+        except OSError as exc:
+            raise RecoveryHold(
+                "HOLD_NONQUIESCENT_NO_MUTATION",
+                "database inode could not be opened for exclusive recovery",
+            ) from exc
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             handle.close()
             raise RecoveryHold("HOLD_NONQUIESCENT_NO_MUTATION", "exclusive recovery maintenance lease is unavailable") from exc
-        handle.seek(0); handle.truncate()
-        handle.write(f"operation_id={self.operation_id}\npid={os.getpid()}\n")
-        handle.flush(); os.fsync(handle.fileno())
+        if not _same_inode(self.db_path, handle):
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+            raise RecoveryHold(
+                "HOLD_NONQUIESCENT_NO_MUTATION",
+                "database path changed while acquiring recovery exclusion",
+            )
         self._handle = handle
+        self.capability = _make_maintenance_capability(self.db_path, handle)
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if self._handle is None:
-            return
+    def promote_sanitized_image(self, sanitized: Path) -> None:
+        """Lock the replacement inode before promotion and retain the old inode lock."""
         try:
-            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            self._handle.close(); self._handle = None
+            replacement, _ = _open_database_lease_handle(str(sanitized), create=False)
+        except OSError as exc:
+            raise RecoveryHold(_SEALING_INCOMPLETE, "sanitized image could not be locked for promotion") from exc
+        try:
+            fcntl.flock(replacement.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            replacement.close()
+            raise RecoveryHold(_SEALING_INCOMPLETE, "sanitized image exclusive lease is unavailable") from exc
+
+        if not _same_inode(str(sanitized), replacement):
+            try:
+                fcntl.flock(replacement.fileno(), fcntl.LOCK_UN)
+            finally:
+                replacement.close()
+            raise RecoveryHold(_SEALING_INCOMPLETE, "sanitized image path changed before promotion")
+
+        try:
+            os.replace(sanitized, self.db_path)
+        except BaseException:
+            try:
+                fcntl.flock(replacement.fileno(), fcntl.LOCK_UN)
+            finally:
+                replacement.close()
+            raise
+
+        previous = self._handle
+        if previous is not None:
+            self._retired_handles.append(previous)
+        if self.capability is not None:
+            self.capability.active = False
+        self._handle = replacement
+        if not _same_inode(self.db_path, replacement):
+            self.retain_fail_closed()
+            raise RecoveryHold(_SEALING_INCOMPLETE, "promoted database inode identity changed unexpectedly")
+        self.capability = _make_maintenance_capability(self.db_path, replacement)
+
+    def retain_fail_closed(self) -> None:
+        """Retain every EX inode lease when DB-handle cleanup is uncertain."""
+        if self._handle is not None:
+            self._retain_fail_closed = True
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        handles = [*self._retired_handles]
+        if self._handle is not None:
+            handles.append(self._handle)
+        if self.capability is not None:
+            self.capability.active = False
+        if not handles:
+            self.capability = None
+            return
+        if self._retain_fail_closed:
+            _RETAINED_MAINTENANCE_EXCLUSIONS.setdefault(self.db_path, []).extend(handles)
+            self._retired_handles = []
+            self._handle = None
+            self.capability = None
+            return
+        for handle in reversed(handles):
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+        self._retired_handles = []
+        self._handle = None
+        self.capability = None
 
 
 def linux_foreign_db_handles(db_path: str) -> list[dict[str, Any]]:
@@ -289,7 +375,7 @@ class SensitiveMemoryRecoveryOperator:
         receipt_path: str,
         state_path: str | None = None,
     ) -> RecoveryResult:
-        db_path = os.path.abspath(plan.db_path)
+        db_path = os.path.realpath(os.path.abspath(plan.db_path))
         receipt = Path(receipt_path).absolute()
         state = Path(state_path).absolute() if state_path else receipt.with_suffix(receipt.suffix + ".state.json")
         if os.path.realpath(receipt) == os.path.realpath(db_path) or os.path.realpath(state) == os.path.realpath(db_path):
@@ -301,7 +387,7 @@ class SensitiveMemoryRecoveryOperator:
                 "HOLD_SQLITE_RUNTIME_UNSUPPORTED_NO_MUTATION",
                 exc.safe_message,
             ) from exc
-        with MaintenanceLease(db_path, plan.operation_id):
+        with MaintenanceLease(db_path, plan.operation_id) as maintenance_lease:
             self._require_quiescent(db_path)
             persisted = self._read_state(state, plan)
             if persisted is None:
@@ -314,6 +400,7 @@ class SensitiveMemoryRecoveryOperator:
             inspections: list[TargetInspection] = []
             try:
                 self._preflight_database(conn, plan)
+                self._validate_recovery_interlock(conn, plan, persisted_phase)
                 inspections = self._inspect_targets(conn, plan)
                 if all(item.already_purged for item in inspections):
                     if persisted_phase not in {
@@ -325,6 +412,7 @@ class SensitiveMemoryRecoveryOperator:
                             "HOLD_RECOVERY_STATE_MISMATCH",
                             "purged targets are not backed by resumable persisted recovery state",
                         )
+                    self._ensure_recovery_interlock(conn, plan)
                     logical_committed = True
                     if persisted_phase == _LOGICAL_PURGE_IN_PROGRESS:
                         self._write_state(state, plan, _SEALING_INCOMPLETE)
@@ -343,9 +431,15 @@ class SensitiveMemoryRecoveryOperator:
                 survivor_snapshot = self._snapshot_survivors(conn, plan)
                 self._write_state(state, plan, _SEALING_INCOMPLETE)
                 self._require_quiescent(db_path)
-                self._seal_and_promote(conn, plan, survivor_snapshot)
+                self._seal_and_promote(conn, plan, survivor_snapshot, maintenance_lease)
                 conn = None
-                await self._real_engine_postflight(plan, survivor_snapshot)
+                assert maintenance_lease.capability is not None
+                await self._real_engine_postflight(
+                    plan,
+                    survivor_snapshot,
+                    maintenance_lease,
+                )
+                self._clear_recovery_interlock(db_path, plan)
                 self._write_state(state, plan, _LOCAL_PURGE_VERIFIED)
                 _atomic_json(receipt, self._receipt(plan, inspections))
                 return RecoveryResult(plan.operation_id, _LOCAL_PURGE_VERIFIED, True, True, str(receipt), str(state), len(plan.targets))
@@ -441,6 +535,72 @@ class SensitiveMemoryRecoveryOperator:
             "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
             (name,),
         ).fetchone() is not None
+
+    @staticmethod
+    def _recovery_interlock_operation(conn: sqlite3.Connection) -> str | None:
+        if not SensitiveMemoryRecoveryOperator._table_exists(conn, "adapter_meta"):
+            return None
+        row = conn.execute(
+            "SELECT value FROM adapter_meta WHERE key = ?",
+            (_SENSITIVE_RECOVERY_INTERLOCK_KEY,),
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    @classmethod
+    def _validate_recovery_interlock(
+        cls,
+        conn: sqlite3.Connection,
+        plan: RecoveryPlan,
+        persisted_phase: str,
+    ) -> None:
+        operation_id = cls._recovery_interlock_operation(conn)
+        if operation_id is None:
+            return
+        if operation_id != plan.operation_id or persisted_phase not in {
+            _LOGICAL_PURGE_IN_PROGRESS,
+            _SEALING_INCOMPLETE,
+        }:
+            raise RecoveryHold(
+                "HOLD_RECOVERY_STATE_MISMATCH",
+                "database recovery interlock does not match the persisted recovery state",
+            )
+
+    @classmethod
+    def _ensure_recovery_interlock(cls, conn: sqlite3.Connection, plan: RecoveryPlan) -> None:
+        operation_id = cls._recovery_interlock_operation(conn)
+        if operation_id is not None and operation_id != plan.operation_id:
+            raise RecoveryHold(
+                "HOLD_RECOVERY_STATE_MISMATCH",
+                "database recovery interlock belongs to a different recovery operation",
+            )
+        conn.execute(
+            "INSERT INTO adapter_meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_SENSITIVE_RECOVERY_INTERLOCK_KEY, plan.operation_id),
+        )
+
+    @classmethod
+    def _clear_recovery_interlock(cls, db_path: str, plan: RecoveryPlan) -> None:
+        conn = cls._open_maintenance_connection(db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            operation_id = cls._recovery_interlock_operation(conn)
+            if operation_id != plan.operation_id:
+                raise RecoveryHold(
+                    _SEALING_INCOMPLETE,
+                    "database recovery interlock changed before recovery completion",
+                )
+            conn.execute(
+                "DELETE FROM adapter_meta WHERE key = ? AND value = ?",
+                (_SENSITIVE_RECOVERY_INTERLOCK_KEY, plan.operation_id),
+            )
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     @staticmethod
     def _require_known_recovery_schema(conn: sqlite3.Connection) -> None:
@@ -781,6 +941,7 @@ class SensitiveMemoryRecoveryOperator:
                 "INSERT INTO memory_content_fts(memory_content_fts, rank) VALUES('integrity-check', 1)"
             )
             self._verify_logical_absence(conn, current)
+            self._ensure_recovery_interlock(conn, plan)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -898,9 +1059,13 @@ class SensitiveMemoryRecoveryOperator:
             )
 
     def _seal_and_promote(
-        self, conn: sqlite3.Connection, plan: RecoveryPlan, survivor_snapshot: SurvivorSnapshot
+        self,
+        conn: sqlite3.Connection,
+        plan: RecoveryPlan,
+        survivor_snapshot: SurvivorSnapshot,
+        maintenance_lease: MaintenanceLease,
     ) -> None:
-        db_path = os.path.abspath(plan.db_path)
+        db_path = maintenance_lease.db_path
         checkpoint1 = tuple(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
         if checkpoint1 != (0, 0, 0):
             raise RecoveryHold(_SEALING_INCOMPLETE, "first post-commit checkpoint did not complete")
@@ -920,7 +1085,7 @@ class SensitiveMemoryRecoveryOperator:
                 raise RecoveryHold(_SEALING_INCOMPLETE, "non-empty WAL/SHM remained after successful sealing checkpoint")
             if sidecar.exists():
                 sidecar.unlink()
-        os.replace(sanitized, db_path)
+        maintenance_lease.promote_sanitized_image(sanitized)
 
     @staticmethod
     def _verify_db_health_and_fts(conn: sqlite3.Connection) -> None:
@@ -979,10 +1144,26 @@ class SensitiveMemoryRecoveryOperator:
             verify.close()
 
     async def _real_engine_postflight(
-        self, plan: RecoveryPlan, survivor_snapshot: SurvivorSnapshot
+        self,
+        plan: RecoveryPlan,
+        survivor_snapshot: SurvivorSnapshot,
+        maintenance_lease: MaintenanceLease,
     ) -> None:
-        engine = SQLiteVecEngine(os.path.abspath(plan.db_path), plan.profile)
-        await engine.open()
+        maintenance_capability = maintenance_lease.capability
+        if maintenance_capability is None:
+            raise RecoveryHold(_SEALING_INCOMPLETE, "maintenance lease capability is unavailable")
+        engine = SQLiteVecEngine._for_maintenance(
+            maintenance_lease.db_path,
+            plan.profile,
+            maintenance_capability,
+        )
+        try:
+            await engine.open()
+        except BaseException:
+            # Post-promotion startup failure can leave partially opened SQLite
+            # state behind. Keep the database exclusion fail-closed until exit.
+            maintenance_lease.retain_fail_closed()
+            raise
         try:
             if engine.conn is None:
                 raise RecoveryHold(_SEALING_INCOMPLETE, "real engine did not reopen")
@@ -999,7 +1180,11 @@ class SensitiveMemoryRecoveryOperator:
                 if row is None or not self._is_same_operation_tombstone(row, plan, target):
                     raise RecoveryHold(_SEALING_INCOMPLETE, "real-engine tombstone verification failed")
         finally:
-            await engine.close()
+            try:
+                await engine.close()
+            except BaseException:
+                maintenance_lease.retain_fail_closed()
+                raise
 
     @staticmethod
     def _receipt(plan: RecoveryPlan, inspections: list[TargetInspection]) -> dict[str, Any]:

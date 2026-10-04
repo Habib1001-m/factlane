@@ -166,6 +166,16 @@ conflicting explicit ID with `BOUND_CONTEXT_IDENTITY_MISMATCH`. `CROSS_PROJECT_W
 different: it forbids the presence of *all* project, worktree, workflow, and agent identity
 keys and does not query all projects automatically.
 
+For `CURRENT` semantic or hybrid search, FactLane selects across distinct validated stored
+provenance sources before filling repeated-source slots. The highest-ranked eligible result
+is preserved, returned relevance scores are not rewritten, and exact, keyword-only, and
+`REVIEW_HISTORY` retrieval keep their existing ordering semantics.
+
+Governed FactLane failures use the same MCP result channel as successful calls and return
+`status=BLOCKED` with a stable `error_code`, a safe `message`, empty `results`, and
+`audit.retryable`. Branch on `error_code`; do not scrape exception prose. Unexpected internal
+exceptions are still transport errors rather than governed FactLane results.
+
 If search returns no result, do not treat that as permission to invent a fact. To contribute
 an actual Candidate, consult `factlane --help-tools` or the live MCP schema for the complete
 required `source_provenance`, `freshness_policy`, `memory_type`, and `idempotency_key`
@@ -174,7 +184,9 @@ fields. Use one bounded, attributable fact, not a transcript or an arbitrary dir
 A trusted verifier reviewing a Candidate uses `REVIEW_HISTORY` to inspect it and
 `memory_update` with `mode=REVERIFY`, `expected_revision`, and the Candidate's
 `expected_record_id` to promote it. A delegated agent has no verifier grant, even with user
-approval in chat.
+approval in chat. `REVERIFY` refreshes verification without changing the memory's
+contradiction identity; use `REPLACE` rather than changing `memory_type` or subject when a
+semantic reclassification is intended.
 
 ## Limits and next references
 
@@ -182,6 +194,12 @@ Facts are limited to 2,000 UTF-8 bytes. FactLane is not a raw-corpus indexer, ba
 service, or remote embedding gateway. Reproduction on this example profile does not
 establish language quality or production-scale throughput for your data. Sensitive-memory
 recovery is a separate, operator-authorized procedure, **not** a public MCP tool.
+Normal runtime engines and that recovery operator coordinate through shared/exclusive locks on
+the database inodes themselves. Recovery locks both the old and replacement database inodes
+through promotion/postflight, so a normal runtime starting during recovery returns
+`MAINTENANCE_IN_PROGRESS` instead of attaching through the final promotion window. If the logical
+purge has committed but sealing is still incomplete, a durable interlock stored in the database
+continues returning `MAINTENANCE_IN_PROGRESS` across process restart until verified recovery clears it.
 
 See the [README](../README.md) for product orientation, [Architecture](ARCHITECTURE.md) for
 exact data flow, [Environment](ENVIRONMENT.md) for runtime and profiles, and

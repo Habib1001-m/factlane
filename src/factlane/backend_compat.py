@@ -90,6 +90,8 @@ def load_pinned_sqlite_vec_storage() -> type[Any]:
     assert_pinned_backend_identity()
     try:
         from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
+    except SystemExit as exc:
+        raise _compatibility_error("pinned backend configuration terminated during import") from exc
     except Exception as exc:
         raise _compatibility_error("pinned backend SQLite storage class is unavailable") from exc
     assert_backend_class_contract(SqliteVecMemoryStorage)

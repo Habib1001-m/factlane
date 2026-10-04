@@ -21,6 +21,10 @@ truth, and verified live sources outrank remembered facts.
 
 This Skill targets **Public Contract Revision 2**.
 
+Governed failures return `status=BLOCKED` with a stable `error_code`, safe `message`, and
+`audit.retryable`; branch on the code instead of scraping exception prose. Unexpected internal
+exceptions remain transport errors.
+
 ## Read within one exact scope
 
 Select one scope before searching. `PROJECT` requires an exact `project_id`; `WORKFLOW`

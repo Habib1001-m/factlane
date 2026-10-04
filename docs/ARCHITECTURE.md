@@ -23,6 +23,12 @@ freshness, permissions, contradiction handling, retrieval budgets, and revision 
 `TruthRouter` selects bounded search behavior inside the adapter. The backend supplies
 SQLite connections and SQLite-vec primitives, not FactLane's authorization decisions.
 
+The public server boundary converts governed `AdapterError` failures into the ordinary MCP
+result shape with `status=BLOCKED`, stable `error_code`, safe `message`, empty `results`, and
+trusted audit metadata. This conversion exists only at the public server boundary; direct
+gateway/adapter callers still receive `AdapterError`, and unexpected exceptions remain MCP
+transport errors rather than being relabeled as governed outcomes.
+
 The server supports **local stdio only**. Codex and Hermes are tested host integrations, but
 the dispatch path is not specific to either. Another client that supports command-launched
 stdio MCP may use the same executable; it is not automatically a separately qualified host.
@@ -58,7 +64,9 @@ Promotion is a distinct `memory_update` operation: a trusted verifier uses `REVE
 expected revision, and the exact Candidate `expected_record_id`. Storage contract v2 keeps
 `contribution_origin` separate from verification and preserves it on promotion. The verifier
 is recorded separately; an older record is not silently rewritten as if it had been
-contributed by the verifier.
+contributed by the verifier. `REVERIFY` also preserves contradiction identity: the fact,
+scope, memory type, and subject remain the same logical memory. Identity-bearing assertions
+must match the existing record; semantic reclassification uses `REPLACE`.
 
 Revision changes use transaction-local compare-and-swap. A stale independent writer receives
 `VERSION_CONFLICT`. For a Candidate promotion, exact scope, logical memory, parent record,
@@ -69,7 +77,10 @@ idempotency key from a more privileged request is not an authorization token.
 Storage contract v2 also blocks stale legacy writers from inserting, updating, or deleting
 adapter records through an untrusted raw SQLite connection. The trusted maintenance path has
 a separate authorization boundary; it does not make arbitrary direct SQL writes part of the
-public API.
+public API. Because writer authorization is a connection-local SQLite function, an unregistered
+raw connection is rejected at function resolution with `no such function:
+factlane_contract_v2_writer`; the persistent trigger's own RAISE text is not reached on that
+connection, but the mutation remains fail-closed.
 
 ## Retrieval and history
 
@@ -78,6 +89,15 @@ For keyword search, the lifecycle filter precedes SQL limits. For semantic searc
 sqlite-vec KNN constrains eligible row IDs **inside the vector query before `k` **.
 Otherwise, many closer unverified Candidates could fill the top results and conceal a
 farther validated fact.
+
+After CURRENT semantic/hybrid candidates pass lifecycle and freshness checks, the adapter
+selects the highest-ranked candidate from distinct stored provenance sources before filling
+remaining slots with repeated-source candidates. This reduces same-document crowding without
+changing stored scores: the top eligible result is preserved, and the selected set is emitted
+in its original relevance order. After the top result, an unseen source can therefore occupy a
+slot ahead of a higher-scored repeat from the same source; this is the deliberate diversity
+tradeoff rather than a score rewrite. Exact, keyword-only, and `REVIEW_HISTORY` retrieval
+bypass this diversity step.
 
 `REVIEW_HISTORY` exposes past revisions and Candidates for explicit inspection. Atomic
 compaction can retain a historical record without its original vector. If semantic or hybrid
@@ -116,13 +136,43 @@ Sensitive-memory incident recovery lives in a **trusted local operator**, outsid
 `MemoryGateway` and the five MCP tools. It requires explicit authorization, exact
 target/database binding, maintenance quiescence, known schema and propagation, supported
 SQLite and verified FTS5 capabilities. A pre-commit failure rolls back; post-commit sealing
-failure leaves normal service blocked until recovery completes. Local purge does not prove
+failure leaves a durable database-resident recovery interlock that blocks ordinary runtime
+startup across process restarts until verified recovery completes. Local purge does not prove
 erasure from external copies or physical media. See [Security](../SECURITY.md).
+
+Runtime/recovery exclusion is cooperative and process-independent on supported POSIX hosts:
+ordinary `SQLiteVecEngine` instances resolve their database path once, acquire a shared advisory
+`flock` on that database inode before backend initialization, and retain it until backend closure
+is proven. Recovery acquires the corresponding exclusive inode lock before its first quiescence
+check. During sealing it also locks the sanitized replacement inode **before** `os.replace()`,
+then retains both the retired old-inode lock and the promoted new-inode lock through the
+operator-owned postflight. Hard-link aliases therefore converge on the same kernel lock identity,
+and promotion never exposes an unlocked replacement inode. A new runtime attach during recovery
+receives `MAINTENANCE_IN_PROGRESS`. The operator's own postflight engine uses an internal,
+exact-inode capability derived from the still-live exclusive lease.
+
+If postflight cleanup cannot prove its SQLite handle closed, including task cancellation, recovery
+keeps all process-owned exclusive inode leases retained fail-closed instead of reopening normal
+service. Process exit releases those descriptors; the sealing-incomplete state still requires
+operator reconciliation.
+
+The exclusion guarantee is bounded to supported local POSIX filesystems with reliable `flock`
+semantics; it does not extend to Windows or unvalidated network/FUSE locking behavior. It is a
+cooperative FactLane-runtime boundary, not a defense against arbitrary raw filesystem replacement
+by a privileged external process, so the independent quiescence inventory/full-stop procedure is
+still part of recovery.
 
 ## Qualification boundary
 
-Controlled local/host evidence establishes behavior for the tested configurations. It does
-not establish support for every MCP client, production-scale ingestion, disaster recovery,
-or every language mix. Arabic/mixed-language retrieval specificity and document crowding
-still need workload-specific validation. FactLane is a fact store, not a transcript archive
-or raw document crawler.
+FactLane 0.1.3 is production-qualified for the documented local configuration: the packaged
+Python runtime, linked SQLite/SQLite-vec storage contract, stdio MCP surface, supported local
+embedding profile, and configured local host integrations. The qualification exercised
+backup/restore compatibility, bounded concurrent operation, crash/restart rollback,
+production-derived retrieval, and fail-closed SQLite capacity behavior.
+
+That evidence does not establish support for every MCP client, arbitrary filesystem,
+production-scale ingestion pattern, unlimited-duration load, or every language mix.
+Source-diverse CURRENT semantic/hybrid selection reduces one known document-crowding
+mechanism, but semantic relevance — including Arabic/mixed-language ranking — remains
+workload-specific. FactLane is a fact store, not a transcript archive or raw document
+crawler.

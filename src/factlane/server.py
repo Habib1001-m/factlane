@@ -8,7 +8,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .adapter import PROFILE_DEFINITIONS, MemoryAdapter, trusted_write_context_for_profile
-from .contract import AdapterError
+from .contract import AdapterError, validate_identifier
 from .gateway import HostBinding, MemoryGateway, TrustedContextBinding
 from .public_contract import (
     MemoryGetRequest,
@@ -21,6 +21,45 @@ from .public_contract import (
 )
 
 STDIO_TRANSPORT = "stdio"
+
+
+def _safe_error_request_id(request: object) -> str | None:
+    """Return only a bounded, non-sensitive caller correlation id for an error envelope."""
+    if not isinstance(request, dict):
+        return None
+    value = request.get("request_id")
+    if value is None:
+        return None
+    try:
+        return validate_identifier(value, "request_id", required=True)  # type: ignore[arg-type]
+    except AdapterError:
+        return None
+
+
+def _governed_error_envelope(
+    gateway: MemoryGateway,
+    exc: AdapterError,
+    request: object,
+) -> dict[str, Any]:
+    """Project one governed adapter error through the public MCP response envelope."""
+    envelope = exc.envelope(request_id=_safe_error_request_id(request))
+    binding = gateway.require_transport(STDIO_TRANSPORT)
+    envelope["audit"]["host_binding"] = binding.audit_projection()
+    if gateway.context_binding is not None:
+        envelope["audit"]["context_binding"] = gateway.context_binding.audit_projection()
+    return envelope
+
+
+async def _dispatch_public_tool(
+    gateway: MemoryGateway,
+    operation: str,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve internal exception semantics while structuring governed public errors."""
+    try:
+        return await gateway.dispatch(operation, request)
+    except AdapterError as exc:
+        return _governed_error_envelope(gateway, exc, request)
 
 
 class _BoundFastMCP(FastMCP):
@@ -58,23 +97,23 @@ def build_mcp_server(gateway: MemoryGateway) -> FastMCP:
 
     @server.tool(name="memory_search", description=TOOL_DESCRIPTIONS["memory_search"])
     async def memory_search(request: MemorySearchRequest) -> dict[str, Any]:
-        return await gateway.dispatch("memory_search", request)
+        return await _dispatch_public_tool(gateway, "memory_search", request)
 
     @server.tool(name="memory_get", description=TOOL_DESCRIPTIONS["memory_get"])
     async def memory_get(request: MemoryGetRequest) -> dict[str, Any]:
-        return await gateway.dispatch("memory_get", request)
+        return await _dispatch_public_tool(gateway, "memory_get", request)
 
     @server.tool(name="memory_store", description=TOOL_DESCRIPTIONS["memory_store"])
     async def memory_store(request: MemoryStoreRequest) -> dict[str, Any]:
-        return await gateway.dispatch("memory_store", request)
+        return await _dispatch_public_tool(gateway, "memory_store", request)
 
     @server.tool(name="memory_update", description=TOOL_DESCRIPTIONS["memory_update"])
     async def memory_update(request: MemoryUpdateRequest) -> dict[str, Any]:
-        return await gateway.dispatch("memory_update", request)
+        return await _dispatch_public_tool(gateway, "memory_update", request)
 
     @server.tool(name="memory_status", description=TOOL_DESCRIPTIONS["memory_status"])
     async def memory_status(request: MemoryStatusRequest) -> dict[str, Any]:
-        return await gateway.dispatch("memory_status", request)
+        return await _dispatch_public_tool(gateway, "memory_status", request)
 
     return server
 
