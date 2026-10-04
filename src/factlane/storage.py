@@ -43,6 +43,7 @@ _CURRENT_AUTHORITY_BY_SCOPE = {
 _CURRENT_VERIFICATIONS = frozenset({"OWNER", "CURRENT_REPO_CHECK", "AUTOMATED_CHECK"})
 _CROSS_PROJECT_MEMORY_TYPES = frozenset({"WORKFLOW_RULE", "DECISION_RATIONALE"})
 _MIN_BUSY_TIMEOUT_MS = 5000
+_SQLITE_FULL_CODE = getattr(sqlite3, "SQLITE_FULL", 13)
 
 
 def _sqlite_pragma_compatibility_error() -> AdapterError:
@@ -526,6 +527,13 @@ class SQLiteVecEngine:
         except sqlite3.OperationalError as exc:
             if "locked" in str(exc).lower() or "busy" in str(exc).lower():
                 raise AdapterError("BACKEND_BUSY", "backend remained busy after bounded retry") from exc
+            error_code = getattr(exc, "sqlite_errorcode", None)
+            base_error_code = error_code & 0xFF if isinstance(error_code, int) else None
+            if base_error_code == _SQLITE_FULL_CODE:
+                raise AdapterError(
+                    "BACKEND_UNAVAILABLE",
+                    "backend storage is temporarily unavailable",
+                ) from exc
             raise
 
     def _read_dimension(self) -> int | None:

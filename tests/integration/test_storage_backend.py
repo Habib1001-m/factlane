@@ -382,6 +382,28 @@ def test_failed_open_preserves_backend_environment(tmp_path, monkeypatch) -> Non
     assert {key: os.environ.get(key) for key in _FACTLANE_BACKEND_ENV_KEYS} == before
 
 
+def test_runtime_sqlite_full_is_governed_as_backend_unavailable(tmp_path, monkeypatch) -> None:
+    async def raise_sqlite_full(storage, operation):
+        del storage, operation
+        exc = sqlite3.OperationalError("database or disk is full")
+        exc.sqlite_errorcode = sqlite3.SQLITE_FULL
+        exc.sqlite_errorname = "SQLITE_FULL"
+        raise exc
+
+    monkeypatch.setattr(storage_module, "execute_with_backend_retry", raise_sqlite_full)
+    engine = SQLiteVecEngine(str(tmp_path / "sqlite-full.db"), profile())
+    engine.conn = object()  # type: ignore[assignment]
+    engine.storage = object()
+
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine._run(lambda: None))
+
+    assert exc_info.value.code == "BACKEND_UNAVAILABLE"
+    assert exc_info.value.safe_message == "backend storage is temporarily unavailable"
+    assert isinstance(exc_info.value.__cause__, sqlite3.OperationalError)
+    assert "database or disk is full" not in exc_info.value.safe_message
+
+
 def test_open_reuses_backend_wal_and_busy_timeout(tmp_path) -> None:
     async def run() -> None:
         engine = SQLiteVecEngine(str(tmp_path / "memory.db"), profile())
