@@ -92,6 +92,21 @@ FactLane's source package and wheel also carry the portable
 [`using-factlane` Skill](../skills/using-factlane/SKILL.md). Installing the package does
 not configure a particular host or auto-register that Skill.
 
+## Version transitions
+
+Python-package installation success does not by itself prove that a database created or
+modified by another FactLane version is compatible. Treat package/runtime compatibility and
+data/schema compatibility as separate release contracts. Preserve the current environment and
+a verified operator-owned backup before any version transition that may affect durable data,
+and do not run an older binary against a potentially migrated database unless the target
+release explicitly documents that downgrade as safe.
+
+`v0.1.3` is the first official production release, so it has no earlier official production
+rollback target. Its published package can be installed and reverified independently, but no
+cross-version production-data migration or downgrade guarantee is implied. See
+[Release operations](RELEASE_OPERATIONS.md) for the exact `v0.1.3` artifact identities and the
+reusable install/upgrade/rollback procedure for later versions.
+
 ## Data and deployment limits
 
 A FactLane fact is bounded to **2,000 UTF-8 bytes**. This interface is not a large-directory
@@ -109,4 +124,5 @@ This is a bounded support statement, not a universal deployment claim. Validate 
 language/ranking workload and operational scale, and keep production data, backup retention,
 monitoring, and recovery operations under their own authorization and runbooks. See
 [Security](../SECURITY.md), [Architecture](ARCHITECTURE.md), and the
-[Quick Start](QUICKSTART.md).
+[Quick Start](QUICKSTART.md). Versioned installation and transition procedures are in
+[Release operations](RELEASE_OPERATIONS.md).

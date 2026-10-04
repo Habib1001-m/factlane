@@ -11,7 +11,7 @@ on the machine that will run FactLane. The Python environment used for FactLane 
 **SQLite 3.42.0+**.
 
 ```bash
-git clone https://github.com/Habib1001-m/factlane.git
+git clone --branch v0.1.3 --depth 1 https://github.com/Habib1001-m/factlane.git
 cd factlane
 uv sync --frozen
 uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
@@ -23,6 +23,13 @@ The SQLite check above uses the project interpreter. A system-wide `python` or `
 executable may report a *different* version. Below the floor, FactLane returns
 `BACKEND_COMPATIBILITY_MISMATCH` before creating or opening its database. Python version
 alone does not satisfy the storage contract.
+
+The command above intentionally checks out the versioned release tag rather than the moving
+`main` branch. The release runbook records the expected commit/tree and artifact digests so an
+operator can verify the tag and downloaded bytes instead of trusting the version name alone. To
+install from the published wheel/source distribution or move between versions, follow
+[Release operations](RELEASE_OPERATIONS.md). Package upgrade/rollback and database/schema
+migration are separate compatibility claims.
 
 ## 2. Install a supported embedding model
 
@@ -202,6 +209,7 @@ purge has committed but sealing is still incomplete, a durable interlock stored 
 continues returning `MAINTENANCE_IN_PROGRESS` across process restart until verified recovery clears it.
 
 See the [README](../README.md) for product orientation, [Architecture](ARCHITECTURE.md) for
-exact data flow, [Environment](ENVIRONMENT.md) for runtime and profiles, and
+exact data flow, [Environment](ENVIRONMENT.md) for runtime and profiles,
+[Release operations](RELEASE_OPERATIONS.md) for versioned install/upgrade/rollback, and
 [Security](../SECURITY.md) for trust and recovery boundaries. The live MCP schema and
 `--help-tools` output are authoritative for request signatures and enums.

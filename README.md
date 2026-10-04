@@ -18,10 +18,10 @@ You need Python **3.11+**, a Python-linked SQLite runtime **3.42.0+**,
 the model for your chosen embedding profile. FactLane is CPU-capable; Docker, a GPU, and
 external embedding APIs are not required.
 
-For a source checkout with the `embeddinggemma-300m-768` profile:
+For the exact `v0.1.3` release with the `embeddinggemma-300m-768` profile:
 
 ```bash
-git clone https://github.com/Habib1001-m/factlane.git
+git clone --branch v0.1.3 --depth 1 https://github.com/Habib1001-m/factlane.git
 cd factlane
 uv sync --frozen
 uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
@@ -46,8 +46,11 @@ default. A trusted operator must configure verifier authority separately. The da
 model remain local; the current provider connects only to Ollama on loopback.
 
 The [quick start](docs/QUICKSTART.md) has client configuration examples, alternative
-profiles, and troubleshooting. The CLI's `--help-tools` output is the offline reference for
-request fields and supported values.
+profiles, and troubleshooting. For release assets, exact hashes, upgrades, rollbacks, and
+post-install reverification, use the [release operations runbook](docs/RELEASE_OPERATIONS.md).
+The `main` branch can move after a release; use a versioned tag or published release asset and
+verify its recorded commit/tree or digest when you need the exact released bits. The CLI's
+`--help-tools` output is the offline reference for request fields and supported values.
 
 ## What agents can do
 
@@ -113,8 +116,8 @@ by itself publish a package, deploy a service, or replace an operator's backup a
 plan.
 
 See [Architecture](docs/ARCHITECTURE.md),
-[Environment and supported profiles](docs/ENVIRONMENT.md), and [Security](SECURITY.md) for
-the precise contracts and limitations.
+[Environment and supported profiles](docs/ENVIRONMENT.md), [Release operations](docs/RELEASE_OPERATIONS.md),
+and [Security](SECURITY.md) for the precise contracts and limitations.
 
 ## Develop
 

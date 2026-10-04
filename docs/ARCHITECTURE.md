@@ -162,6 +162,23 @@ cooperative FactLane-runtime boundary, not a defense against arbitrary raw files
 by a privileged external process, so the independent quiescence inventory/full-stop procedure is
 still part of recovery.
 
+## Version and migration boundary
+
+The Python package/runtime and the durable database are related but distinct compatibility
+surfaces. Installing a newer package does not itself migrate a database, and successful package
+replacement does not prove that an older runtime can safely reopen state touched by a newer
+release. A release that changes stored schema or data semantics must provide an explicit
+migration contract, post-migration verification, and any supported rollback/restore path.
+
+`v0.1.3` is the first official production release and does not define a cross-version
+production-data downgrade contract. The release-operations runbook defines a published release
+by its recorded tag target, Git tree, and artifact digests, and requires later maintenance not to
+silently retarget that tag or replace its assets to match different bytes. Operators still verify
+those identities because the hosting platform can technically permit mutation. Later
+documentation or development changes on `main` do not change the recorded identity of an already
+published release. The exact release-identity and transition procedure lives in
+[Release operations](RELEASE_OPERATIONS.md).
+
 ## Qualification boundary
 
 FactLane 0.1.3 is production-qualified for the documented local configuration: the packaged
