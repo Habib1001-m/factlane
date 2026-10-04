@@ -82,8 +82,9 @@ Ambient backend environment must not weaken that storage posture. FactLane conve
 backend first-import configuration exit into `BACKEND_COMPATIBILITY_MISMATCH` instead of letting
 the process terminate outside the governed boundary. `MCP_MEMORY_SQLITE_PRAGMAS` may not change
 `journal_mode` away from `WAL`, reduce `synchronous` below `NORMAL`, or reduce `busy_timeout`
-below 5000 ms; startup rejects such overrides and verifies the effective pragmas after backend
-initialization.
+below 5000 ms. Schema-qualified forms such as `main.synchronous=OFF` are normalized to the same
+required pragma names, so hostile overrides are rejected before database creation; startup also
+verifies the effective pragmas after backend initialization.
 
 FactLane's source package and wheel also carry the portable
 [`using-factlane` Skill](../skills/using-factlane/SKILL.md). Installing the package does

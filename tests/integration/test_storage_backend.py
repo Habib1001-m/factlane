@@ -422,6 +422,18 @@ def test_open_rejects_hostile_required_sqlite_pragma_overrides(tmp_path, monkeyp
     assert not db_path.exists()
 
 
+def test_open_rejects_schema_qualified_hostile_pragma_before_db_creation(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "schema-qualified-hostile-pragmas.db"
+    monkeypatch.setenv("MCP_MEMORY_SQLITE_PRAGMAS", "main.synchronous=OFF")
+    engine = SQLiteVecEngine(str(db_path), profile())
+
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+
+    assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+    assert not db_path.exists()
+
+
 def test_maintenance_lock_noncontention_os_error_is_backend_unavailable(tmp_path, monkeypatch) -> None:
     import fcntl
 

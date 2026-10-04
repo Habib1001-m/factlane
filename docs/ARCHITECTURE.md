@@ -77,7 +77,10 @@ idempotency key from a more privileged request is not an authorization token.
 Storage contract v2 also blocks stale legacy writers from inserting, updating, or deleting
 adapter records through an untrusted raw SQLite connection. The trusted maintenance path has
 a separate authorization boundary; it does not make arbitrary direct SQL writes part of the
-public API.
+public API. Because writer authorization is a connection-local SQLite function, an unregistered
+raw connection is rejected at function resolution with `no such function:
+factlane_contract_v2_writer`; the persistent trigger's own RAISE text is not reached on that
+connection, but the mutation remains fail-closed.
 
 ## Retrieval and history
 

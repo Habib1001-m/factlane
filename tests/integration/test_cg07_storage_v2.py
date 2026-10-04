@@ -349,19 +349,167 @@ def test_storage_v2_raw_legacy_writer_cannot_mutate_adapter_records(tmp_path) ->
                 insert_values.append("'raw-insert-idempotency'")
             else:
                 insert_values.append(column)
-        with pytest.raises(sqlite3.OperationalError, match="factlane_contract_v2_writer"):
+        with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v2_writer"):
             raw.execute(
                 f"INSERT INTO adapter_records ({','.join(columns)}) SELECT {','.join(insert_values)} "
                 "FROM adapter_records WHERE record_id=?",
                 (record_id,),
             )
         for sql, params in (("UPDATE adapter_records SET fact='stale-writer' WHERE record_id=?", (record_id,)), ("DELETE FROM adapter_records WHERE record_id=?", (record_id,))):
-            with pytest.raises(sqlite3.OperationalError, match="factlane_contract_v2_writer"):
+            with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v2_writer"):
                 raw.execute(sql, params)
     finally:
         raw.close()
     after = _database_snapshot(db_path)
     assert after == before
+
+
+def test_exact_and_keyword_search_use_consistent_unicode_casefolding(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "unicode-casefold.db"), _profile())
+        await engine.open()
+        try:
+            current = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="u",
+                fact="Der Termin liegt an der Straße",
+                created_at="2026-10-04T00:00:00Z",
+            )
+            await engine.write_record(current, [1.0] + [0.0] * 255)
+            scope = validate_scope("CROSS_PROJECT_WORKFLOW")
+
+            exact = await engine.keyword_candidates(
+                "DER TERMIN LIEGT AN DER STRASSE",
+                scope,
+                limit=4,
+                history=False,
+                exact=True,
+            )
+            keyword = await engine.keyword_candidates(
+                "STRASSE",
+                scope,
+                limit=4,
+                history=False,
+                exact=False,
+            )
+            assert [row["record_id"] for row in exact] == [current["record_id"]]
+            assert [row["record_id"] for row in keyword] == [current["record_id"]]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_reverify_rejects_malformed_current_predecessor_contradiction_state_after_cas(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "malformed-current-predecessor.db"), _profile())
+        await engine.open()
+        try:
+            current = _record(
+                lifecycle="VALIDATED_CURRENT",
+                marker="v",
+                fact="Malformed current predecessors cannot be laundered by REVERIFY.",
+                created_at="2026-10-04T00:00:00Z",
+            )
+            await engine.write_record(current, [1.0] + [0.0] * 255)
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_records SET contradiction_state='UNRESOLVED' WHERE record_id=?",
+                (current["record_id"],),
+            )
+            engine.conn.commit()
+
+            successor = deepcopy(current)
+            successor.update(
+                {
+                    "record_id": str(uuid.uuid4()),
+                    "revision": 2,
+                    "parent_record_id": current["record_id"],
+                    "contradiction_state": "NONE",
+                    "native_content_hash": "e" * 64,
+                    "payload_fingerprint": "f" * 64,
+                    "idempotency_key": "malformed-current-predecessor-reverify",
+                }
+            )
+
+            with pytest.raises(AdapterError) as error:
+                await engine.write_record(
+                    successor,
+                    [0.0, 1.0] + [0.0] * 254,
+                    supersede_record_id=current["record_id"],
+                )
+            assert error.value.code == "INVALID_ENVELOPE"
+            rows = engine.conn.execute(
+                "SELECT revision,lifecycle_state,contradiction_state FROM adapter_records "
+                "WHERE memory_id=? ORDER BY revision",
+                (current["memory_id"],),
+            ).fetchall()
+            assert rows == [(1, "VALIDATED_CURRENT", "UNRESOLVED")]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_owner_reverify_rejects_malformed_current_predecessor_through_adapter(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "malformed-current-predecessor-adapter.db"), _profile())
+        await engine.open()
+        try:
+            owner = MemoryAdapter(
+                engine,
+                _Provider(),
+                trusted_write_context=trusted_write_context_for_profile("owner-current"),
+            )
+            stored = await owner.store(
+                fact="Malformed current predecessors must fail at the public update path.",
+                scope="PROJECT",
+                project_id="project-a",
+                memory_type="PROJECT_LEARNED_FACT",
+                source_provenance={
+                    "source_class": "TEST",
+                    "source_ref": "malformed-predecessor-adapter",
+                    "source_hash": "a" * 64,
+                    "review_ref": "malformed-predecessor-adapter",
+                    "extraction_method": "test",
+                },
+                freshness_policy={"kind": "manual"},
+                idempotency_key="malformed-predecessor-adapter-store",
+                source_timestamp="2026-10-04T00:00:00Z",
+                last_verified_at="2026-10-04T00:00:00Z",
+                verified_by="OWNER",
+                requested_lifecycle_state="VALIDATED_CURRENT",
+            )
+            current = stored["results"][0]
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_records SET contradiction_state='UNRESOLVED' WHERE record_id=?",
+                (current["record_id"],),
+            )
+            engine.conn.commit()
+
+            with pytest.raises(AdapterError) as error:
+                await owner.update(
+                    memory_id=current["memory_id"],
+                    scope="PROJECT",
+                    project_id="project-a",
+                    expected_record_id=current["record_id"],
+                    expected_revision=current["revision"],
+                    mode="REVERIFY",
+                    idempotency_key="malformed-predecessor-adapter-reverify",
+                    verification={"verified_by": "OWNER"},
+                )
+            assert error.value.code == "INVALID_ENVELOPE"
+            rows = engine.conn.execute(
+                "SELECT revision,lifecycle_state,contradiction_state FROM adapter_records "
+                "WHERE memory_id=? ORDER BY revision",
+                (current["memory_id"],),
+            ).fetchall()
+            assert rows == [(1, "VALIDATED_CURRENT", "UNRESOLVED")]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
 
 
 def test_owner_reverify_promotes_candidate_same_memory_and_preserves_origin(tmp_path) -> None:

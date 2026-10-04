@@ -7,6 +7,7 @@ import os
 import shutil
 import sqlite3
 import time
+import urllib.parse
 from collections.abc import Callable
 from typing import Any
 
@@ -28,6 +29,7 @@ from .embeddings import EmbeddingProfile
 STORAGE_CONTRACT_VERSION = 2
 MIN_SQLITE_VERSION = (3, 42, 0)
 _WRITER_FUNCTION = "factlane_contract_v2_writer"
+_CASEFOLD_FUNCTION = "factlane_unicode_casefold"
 _LEGACY_ORIGIN_JSON = canonical_json({"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None})
 _MAINTENANCE_CAPABILITY_SECRET = object()
 _SENSITIVE_RECOVERY_INTERLOCK_KEY = "sensitive_recovery_interlock"
@@ -60,7 +62,7 @@ def _assert_required_sqlite_pragma_environment() -> None:
         if "=" not in pragma_pair:
             continue
         raw_name, raw_value = pragma_pair.split("=", 1)
-        name = raw_name.strip().lower()
+        name = raw_name.strip().lower().rsplit(".", 1)[-1]
         value = raw_value.strip().lower()
         if name == "journal_mode" and value != "wal":
             raise _sqlite_pragma_compatibility_error()
@@ -334,7 +336,8 @@ def _assert_sensitive_recovery_interlock_clear(db_path: str) -> None:
         return
     conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        ro_uri = "file:" + urllib.parse.quote(os.path.abspath(db_path), safe="/") + "?mode=ro"
+        conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0)
         try:
             row = conn.execute(
                 "SELECT value FROM adapter_meta WHERE key = ?",
@@ -368,6 +371,7 @@ class RecordUniquenessConflict(RuntimeError):
 def register_storage_v2_writer(conn: sqlite3.Connection) -> None:
     """Mark one trusted FactLane connection as an authorized storage-v2 writer."""
     conn.create_function(_WRITER_FUNCTION, 0, lambda: 1)
+    conn.create_function(_CASEFOLD_FUNCTION, 1, lambda value: str(value).casefold(), deterministic=True)
 
 
 def assert_supported_sqlite_runtime(version_info: tuple[int, int, int] | None = None) -> None:
@@ -837,7 +841,7 @@ class SQLiteVecEngine:
                 if supersede_record_id is not None:
                     old = self.conn.execute(
                         "SELECT native_content_hash, lifecycle_state,scope,project_id,worktree_id,workflow_id,agent_id,"
-                        "memory_id,revision "
+                        "memory_id,revision,contradiction_state "
                         "FROM adapter_records WHERE record_id = ?",
                         (supersede_record_id,),
                     ).fetchone()
@@ -877,6 +881,11 @@ class SQLiteVecEngine:
                         raise AdapterError(
                             "INVALID_ENVELOPE",
                             "update successor has an invalid memory lineage shape",
+                        )
+                    if str(old[9]) not in {"NONE", "RESOLVED"}:
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "validated-current predecessor has an invalid contradiction state",
                         )
                     superseded_native_hash = str(old[0])
 
@@ -1431,7 +1440,7 @@ class SQLiteVecEngine:
             assert self.conn is not None
             rows = self.conn.execute(
                 self._select_sql(
-                    f"WHERE lower(a.fact) {operator} ? AND {where}{lifecycle} "
+                    f"WHERE {_CASEFOLD_FUNCTION}(a.fact) {operator} ? AND {where}{lifecycle} "
                     "ORDER BY a.created_at DESC, a.record_id LIMIT ?"
                 ),
                 [value, *params, limit],

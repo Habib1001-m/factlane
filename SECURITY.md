@@ -27,7 +27,11 @@ release/commit and relevant runtime versions.
 - **Storage consistency:** Revision updates use transaction-local compare-and-swap. The
   storage v2 contract rejects raw legacy writes to adapter records, and supported operations
   have atomic rollback and idempotent retry behavior at the documented transaction
-  boundaries.
+  boundaries. An unregistered raw SQLite connection fails closed while resolving the
+  connection-local `factlane_contract_v2_writer` authorization function; SQLite therefore
+  reports `no such function: factlane_contract_v2_writer` rather than the trigger's internal
+  `FACTLANE_STORAGE_V2_WRITER_REQUIRED` marker. That diagnostic difference does not grant a
+  write path.
 - **Local providers:** The shipped embedding provider connects to Ollama on loopback;
   non-local embedding endpoints and automatic remote fallbacks are not supported. Embedding
   model identity, capabilities, dimensions, and input limits are checked against the
