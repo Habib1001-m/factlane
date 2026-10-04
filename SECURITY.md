@@ -97,6 +97,21 @@ live production recovery requires its own authorization and containment plan.
 logs, or external systems.** Normal `memory_update`, superseded-record compaction, and
 manual housekeeping are not substitutes for incident recovery.
 
+## Upgrade and rollback security boundary
+
+Package rollback and durable-data rollback are different operations. Preserve an operator-owned
+backup before a version transition that may affect stored data. Do not run an older FactLane
+runtime against a database that may have been migrated or made incompatible by a newer release
+unless the newer release explicitly documents that downgrade as safe. Otherwise, recovery of
+durable state requires a documented reverse migration or restoration of a verified compatible
+backup.
+
+`v0.1.3` is the first official production release and has no earlier official production
+rollback target. Its public package can be replaced mechanically in an isolated environment,
+but that does not establish a production-database downgrade path. See
+[Release operations](docs/RELEASE_OPERATIONS.md) for versioned artifact verification and the
+operator transition checklist.
+
 ## Known limits
 
 FactLane is a local service, not a distributed consensus system. Version 0.1.3 is
@@ -113,4 +128,5 @@ Arabic/mixed-language semantic specificity remains workload-specific. None of th
 limitations permits bypassing scope, authority, freshness, or verification policy.
 
 See the [architecture](docs/ARCHITECTURE.md) and
-[environment requirements](docs/ENVIRONMENT.md) for implementation and runtime details.
+[environment requirements](docs/ENVIRONMENT.md) for implementation and runtime details, and
+[release operations](docs/RELEASE_OPERATIONS.md) for versioned install/upgrade/rollback.
