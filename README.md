@@ -1,11 +1,14 @@
-<div align="center">
-
+<h1 align="center">
 <picture>
+  <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/assets/brand/readme/factlane-readme-hero-mobile-dark.svg">
+  <source media="(max-width: 600px) and (prefers-color-scheme: light)" srcset="docs/assets/brand/readme/factlane-readme-hero-mobile-light.svg">
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/readme/factlane-readme-hero-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/readme/factlane-readme-hero-light.svg">
   <img alt="FactLane — Share facts. Not context. Governed memory for MCP agents." src="docs/assets/brand/readme/factlane-readme-hero-light.svg" width="100%">
 </picture>
+</h1>
 
+<div align="center">
 <br>
 
 [Quick Start](#quick-start) · [How it works](#how-factlane-works) · [Architecture](docs/ARCHITECTURE.md) · [Security](SECURITY.md) · [Release operations](docs/RELEASE_OPERATIONS.md)
@@ -33,7 +36,10 @@ That distinction is the core of FactLane: **remembered context can support a dec
 ## How FactLane works
 
 <p align="center">
-  <img alt="FactLane memory lifecycle: an agent proposes a Candidate, trusted authority verifies it, and eligible Current memory is returned within exact scope and freshness rules." src="docs/assets/brand/diagrams/factlane-memory-lifecycle.svg" width="100%">
+  <picture>
+    <source media="(max-width: 600px)" srcset="docs/assets/brand/diagrams/factlane-memory-lifecycle-mobile.svg">
+    <img alt="FactLane memory lifecycle: an agent proposes a Candidate, trusted authority verifies it, and eligible Current memory is returned within exact scope and freshness rules." src="docs/assets/brand/diagrams/factlane-memory-lifecycle.svg" width="100%">
+  </picture>
 </p>
 
 The key boundary is the transition from **Candidate** to **Current**:
