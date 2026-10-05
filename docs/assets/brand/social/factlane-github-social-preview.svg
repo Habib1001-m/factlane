@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640">
+<defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#0A0F1A"/><stop offset=".55" stop-color="#0B1730"/><stop offset="1" stop-color="#062C33"/></linearGradient><linearGradient id="w" x1="0" x2="1"><stop stop-color="#3B82F6"/><stop offset=".5" stop-color="#16D9F4"/><stop offset="1" stop-color="#22C55E"/></linearGradient></defs>
+<rect width="1280" height="640" rx="32" fill="url(#bg)"/>
+<path d="M-40 595 C250 485 405 700 705 585 C950 490 1090 575 1320 470" fill="none" stroke="url(#w)" stroke-width="20" opacity=".45"/>
+<g transform="translate(90 130) scale(.62)">
+<defs>
+<linearGradient id="gTop" gradientUnits="userSpaceOnUse" x1="150" y1="120" x2="410" y2="170"><stop offset="0" stop-color="#3B82F6"/><stop offset="1" stop-color="#16D9F4"/></linearGradient>
+<linearGradient id="gMid" gradientUnits="userSpaceOnUse" x1="190" y1="230" x2="370" y2="250"><stop offset="0" stop-color="#16D9F4"/><stop offset="1" stop-color="#22C55E"/></linearGradient>
+<linearGradient id="gStem" gradientUnits="userSpaceOnUse" x1="185" y1="130" x2="110" y2="370"><stop offset="0" stop-color="#3B82F6"/><stop offset=".7" stop-color="#16D9F4"/><stop offset="1" stop-color="#16D9F4"/></linearGradient>
+<radialGradient id="node" cx="35%" cy="25%" r="75%"><stop offset="0" stop-color="#16D9F4"/><stop offset="1" stop-color="#22C55E"/></radialGradient>
+</defs>
+<path d="M176 124 H396" fill="none" stroke="url(#gTop)" stroke-width="62" stroke-linecap="round"/>
+<path d="M199 237 H352" fill="none" stroke="url(#gMid)" stroke-width="62" stroke-linecap="round"/>
+<path d="M197 150 L116 354" fill="none" stroke="url(#gStem)" stroke-width="70" stroke-linecap="round"/>
+<circle cx="84" cy="237" r="34" fill="url(#node)"/>
+</g>
+<text x="465" y="275" font-family="Inter,Arial" font-size="112" font-weight="800" fill="#FFFFFF">FactLane</text>
+<text x="470" y="350" font-family="Inter,Arial" font-size="52" font-weight="700" fill="#16D9F4">Share facts. Not context.</text>
+<text x="470" y="414" font-family="Inter,Arial" font-size="34" fill="#C4D0DE">Governed memory for MCP agents.</text>
+<text x="470" y="485" font-family="Inter,Arial" font-size="26" fill="#94A3B8">Local-first · Scoped · Authority-aware · MCP-native</text>
+</svg>

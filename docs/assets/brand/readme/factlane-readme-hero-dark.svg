@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 620">
+<defs><linearGradient id="wave" x1="0" x2="1"><stop stop-color="#3B82F6" stop-opacity=".1"/><stop offset=".5" stop-color="#3B82F6" stop-opacity=".8"/><stop offset="1" stop-color="#22C55E" stop-opacity=".55"/></linearGradient></defs>
+<rect width="1600" height="620" rx="42" fill="#0A0F1A"/>
+<path d="M870 40 C1060 20 1180 180 1560 110" fill="none" stroke="url(#wave)" stroke-width="55" opacity=".45"/>
+<path d="M860 530 C1100 410 1260 640 1600 410" fill="none" stroke="#3B82F6" stroke-width="2" opacity=".55"/>
+<g transform="translate(80 145) scale(.55)">
+<defs>
+<linearGradient id="gTop" gradientUnits="userSpaceOnUse" x1="150" y1="120" x2="410" y2="170"><stop offset="0" stop-color="#3B82F6"/><stop offset="1" stop-color="#16D9F4"/></linearGradient>
+<linearGradient id="gMid" gradientUnits="userSpaceOnUse" x1="190" y1="230" x2="370" y2="250"><stop offset="0" stop-color="#16D9F4"/><stop offset="1" stop-color="#22C55E"/></linearGradient>
+<linearGradient id="gStem" gradientUnits="userSpaceOnUse" x1="185" y1="130" x2="110" y2="370"><stop offset="0" stop-color="#3B82F6"/><stop offset=".7" stop-color="#16D9F4"/><stop offset="1" stop-color="#16D9F4"/></linearGradient>
+<radialGradient id="node" cx="35%" cy="25%" r="75%"><stop offset="0" stop-color="#16D9F4"/><stop offset="1" stop-color="#22C55E"/></radialGradient>
+</defs>
+<path d="M176 124 H396" fill="none" stroke="url(#gTop)" stroke-width="62" stroke-linecap="round"/>
+<path d="M199 237 H352" fill="none" stroke="url(#gMid)" stroke-width="62" stroke-linecap="round"/>
+<path d="M197 150 L116 354" fill="none" stroke="url(#gStem)" stroke-width="70" stroke-linecap="round"/>
+<circle cx="84" cy="237" r="34" fill="url(#node)"/>
+</g>
+<text x="430" y="270" font-family="Inter,Arial,sans-serif" font-size="126" font-weight="800" fill="#FFFFFF">FactLane</text>
+<text x="434" y="344" font-family="Inter,Arial,sans-serif" font-size="52" font-weight="700" fill="#16D9F4">Share facts. Not context.</text>
+<text x="434" y="407" font-family="Inter,Arial,sans-serif" font-size="38" fill="#B7C3D3">Governed memory for MCP agents.</text>
+<g font-family="Inter,Arial" font-size="24" font-weight="600">
+<rect x="84" y="42" width="112" height="48" rx="12" fill="#3B82F6"/><text x="140" y="75" text-anchor="middle" fill="#FFFFFF">v0.1.3</text>
+<rect x="210" y="42" width="154" height="48" rx="12" fill="#10213B" stroke="#234362"/><text x="287" y="75" text-anchor="middle" fill="#FFFFFF">Apache 2.0</text>
+<rect x="378" y="42" width="170" height="48" rx="12" fill="#10213B" stroke="#234362"/><text x="463" y="75" text-anchor="middle" fill="#FFFFFF">Python 3.11+</text>
+<rect x="562" y="42" width="112" height="48" rx="12" fill="#10213B" stroke="#234362"/><text x="618" y="75" text-anchor="middle" fill="#FFFFFF">MCP</text>
+<rect x="704" y="42" width="310" height="48" rx="12" fill="#0E3B2B" stroke="#22C55E"/><text x="859" y="75" text-anchor="middle" fill="#22C55E">Production-qualified profile</text>
+</g>
+<g font-family="Inter,Arial" font-size="26" font-weight="600">
+<rect x="84" y="494" width="250" height="72" rx="18" fill="#10213B" stroke="#234362"/><circle cx="120" cy="530" r="11" fill="#3B82F6"/><text x="150" y="539" fill="#FFFFFF">Local-first</text>
+<rect x="350" y="494" width="230" height="72" rx="18" fill="#10213B" stroke="#234362"/><circle cx="386" cy="530" r="11" fill="#16D9F4"/><text x="416" y="539" fill="#FFFFFF">Scoped</text>
+<rect x="596" y="494" width="305" height="72" rx="18" fill="#10213B" stroke="#234362"/><circle cx="632" cy="530" r="11" fill="#22C55E"/><text x="662" y="539" fill="#FFFFFF">Authority-aware</text>
+<rect x="917" y="494" width="260" height="72" rx="18" fill="#10213B" stroke="#234362"/><circle cx="953" cy="530" r="11" fill="#8B5CF6"/><text x="983" y="539" fill="#FFFFFF">MCP-native</text>
+</g>
+</svg>
