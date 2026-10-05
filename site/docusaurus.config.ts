@@ -174,7 +174,6 @@ const config: Config = {
           to: '/docs/QUICKSTART',
           label: 'Get started',
           position: 'right',
-          className: 'navbar__item--cta',
         },
       ],
     },

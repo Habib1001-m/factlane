@@ -7,10 +7,10 @@ import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
 import {
-  arabicLandingExperience,
   homeCopy,
-  type ArabicLandingExperience,
+  landingExperience,
   type HomeCopy,
+  type LandingExperience,
 } from '../content/homeCopy';
 import styles from './index.module.css';
 
@@ -43,10 +43,7 @@ function Section({
   );
 }
 
-function Hero({copy, locale}: {copy: HomeCopy; locale: 'en' | 'ar'}) {
-  const primaryHref = locale === 'ar' ? '#agent-onboarding' : '#use-cases';
-  const secondaryHref = locale === 'ar' ? '#use-cases' : '#how-it-works';
-
+function Hero({copy}: {copy: HomeCopy}) {
   return (
     <header className={styles.hero}>
       <div className={clsx(styles.container, styles.heroGrid)}>
@@ -61,10 +58,10 @@ function Hero({copy, locale}: {copy: HomeCopy; locale: 'en' | 'ar'}) {
           </Heading>
           <p className={styles.heroLead}>{copy.hero.lead}</p>
           <div className={styles.heroActions}>
-            <a className="button button--primary button--lg" href={primaryHref}>
+            <a className="button button--primary button--lg" href="#agent-onboarding">
               {copy.hero.primaryCta}
             </a>
-            <a className="button button--secondary button--lg" href={secondaryHref}>
+            <a className="button button--secondary button--lg" href="#why-different">
               {copy.hero.secondaryCta}
             </a>
           </div>
@@ -119,6 +116,54 @@ function Hero({copy, locale}: {copy: HomeCopy; locale: 'en' | 'ar'}) {
         </figure>
       </div>
     </header>
+  );
+}
+
+function ProductDifference({copy}: {copy: LandingExperience['differentiation']}) {
+  return (
+    <Section
+      id="why-different"
+      eyebrow={copy.eyebrow}
+      title={copy.title}
+      intro={copy.intro}>
+      <div className={styles.differenceGrid}>
+        {copy.cards.map((card, index) => (
+          <article key={card.title} className={styles.differenceCard}>
+            <span className={styles.trustNumber}>0{index + 1}</span>
+            <Heading as="h3">{card.title}</Heading>
+            <p>{card.body}</p>
+          </article>
+        ))}
+      </div>
+      <div className={styles.sectionCta}>
+        <Link to="/docs/CORE_CONCEPTS">{copy.docsAction}</Link>
+      </div>
+    </Section>
+  );
+}
+
+function MemoryCoexistence({copy}: {copy: LandingExperience['coexistence']}) {
+  return (
+    <Section
+      id="memory-stack"
+      eyebrow={copy.eyebrow}
+      title={copy.title}
+      intro={copy.intro}
+      soft>
+      <div className={styles.memoryStackGrid}>
+        {copy.lanes.map((lane) => (
+          <article key={lane.label} className={styles.memoryStackCard}>
+            <span>{lane.label}</span>
+            <Heading as="h3">{lane.title}</Heading>
+            <p>{lane.body}</p>
+          </article>
+        ))}
+      </div>
+      <div className={styles.stackNote}>{copy.note}</div>
+      <div className={styles.sectionCta}>
+        <Link to="/docs/ARCHITECTURE">{copy.docsAction}</Link>
+      </div>
+    </Section>
   );
 }
 
@@ -208,7 +253,7 @@ async function copyText(text: string): Promise<void> {
   }
 }
 
-function AgentOnboarding({copy}: {copy: ArabicLandingExperience['onboarding']}) {
+function AgentOnboarding({copy}: {copy: LandingExperience['onboarding']}) {
   const [copyState, setCopyState] = React.useState<'idle' | 'copied' | 'failed'>('idle');
 
   const handleCopy = async () => {
@@ -251,9 +296,9 @@ function AgentOnboarding({copy}: {copy: ArabicLandingExperience['onboarding']}) 
               <span>{copy.promptLabel}</span>
               <Heading id="agent-prompt-title" as="h3">{copy.promptTitle}</Heading>
             </div>
-            <span className={styles.promptBadge}>AGENT-NATIVE</span>
+            <span className={styles.promptBadge}>{copy.badge}</span>
           </div>
-          <div className={styles.agentPromptText} dir="rtl">{copy.promptBody}</div>
+          <div className={styles.agentPromptText} dir={copy.promptDirection}>{copy.promptBody}</div>
           <div className={styles.agentPromptActions}>
             <button className="button button--primary" type="button" onClick={handleCopy}>
               {copyState === 'copied' ? copy.copiedAction : copy.copyAction}
@@ -280,7 +325,7 @@ function AgentOnboarding({copy}: {copy: ArabicLandingExperience['onboarding']}) 
   );
 }
 
-function ArabicTrust({copy}: {copy: ArabicLandingExperience['trust']}) {
+function CompactTrust({copy}: {copy: LandingExperience['trust']}) {
   return (
     <Section id="how-it-works" eyebrow={copy.eyebrow} title={copy.title} intro={copy.intro}>
       <div className={styles.arabicTrustGrid}>
@@ -306,6 +351,45 @@ function ArabicTrust({copy}: {copy: ArabicLandingExperience['trust']}) {
       <div className={styles.sectionCta}>
         <Link to="/docs/CORE_CONCEPTS">{copy.docsAction}</Link>
       </div>
+    </Section>
+  );
+}
+
+function EngineeringRigor({
+  copy,
+  whyNow,
+}: {
+  copy: LandingExperience['rigor'];
+  whyNow: LandingExperience['whyNow'];
+}) {
+  return (
+    <Section
+      id="engineering-rigor"
+      eyebrow={copy.eyebrow}
+      title={copy.title}
+      intro={copy.intro}
+      soft>
+      <div className={styles.rigorGrid}>
+        {copy.cards.map((card, index) => (
+          <article key={card.title} className={styles.rigorCard}>
+            <span className={styles.trustNumber}>0{index + 1}</span>
+            <Heading as="h3">{card.title}</Heading>
+            <p>{card.body}</p>
+          </article>
+        ))}
+      </div>
+      <p className={styles.qualificationLine}>{copy.qualification}</p>
+      <div className={styles.rigorActions}>
+        <Link to="/docs/ARCHITECTURE">{copy.architectureAction}</Link>
+        <Link to="/docs/SECURITY">{copy.securityAction}</Link>
+      </div>
+      <aside className={styles.whyNowPanel}>
+        <div className={styles.cardEyebrow}>{whyNow.eyebrow}</div>
+        <Heading as="h3">{whyNow.title}</Heading>
+        <p>{whyNow.body}</p>
+        <strong>{whyNow.caveat}</strong>
+        <Link href={whyNow.sourceHref}>{whyNow.sourceLabel}</Link>
+      </aside>
     </Section>
   );
 }
@@ -528,7 +612,7 @@ function Architecture({copy}: {copy: HomeCopy}) {
   );
 }
 
-function FinalCta({copy, locale = 'en'}: {copy: HomeCopy; locale?: 'en' | 'ar'}) {
+function FinalCta({copy}: {copy: HomeCopy}) {
   return (
     <section className={styles.finalCta}>
       <div className={styles.container}>
@@ -538,15 +622,9 @@ function FinalCta({copy, locale = 'en'}: {copy: HomeCopy; locale?: 'en' | 'ar'})
             <Heading as="h2">{copy.finalCta.title}</Heading>
           </div>
           <div className={styles.finalCtaActions}>
-            {locale === 'ar' ? (
-              <a className="button button--primary button--lg" href="#agent-onboarding">
-                {copy.finalCta.fitCta}
-              </a>
-            ) : (
-              <Link className="button button--primary button--lg" to="/docs/FAQ">
-                {copy.finalCta.fitCta}
-              </Link>
-            )}
+            <a className="button button--primary button--lg" href="#agent-onboarding">
+              {copy.finalCta.fitCta}
+            </a>
             <Link className="button button--secondary button--lg" to="/docs/QUICKSTART">
               {copy.finalCta.setupCta}
             </Link>
@@ -560,36 +638,23 @@ function FinalCta({copy, locale = 'en'}: {copy: HomeCopy; locale?: 'en' | 'ar'})
   );
 }
 
-function EnglishLanding({copy}: {copy: HomeCopy}) {
+function ProductLanding({
+  copy,
+  experience,
+}: {
+  copy: HomeCopy;
+  experience: LandingExperience;
+}) {
   return (
     <>
-      <Hero copy={copy} locale="en" />
+      <Hero copy={copy} />
+      <ProductDifference copy={experience.differentiation} />
       <UseCases copy={copy} />
-      <EverydayFit copy={copy} />
-      <WhyGoverned copy={copy} />
-      <Lifecycle copy={copy} />
-      <Authority copy={copy} />
-      <QuickStart copy={copy} />
-      <Boundaries copy={copy} />
-      <Tools copy={copy} />
-      <Architecture copy={copy} />
+      <AgentOnboarding copy={experience.onboarding} />
+      <MemoryCoexistence copy={experience.coexistence} />
+      <CompactTrust copy={experience.trust} />
+      <EngineeringRigor copy={experience.rigor} whyNow={experience.whyNow} />
       <FinalCta copy={copy} />
-    </>
-  );
-}
-
-function ArabicLanding({copy}: {copy: HomeCopy}) {
-  return (
-    <>
-      <Hero copy={copy} locale="ar" />
-      <AgentOnboarding copy={arabicLandingExperience.onboarding} />
-      <UseCases copy={copy} />
-      <EverydayFit copy={copy} locale="ar" />
-      <ArabicTrust copy={arabicLandingExperience.trust} />
-      <Boundaries copy={copy} />
-      <Tools copy={copy} />
-      <Architecture copy={copy} />
-      <FinalCta copy={copy} locale="ar" />
     </>
   );
 }
@@ -598,6 +663,7 @@ export default function Home(): ReactNode {
   const {siteConfig, i18n} = useDocusaurusContext();
   const locale = i18n.currentLocale === 'ar' ? 'ar' : 'en';
   const copy = homeCopy[locale];
+  const experience = landingExperience[locale];
   const localeUrl = new URL(siteConfig.baseUrl, siteConfig.url).toString();
   const structuredData = {
     '@context': 'https://schema.org',
@@ -619,7 +685,7 @@ export default function Home(): ReactNode {
         <script type="application/ld+json">{JSON.stringify(structuredData)}</script>
       </Head>
       <main>
-        {locale === 'ar' ? <ArabicLanding copy={copy} /> : <EnglishLanding copy={copy} />}
+        <ProductLanding copy={copy} experience={experience} />
       </main>
     </Layout>
   );

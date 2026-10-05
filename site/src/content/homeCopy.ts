@@ -115,28 +115,28 @@ export type HomeCopy = {
 export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
   en: {
     meta: {
-      title: 'Memory your AI assistant can actually reuse',
+      title: 'Governed memory for AI agents',
       description:
-        'FactLane helps compatible AI assistants remember useful facts across sessions without turning old memory into automatic authority.',
+        'FactLane is free, local-first governed memory for MCP agents: bounded facts, provenance, freshness and a Candidate-to-Current trust boundary.',
       structuredDataDescription:
-        'Local-first governed memory for compatible AI assistants, with bounded facts, scope, provenance, freshness and trusted verification.',
+        'Free, local-first governed memory for compatible MCP agents, with bounded facts, exact scope, provenance, freshness and trusted verification.',
     },
     hero: {
-      kicker: 'Useful memory across sessions for compatible AI assistants',
-      title: 'Let your assistant remember the useful things.',
-      titleMuted: ' Not the whole conversation.',
+      kicker: 'Free · local-first · governed memory for MCP agents',
+      title: 'Give your agents memory they can trust.',
+      titleMuted: ' Without giving memory authority.',
       lead:
-        'FactLane helps compatible AI assistants remember your preferences, projects and recurring facts across sessions — without treating every old memory as permanent truth.',
-      primaryCta: 'See what it can remember',
-      secondaryCta: "Why memory won't overrule you",
+        'FactLane keeps bounded facts with scope, provenance and freshness, separates Candidate from Current, and sits beside the memory systems you already use.',
+      primaryCta: 'Start with your agent',
+      secondaryCta: 'Why FactLane is different',
       proofsLabel: 'FactLane at a glance',
       proofs: [
-        {strong: 'Stays local', rest: ' in the supported setup'},
-        {strong: 'Facts', rest: ', not transcripts'},
-        {strong: 'Current instructions', rest: ' still win'},
+        {strong: 'Apache-2.0', rest: ' open source'},
+        {strong: 'v0.1.3', rest: ' production-qualified local profile'},
+        {strong: 'Five tools', rest: ' focused MCP surface'},
       ],
-      developerLabel: 'Developer?',
-      developerLink: 'Go straight to the technical setup →',
+      developerLabel: 'Prefer manual setup?',
+      developerLink: 'Open the Quick Start →',
       windowTitle: 'FactLane · reusable memory',
       localBadge: 'LOCAL',
       promptLabel: 'You',
@@ -153,37 +153,31 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       caption: 'Share facts. Not context.',
     },
     useCases: {
-      eyebrow: 'Start with the outcome',
-      title: 'What could FactLane remember for you?',
+      eyebrow: 'What belongs in the governed lane?',
+      title: 'Keep the facts that should survive a session.',
       intro:
-        'You do not need to know MCP, embeddings, vector search or SQLite to understand the point: keep the useful fact, without replaying the whole chat.',
+        'FactLane is strongest when a small fact will matter later and you want to know where it came from, how fresh it is, and whether it is actually Current.',
       items: [
         {
-          eyebrow: 'Your preferences',
-          title: 'Stop repeating how you like things done.',
-          quote: '“Keep answers concise, explain in Arabic, and preserve English technical terms.”',
-          note: 'A useful preference can be reused in later sessions instead of being re-explained.',
+          eyebrow: 'Project state',
+          title: 'Carry forward facts that change how work should continue.',
+          quote: '“The release is v0.1.3. Production changes still require owner approval.”',
+          note: 'Current retrieval can reuse the verified fact without replaying the project history.',
         },
         {
-          eyebrow: 'Your projects',
-          title: 'Carry important project facts forward.',
-          quote: '“Remember the product goal, the current release, and the decisions we already made.”',
-          note: 'Your next session can start with useful established facts rather than a blank slate.',
+          eyebrow: 'Stable preferences',
+          title: 'Remember durable working preferences without making them absolute.',
+          quote: '“Keep answers concise unless I explicitly ask for a deep explanation.”',
+          note: 'The preference can survive the session while a new current instruction still wins.',
         },
         {
-          eyebrow: 'Your workflow',
-          title: 'Keep recurring rules available.',
+          eyebrow: 'Workflow boundaries',
+          title: 'Preserve rules that agents need to see again.',
           quote: '“Production changes need approval. Local tests can run automatically.”',
-          note: 'Workflow facts stay available without replaying an old conversation every time.',
-        },
-        {
-          eyebrow: 'Across assistants',
-          title: 'Reuse facts without sharing whole chats.',
-          quote: '“Let my coding assistant and another AI use the same approved project facts.”',
-          note: 'FactLane shares bounded facts, not entire transcripts or conversational context.',
+          note: 'A bounded fact can be reused across compatible hosts without turning the memory store into the authority that grants execution rights.',
         },
       ],
-      link: 'See more everyday examples →',
+      link: 'See more use cases →',
     },
     everydayFit: {
       eyebrow: 'What using it actually means',
@@ -288,10 +282,10 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       cta: 'Follow the Quick Start',
     },
     boundaries: {
-      eyebrow: 'Evidence before adjectives',
-      title: 'Qualified where we can prove it. Explicit where we cannot.',
+      eyebrow: 'A bounded production claim',
+      title: 'Production-qualified for one documented local profile — not marketed as universal infrastructure.',
       intro:
-        'FactLane v0.1.3 is the first official production release for a documented local profile — not a universal deployment claim.',
+        'FactLane v0.1.3 is the first official production release. The support statement is intentionally specific enough to verify and narrow enough to be honest.',
       supportedLabel: 'Supported profile',
       supportedItems: [
         'Python 3.11+',
@@ -337,34 +331,34 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       link: 'Read the architecture →',
     },
     finalCta: {
-      eyebrow: 'Share facts. Not context.',
-      title: 'Give your assistants memory without giving old memory the final word.',
-      fitCta: 'See if FactLane fits',
-      setupCta: 'Start the technical setup',
-      githubCta: 'View on GitHub ↗',
+      eyebrow: 'A governed lane for reusable facts',
+      title: 'Keep your broad memory. Add a governed fact lane.',
+      fitCta: 'Start with your agent',
+      setupCta: 'Manual setup',
+      githubCta: 'View the source on GitHub ↗',
     },
   },
   ar: {
     meta: {
-      title: 'ذاكرة لوكيلك من دون أن تبدأ من الصفر كل مرة',
+      title: 'ذاكرة محكومة لوكلاء الذكاء الاصطناعي',
       description:
-        'FactLane يمنح مساعدات الذكاء الاصطناعي المتوافقة ذاكرة محلية للحقائق التي تستحق أن تبقى بين الجلسات، مع بقاء تعليماتك الحالية والواقع الحي أعلى من الذاكرة.',
+        'FactLane ذاكرة محلية ومحكومة لوكلاء MCP: حقائق محددة مع نطاق ومصدر وحداثة وفصل واضح بين Candidate وCurrent.',
       structuredDataDescription:
-        'ذاكرة محلية بضوابط واضحة لوكلاء الذكاء الاصطناعي المتوافقين، تحفظ حقائق محدودة النطاق مع مصدر وحداثة وتحقّق، من دون تحويل الذاكرة إلى صلاحية تنفيذ.',
+        'ذاكرة محلية ومفتوحة المصدر لوكلاء MCP المتوافقين، تحفظ حقائق محددة مع نطاق ومصدر وحداثة وتحقّق موثوق من دون تحويل الذاكرة إلى صلاحية تنفيذ.',
     },
     hero: {
-      kicker: 'ذاكرة محلية للحقائق التي يحتاجها وكيلك مرة بعد مرة',
-      title: 'لا تبدأ مع وكيلك من الصفر في كل جلسة.',
-      titleMuted: ' أعطه ذاكرة لما يستحق أن يبقى.',
+      kicker: 'مجاني · محلي · ذاكرة محكومة لوكلاء MCP',
+      title: 'أعطِ وكلاءك ذاكرة تستحق إعادة الاستخدام.',
+      titleMuted: ' وأبقِ الحقيقة الحالية أعلى من الذاكرة.',
       lead:
-        'FactLane يضيف إلى مساعدات الذكاء الاصطناعي المتوافقة ذاكرة محلية للتفضيلات وقرارات المشروع والقواعد المتكررة — من دون حفظ المحادثة كاملة، ومن دون أن تصبح الذاكرة القديمة أعلى من تعليماتك الحالية.',
+        'يحفظ FactLane حقائق محددة مع النطاق والمصدر والحداثة، ويفصل بين Candidate وCurrent، ويعمل بجانب أنظمة الذاكرة التي تستخدمها بالفعل — من دون أن تتحول الذاكرة إلى صلاحية تنفيذ.',
       primaryCta: 'ابدأ مع وكيلك',
-      secondaryCta: 'شاهد كيف سيفيدك',
+      secondaryCta: 'لماذا FactLane مختلف؟',
       proofsLabel: 'FactLane باختصار',
       proofs: [
-        {strong: 'حقائق محددة', rest: ' لا أرشيف محادثات'},
-        {strong: 'تعليماتك الحالية', rest: ' تتقدم على الذاكرة'},
-        {strong: 'محلي', rest: ' ضمن ملف التشغيل المدعوم'},
+        {strong: 'Apache-2.0', rest: ' مفتوح المصدر'},
+        {strong: 'v0.1.3', rest: ' ملف محلي مؤهل إنتاجيًا'},
+        {strong: 'خمس أدوات', rest: ' سطح MCP مركز'},
       ],
       developerLabel: 'تفضّل الإعداد بنفسك؟',
       developerLink: 'افتح Quick Start للمطور',
@@ -383,34 +377,28 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       caption: 'شارك الحقائق، لا السياق.',
     },
     useCases: {
-      eyebrow: 'ما الذي يتوقف عن الضياع بين الجلسات؟',
-      title: 'الأشياء التي تكررها اليوم يمكن أن تصبح ذاكرة نافعة غدًا.',
+      eyebrow: 'ما الذي يستحق المسار المحكوم؟',
+      title: 'احتفظ بالحقائق التي يجب أن تعبر الجلسات.',
       intro:
-        'الفكرة أبسط من تفاصيل التنفيذ: احتفظ بالحقيقة التي سيحتاجها وكيلك لاحقًا، بدل إعادة شرحها أو إعادة محادثة كاملة في كل مرة.',
+        'يظهر تفوق FactLane عندما تكون هناك حقيقة صغيرة ستؤثر في العمل لاحقًا وتريد معرفة مصدرها وحداثتها وهل أصبحت Current فعلًا.',
       items: [
         {
-          eyebrow: 'تفضيلاتك',
-          title: 'لا تعِد شرح طريقة العمل التي تفضّلها.',
-          quote: '«اجعل الإجابات مختصرة، واشرح بالعربية، وأبقِ المصطلحات التقنية بالإنجليزية.»',
-          note: 'يمكن لوكيل متوافق إعادة استخدام هذا التفضيل في جلسة لاحقة بدل أن تبدأ التعليمات من جديد.',
+          eyebrow: 'حالة المشروع',
+          title: 'انقل الحقائق التي تغيّر كيف يجب أن يستمر العمل.',
+          quote: '«الإصدار الحالي v0.1.3. تغييرات الإنتاج ما زالت تحتاج موافقة المالك.»',
+          note: 'يمكن للاسترجاع الحالي إعادة استخدام الحقيقة المتحقَّق منها من دون إعادة تاريخ المشروع كله.',
         },
         {
-          eyebrow: 'مشروعاتك',
-          title: 'اجعل الجلسة التالية تعرف أين وصل المشروع.',
-          quote: '«تذكّر هدف المنتج، والإصدار الحالي، والقرارات التي اتخذناها بالفعل.»',
-          note: 'بدل إعادة بناء تاريخ المشروع، يبدأ الوكيل من حقائق محددة سبق اعتمادها وما تزال مؤهلة للاستخدام.',
+          eyebrow: 'تفضيلات مستقرة',
+          title: 'تذكّر تفضيلات العمل من دون تحويلها إلى أوامر مطلقة.',
+          quote: '«اجعل الإجابات مختصرة إلا إذا طلبت منك صراحةً شرحًا عميقًا.»',
+          note: 'يبقى التفضيل عبر الجلسات، لكن تعليماتك الحالية الجديدة تظل أعلى منه.',
         },
         {
-          eyebrow: 'سير العمل',
-          title: 'دع قواعد العمل المهمة تبقى متاحة.',
+          eyebrow: 'حدود سير العمل',
+          title: 'أبقِ القواعد التي يحتاج الوكلاء إلى رؤيتها مرة أخرى.',
           quote: '«تغييرات بيئة الإنتاج تحتاج موافقة. الاختبارات المحلية يمكن تشغيلها تلقائيًا.»',
-          note: 'يمكن حفظ القاعدة كحقيقة محددة بدل الاعتماد على وجودها داخل محادثة قديمة.',
-        },
-        {
-          eyebrow: 'بين المساعدات',
-          title: 'شارك الحقائق المعتمدة، لا تاريخ الدردشة كله.',
-          quote: '«اجعل مساعد البرمجة ومساعد ذكاء اصطناعي آخر يستخدمان حقائق المشروع المعتمدة نفسها.»',
-          note: 'يمكن لأكثر من host محلي متوافق استخدام مخزن FactLane نفسه ضمن حدود النطاق والصلاحيات، من دون مشاركة transcript كامل.',
+          note: 'تُعاد استخدام الحقيقة عبر hosts متوافقة من دون أن يصبح مخزن الذاكرة هو الجهة التي تمنح صلاحية التنفيذ.',
         },
       ],
       link: 'شاهد حالات استخدام إضافية',
@@ -518,10 +506,10 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       cta: 'اتبع Quick Start',
     },
     boundaries: {
-      eyebrow: 'ما الذي ندعمه اليوم؟',
-      title: 'واضح فيما يدعمه v0.1.3 — وواضح فيما لا يدّعيه.',
+      eyebrow: 'ادعاء إنتاجي محدد',
+      title: 'مؤهل إنتاجيًا لملف محلي موثق — وليس ادعاءً بأننا بنية تحتية مناسبة لكل بيئة.',
       intro:
-        'FactLane v0.1.3 هو أول إصدار إنتاج رسمي ضمن ملف تشغيل محلي موثَّق. هذه حدود دعم محددة، وليست وعدًا بأنه مناسب لكل بيئة أو كل workload.',
+        'FactLane v0.1.3 هو أول إصدار إنتاج رسمي. تعمدنا أن يكون نطاق الدعم محددًا بما يكفي لإثباته وصريحًا بما يكفي لعدم المبالغة.',
       supportedLabel: 'ملف التشغيل المدعوم',
       supportedItems: [
         'Python 3.11+',
@@ -567,8 +555,8 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       link: 'اقرأ المعمارية',
     },
     finalCta: {
-      eyebrow: 'ابدأ من الوكيل الذي تستخدمه بالفعل',
-      title: 'أعطِ وكيلك رابط FactLane. دعه يشرح الملاءمة — ثم يجهّزه معك إن كانت لديه الصلاحيات.',
+      eyebrow: 'مسار محكوم للحقائق القابلة لإعادة الاستخدام',
+      title: 'أبقِ ذاكرتك الواسعة. وأضف مسارًا محكومًا للحقائق.',
       fitCta: 'ابدأ مع وكيلك',
       setupCta: 'الإعداد اليدوي للمطور',
       githubCta: 'اعرض المشروع على GitHub',
@@ -576,7 +564,22 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
   },
 };
 
-export type ArabicLandingExperience = {
+export type LandingExperience = {
+  differentiation: {
+    eyebrow: string;
+    title: string;
+    intro: string;
+    cards: Array<{title: string; body: string}>;
+    docsAction: string;
+  };
+  coexistence: {
+    eyebrow: string;
+    title: string;
+    intro: string;
+    lanes: Array<{label: string; title: string; body: string}>;
+    note: string;
+    docsAction: string;
+  };
   onboarding: {
     eyebrow: string;
     title: string;
@@ -592,6 +595,8 @@ export type ArabicLandingExperience = {
     copyFailedAction: string;
     githubAction: string;
     manualAction: string;
+    promptDirection: 'ltr' | 'rtl';
+    badge: string;
   };
   trust: {
     eyebrow: string;
@@ -601,72 +606,324 @@ export type ArabicLandingExperience = {
     flow: Array<{label: string; body: string}>;
     docsAction: string;
   };
+  rigor: {
+    eyebrow: string;
+    title: string;
+    intro: string;
+    cards: Array<{title: string; body: string}>;
+    qualification: string;
+    architectureAction: string;
+    securityAction: string;
+  };
+  whyNow: {
+    eyebrow: string;
+    title: string;
+    body: string;
+    caveat: string;
+    sourceLabel: string;
+    sourceHref: string;
+  };
 };
 
-export const arabicLandingExperience: ArabicLandingExperience = {
-  onboarding: {
-    eyebrow: 'ابدأ من وكيلك، لا من سطر الأوامر',
-    title: 'أبسط بداية؟ أعطِ رابط FactLane لوكيلك، ودعه يقيّم ويشرح ثم يجهّزه معك.',
-    intro:
-      'قبل أن تثبّت شيئًا بنفسك، أعطِ وكيلك رابط FactLane واطلب منه أن يربط الفكرة باستخدامك الفعلي. إذا كان يستطيع الوصول إلى Terminal والملفات وإعداد MCP host على جهازك، يمكنه أيضًا تنفيذ المسار المدعوم خطوة بخطوة.',
-    capabilityTitle: 'ما الذي يجب أن يستطيع وكيلك فعله؟',
-    capabilityBody:
-      'الشرح وتقييم الملاءمة لا يحتاجان صلاحيات على جهازك. أما التثبيت والتهيئة فعليًا فيتطلبان وكيلًا لديه وصول مناسب إلى Terminal والملفات وإعدادات MCP host. إذا لم يملك هذه الصلاحيات، يجب أن يشرح ويرشد فقط — لا أن يدّعي أنه نفّذ التثبيت.',
-    steps: [
-      {
-        title: 'أرسل له الرابط الرسمي',
-        body: 'اطلب منه قراءة المشروع والوثائق الرسمية أولًا، بدل الاعتماد على تخمين أو شرح عام عن أدوات الذاكرة.',
-      },
-      {
-        title: 'اطلب تقييمًا يخص استخدامك أنت',
-        body: 'دعه يشرح هل FactLane مناسب لطريقة عملك، ثم يقترح سيناريوهات عملية مرتبطة بمشروعاتك وتفضيلاتك والوكلاء الذين تستخدمهم.',
-      },
-      {
-        title: 'تعلّم الفكرة قبل التنفيذ',
-        body: 'اطلب شرحًا بسيطًا لما يحفظه FactLane وما لا يحفظه، ولماذا الذاكرة دليل مساعد وليست صلاحية تنفيذ أو حقيقة أعلى من الواقع الحالي.',
-      },
-      {
-        title: 'إذا كان قادرًا، دعه يجهّز البيئة',
-        body: 'مع صلاحيات Terminal والملفات وإعداد MCP host، يمكنه فحص المتطلبات وتثبيت الإصدار v0.1.3 وضبط الاتصال المحلي المدعوم. البداية الآمنة تكون read-only.',
-      },
-      {
-        title: 'تحقّق أولًا، ثم فكّر في الكتابة',
-        body: 'يجب أن يتحقق الـhost من ظهور أدوات FactLane الخمس وأن ينجح اتصال read-only مناسب. قبل أي كتابة، افهم الفرق بين Candidate (مرشّح) وCurrent (حالي ومتحقَّق منه) وحدود الصلاحيات؛ الوكيل العادي لا يستطيع منح نفسه صلاحية verifier.',
-      },
-    ],
-    promptLabel: 'رسالة جاهزة لوكيلك',
-    promptTitle: 'انسخها كما هي، ثم عدّلها حسب استخدامك.',
-    promptBody: `هذا رابط FactLane الرسمي:\nhttps://github.com/Habib1001-m/factlane\n\nقبل أن تغيّر أي شيء على جهازي:\n1) اقرأ المشروع والوثائق الرسمية واشرح لي هل FactLane مناسب لطريقة استخدامي لك.\n2) اقترح لي سيناريوهات عملية تناسب استخدامي ومشروعاتي، ثم علّمني الفكرة بلغة بسيطة.\n3) وضّح لي ما الذي يحفظه FactLane وما الذي لا يحفظه، ولماذا الذاكرة لا تتقدم على تعليماتي الحالية أو الحالة الحية للمشروع.\n4) إذا كنت تملك صلاحية Terminal والملفات وإعداد MCP host على هذا الجهاز، افحص المتطلبات وثبّت الإصدار المدعوم v0.1.3 وفق المسار الرسمي، ثم اضبط الاتصال read-only أولًا.\n5) تحقّق من أن الـhost يكتشف أدوات FactLane الخمس وأن ينجح طلب memory_status ضمن نطاق مناسب قبل تمكين أي كتابة.\n6) قبل أي كتابة، اشرح لي الفرق بين Candidate (مرشّح) وCurrent (حالي ومتحقَّق منه) وحدود الصلاحيات، ولا تمنح نفسك صلاحية verifier ولا تفعّل صلاحية كتابة أوسع من المطلوب.\n\nإذا لم تكن تملك الصلاحيات اللازمة للتثبيت أو تعديل إعداد MCP host، لا تدّع أنك نفّذت ذلك؛ اكتفِ بالشرح والإرشاد والخطوات التي يجب أن ينفذها مستخدم أو مشغّل مخوّل.`,
-    copyAction: 'انسخ الرسالة لوكيلك',
-    copiedAction: 'تم نسخ الرسالة',
-    copyFailedAction: 'تعذّر النسخ تلقائيًا — يمكنك تحديد النص ونسخه يدويًا',
-    githubAction: 'افتح FactLane على GitHub',
-    manualAction: 'أفضل الإعداد اليدوي — افتح Quick Start',
+export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
+  en: {
+    differentiation: {
+      eyebrow: 'Why FactLane is different',
+      title: 'Many memory systems focus on recall. FactLane adds a governed boundary for what may count as Current.',
+      intro:
+        'The distinctive choice is not bigger storage. It is a governed fact lifecycle for information that may influence future work.',
+      cards: [
+        {
+          title: 'Bounded facts, not memory exhaust.',
+          body: 'FactLane keeps small reusable facts with exact scope, provenance and freshness instead of trying to absorb every document, transcript or thought.',
+        },
+        {
+          title: 'Candidate is not Current.',
+          body: 'An agent may contribute something worth remembering without being allowed to declare its own contribution verified current truth.',
+        },
+        {
+          title: 'Memory is not authority.',
+          body: 'Current user instructions, live project state and verified live sources outrank remembered facts. Tool visibility also does not grant write authority.',
+        },
+      ],
+      docsAction: 'Read the core concepts →',
+    },
+    coexistence: {
+      eyebrow: 'Complement, do not replace',
+      title: 'Keep your broad memory. Add FactLane as the governed fact lane.',
+      intro:
+        'Integrated memory is not one problem with one correct architecture. Different layers are good at different jobs.',
+      lanes: [
+        {
+          label: 'Broad / native memory',
+          title: 'Rich recall and continuity',
+          body: 'Useful for preferences, summaries, long-lived context and the broad personal or agent memory experience.',
+        },
+        {
+          label: 'Knowledge graphs / wikis',
+          title: 'Connected knowledge at scale',
+          body: 'Useful for relationships, documents, concepts and large bodies of organized knowledge.',
+        },
+        {
+          label: 'FactLane',
+          title: 'A governed fact lane',
+          body: 'Useful when a small fact needs exact scope, provenance, freshness, Candidate → Current verification and explicit authority boundaries.',
+        },
+      ],
+      note:
+        'Codex and Hermes are tested stdio hosts. The intended pattern is coexistence: FactLane can sit beside the other memory layers in those workflows rather than trying to replace them.',
+      docsAction: 'See the architecture and tested-host boundary →',
+    },
+    onboarding: {
+      eyebrow: 'Start with your agent, not a terminal',
+      title: 'Give FactLane to the agent you already use.',
+      intro:
+        'Ask your agent to read the project, compare it with your current memory stack and explain whether the governed-fact model solves a real problem for you. Installation comes after understanding fit.',
+      capabilityTitle: 'What can your agent actually do?',
+      capabilityBody:
+        'An agent that can read the public repository and docs can explain the project and assess fit. Installing and configuring it requires access to Terminal, files and your MCP-host configuration. Without those permissions, the agent should guide you — not claim it installed anything.',
+      steps: [
+        {
+          title: 'Evaluate fit first',
+          body: 'Ask what FactLane adds beside the memory you already have, which facts belong in it, and which information should stay in broader memory or knowledge systems.',
+        },
+        {
+          title: 'Learn the trust model',
+          body: 'Understand Candidate, Current, freshness, scope and why remembered information remains below current instructions and live state.',
+        },
+        {
+          title: 'If the agent has access, install read-only',
+          body: 'Use the exact v0.1.3 release, the supported local profile and a compatible MCP host. Verify all five tools and a suitable memory_status call before enabling writes.',
+        },
+        {
+          title: 'Enable contribution only after the boundary is clear',
+          body: 'If Candidate writes are useful, grant only the delegated-candidate profile. An ordinary agent does not grant itself verifier authority.',
+        },
+      ],
+      promptLabel: 'Prompt for your agent',
+      promptTitle: 'Copy this, then adapt it to your workflow.',
+      promptBody: `Official FactLane repository:\nhttps://github.com/Habib1001-m/factlane\n\nBefore changing anything on my machine:\n1) Read the project and official docs. Explain what FactLane adds beside the memory systems I already use and whether it fits my workflow.\n2) Give me concrete use cases, and explain Candidate, Current, freshness, scope and the authority boundary in plain language.\n3) If you have Terminal, file and MCP-host configuration access, inspect the prerequisites and install the exact supported v0.1.3 release. Configure it read-only first.\n4) Verify that my host discovers exactly five FactLane tools and that an appropriate memory_status request succeeds.\n5) Before enabling any write capability, explain delegated-candidate versus verifier authority and ask me before changing the write profile.\n\nIf you do not have the required machine or MCP-host access, do not claim you installed or configured anything. Explain and guide me instead.`,
+      copyAction: 'Copy prompt',
+      copiedAction: 'Prompt copied',
+      copyFailedAction: 'Automatic copy failed — select and copy the prompt manually',
+      githubAction: 'Open FactLane on GitHub',
+      manualAction: 'Prefer manual setup? Open Quick Start',
+      promptDirection: 'ltr',
+      badge: 'AGENT-NATIVE',
+    },
+    trust: {
+      eyebrow: 'Useful memory without hidden authority',
+      title: 'Memory can help without becoming permission.',
+      intro:
+        'FactLane separates memory eligibility from execution authority. This is the center of the design, not a warning added afterward.',
+      cards: [
+        {
+          title: 'Current reality wins.',
+          body: 'A current user instruction, live repository/product state or verified live source outranks memory when they conflict.',
+        },
+        {
+          title: 'Contributors do not verify themselves.',
+          body: 'A normal delegated agent can contribute a Candidate when allowed; trusted promotion is a separate operation with revision and identity checks.',
+        },
+        {
+          title: 'Write authority belongs to the launcher boundary.',
+          body: 'Seeing memory_store or memory_update does not itself grant permission to use them with privileged semantics.',
+        },
+      ],
+      flow: [
+        {label: 'Candidate', body: 'Worth remembering, but not trusted as current yet.'},
+        {label: 'Trusted verification', body: 'A separate trusted step checks identity, revision and lifecycle.'},
+        {label: 'Current', body: 'Verified, fresh enough and eligible for current-state retrieval.'},
+      ],
+      docsAction: 'Read Candidate → Current in detail →',
+    },
+    rigor: {
+      eyebrow: 'Quality you can inspect',
+      title: 'Free and open source. Production-qualified where we claim support.',
+      intro:
+        'FactLane v0.1.3 is an official production release for a deliberately bounded local profile. The quality claim is tied to explicit contracts, fail-closed behavior and documented qualification — not adjectives.',
+      cards: [
+        {
+          title: 'Small public surface',
+          body: 'Exactly five MCP tools keep the contract focused: search, read, contribute, governed update and status.',
+        },
+        {
+          title: 'Fail-closed defaults',
+          body: 'Read-only is the default. Unsupported runtime/provider conditions and unauthorized transitions fail closed instead of silently degrading into broader authority.',
+        },
+        {
+          title: 'Production qualification',
+          body: 'The documented profile was exercised for installation, backup/restore, bounded concurrency, crash/restart behavior, configured host startup, production-derived retrieval and SQLite capacity failure.',
+        },
+        {
+          title: 'Inspectable and local',
+          body: 'Apache-2.0 source, local SQLite/SQLite-vec storage and supported local Ollama embeddings make the current profile inspectable; no hosted memory service or external embedding API is required for it.',
+        },
+      ],
+      qualification:
+        'The boundary is explicit: stdio MCP, Python 3.11+, linked SQLite 3.42.0+, supported local Ollama embeddings and the documented local POSIX storage/recovery contract.',
+      architectureAction: 'Read the architecture →',
+      securityAction: 'Read the security model →',
+    },
+    whyNow: {
+      eyebrow: 'Why this niche matters now',
+      title: 'Agents are moving from chat to action. Memory needs a trust boundary too.',
+      body:
+        'In August 2026, OpenAI reported third-party cyber-evaluation incidents where model activity extended beyond intended testing boundaries. That is an agent-control problem larger than memory, and FactLane does not claim to solve sandboxing or general agent safety.',
+      caveat:
+        'Its narrower contribution is concrete: remembered information should not silently become current truth, verifier authority or execution permission.',
+      sourceLabel: 'OpenAI: third-party cyber evaluations involving OpenAI models ↗',
+      sourceHref: 'https://openai.com/index/third-party-cyber-evaluations-involving-openai-models/',
+    },
   },
-  trust: {
-    eyebrow: 'ذاكرة نافعة بلا سلطة خفية',
-    title: 'يتذكّر وكيلك أكثر، لكن تعليماتك الحالية والواقع الحي يظلان أعلى من الذاكرة.',
-    intro:
-      'FactLane صُمّم لكي يجعل الذاكرة مفيدة من دون أن يحوّل معلومة قديمة أو مساهمة وكيل إلى أمر نافذ تلقائيًا.',
-    cards: [
-      {
-        title: 'الذاكرة دليل مساعد، لا صلاحية تنفيذ.',
-        body: 'FactLane قد يعيد حقيقة مناسبة للسياق، لكنه لا يمنح الوكيل سلطة تنفيذ أو يرفع الذاكرة فوق تعليماتك الحالية.',
-      },
-      {
-        title: 'الحقيقة الحية تتقدم على الذاكرة.',
-        body: 'تعليمات المستخدم الحالية، وحالة المشروع الحية، والمصادر الحية المتحقَّق منها تتقدم على ما تم تذكّره سابقًا.',
-      },
-      {
-        title: 'الوكيل العادي لا يرقّي نفسه.',
-        body: 'يمكن لوكيل مفوّض أن يقترح Candidate عندما يسمح الـlauncher بذلك، لكنه لا يستطيع أن يمنح نفسه صلاحية verifier أو يحوّل مساهمته إلى Current لمجرد أنه اقترحها.',
-      },
-    ],
-    flow: [
-      {label: 'Candidate (مرشّح)', body: 'معلومة تستحق التذكّر، لكنها ليست حقيقة حالية موثوقة بعد.'},
-      {label: 'تحقّق موثوق', body: 'خطوة مستقلة تتحقق من الهوية والمراجعة والنسخة قبل الترقية.'},
-      {label: 'Current (حالي ومتحقَّق منه)', body: 'حقيقة مؤهلة للاسترجاع كحالة حالية ضمن نطاقها وحداثتها.'},
-    ],
-    docsAction: 'اقرأ تفاصيل Candidate وCurrent في الوثائق',
+  ar: {
+    differentiation: {
+      eyebrow: 'لماذا FactLane مختلف؟',
+      title: 'تركّز كثير من أنظمة الذاكرة على الاستدعاء. يضيف FactLane حدًا محكومًا لما يجوز اعتباره Current.',
+      intro:
+        'الفارق ليس مساحة تخزين أكبر. الفارق هو دورة حياة محكومة للحقائق التي قد تؤثر في عمل لاحق.',
+      cards: [
+        {
+          title: 'حقائق محددة، لا تجميعًا شاملًا لكل السياق.',
+          body: 'يحفظ FactLane حقائق صغيرة قابلة لإعادة الاستخدام مع نطاق ومصدر وحداثة، بدل محاولة جمع كل وثيقة ومحادثة وسياق في مخزن واحد.',
+        },
+        {
+          title: 'Candidate ليس Current.',
+          body: 'يمكن للوكيل أن يقترح معلومة تستحق الحفظ من دون أن يمتلك حق إعلان مساهمته حقيقة حالية متحقَّقًا منها.',
+        },
+        {
+          title: 'الذاكرة ليست سلطة.',
+          body: 'تعليماتك الحالية وحالة المشروع الحية والمصادر الحية المتحقَّق منها تتقدم على الذاكرة. وظهور الأداة لا يمنح صلاحية الكتابة.',
+        },
+      ],
+      docsAction: 'اقرأ المفاهيم الأساسية →',
+    },
+    coexistence: {
+      eyebrow: 'يكمل، لا يستبدل',
+      title: 'أبقِ ذاكرتك الواسعة. وأضف FactLane كمسار محكوم للحقائق.',
+      intro:
+        'الذاكرة المتكاملة ليست مسألة واحدة لها هندسة صحيحة واحدة. كل طبقة تتفوق في وظيفة مختلفة.',
+      lanes: [
+        {
+          label: 'الذاكرة الواسعة / الأصلية',
+          title: 'استدعاء غني واستمرارية',
+          body: 'مناسبة للتفضيلات والملخصات والسياق طويل العمر وتجربة الذاكرة الشخصية أو ذاكرة الوكيل الواسعة.',
+        },
+        {
+          label: 'Knowledge graphs / wikis',
+          title: 'معرفة مترابطة على نطاق كبير',
+          body: 'مناسبة للعلاقات والوثائق والمفاهيم وأجسام المعرفة الكبيرة والمنظمة.',
+        },
+        {
+          label: 'FactLane',
+          title: 'مسار محكوم للحقائق',
+          body: 'مناسب عندما تحتاج حقيقة صغيرة إلى نطاق محدد ومصدر وحداثة وتحقّق Candidate → Current وحدود صلاحيات صريحة.',
+        },
+      ],
+      note:
+        'اختُبر Codex وHermes كـstdio hosts. والنمط المقصود هو التعايش: يمكن لـFactLane أن يعمل بجانب طبقات الذاكرة الأخرى في هذه البيئات بدل محاولة استبدالها.',
+      docsAction: 'شاهد المعمارية وحدود الـhosts المختبرة →',
+    },
+    onboarding: {
+      eyebrow: 'ابدأ من وكيلك، لا من سطر الأوامر',
+      title: 'أعطِ FactLane للوكيل الذي تستخدمه بالفعل.',
+      intro:
+        'اطلب من وكيلك قراءة المشروع ومقارنته بطبقات الذاكرة الموجودة لديك وشرح ما إذا كان نموذج الحقائق المحكومة يحل مشكلة حقيقية لك. التثبيت يأتي بعد فهم الملاءمة.',
+      capabilityTitle: 'ما الذي يستطيع وكيلك فعله فعلًا؟',
+      capabilityBody:
+        'الوكيل القادر على قراءة المستودع العام والوثائق يستطيع شرح المشروع وتقييم الملاءمة. أما التثبيت والتهيئة فعليًا فيتطلبان وصولًا إلى Terminal والملفات وإعداد MCP host. من دون هذه الصلاحيات، يجب أن يرشدك فقط — لا أن يدّعي أنه ثبّت شيئًا.',
+      steps: [
+        {
+          title: 'قيّم الملاءمة أولًا',
+          body: 'اسأله ماذا يضيف FactLane بجانب الذاكرة التي لديك، وما الحقائق التي تنتمي إليه، وما الذي يجب أن يبقى في ذاكرة أوسع أو نظام معرفة آخر.',
+        },
+        {
+          title: 'افهم نموذج الثقة',
+          body: 'تعلّم Candidate وCurrent والحداثة والنطاق ولماذا تظل الذاكرة أدنى من تعليماتك الحالية والحالة الحية.',
+        },
+        {
+          title: 'إن كان قادرًا، ثبّت read-only أولًا',
+          body: 'استخدم الإصدار v0.1.3 بالضبط وملف التشغيل المحلي المدعوم وMCP host متوافقًا. تحقّق من الأدوات الخمس وطلب memory_status مناسب قبل أي كتابة.',
+        },
+        {
+          title: 'فعّل المساهمة بعد فهم الحدود',
+          body: 'إذا احتجت Candidate writes فامنح فقط delegated-candidate. الوكيل العادي لا يمنح نفسه صلاحية verifier.',
+        },
+      ],
+      promptLabel: 'رسالة جاهزة لوكيلك',
+      promptTitle: 'انسخها ثم عدّلها على حسب سير عملك.',
+      promptBody: `هذا رابط FactLane الرسمي:\nhttps://github.com/Habib1001-m/factlane\n\nقبل أن تغيّر أي شيء على جهازي:\n1) اقرأ المشروع والوثائق الرسمية. اشرح لي ماذا يضيف FactLane بجانب أنظمة الذاكرة التي أستخدمها وهل يناسب سير عملي.\n2) اقترح حالات استخدام عملية، واشرح ببساطة Candidate وCurrent والحداثة والنطاق وحدود الصلاحيات.\n3) إذا كنت تملك صلاحيات Terminal والملفات وإعداد MCP host، افحص المتطلبات وثبّت الإصدار المدعوم v0.1.3 بالضبط، واضبط الاتصال read-only أولًا.\n4) تحقّق من أن الـhost يكتشف أدوات FactLane الخمس وأن طلب memory_status مناسبًا ينجح.\n5) قبل أي كتابة، اشرح delegated-candidate مقابل verifier authority واطلب موافقتي قبل تغيير write profile.\n\nإذا لم تكن تملك الصلاحيات اللازمة على الجهاز أو إعداد MCP host، لا تدّع أنك ثبّت أو هيّأت شيئًا؛ اشرح وارشدني فقط.`,
+      copyAction: 'انسخ الرسالة',
+      copiedAction: 'تم نسخ الرسالة',
+      copyFailedAction: 'تعذّر النسخ تلقائيًا — حدّد النص وانسخه يدويًا',
+      githubAction: 'افتح FactLane على GitHub',
+      manualAction: 'تفضّل الإعداد اليدوي؟ افتح Quick Start',
+      promptDirection: 'rtl',
+      badge: 'AGENT-NATIVE',
+    },
+    trust: {
+      eyebrow: 'ذاكرة نافعة بلا سلطة خفية',
+      title: 'الذاكرة تساعد. لكنها لا تصبح صلاحية.',
+      intro:
+        'يفصل FactLane بين أهلية الذاكرة وصلاحية التنفيذ. هذا جوهر التصميم، وليس تحذيرًا أضفناه بعد اكتمال المنتج.',
+      cards: [
+        {
+          title: 'الحقيقة الحالية تتقدم.',
+          body: 'تعليمات المستخدم الحالية أو حالة المشروع/المنتج الحية أو المصدر الحي المتحقَّق منه تتقدم على الذاكرة عند التعارض.',
+        },
+        {
+          title: 'المساهم لا يتحقق من نفسه.',
+          body: 'يمكن لوكيل delegated أن يساهم بـCandidate عندما يُسمح له؛ الترقية الموثوقة عملية منفصلة لها فحوص revision وهوية.',
+        },
+        {
+          title: 'صلاحية الكتابة تأتي من launcher boundary.',
+          body: 'مجرد ظهور memory_store أو memory_update لا يمنح الوكيل حق استخدامهما بمعاني الصلاحيات الأعلى.',
+        },
+      ],
+      flow: [
+        {label: 'Candidate (مرشّح)', body: 'يستحق التذكّر، لكنه ليس حقيقة حالية موثوقة بعد.'},
+        {label: 'تحقّق موثوق', body: 'خطوة مستقلة تتحقق من الهوية والـrevision ودورة الحياة.'},
+        {label: 'Current (حالي ومتحقَّق منه)', body: 'متحقَّق منه، حديث بما يكفي، ومؤهل للاسترجاع الحالي.'},
+      ],
+      docsAction: 'اقرأ Candidate → Current بالتفصيل →',
+    },
+    rigor: {
+      eyebrow: 'جودة يمكنك فحصها',
+      title: 'مجاني ومفتوح المصدر. ومؤهل إنتاجيًا ضمن نطاق الدعم المعلن.',
+      intro:
+        'FactLane v0.1.3 إصدار إنتاج رسمي لملف محلي محدد عمدًا. ادعاء الجودة مربوط بعقود صريحة وفشل مغلق وتأهيل موثّق — لا بصفات تسويقية.',
+      cards: [
+        {
+          title: 'سطح عام صغير',
+          body: 'خمس أدوات MCP فقط تغطي البحث والقراءة والمساهمة والتحديث المحكوم والحالة.',
+        },
+        {
+          title: 'Fail-closed افتراضيًا',
+          body: 'الوضع الافتراضي read-only. حالات runtime/provider غير المدعومة والانتقالات غير المصرح بها تفشل مغلقة بدل توسيع الصلاحيات بصمت.',
+        },
+        {
+          title: 'تأهيل إنتاجي حقيقي',
+          body: 'الملف الموثق اختُبر للتثبيت وbackup/restore وbounded concurrency وcrash/restart وconfigured host startup وproduction-derived retrieval وفشل سعة SQLite.',
+        },
+        {
+          title: 'محلي وقابل للفحص',
+          body: 'كود Apache-2.0 وتخزين SQLite/SQLite-vec محلي وOllama embeddings محلية ومدعومة تجعل الملف الحالي قابلًا للفحص؛ ولا يحتاج إلى خدمة ذاكرة مستضافة أو API خارجي للـembeddings.',
+        },
+      ],
+      qualification:
+        'الحدود صريحة: stdio MCP وPython 3.11+ وSQLite 3.42.0+ المرتبط بـPython وOllama embeddings محلية ومدعومة وعقد POSIX storage/recovery المحلي الموثق.',
+      architectureAction: 'اقرأ المعمارية →',
+      securityAction: 'اقرأ نموذج الأمان →',
+    },
+    whyNow: {
+      eyebrow: 'لماذا يهم هذا المجال الآن؟',
+      title: 'الوكلاء ينتقلون من المحادثة إلى الفعل. والذاكرة تحتاج هي الأخرى إلى حد ثقة.',
+      body:
+        'في أغسطس 2026 نشرت OpenAI عن حوادث في تقييمات سيبرانية خارجية امتد فيها نشاط النماذج خارج حدود بيئات الاختبار المقصودة. هذه مشكلة أوسع من الذاكرة، وFactLane لا يدّعي أنه يحل sandboxing أو أمان الوكلاء عمومًا.',
+      caveat:
+        'مساهمته أضيق وأكثر تحديدًا: المعلومة المتذكّرة لا ينبغي أن تتحول بصمت إلى حقيقة حالية أو verifier authority أو صلاحية تنفيذ.',
+      sourceLabel: 'OpenAI: تقييمات سيبرانية خارجية باستخدام نماذج OpenAI ↗',
+      sourceHref: 'https://openai.com/index/third-party-cyber-evaluations-involving-openai-models/',
+    },
   },
 };
