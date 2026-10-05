@@ -388,7 +388,6 @@ function EngineeringRigor({
         <Heading as="h3">{whyNow.title}</Heading>
         <p>{whyNow.body}</p>
         <strong>{whyNow.caveat}</strong>
-        <Link href={whyNow.sourceHref}>{whyNow.sourceLabel}</Link>
       </aside>
     </Section>
   );

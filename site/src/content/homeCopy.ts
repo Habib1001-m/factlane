@@ -119,7 +119,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       description:
         'FactLane is a free, local-first fact layer for MCP agents: bounded facts, provenance, freshness and a Candidate-to-Current trust boundary.',
       structuredDataDescription:
-        'Free, local-first governed memory for compatible MCP agents, with bounded facts, exact scope, provenance, freshness and trusted verification.',
+        'Free, local-first governed facts for compatible MCP agents, with exact scope, provenance, freshness and trusted Candidate-to-Current verification.',
     },
     hero: {
       kicker: 'Free · local-first · governed facts for MCP agents',
@@ -137,7 +137,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       ],
       developerLabel: 'Prefer manual setup?',
       developerLink: 'Open the Quick Start →',
-      windowTitle: 'FactLane · reusable memory',
+      windowTitle: 'FactLane · governed facts',
       localBadge: 'LOCAL',
       promptLabel: 'You',
       prompt:
@@ -344,7 +344,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       description:
         'FactLane طبقة حقائق مجانية ومحلية لوكلاء MCP: حقائق محددة مع نطاق ومصدر وحداثة وفصل واضح بين Candidate وCurrent.',
       structuredDataDescription:
-        'ذاكرة محلية ومفتوحة المصدر لوكلاء MCP المتوافقين، تحفظ حقائق محددة مع نطاق ومصدر وحداثة وتحقّق موثوق من دون تحويل الذاكرة إلى صلاحية تنفيذ.',
+        'طبقة حقائق مجانية ومحلية لوكلاء MCP المتوافقين، مع نطاق ومصدر وحداثة وتحقّق موثوق بين Candidate وCurrent من دون تحويل الذاكرة إلى صلاحية تنفيذ.',
     },
     hero: {
       kicker: 'مجاني · محلي · حقائق محكومة لوكلاء MCP',
@@ -362,7 +362,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       ],
       developerLabel: 'تفضّل الإعداد بنفسك؟',
       developerLink: 'افتح Quick Start للمطور',
-      windowTitle: 'FactLane · ذاكرة قابلة لإعادة الاستخدام',
+      windowTitle: 'FactLane · حقائق محكومة',
       localBadge: 'LOCAL',
       promptLabel: 'أنت',
       prompt: 'تذكّر أنني أفضّل إجابات عربية مختصرة، مع إبقاء المصطلحات التقنية بالإنجليزية.',
@@ -620,8 +620,6 @@ export type LandingExperience = {
     title: string;
     body: string;
     caveat: string;
-    sourceLabel: string;
-    sourceHref: string;
   };
 };
 
@@ -757,7 +755,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
         },
         {
           title: 'Inspectable and local',
-          body: 'Apache-2.0 source, local SQLite/SQLite-vec storage and supported local Ollama embeddings make the current profile inspectable; no hosted memory service or external embedding API is required for it.',
+          body: 'Apache-2.0 source can be inspected, run and adapted. Local SQLite/SQLite-vec storage and supported local Ollama embeddings mean the qualified profile does not require a hosted memory service or external embedding API.',
         },
       ],
       qualification:
@@ -767,13 +765,11 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
     },
     whyNow: {
       eyebrow: 'Why this niche matters now',
-      title: 'Agents are moving from chat to action. Memory needs a trust boundary too.',
+      title: 'Persistent agents make memory lifecycle matter.',
       body:
-        'In August 2026, OpenAI reported third-party cyber-evaluation incidents where model activity extended beyond intended testing boundaries. That is an agent-control problem larger than memory, and FactLane does not claim to solve sandboxing or general agent safety.',
+        'When an agent carries context across sessions and acts through tools, a remembered fact can influence work long after the conversation that produced it. That makes freshness, verification and authority boundaries operational concerns, not just retrieval quality.',
       caveat:
-        'Its narrower contribution is concrete: remembered information should not silently become current truth, verifier authority or execution permission.',
-      sourceLabel: 'OpenAI: third-party cyber evaluations involving OpenAI models ↗',
-      sourceHref: 'https://openai.com/index/third-party-cyber-evaluations-involving-openai-models/',
+        'FactLane stays narrow: it does not solve general agent safety. It governs which reusable facts may count as Current and who is allowed to promote them.',
     },
   },
   ar: {
@@ -907,7 +903,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
         },
         {
           title: 'محلي وقابل للفحص',
-          body: 'كود Apache-2.0 وتخزين SQLite/SQLite-vec محلي وOllama embeddings محلية ومدعومة تجعل الملف الحالي قابلًا للفحص؛ ولا يحتاج إلى خدمة ذاكرة مستضافة أو API خارجي للـembeddings.',
+          body: 'يتيح ترخيص Apache-2.0 فحص الكود وتشغيله وتكييفه. ومع تخزين SQLite/SQLite-vec محلي وOllama embeddings محلية ومدعومة، لا يحتاج ملف التشغيل المؤهل إلى خدمة ذاكرة مستضافة أو API خارجي للـembeddings.',
         },
       ],
       qualification:
@@ -917,13 +913,11 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
     },
     whyNow: {
       eyebrow: 'لماذا يهم هذا المجال الآن؟',
-      title: 'الوكلاء ينتقلون من المحادثة إلى الفعل. والذاكرة تحتاج هي الأخرى إلى حد ثقة.',
+      title: 'استمرار الوكيل عبر الجلسات يجعل دورة حياة الذاكرة مهمة.',
       body:
-        'في أغسطس 2026 نشرت OpenAI عن حوادث في تقييمات سيبرانية خارجية امتد فيها نشاط النماذج خارج حدود بيئات الاختبار المقصودة. هذه مشكلة أوسع من الذاكرة، وFactLane لا يدّعي أنه يحل sandboxing أو أمان الوكلاء عمومًا.',
+        'عندما يحمل الوكيل سياقًا بين الجلسات ويستخدم أدوات، يمكن لحقيقة متذكَّرة أن تؤثر في عمل لاحق بعد زمن من المحادثة التي أنتجتها. عندها تصبح الحداثة والتحقّق وحدود الصلاحيات مسائل تشغيلية، لا مجرد جودة استرجاع.',
       caveat:
-        'مساهمته أضيق وأكثر تحديدًا: المعلومة المتذكّرة لا ينبغي أن تتحول بصمت إلى حقيقة حالية أو verifier authority أو صلاحية تنفيذ.',
-      sourceLabel: 'OpenAI: تقييمات سيبرانية خارجية باستخدام نماذج OpenAI ↗',
-      sourceHref: 'https://openai.com/index/third-party-cyber-evaluations-involving-openai-models/',
+        'يبقى نطاق FactLane أضيق: لا يدّعي حل أمان الوكلاء عمومًا؛ بل يحكم أي الحقائق القابلة لإعادة الاستخدام يجوز اعتبارها Current، ومن يملك صلاحية ترقيتها.',
     },
   },
 };
