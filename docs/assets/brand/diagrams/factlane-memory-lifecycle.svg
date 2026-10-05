@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 420">
+<defs>
+<linearGradient id="arrow" x1="0" x2="1"><stop stop-color="#3B82F6"/><stop offset="1" stop-color="#22C55E"/></linearGradient>
+<filter id="glow"><feGaussianBlur stdDeviation="7" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+</defs>
+<rect width="1400" height="420" rx="30" fill="#0A0F1A"/>
+<path d="M160 328 C365 390 765 390 1120 326" fill="none" stroke="#3B82F6" stroke-width="3" stroke-dasharray="9 9" opacity=".85"/>
+<rect x="500" y="350" width="280" height="48" rx="16" fill="#0A0F1A"/>
+<text x="640" y="383" font-family="Inter,Arial" font-size="26" text-anchor="middle" fill="#94A3B8">Scoped, fresh retrieval</text>
+<rect x="58" y="82" width="250" height="210" rx="26" fill="#10213B" stroke="#3B82F6" stroke-width="2"/>
+<circle cx="183" cy="148" r="31" fill="#3B82F6"/><path d="M120 240 Q183 175 246 240" fill="#3B82F6" opacity=".9"/>
+<text x="183" y="274" font-family="Inter,Arial" font-size="30" font-weight="700" text-anchor="middle" fill="#FFFFFF">Agent</text>
+<rect x="402" y="82" width="250" height="210" rx="26" fill="#10213B" stroke="#3B82F6" stroke-width="2"/>
+<rect x="472" y="126" width="110" height="82" rx="16" fill="#173564" stroke="#16D9F4" stroke-width="2"/>
+<path d="M493 152 H560 M493 174 H548 M493 196 H532" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round" opacity=".9"/>
+<text x="527" y="252" font-family="Inter,Arial" font-size="30" font-weight="700" text-anchor="middle" fill="#FFFFFF">Candidate</text>
+<text x="527" y="282" font-family="Inter,Arial" font-size="20" text-anchor="middle" fill="#94A3B8">proposed fact</text>
+<circle cx="825" cy="184" r="85" fill="#0F2B2A" stroke="#22C55E" stroke-width="3" filter="url(#glow)"/>
+<path d="M825 122 L872 142 V184 C872 222 849 247 825 260 C801 247 778 222 778 184 V142 Z" fill="#22C55E" opacity=".9"/>
+<path d="M802 184 L818 200 L850 165" fill="none" stroke="#FFFFFF" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="825" y="72" font-family="Inter,Arial" font-size="27" font-weight="700" text-anchor="middle" fill="#FFFFFF">Authority verification</text>
+<rect x="1040" y="82" width="300" height="210" rx="26" fill="#0E2826" stroke="#22C55E" stroke-width="2"/>
+<ellipse cx="1190" cy="142" rx="58" ry="20" fill="#22C55E"/><rect x="1132" y="142" width="116" height="64" fill="#22C55E" opacity=".86"/><ellipse cx="1190" cy="206" rx="58" ry="20" fill="#22C55E"/>
+<text x="1190" y="252" font-family="Inter,Arial" font-size="30" font-weight="700" text-anchor="middle" fill="#FFFFFF">Current</text>
+<text x="1190" y="282" font-family="Inter,Arial" font-size="20" text-anchor="middle" fill="#94A3B8">verified + scoped</text>
+<path d="M315 184 H388" stroke="url(#arrow)" stroke-width="7" stroke-linecap="round"/><path d="M378 170 L398 184 L378 198" fill="none" stroke="#3B82F6" stroke-width="6"/>
+<text x="352" y="154" font-family="Inter,Arial" font-size="18" text-anchor="middle" fill="#94A3B8">proposes</text>
+<path d="M660 184 H724" stroke="url(#arrow)" stroke-width="7" stroke-linecap="round"/><path d="M714 170 L734 184 L714 198" fill="none" stroke="#16D9F4" stroke-width="6"/>
+<path d="M914 184 H1022" stroke="url(#arrow)" stroke-width="7" stroke-linecap="round"/><path d="M1012 170 L1032 184 L1012 198" fill="none" stroke="#22C55E" stroke-width="6"/>
+</svg>

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+<defs>
+<linearGradient id="gTop" gradientUnits="userSpaceOnUse" x1="150" y1="120" x2="410" y2="170"><stop offset="0" stop-color="#0A0F1A"/><stop offset="1" stop-color="#0A0F1A"/></linearGradient>
+<linearGradient id="gMid" gradientUnits="userSpaceOnUse" x1="190" y1="230" x2="370" y2="250"><stop offset="0" stop-color="#0A0F1A"/><stop offset="1" stop-color="#0A0F1A"/></linearGradient>
+<linearGradient id="gStem" gradientUnits="userSpaceOnUse" x1="185" y1="130" x2="110" y2="370"><stop offset="0" stop-color="#0A0F1A"/><stop offset=".7" stop-color="#0A0F1A"/><stop offset="1" stop-color="#0A0F1A"/></linearGradient>
+<radialGradient id="node" cx="35%" cy="25%" r="75%"><stop offset="0" stop-color="#0A0F1A"/><stop offset="1" stop-color="#0A0F1A"/></radialGradient>
+</defs>
+<path d="M176 124 H396" fill="none" stroke="url(#gTop)" stroke-width="62" stroke-linecap="round"/>
+<path d="M199 237 H352" fill="none" stroke="url(#gMid)" stroke-width="62" stroke-linecap="round"/>
+<path d="M197 150 L116 354" fill="none" stroke="url(#gStem)" stroke-width="70" stroke-linecap="round"/>
+<circle cx="84" cy="237" r="34" fill="url(#node)"/>
+</svg>
