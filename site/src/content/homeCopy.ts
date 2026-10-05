@@ -115,18 +115,18 @@ export type HomeCopy = {
 export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
   en: {
     meta: {
-      title: 'Governed memory for AI agents',
+      title: 'Governed facts for AI agents',
       description:
-        'FactLane is free, local-first governed memory for MCP agents: bounded facts, provenance, freshness and a Candidate-to-Current trust boundary.',
+        'FactLane is a free, local-first fact layer for MCP agents: bounded facts, provenance, freshness and a Candidate-to-Current trust boundary.',
       structuredDataDescription:
         'Free, local-first governed memory for compatible MCP agents, with bounded facts, exact scope, provenance, freshness and trusted verification.',
     },
     hero: {
-      kicker: 'Free · local-first · governed memory for MCP agents',
-      title: 'Give your agents memory they can trust.',
-      titleMuted: ' Without giving memory authority.',
+      kicker: 'Free · local-first · governed facts for MCP agents',
+      title: 'Give your agents reusable facts.',
+      titleMuted: ' Without letting memory declare itself truth.',
       lead:
-        'FactLane keeps bounded facts with scope, provenance and freshness, separates Candidate from Current, and sits beside the memory systems you already use.',
+        'FactLane is a narrow MCP layer for the small facts that should survive a session. Each fact carries scope, provenance and freshness; contributors can submit Candidates, but only trusted verification makes them Current.',
       primaryCta: 'Start with your agent',
       secondaryCta: 'Why FactLane is different',
       proofsLabel: 'FactLane at a glance',
@@ -340,18 +340,18 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
   },
   ar: {
     meta: {
-      title: 'ذاكرة محكومة لوكلاء الذكاء الاصطناعي',
+      title: 'حقائق محكومة لوكلاء الذكاء الاصطناعي',
       description:
-        'FactLane ذاكرة محلية ومحكومة لوكلاء MCP: حقائق محددة مع نطاق ومصدر وحداثة وفصل واضح بين Candidate وCurrent.',
+        'FactLane طبقة حقائق مجانية ومحلية لوكلاء MCP: حقائق محددة مع نطاق ومصدر وحداثة وفصل واضح بين Candidate وCurrent.',
       structuredDataDescription:
         'ذاكرة محلية ومفتوحة المصدر لوكلاء MCP المتوافقين، تحفظ حقائق محددة مع نطاق ومصدر وحداثة وتحقّق موثوق من دون تحويل الذاكرة إلى صلاحية تنفيذ.',
     },
     hero: {
-      kicker: 'مجاني · محلي · ذاكرة محكومة لوكلاء MCP',
-      title: 'أعطِ وكلاءك ذاكرة تستحق إعادة الاستخدام.',
-      titleMuted: ' وأبقِ الحقيقة الحالية أعلى من الذاكرة.',
+      kicker: 'مجاني · محلي · حقائق محكومة لوكلاء MCP',
+      title: 'امنح وكلاءك حقائق قابلة لإعادة الاستخدام.',
+      titleMuted: ' من دون أن تعلن الذاكرة نفسها حقيقة حالية.',
       lead:
-        'يحفظ FactLane حقائق محددة مع النطاق والمصدر والحداثة، ويفصل بين Candidate وCurrent، ويعمل بجانب أنظمة الذاكرة التي تستخدمها بالفعل — من دون أن تتحول الذاكرة إلى صلاحية تنفيذ.',
+        'FactLane طبقة MCP ضيقة للحقائق الصغيرة التي يجب أن تعبر الجلسات. لكل حقيقة نطاق ومصدر وحداثة؛ يمكن للمساهم أن يقترح Candidate، لكن التحقّق الموثوق وحده يجعلها Current.',
       primaryCta: 'ابدأ مع وكيلك',
       secondaryCta: 'لماذا FactLane مختلف؟',
       proofsLabel: 'FactLane باختصار',
@@ -629,9 +629,9 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
   en: {
     differentiation: {
       eyebrow: 'Why FactLane is different',
-      title: 'Many memory systems focus on recall. FactLane adds a governed boundary for what may count as Current.',
+      title: 'FactLane has a narrower job: governed facts with a contributor / verifier split.',
       intro:
-        'The distinctive choice is not bigger storage. It is a governed fact lifecycle for information that may influence future work.',
+        'It does not try to become all of your memory. It gives reusable facts an explicit lifecycle and keeps memory separate from execution authority.',
       cards: [
         {
           title: 'Bounded facts, not memory exhaust.',
@@ -779,9 +779,9 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
   ar: {
     differentiation: {
       eyebrow: 'لماذا FactLane مختلف؟',
-      title: 'تركّز كثير من أنظمة الذاكرة على الاستدعاء. يضيف FactLane حدًا محكومًا لما يجوز اعتباره Current.',
+      title: 'مهمة FactLane أضيق: حقائق محكومة مع فصل بين المساهم والمتحقّق.',
       intro:
-        'الفارق ليس مساحة تخزين أكبر. الفارق هو دورة حياة محكومة للحقائق التي قد تؤثر في عمل لاحق.',
+        'لا يحاول أن يصبح كل ذاكرتك. يمنح الحقائق القابلة لإعادة الاستخدام دورة حياة صريحة، ويفصل الذاكرة عن صلاحية التنفيذ.',
       cards: [
         {
           title: 'حقائق محددة، لا تجميعًا شاملًا لكل السياق.',
