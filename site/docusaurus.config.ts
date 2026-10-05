@@ -1,20 +1,96 @@
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
+import {isIP} from 'node:net';
+
+const configuredSiteUrl = process.env.FACTLANE_SITE_URL ?? 'https://factlane.local';
+const parsedSiteUrl = new URL(configuredSiteUrl);
+const publicBuildFlag = process.env.FACTLANE_PUBLIC_BUILD ?? '0';
+
+if (
+  parsedSiteUrl.protocol !== 'https:' ||
+  parsedSiteUrl.username ||
+  parsedSiteUrl.password ||
+  parsedSiteUrl.pathname !== '/' ||
+  parsedSiteUrl.search ||
+  parsedSiteUrl.hash
+) {
+  throw new Error(
+    'FACTLANE_SITE_URL must be an HTTPS origin with no credentials, path, query, or fragment',
+  );
+}
+
+if (!['0', '1'].includes(publicBuildFlag)) {
+  throw new Error('FACTLANE_PUBLIC_BUILD must be exactly 0 or 1');
+}
+
+const siteUrl = parsedSiteUrl.origin;
+const publicBuild = publicBuildFlag === '1';
+
+const publicHostname = parsedSiteUrl.hostname.toLowerCase();
+const reservedPublicHostname =
+  publicHostname.endsWith('.') ||
+  isIP(publicHostname) !== 0 ||
+  !publicHostname.includes('.') ||
+  publicHostname === 'localhost' ||
+  publicHostname.endsWith('.localhost') ||
+  publicHostname.endsWith('.local') ||
+  publicHostname.endsWith('.test') ||
+  publicHostname.endsWith('.invalid') ||
+  publicHostname.endsWith('.example') ||
+  ['example.com', 'example.net', 'example.org'].some(
+    (domain) => publicHostname === domain || publicHostname.endsWith('.' + domain),
+  );
+
+if (publicBuild && reservedPublicHostname) {
+  throw new Error(
+    'FACTLANE_PUBLIC_BUILD=1 requires a non-local, non-reserved DNS hostname approved for publication',
+  );
+}
 
 const config: Config = {
   title: 'FactLane',
   tagline: 'Share facts. Not context.',
   favicon: 'favicon/favicon-32.png',
 
-  // Placeholder origin for a local prototype. Hosting/domain are deliberately deferred.
-  url: 'https://factlane.local',
+  // A public deployment must provide its real canonical origin.
+  // The local fallback remains deliberately non-indexable.
+  url: siteUrl,
   baseUrl: '/',
   organizationName: 'Habib1001-m',
   projectName: 'factlane',
 
   onBrokenLinks: 'throw',
-  onBrokenAnchors: 'warn',
-  staticDirectories: ['static', '../docs/assets/brand'],
+  onBrokenAnchors: 'throw',
+  staticDirectories: ['.generated-static'],
+  headTags: [
+    {
+      tagName: 'meta',
+      attributes: {name: 'theme-color', content: '#0a0f1a'},
+    },
+    {
+      tagName: 'meta',
+      attributes: {
+        name: 'keywords',
+        content:
+          'FactLane, AI assistant memory, AI agent memory, MCP memory, local-first memory, governed memory',
+      },
+    },
+    {
+      tagName: 'meta',
+      attributes: {property: 'og:type', content: 'website'},
+    },
+    ...(!publicBuild
+      ? [
+          {
+            tagName: 'meta',
+            attributes: {
+              name: 'robots',
+              content: 'noindex,nofollow,noarchive',
+            },
+          },
+        ]
+      : []),
+  ],
 
   presets: [
     [
@@ -29,6 +105,12 @@ const config: Config = {
           showLastUpdateTime: false,
         },
         blog: false,
+        sitemap: publicBuild
+          ? {
+              changefreq: 'weekly',
+              priority: 0.5,
+            }
+          : false,
         theme: {
           customCss: './src/css/custom.css',
         },
@@ -78,8 +160,9 @@ const config: Config = {
           title: 'Learn',
           items: [
             {label: 'Use cases', to: '/docs/USE_CASES'},
-            {label: 'Quick Start', to: '/docs/QUICKSTART'},
+            {label: 'FAQ', to: '/docs/FAQ'},
             {label: 'Core concepts', to: '/docs/CORE_CONCEPTS'},
+            {label: 'Quick Start', to: '/docs/QUICKSTART'},
           ],
         },
         {
@@ -97,7 +180,7 @@ const config: Config = {
             {label: 'GitHub', href: 'https://github.com/Habib1001-m/factlane'},
             {
               label: 'Security',
-              href: 'https://github.com/Habib1001-m/factlane/blob/main/SECURITY.md',
+              to: '/docs/SECURITY',
             },
             {
               label: 'Apache-2.0',

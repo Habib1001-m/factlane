@@ -1,7 +1,9 @@
 import React from 'react';
 import type {ReactNode} from 'react';
 import clsx from 'clsx';
+import Head from '@docusaurus/Head';
 import Link from '@docusaurus/Link';
+import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
 import styles from './index.module.css';
@@ -31,13 +33,6 @@ const useCases = [
     quote: '“Let my coding assistant and another AI use the same approved project facts.”',
     note: 'FactLane shares bounded facts, not entire transcripts or conversational context.',
   },
-];
-
-const pillars = [
-  ['Governed memory', 'A remembered fact does not automatically become current truth.'],
-  ['Exact scope', 'Facts stay inside explicit user, project, workflow, or tool boundaries.'],
-  ['Local-first', 'The supported storage and embedding path stays on the operator’s machine.'],
-  ['Small MCP surface', 'Five focused tools cover search, reading, contribution, governed updates, and status.'],
 ];
 
 const tools = [
@@ -84,7 +79,7 @@ function Hero() {
         <div className={styles.heroCopy}>
           <div className={styles.heroKicker}>
             <span className={styles.statusDot} aria-hidden="true" />
-            Local-first memory for AI assistants
+            Useful memory across sessions for compatible AI assistants
           </div>
           <Heading as="h1">
             Let your assistant remember the useful things.
@@ -98,17 +93,22 @@ function Hero() {
             <a className="button button--primary button--lg" href="#use-cases">
               See what it can remember
             </a>
-            <Link className="button button--secondary button--lg" to="/docs/QUICKSTART">
-              Get started
-            </Link>
+            <a className="button button--secondary button--lg" href="#how-it-works">
+              Why memory won&apos;t overrule you
+            </a>
           </div>
-          <div className={styles.technicalQualifier}>
-            <strong>For developers:</strong> governed MCP memory with provenance, exact scope,
-            freshness and trusted verification.
-          </div>
+          <ul className={styles.heroProofs} aria-label="FactLane at a glance">
+            <li><strong>Stays local</strong> in the supported setup</li>
+            <li><strong>Facts</strong>, not transcripts</li>
+            <li><strong>Current instructions</strong> still win</li>
+          </ul>
+          <p className={styles.technicalQualifier}>
+            <strong>Developer?</strong>{' '}
+            <Link to="/docs/QUICKSTART">Go straight to the technical setup →</Link>
+          </p>
         </div>
 
-        <div className={styles.heroVisual} aria-label="Example of a reusable FactLane memory">
+        <figure className={styles.heroVisual}>
           <div className={styles.memoryWindow}>
             <div className={styles.windowTop}>
               <div className={styles.windowDots} aria-hidden="true">
@@ -145,8 +145,8 @@ function Hero() {
               </div>
             </div>
           </div>
-          <div className={styles.heroCaption}>Share facts. Not context.</div>
-        </div>
+          <figcaption className={styles.heroCaption}>Share facts. Not context.</figcaption>
+        </figure>
       </div>
     </header>
   );
@@ -217,6 +217,9 @@ function EverydayFit() {
         </Link>
         <Link className="button button--secondary" to="/docs/QUICKSTART">
           I&apos;m ready for technical setup
+        </Link>
+        <Link className={styles.fitTextLink} to="/docs/FAQ">
+          Not sure yet? Read the FAQ →
         </Link>
       </div>
     </Section>
@@ -333,25 +336,6 @@ function Authority() {
             environment state and other facts that can change over time.
           </p>
         </div>
-      </div>
-    </Section>
-  );
-}
-
-function Pillars() {
-  return (
-    <Section
-      eyebrow="Under the hood, deliberately"
-      title="Simple for the user. Explicit for the system."
-      intro="Once the outcome is clear, the technical model stays small enough to reason about.">
-      <div className={styles.pillarGrid}>
-        {pillars.map(([title, body], index) => (
-          <article key={title} className={styles.pillarCard}>
-            <span>0{index + 1}</span>
-            <Heading as="h3">{title}</Heading>
-            <p>{body}</p>
-          </article>
-        ))}
       </div>
     </Section>
   );
@@ -512,11 +496,11 @@ function FinalCta() {
             </Heading>
           </div>
           <div className={styles.finalCtaActions}>
-            <Link className="button button--primary button--lg" to="/docs/USE_CASES">
-              Explore use cases
+            <Link className="button button--primary button--lg" to="/docs/FAQ">
+              See if FactLane fits
             </Link>
             <Link className="button button--secondary button--lg" to="/docs/QUICKSTART">
-              Get started
+              Start the technical setup
             </Link>
             <Link className={styles.textLink} href="https://github.com/Habib1001-m/factlane">
               View on GitHub ↗
@@ -529,10 +513,28 @@ function FinalCta() {
 }
 
 export default function Home(): ReactNode {
+  const {siteConfig} = useDocusaurusContext();
+  const structuredData = {
+    '@context': 'https://schema.org',
+    '@type': 'SoftwareSourceCode',
+    name: 'FactLane',
+    description:
+      'Local-first governed memory for compatible AI assistants, with bounded facts, scope, provenance, freshness and trusted verification.',
+    codeRepository: 'https://github.com/Habib1001-m/factlane',
+    programmingLanguage: 'Python',
+    runtimePlatform: 'Python 3.11+',
+    softwareVersion: '0.1.3',
+    license: 'https://www.apache.org/licenses/LICENSE-2.0',
+    url: siteConfig.url,
+  };
+
   return (
     <Layout
       title="Memory your AI assistant can actually reuse"
-      description="FactLane helps AI assistants remember useful facts across sessions without turning old memory into automatic authority.">
+      description="FactLane helps compatible AI assistants remember useful facts across sessions without turning old memory into automatic authority.">
+      <Head>
+        <script type="application/ld+json">{JSON.stringify(structuredData)}</script>
+      </Head>
       <main>
         <Hero />
         <UseCases />
@@ -540,11 +542,10 @@ export default function Home(): ReactNode {
         <WhyGoverned />
         <Lifecycle />
         <Authority />
-        <Pillars />
-        <Tools />
-        <Architecture />
         <QuickStart />
         <Boundaries />
+        <Tools />
+        <Architecture />
         <FinalCta />
       </main>
     </Layout>

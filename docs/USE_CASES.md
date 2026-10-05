@@ -8,11 +8,8 @@ from earlier work, but **old memory should not silently become the final authori
 true now**.
 
 FactLane does not replace your assistant. It sits behind a **compatible AI-agent app or host** as
-its local memory layer. It does not add memory to every chat product automatically.
-
-In the current v0.1.3 release, someone still needs to perform the technical setup: the compatible
-host launches FactLane locally over stdio MCP and connects to its tools. Once that connection is
-configured, the everyday use case can stay much simpler than the setup.
+its local memory layer. Once connected, the everyday experience can stay much simpler than the
+technical setup.
 
 ## Remember my preferences between sessions
 
@@ -61,8 +58,8 @@ new execution permissions.
 
 ## Reuse approved facts across more than one agent host
 
-FactLane is a local, multi-host memory plane. More than one compatible local agent host can use
-the same governed fact store when the operator configures them against that environment.
+More than one compatible local agent host can use the same governed FactLane store when the
+operator configures them against that environment.
 
 This lets the hosts reuse **facts** instead of sharing entire transcripts.
 
@@ -86,31 +83,22 @@ Read [Core concepts](CORE_CONCEPTS.md) for the Candidate → Current lifecycle.
 
 ## Keep memory inside the right boundary
 
-FactLane does not treat memory as one giant bucket. Public scopes include:
-
-- `GLOBAL_USER`
-- `PROJECT`
-- `WORKFLOW`
-- `TOOL_ENVIRONMENT`
-- `CROSS_PROJECT_WORKFLOW`
+FactLane does not treat memory as one giant bucket. A fact can belong to a user, one exact project,
+one workflow inside a project, one tool/agent environment, or a narrowly defined workflow rule
+that is deliberately allowed to cross projects.
 
 For example, a fact about one project should not implicitly fan out into another project merely
 because the same assistant is connected.
 
-See [Architecture](ARCHITECTURE.md) for the exact identity rules.
+See [Core concepts](CORE_CONCEPTS.md) for the plain-language scope model and
+[Architecture](ARCHITECTURE.md) for the exact identity rules.
 
-## What FactLane is not
+## Next: check fit before setup
 
-FactLane is not:
+If these examples match the problem you are trying to solve, use the [FAQ](FAQ.md) as the decision
+checkpoint. It covers fit, non-goals, where data lives, and what the current technical setup
+requires.
 
-- a full transcript archive;
-- a bulk file or document crawler;
-- a remote memory cloud;
-- a substitute for current instructions or live authoritative sources;
-- an automatic permission system for an agent;
-- a general backup service.
-
-Facts are bounded to 2,000 UTF-8 bytes. The current server supports command-launched stdio MCP
-and supported local Ollama embeddings.
-
-When the use case above matches what you want, continue with the [Quick start](QUICKSTART.md).
+One boundary is worth knowing now: v0.1.3 still needs someone to install FactLane and configure a
+compatible local host. If that is acceptable, continue with the [FAQ](FAQ.md), then
+[Core concepts](CORE_CONCEPTS.md).

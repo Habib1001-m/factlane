@@ -18,10 +18,12 @@ Start with the outcome rather than the protocol:
 
 1. Read [Everyday use cases](USE_CASES.md) to see what FactLane can remember and where its
    boundaries matter.
-2. Read [Core concepts](CORE_CONCEPTS.md) for the plain-language model of Candidate, Current,
+2. Read the [FAQ](FAQ.md) to check fit before spending time on setup.
+3. Read [Core concepts](CORE_CONCEPTS.md) for the plain-language model of Candidate, Current,
    scope, freshness, and authority.
-3. Follow the [Quick start](QUICKSTART.md) when you are ready to install and connect a supported
+4. Follow the [Quick start](QUICKSTART.md) when you are ready to install and connect a supported
    local MCP host.
+5. Use [Five MCP tools](TOOLS.md) as the developer reference once the connection works.
 
 ### Do I need to be a developer to benefit from it?
 
@@ -33,12 +35,13 @@ part can feel much simpler: keep using the assistant while approved preferences,
 recurring rules remain available across sessions.
 
 If you are mainly trying to understand whether this solves your problem, start with
-[Everyday use cases](USE_CASES.md). You can leave Python, SQLite, MCP and embedding details until
-you are ready to install it yourself.
+[Everyday use cases](USE_CASES.md) and the [FAQ](FAQ.md). You can leave Python, SQLite, MCP and
+embedding details until you are ready to install it yourself.
 
 ## Building or integrating?
 
-- [Five MCP tools](TOOLS.md) — what each public tool is for and which authority boundary applies.
+- [Quick start](QUICKSTART.md) — establish a safe read-only connection first.
+- [Five MCP tools](TOOLS.md) — what each public tool is for after connectivity works.
 - [Architecture](ARCHITECTURE.md) — request path, scope/identity model, storage and recovery.
 - [Environment and compatibility](ENVIRONMENT.md) — Python, SQLite, embedding profiles and
   deployment limits.

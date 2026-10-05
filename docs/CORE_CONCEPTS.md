@@ -7,6 +7,19 @@ FactLane is easier to understand if you separate four questions:
 3. **Where is that fact allowed to apply?**
 4. **What outranks memory when the world changes?**
 
+## The mental model in plain language
+
+| Plain-language question | FactLane term |
+| --- | --- |
+| Is this worth keeping for later? | **Candidate** |
+| Has it been separately verified and is it eligible now? | **Current** |
+| Where is this fact allowed to apply? | **Scope** |
+| Could this fact have become stale? | **Freshness** |
+| Where did the fact come from? | **Provenance** |
+
+You can understand the product with those five ideas. The sections near the end of this page add
+the exact integration mechanics for developers and operators.
+
 ## Memory supports decisions; it is not execution authority
 
 FactLane memory is supporting state.
@@ -19,8 +32,8 @@ This is the central product boundary.
 
 ## Candidate: worth remembering, not trusted yet
 
-A host running with the `delegated-candidate` write profile can allow an ordinary agent to
-contribute a **Candidate**.
+A compatible host can allow an assistant to contribute a **Candidate**: a fact that looks useful
+enough to keep available for review.
 
 Think of Candidate as:
 
@@ -30,16 +43,12 @@ It does **not** mean:
 
 > “Treat this as verified current truth.”
 
-The contributing agent cannot promote its own Candidate merely by claiming a verifier identity
-inside the tool request.
+The assistant that contributed it cannot make it Current merely by claiming more authority.
 
 ## Current: verified and eligible to use now
 
-A trusted verifier can promote an eligible Candidate through `memory_update` with
-`REVERIFY`, the expected revision, and the exact expected record identity.
-
-Normal `CURRENT` retrieval admits eligible `VALIDATED_CURRENT` facts, not unverified
-Candidates.
+An eligible Candidate becomes Current only after a separate trusted verification step. Normal
+current-state use excludes unverified Candidates.
 
 Think of Current as:
 
@@ -60,9 +69,6 @@ FactLane defines five public scopes:
 | `CROSS_PROJECT_WORKFLOW` | An identity-free workflow rule that applies across projects under its specific contract. |
 
 `CROSS_PROJECT_WORKFLOW` does **not** mean “search all projects.”
-
-A trusted launcher can bind relevant identity context. Conflicting caller-supplied bound
-identities are rejected rather than silently rewritten.
 
 ## Freshness: could the fact have expired?
 
@@ -85,10 +91,13 @@ source.
 A durable fact is more useful when an operator or agent can inspect its source. FactLane records
 source provenance rather than treating the text alone as sufficient context.
 
-Retrieval can also preserve source diversity for semantic/hybrid `CURRENT` search so one source
-does not crowd every result slot merely because it contains several nearby matches.
+## For integrators: authority and revision mechanics
 
-## Write profiles: seeing a tool is not the same as being allowed to use it
+The rest of this page uses runtime terminology that matters when configuring or integrating a
+FactLane host. If you are evaluating the product as an end user, you can continue directly to the
+[Quick start](QUICKSTART.md) when someone is ready to perform the setup.
+
+### Write profiles: seeing a tool is not the same as being allowed to use it
 
 FactLane exposes the same five public MCP tools, but launcher configuration controls authority.
 
@@ -100,7 +109,19 @@ FactLane exposes the same five public MCP tools, but launcher configuration cont
 
 An agent does not become a verifier simply because `memory_update` appears in tool discovery.
 
-## REVERIFY vs REPLACE
+### Bound identity and current retrieval
+
+A trusted launcher can bind relevant project, workflow, or tool identity context. Conflicting
+caller-supplied bound identities are rejected rather than silently rewritten.
+
+Normal `CURRENT` retrieval admits eligible `VALIDATED_CURRENT` facts, not unverified Candidates.
+Semantic or hybrid `CURRENT` retrieval can also preserve source diversity so one provenance source
+does not crowd every result slot merely because it contains several nearby matches.
+
+### REVERIFY vs REPLACE
+
+Trusted promotion uses `memory_update` with `REVERIFY`, the expected revision, and the exact
+expected record identity.
 
 `REVERIFY` preserves the logical memory identity while refreshing verification of the same
 fact/scope/type/subject.
@@ -110,7 +131,7 @@ fact/scope/type/subject.
 This distinction prevents a “verification” operation from quietly turning into an unrelated
 reclassification.
 
-## History is different from Current
+### History is different from Current
 
 `REVIEW_HISTORY` can expose past revisions and Candidates for explicit inspection.
 
@@ -118,7 +139,6 @@ That history is useful evidence, but it is not automatically eligible for a `CUR
 
 ## Next
 
-- [Everyday use cases](USE_CASES.md)
 - [Quick start](QUICKSTART.md)
-- [Five MCP tools](TOOLS.md)
-- [Architecture](ARCHITECTURE.md)
+- [Five MCP tools](TOOLS.md) — developer reference after the connection works.
+- [Architecture](ARCHITECTURE.md) — optional deeper system model.

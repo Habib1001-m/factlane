@@ -13,6 +13,9 @@ memory_status
 The purpose of this page is to explain **when** each tool is useful. The live MCP schema and
 `factlane --help-tools` remain authoritative for exact request fields, enums, and signatures.
 
+This is a developer/integrator reference. If you have not connected FactLane yet, start with the
+[Quick start](QUICKSTART.md) and establish a safe read-only connection first.
+
 ## `memory_search`
 
 Use it to retrieve facts inside one exact scope.
@@ -114,6 +117,5 @@ live schema and omit conflicting caller-supplied identity.
 
 ## Next
 
-- [Core concepts](CORE_CONCEPTS.md)
-- [Quick start](QUICKSTART.md)
-- [Architecture](ARCHITECTURE.md)
+- [Architecture](ARCHITECTURE.md) — exact request path, identity, storage and recovery boundaries.
+- [Environment](ENVIRONMENT.md) — runtime and embedding-profile compatibility.

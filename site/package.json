@@ -1,16 +1,18 @@
 {
   "name": "factlane-site",
   "private": true,
-  "version": "0.0.0-local-r1",
+  "version": "0.0.0-local-r2",
   "scripts": {
-    "sync:docs": "node scripts/sync-docs.mjs",
-    "prestart": "npm run sync:docs",
+    "sync:site": "node scripts/sync-docs.mjs",
+    "sync:docs": "npm run sync:site",
+    "prestart": "npm run sync:site",
     "start": "docusaurus start",
-    "prebuild": "npm run sync:docs",
+    "prebuild": "npm run sync:site",
     "build": "docusaurus build",
     "serve": "docusaurus serve",
     "clear": "docusaurus clear",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run build"
   },
   "dependencies": {
     "@docusaurus/core": "3.10.2",
