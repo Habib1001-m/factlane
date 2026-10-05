@@ -6,7 +6,12 @@ import Link from '@docusaurus/Link';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
-import {homeCopy, type HomeCopy} from '../content/homeCopy';
+import {
+  arabicLandingExperience,
+  homeCopy,
+  type ArabicLandingExperience,
+  type HomeCopy,
+} from '../content/homeCopy';
 import styles from './index.module.css';
 
 function Section({
@@ -38,7 +43,10 @@ function Section({
   );
 }
 
-function Hero({copy}: {copy: HomeCopy}) {
+function Hero({copy, locale}: {copy: HomeCopy; locale: 'en' | 'ar'}) {
+  const primaryHref = locale === 'ar' ? '#agent-onboarding' : '#use-cases';
+  const secondaryHref = locale === 'ar' ? '#use-cases' : '#how-it-works';
+
   return (
     <header className={styles.hero}>
       <div className={clsx(styles.container, styles.heroGrid)}>
@@ -53,10 +61,10 @@ function Hero({copy}: {copy: HomeCopy}) {
           </Heading>
           <p className={styles.heroLead}>{copy.hero.lead}</p>
           <div className={styles.heroActions}>
-            <a className="button button--primary button--lg" href="#use-cases">
+            <a className="button button--primary button--lg" href={primaryHref}>
               {copy.hero.primaryCta}
             </a>
-            <a className="button button--secondary button--lg" href="#how-it-works">
+            <a className="button button--secondary button--lg" href={secondaryHref}>
               {copy.hero.secondaryCta}
             </a>
           </div>
@@ -138,7 +146,7 @@ function UseCases({copy}: {copy: HomeCopy}) {
   );
 }
 
-function EverydayFit({copy}: {copy: HomeCopy}) {
+function EverydayFit({copy, locale = 'en'}: {copy: HomeCopy; locale?: 'en' | 'ar'}) {
   return (
     <Section
       id="everyday-fit"
@@ -156,15 +164,147 @@ function EverydayFit({copy}: {copy: HomeCopy}) {
         ))}
       </div>
       <div className={styles.fitActions}>
-        <Link className="button button--primary" to="/docs/">
-          {copy.everydayFit.beginnerCta}
-        </Link>
+        {locale === 'ar' ? (
+          <a className="button button--primary" href="#agent-onboarding">
+            {copy.everydayFit.beginnerCta}
+          </a>
+        ) : (
+          <Link className="button button--primary" to="/docs/">
+            {copy.everydayFit.beginnerCta}
+          </Link>
+        )}
         <Link className="button button--secondary" to="/docs/QUICKSTART">
           {copy.everydayFit.setupCta}
         </Link>
         <Link className={styles.fitTextLink} to="/docs/FAQ">
           {copy.everydayFit.faqCta}
         </Link>
+      </div>
+    </Section>
+  );
+}
+
+async function copyText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall through to the document-level copy path for restricted browser contexts.
+    }
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand('copy');
+  document.body.removeChild(textarea);
+  if (!copied) {
+    throw new Error('Copy command was not accepted by the browser');
+  }
+}
+
+function AgentOnboarding({copy}: {copy: ArabicLandingExperience['onboarding']}) {
+  const [copyState, setCopyState] = React.useState<'idle' | 'copied' | 'failed'>('idle');
+
+  const handleCopy = async () => {
+    try {
+      await copyText(copy.promptBody);
+      setCopyState('copied');
+      window.setTimeout(() => setCopyState('idle'), 2400);
+    } catch {
+      setCopyState('failed');
+    }
+  };
+
+  return (
+    <Section
+      id="agent-onboarding"
+      eyebrow={copy.eyebrow}
+      title={copy.title}
+      intro={copy.intro}
+      soft>
+      <div className={styles.agentOnboardingLayout}>
+        <div className={styles.agentSteps}>
+          {copy.steps.map((step, index) => (
+            <article key={step.title} className={styles.agentStep}>
+              <span className={styles.agentStepNumber}>0{index + 1}</span>
+              <div>
+                <Heading as="h3">{step.title}</Heading>
+                <p>{step.body}</p>
+              </div>
+            </article>
+          ))}
+          <aside className={styles.capabilityNote}>
+            <strong>{copy.capabilityTitle}</strong>
+            <p>{copy.capabilityBody}</p>
+          </aside>
+        </div>
+
+        <aside className={styles.agentPromptCard} aria-labelledby="agent-prompt-title">
+          <div className={styles.agentPromptHeader}>
+            <div>
+              <span>{copy.promptLabel}</span>
+              <Heading id="agent-prompt-title" as="h3">{copy.promptTitle}</Heading>
+            </div>
+            <span className={styles.promptBadge}>AGENT-NATIVE</span>
+          </div>
+          <div className={styles.agentPromptText} dir="rtl">{copy.promptBody}</div>
+          <div className={styles.agentPromptActions}>
+            <button className="button button--primary" type="button" onClick={handleCopy}>
+              {copyState === 'copied' ? copy.copiedAction : copy.copyAction}
+            </button>
+            <Link
+              className="button button--secondary"
+              href="https://github.com/Habib1001-m/factlane">
+              {copy.githubAction}
+            </Link>
+          </div>
+          <div className={styles.copyStatus} aria-live="polite">
+            {copyState === 'copied'
+              ? copy.copiedAction
+              : copyState === 'failed'
+                ? copy.copyFailedAction
+                : ''}
+          </div>
+          <Link className={styles.manualSetupLink} to="/docs/QUICKSTART">
+            {copy.manualAction}
+          </Link>
+        </aside>
+      </div>
+    </Section>
+  );
+}
+
+function ArabicTrust({copy}: {copy: ArabicLandingExperience['trust']}) {
+  return (
+    <Section id="how-it-works" eyebrow={copy.eyebrow} title={copy.title} intro={copy.intro}>
+      <div className={styles.arabicTrustGrid}>
+        {copy.cards.map((card, index) => (
+          <article key={card.title} className={styles.arabicTrustCard}>
+            <span className={styles.trustNumber}>0{index + 1}</span>
+            <Heading as="h3">{card.title}</Heading>
+            <p>{card.body}</p>
+          </article>
+        ))}
+      </div>
+      <div className={styles.trustFlow} aria-label="Candidate to Current">
+        {copy.flow.map((item, index) => (
+          <React.Fragment key={item.label}>
+            <div className={styles.trustFlowItem}>
+              <strong><bdi dir="auto">{item.label}</bdi></strong>
+              <span>{item.body}</span>
+            </div>
+            {index < copy.flow.length - 1 && <span className={styles.trustFlowArrow} aria-hidden="true">←</span>}
+          </React.Fragment>
+        ))}
+      </div>
+      <div className={styles.sectionCta}>
+        <Link to="/docs/CORE_CONCEPTS">{copy.docsAction}</Link>
       </div>
     </Section>
   );
@@ -388,7 +528,7 @@ function Architecture({copy}: {copy: HomeCopy}) {
   );
 }
 
-function FinalCta({copy}: {copy: HomeCopy}) {
+function FinalCta({copy, locale = 'en'}: {copy: HomeCopy; locale?: 'en' | 'ar'}) {
   return (
     <section className={styles.finalCta}>
       <div className={styles.container}>
@@ -398,9 +538,15 @@ function FinalCta({copy}: {copy: HomeCopy}) {
             <Heading as="h2">{copy.finalCta.title}</Heading>
           </div>
           <div className={styles.finalCtaActions}>
-            <Link className="button button--primary button--lg" to="/docs/FAQ">
-              {copy.finalCta.fitCta}
-            </Link>
+            {locale === 'ar' ? (
+              <a className="button button--primary button--lg" href="#agent-onboarding">
+                {copy.finalCta.fitCta}
+              </a>
+            ) : (
+              <Link className="button button--primary button--lg" to="/docs/FAQ">
+                {copy.finalCta.fitCta}
+              </Link>
+            )}
             <Link className="button button--secondary button--lg" to="/docs/QUICKSTART">
               {copy.finalCta.setupCta}
             </Link>
@@ -411,6 +557,40 @@ function FinalCta({copy}: {copy: HomeCopy}) {
         </div>
       </div>
     </section>
+  );
+}
+
+function EnglishLanding({copy}: {copy: HomeCopy}) {
+  return (
+    <>
+      <Hero copy={copy} locale="en" />
+      <UseCases copy={copy} />
+      <EverydayFit copy={copy} />
+      <WhyGoverned copy={copy} />
+      <Lifecycle copy={copy} />
+      <Authority copy={copy} />
+      <QuickStart copy={copy} />
+      <Boundaries copy={copy} />
+      <Tools copy={copy} />
+      <Architecture copy={copy} />
+      <FinalCta copy={copy} />
+    </>
+  );
+}
+
+function ArabicLanding({copy}: {copy: HomeCopy}) {
+  return (
+    <>
+      <Hero copy={copy} locale="ar" />
+      <AgentOnboarding copy={arabicLandingExperience.onboarding} />
+      <UseCases copy={copy} />
+      <EverydayFit copy={copy} locale="ar" />
+      <ArabicTrust copy={arabicLandingExperience.trust} />
+      <Boundaries copy={copy} />
+      <Tools copy={copy} />
+      <Architecture copy={copy} />
+      <FinalCta copy={copy} locale="ar" />
+    </>
   );
 }
 
@@ -439,17 +619,7 @@ export default function Home(): ReactNode {
         <script type="application/ld+json">{JSON.stringify(structuredData)}</script>
       </Head>
       <main>
-        <Hero copy={copy} />
-        <UseCases copy={copy} />
-        <EverydayFit copy={copy} />
-        <WhyGoverned copy={copy} />
-        <Lifecycle copy={copy} />
-        <Authority copy={copy} />
-        <QuickStart copy={copy} />
-        <Boundaries copy={copy} />
-        <Tools copy={copy} />
-        <Architecture copy={copy} />
-        <FinalCta copy={copy} />
+        {locale === 'ar' ? <ArabicLanding copy={copy} /> : <EnglishLanding copy={copy} />}
       </main>
     </Layout>
   );
