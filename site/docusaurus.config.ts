@@ -59,6 +59,27 @@ const config: Config = {
   organizationName: 'Habib1001-m',
   projectName: 'factlane',
 
+  i18n: {
+    defaultLocale: 'en',
+    locales: ['en', 'ar'],
+    localeConfigs: {
+      en: {
+        label: 'English',
+        htmlLang: 'en',
+        direction: 'ltr',
+        translate: false,
+        baseUrl: '/',
+      },
+      ar: {
+        label: 'العربية',
+        htmlLang: 'ar',
+        direction: 'rtl',
+        translate: true,
+        baseUrl: '/ar/',
+      },
+    },
+  },
+
   onBrokenLinks: 'throw',
   onBrokenAnchors: 'throw',
   staticDirectories: ['.generated-static'],
@@ -72,7 +93,7 @@ const config: Config = {
       attributes: {
         name: 'keywords',
         content:
-          'FactLane, AI assistant memory, AI agent memory, MCP memory, local-first memory, governed memory',
+          'FactLane, AI assistant memory, AI agent memory, MCP memory, local-first memory, governed memory, ذاكرة مساعد الذكاء الاصطناعي, ذاكرة MCP',
       },
     },
     {
@@ -143,6 +164,10 @@ const config: Config = {
         {
           href: 'https://github.com/Habib1001-m/factlane',
           label: 'GitHub',
+          position: 'right',
+        },
+        {
+          type: 'localeDropdown',
           position: 'right',
         },
         {

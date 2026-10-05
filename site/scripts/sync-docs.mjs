@@ -1,4 +1,4 @@
-import {cp, mkdir, readdir, readFile, rm, writeFile} from 'node:fs/promises';
+import {access, cp, mkdir, readdir, readFile, rm, writeFile} from 'node:fs/promises';
 import {isIP} from 'node:net';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -9,6 +9,13 @@ const repoRoot = path.resolve(siteRoot, '..');
 const sourceDocs = path.join(repoRoot, 'docs');
 const output = path.join(siteRoot, '.generated-docs');
 const staticOutput = path.join(siteRoot, '.generated-static');
+const arabicDocsRoot = path.join(
+  siteRoot,
+  'i18n',
+  'ar',
+  'docusaurus-plugin-content-docs',
+  'current',
+);
 const configuredSiteUrl = process.env.FACTLANE_SITE_URL ?? 'https://factlane.local';
 const parsedSiteUrl = new URL(configuredSiteUrl);
 const publicBuildFlag = process.env.FACTLANE_PUBLIC_BUILD ?? '0';
@@ -52,6 +59,52 @@ if (publicBuild && reservedPublicHostname) {
   throw new Error(
     'FACTLANE_PUBLIC_BUILD=1 requires a non-local, non-reserved DNS hostname approved for publication',
   );
+}
+
+const requiredArabicDocs = [
+  'ARCHITECTURE.md',
+  'CORE_CONCEPTS.md',
+  'ENVIRONMENT.md',
+  'FAQ.md',
+  'INTRO.md',
+  'PROJECT_HISTORY.md',
+  'QUICKSTART.md',
+  'RELEASE_OPERATIONS.md',
+  'SECURITY.md',
+  'TOOLS.md',
+  'USE_CASES.md',
+  'USING_FACTLANE_SKILL.md',
+];
+
+const requiredArabicUiTranslations = [
+  path.join(siteRoot, 'i18n', 'ar', 'code.json'),
+  path.join(siteRoot, 'i18n', 'ar', 'docusaurus-theme-classic', 'navbar.json'),
+  path.join(siteRoot, 'i18n', 'ar', 'docusaurus-theme-classic', 'footer.json'),
+  path.join(siteRoot, 'i18n', 'ar', 'docusaurus-plugin-content-docs', 'current.json'),
+];
+
+if (publicBuild) {
+  for (const fileName of requiredArabicDocs) {
+    try {
+      await access(path.join(arabicDocsRoot, fileName));
+    } catch {
+      throw new Error(
+        `FACTLANE_PUBLIC_BUILD=1 requires the complete Arabic docs set; missing ${fileName}`,
+      );
+    }
+  }
+  for (const translationPath of requiredArabicUiTranslations) {
+    try {
+      await access(translationPath);
+    } catch {
+      throw new Error(
+        `FACTLANE_PUBLIC_BUILD=1 requires Arabic UI translations; missing ${path.relative(
+          siteRoot,
+          translationPath,
+        )}`,
+      );
+    }
+  }
 }
 
 const replacements = [
@@ -114,7 +167,7 @@ for (const assetRelative of [
 await writeFile(
   path.join(staticOutput, 'robots.txt'),
   publicBuild
-    ? `User-agent: *\nAllow: /\nSitemap: ${siteUrl}/sitemap.xml\n`
+    ? `User-agent: *\nAllow: /\nSitemap: ${siteUrl}/sitemap.xml\nSitemap: ${siteUrl}/ar/sitemap.xml\n`
     : 'User-agent: *\nDisallow: /\n',
 );
 

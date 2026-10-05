@@ -246,7 +246,7 @@
 
 .heroCaption {
   position: absolute;
-  right: -1.4rem;
+  inset-inline-end: -1.4rem;
   bottom: -1.1rem;
   padding: 0.58rem 0.82rem;
   border: 1px solid rgba(22, 217, 244, 0.24);
@@ -324,8 +324,8 @@
 .useCaseCard blockquote {
   margin: 0 0 1rem;
   padding: 1rem;
-  border-left: 3px solid var(--factlane-blue);
-  border-radius: 0 0.65rem 0.65rem 0;
+  border-inline-start: 3px solid var(--factlane-blue);
+  border-radius: 0.65rem;
   background: var(--ifm-color-emphasis-100);
   color: var(--ifm-font-color-base);
   font-size: 1.02rem;
@@ -471,8 +471,8 @@
   content: '';
   position: absolute;
   top: 50%;
-  left: 5px;
-  right: 5px;
+  inset-inline-start: 5px;
+  inset-inline-end: 5px;
   height: 1px;
   background: linear-gradient(90deg, var(--factlane-blue), var(--factlane-green));
 }
@@ -676,7 +676,7 @@
 
 .boundaryCard ul {
   margin: 1rem 0 0;
-  padding-left: 1.1rem;
+  padding-inline-start: 1.1rem;
 }
 
 .boundaryCard li {
@@ -703,6 +703,44 @@
 .limitLabel {
   background: rgba(59, 130, 246, 0.11);
   color: var(--factlane-blue);
+}
+
+:global(html[dir='rtl']) .heroCopy h1,
+:global(html[dir='rtl']) .sectionHeading h2,
+:global(html[dir='rtl']) .finalCta h2,
+:global(html[dir='rtl']) .useCaseCard h3,
+:global(html[dir='rtl']) .fitCard h3,
+:global(html[dir='rtl']) .authorityCopy h3,
+:global(html[dir='rtl']) .quickStartCopy h3 {
+  letter-spacing: 0;
+}
+
+:global(html[dir='rtl']) .heroKicker,
+:global(html[dir='rtl']) .eyebrow,
+:global(html[dir='rtl']) .cardEyebrow,
+:global(html[dir='rtl']) .memoryPrompt span,
+:global(html[dir='rtl']) .memoryLater > span,
+:global(html[dir='rtl']) .authorityTop > span,
+:global(html[dir='rtl']) .authorityMemory > span,
+:global(html[dir='rtl']) .lifecycleStep span,
+:global(html[dir='rtl']) .goodLabel,
+:global(html[dir='rtl']) .limitLabel,
+:global(html[dir='rtl']) .authorityArrow {
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+:global(html[dir='rtl']) .authorityArrow {
+  font-family: var(--ifm-font-family-base);
+}
+
+:global(html[dir='rtl']) .windowTop,
+:global(html[dir='rtl']) .recordMeta,
+:global(html[dir='rtl']) .toolRow code,
+:global(html[dir='rtl']) .codePanel,
+:global(html[dir='rtl']) .architectureFlow {
+  direction: ltr;
+  text-align: left;
 }
 
 .finalCta {
@@ -766,8 +804,8 @@
   .lifecycleConnector::before {
     top: 0;
     bottom: 0;
-    left: 28px;
-    right: auto;
+    inset-inline-start: 28px;
+    inset-inline-end: auto;
     width: 1px;
     height: auto;
     background: linear-gradient(var(--factlane-blue), var(--factlane-green));

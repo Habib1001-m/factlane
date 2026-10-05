@@ -57,7 +57,7 @@ body {
 }
 
 .navbar__item--cta {
-  margin-left: 0.6rem;
+  margin-inline-start: 0.6rem;
   padding: 0.55rem 0.9rem !important;
   border-radius: 0.7rem;
   background: var(--factlane-button);
@@ -99,7 +99,39 @@ body {
 }
 
 .theme-doc-sidebar-container {
-  border-right-color: rgba(148, 163, 184, 0.14) !important;
+  border-inline-end-color: rgba(148, 163, 184, 0.14) !important;
+}
+
+html[dir='rtl'] {
+  --ifm-font-family-base:
+    Tahoma, "Segoe UI", Arial, ui-sans-serif, system-ui, sans-serif;
+}
+
+html[dir='rtl'] body {
+  text-align: start;
+}
+
+html[dir='rtl'] h1,
+html[dir='rtl'] h2,
+html[dir='rtl'] h3,
+html[dir='rtl'] h4,
+html[dir='rtl'] h5,
+html[dir='rtl'] h6 {
+  letter-spacing: 0;
+}
+
+html[dir='rtl'] code,
+html[dir='rtl'] pre,
+html[dir='rtl'] kbd {
+  /* rtl:ignore */
+  direction: ltr;
+  /* rtl:ignore */
+  text-align: left;
+  unicode-bidi: isolate;
+}
+
+html[dir='rtl'] .theme-doc-markdown {
+  line-height: 1.9;
 }
 
 @media (max-width: 996px) {

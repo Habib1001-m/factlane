@@ -9,6 +9,15 @@ npm ci
 npm run start
 ```
 
+English remains the default locale at `/`. To develop the Arabic locale directly:
+
+```bash
+npm run start:ar
+```
+
+The Arabic site is served under `/ar/` and uses native Docusaurus RTL mode. English remains LTR.
+Locale switching is handled by Docusaurus; do not hardcode `/ar/` into authored navigation links.
+
 The pre-start/pre-build hook generates two ignored inputs:
 
 - `.generated-docs/` from canonical repository docs, `SECURITY.md`, and the using-factlane Skill;
@@ -22,7 +31,18 @@ Do not hand-edit either generated directory. The tracked repository files remain
 npm run check
 ```
 
-This runs TypeScript checking followed by a production Docusaurus build. Broken links and broken anchors fail the build.
+This runs TypeScript checking followed by a production Docusaurus build for both configured locales.
+Broken links and broken anchors fail the build. Locale-specific build helpers are also available:
+
+```bash
+npm run build:en
+npm run build:ar
+```
+
+Arabic documentation translations live under
+`i18n/ar/docusaurus-plugin-content-docs/current/`. They are localized derivatives of the canonical
+English repository docs; the English sources remain authoritative for technical truth. Commands,
+paths, tool names, versions and other exact identifiers must remain unchanged inside translations.
 
 ### Dependency-audit boundary
 
@@ -54,12 +74,15 @@ FACTLANE_SITE_URL=https://<approved-public-host> FACTLANE_PUBLIC_BUILD=1 npm run
 
 `FACTLANE_SITE_URL` must be an HTTPS origin only: no credentials, path, query string, or fragment.
 `FACTLANE_PUBLIC_BUILD` accepts only `0` or `1`. Public mode refuses IP literals, local/reserved
-hostnames and the placeholder origin; when enabled with a syntactically public DNS hostname,
-generated `robots.txt` allows crawling and points to that origin's sitemap. Passing this build
-gate does not prove domain ownership or authorize deployment.
+hostnames and the placeholder origin. It also fails closed unless the complete required Arabic
+documentation set and Arabic UI translation files are present. When enabled with a syntactically
+public DNS hostname, generated `robots.txt` allows crawling and advertises both the English
+`/sitemap.xml` and Arabic `/ar/sitemap.xml`. Passing this build gate does not prove domain ownership
+or authorize deployment.
 
-The current `baseUrl` is `/`. Hosting below a URL subpath is outside this R2 publication profile
-and needs a separate reviewed configuration change.
+The English locale uses `baseUrl=/`; Arabic uses the explicit locale base URL `/ar/`. Hosting the
+whole site below another URL subpath remains outside the reviewed publication profile and needs a
+separate configuration change.
 
 Do not substitute a real public URL until hosting/domain ownership has been approved separately.
 
