@@ -1197,6 +1197,15 @@
     font-size: clamp(2.7rem, 13vw, 4rem);
   }
 
+  :global(html[dir='ltr']) .hero {
+    padding: 4.3rem 0 3.6rem;
+  }
+
+  :global(html[dir='ltr']) .heroCopy h1 {
+    font-size: clamp(2.35rem, 10.5vw, 3rem);
+    line-height: 1.08;
+  }
+
   :global(html[dir='rtl']) .hero {
     padding: 4.3rem 0 3.6rem;
   }
