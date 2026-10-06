@@ -380,7 +380,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       eyebrow: 'ما الذي يستحق المسار المحكوم؟',
       title: 'احتفظ بالحقائق التي يجب أن تعبر الجلسات.',
       intro:
-        'يظهر تفوق FactLane عندما تكون هناك حقيقة صغيرة ستؤثر في العمل لاحقًا وتريد معرفة مصدرها وحداثتها وهل أصبحت Current فعلًا.',
+        'تظهر قيمة FactLane عندما تكون هناك حقيقة صغيرة ستؤثر في العمل لاحقًا وتريد معرفة مصدرها وحداثتها وهل أصبحت Current فعلًا.',
       items: [
         {
           eyebrow: 'حالة المشروع',
@@ -898,7 +898,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
           body: 'الوضع الافتراضي read-only. حالات runtime/provider غير المدعومة والانتقالات غير المصرح بها تفشل مغلقة بدل توسيع الصلاحيات بصمت.',
         },
         {
-          title: 'تأهيل إنتاجي حقيقي',
+          title: 'تأهيل إنتاجي موثّق',
           body: 'الملف الموثق اختُبر للتثبيت وbackup/restore وbounded concurrency وcrash/restart وconfigured host startup وproduction-derived retrieval وفشل سعة SQLite.',
         },
         {
