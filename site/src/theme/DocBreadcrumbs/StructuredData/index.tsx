@@ -3,6 +3,7 @@ import Head from '@docusaurus/Head';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import {translate} from '@docusaurus/Translate';
+import {applyTrailingSlash} from '@docusaurus/utils-common';
 import type {Props} from '@theme/DocBreadcrumbs/StructuredData';
 
 export default function DocBreadcrumbsStructuredData({
@@ -10,6 +11,10 @@ export default function DocBreadcrumbsStructuredData({
 }: Props): ReactNode {
   const {siteConfig} = useDocusaurusContext();
   const homeHref = useBaseUrl('/');
+  const trailingSlashOptions = {
+    trailingSlash: siteConfig.trailingSlash,
+    baseUrl: siteConfig.baseUrl,
+  };
   const linkedBreadcrumbs = breadcrumbs.filter((breadcrumb) => breadcrumb.href);
 
   const structuredData = {
@@ -24,14 +29,20 @@ export default function DocBreadcrumbsStructuredData({
           message: 'Home page',
           description: 'The ARIA label for the home page in the breadcrumbs',
         }),
-        item: `${siteConfig.url}${homeHref}`,
+        item: `${siteConfig.url}${applyTrailingSlash(homeHref, trailingSlashOptions)}`,
       },
-      ...linkedBreadcrumbs.map((breadcrumb, index) => ({
-        '@type': 'ListItem',
-        position: index + 2,
-        name: breadcrumb.label,
-        item: `${siteConfig.url}${breadcrumb.href}`,
-      })),
+      ...linkedBreadcrumbs.map((breadcrumb, index) => {
+        const itemHref = applyTrailingSlash(
+          breadcrumb.href,
+          trailingSlashOptions,
+        );
+        return {
+          '@type': 'ListItem',
+          position: index + 2,
+          name: breadcrumb.label,
+          item: `${siteConfig.url}${itemHref}`,
+        };
+      }),
     ],
   };
 

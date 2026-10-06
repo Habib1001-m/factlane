@@ -45,7 +45,7 @@ async function discoverDocIds(locale) {
 
 function routePath(locale, id) {
   const localePrefix = locale === 'en' ? '' : '/ar';
-  return id === 'INTRO' ? `${localePrefix}/docs/` : `${localePrefix}/docs/${id}`;
+  return id === 'INTRO' ? `${localePrefix}/docs/` : `${localePrefix}/docs/${id}/`;
 }
 
 function htmlPath(locale, id) {

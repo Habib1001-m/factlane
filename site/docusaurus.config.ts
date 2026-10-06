@@ -72,6 +72,7 @@ const config: Config = {
   // The local fallback remains deliberately non-indexable.
   url: siteUrl,
   baseUrl: '/',
+  trailingSlash: true,
   organizationName: 'Habib1001-m',
   projectName: 'factlane',
 
