@@ -1,6 +1,11 @@
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
+import {execFileSync} from 'node:child_process';
 import {isIP} from 'node:net';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+
+const siteRoot = path.dirname(fileURLToPath(import.meta.url));
 
 const configuredSiteUrl = process.env.FACTLANE_SITE_URL ?? 'https://factlane.local';
 const parsedSiteUrl = new URL(configuredSiteUrl);
@@ -45,6 +50,17 @@ if (publicBuild && reservedPublicHostname) {
   throw new Error(
     'FACTLANE_PUBLIC_BUILD=1 requires a non-local, non-reserved DNS hostname approved for publication',
   );
+}
+
+if (publicBuild) {
+  execFileSync(process.execPath, [path.join(siteRoot, 'scripts/sync-docs.mjs')], {
+    cwd: siteRoot,
+    stdio: 'inherit',
+  });
+  execFileSync(process.execPath, [path.join(siteRoot, 'scripts/check-i18n.mjs')], {
+    cwd: siteRoot,
+    stdio: 'inherit',
+  });
 }
 
 const config: Config = {

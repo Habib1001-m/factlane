@@ -115,11 +115,11 @@ export type HomeCopy = {
 export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
   en: {
     meta: {
-      title: 'Governed facts for AI agents',
+      title: 'Governed MCP memory for AI agents',
       description:
-        'FactLane is a free, local-first fact layer for MCP agents: bounded facts, provenance, freshness and a Candidate-to-Current trust boundary.',
+        'FactLane is a free, local-first MCP memory layer for AI agents: bounded reusable facts with provenance, freshness and a Candidate-to-Current trust boundary.',
       structuredDataDescription:
-        'Free, local-first governed facts for compatible MCP agents, with exact scope, provenance, freshness and trusted Candidate-to-Current verification.',
+        'Free, local-first governed MCP memory for compatible AI agents, built around bounded reusable facts with exact scope, provenance, freshness and trusted Candidate-to-Current verification.',
     },
     hero: {
       kicker: 'Free · local-first · governed facts for MCP agents',
@@ -340,11 +340,11 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
   },
   ar: {
     meta: {
-      title: 'حقائق محكومة لوكلاء الذكاء الاصطناعي',
+      title: 'ذاكرة MCP محكومة لوكلاء الذكاء الاصطناعي',
       description:
-        'FactLane طبقة حقائق مجانية ومحلية لوكلاء MCP: حقائق محددة مع نطاق ومصدر وحداثة وفصل واضح بين Candidate وCurrent.',
+        'FactLane طبقة ذاكرة MCP مجانية ومحلية لوكلاء الذكاء الاصطناعي: حقائق محددة قابلة لإعادة الاستخدام مع نطاق ومصدر وحداثة وفصل واضح بين Candidate وCurrent.',
       structuredDataDescription:
-        'طبقة حقائق مجانية ومحلية لوكلاء MCP المتوافقين، مع نطاق ومصدر وحداثة وتحقّق موثوق بين Candidate وCurrent من دون تحويل الذاكرة إلى صلاحية تنفيذ.',
+        'ذاكرة MCP محكومة ومجانية ومحلية لوكلاء الذكاء الاصطناعي المتوافقين، مبنية على حقائق محددة قابلة لإعادة الاستخدام مع نطاق ومصدر وحداثة وتحقّق موثوق بين Candidate وCurrent.',
     },
     hero: {
       kicker: 'مجاني · محلي · حقائق محكومة لوكلاء MCP',
