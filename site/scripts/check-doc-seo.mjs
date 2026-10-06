@@ -181,7 +181,16 @@ for (const page of pages) {
     `Landing SoftwareSourceCode schema leaked into docs: ${page.locale}/${page.id}`,
   );
   const items = breadcrumbs[0].itemListElement;
-  assert(Array.isArray(items) && items.length >= 1, `Invalid BreadcrumbList items: ${page.locale}/${page.id}`);
+  assert(Array.isArray(items) && items.length >= 2, `Invalid BreadcrumbList items: ${page.locale}/${page.id}`);
+  const expectedHome = page.locale === 'ar' ? `${origin}/ar/` : `${origin}/`;
+  const expectedHomeName = page.locale === 'ar' ? 'الرئيسية' : 'Home page';
+  assert(items[0]?.position === 1, `Breadcrumb home position mismatch: ${page.locale}/${page.id}`);
+  assert(items[0]?.name === expectedHomeName, `Breadcrumb home name mismatch: ${page.locale}/${page.id}`);
+  assert(items[0]?.item === expectedHome, `Breadcrumb home URL mismatch: ${page.locale}/${page.id}`);
+  assert(
+    items.every((item, index) => item?.position === index + 1),
+    `Breadcrumb positions are not contiguous: ${page.locale}/${page.id}`,
+  );
   assert(items.at(-1)?.item === expectedCanonical, `Breadcrumb canonical mismatch: ${page.locale}/${page.id}`);
 
   for (const [map, value, kind] of [
