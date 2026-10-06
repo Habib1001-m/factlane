@@ -93,7 +93,23 @@ function useMobileNavKeyboardGuard() {
   }, []);
 }
 
+function useSsrRouteBoundaryRestore() {
+  React.useEffect(() => {
+    const routedWindow = window as typeof window & {
+      __factlaneSsrPathRestore?: string;
+    };
+    const restore = routedWindow.__factlaneSsrPathRestore;
+    if (!restore) {
+      return;
+    }
+
+    window.history.replaceState(window.history.state, '', restore);
+    delete routedWindow.__factlaneSsrPathRestore;
+  }, []);
+}
+
 export default function Root({children}: {children: ReactNode}): ReactNode {
   useMobileNavKeyboardGuard();
+  useSsrRouteBoundaryRestore();
   return <>{children}</>;
 }

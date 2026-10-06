@@ -52,16 +52,16 @@ if (publicBuild && reservedPublicHostname) {
   );
 }
 
-if (publicBuild) {
-  execFileSync(process.execPath, [path.join(siteRoot, 'scripts/sync-docs.mjs')], {
-    cwd: siteRoot,
-    stdio: 'inherit',
-  });
-  execFileSync(process.execPath, [path.join(siteRoot, 'scripts/check-i18n.mjs')], {
-    cwd: siteRoot,
-    stdio: 'inherit',
-  });
-}
+// Keep generated inputs deterministic even when callers invoke Docusaurus
+// directly instead of going through the npm lifecycle.
+execFileSync(process.execPath, [path.join(siteRoot, 'scripts/sync-docs.mjs')], {
+  cwd: siteRoot,
+  stdio: 'inherit',
+});
+execFileSync(process.execPath, [path.join(siteRoot, 'scripts/check-i18n.mjs')], {
+  cwd: siteRoot,
+  stdio: 'inherit',
+});
 
 const config: Config = {
   title: 'FactLane',
@@ -129,6 +129,8 @@ const config: Config = {
         ]
       : []),
   ],
+
+  plugins: ['./plugins/seo-regression-guard.mjs'],
 
   presets: [
     [
