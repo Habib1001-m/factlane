@@ -6,6 +6,84 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const siteRoot = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(siteRoot, '..');
+const freshnessSourceRoots = [
+  'docs',
+  'SECURITY.md',
+  'skills/using-factlane/SKILL.md',
+  'site/i18n/ar/docusaurus-plugin-content-docs/current',
+  'site/src/pages/index.tsx',
+  'site/src/content/homeCopy.ts',
+];
+const gitFreshnessAvailable = (() => {
+  try {
+    const insideWorkTree =
+      execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim() === 'true';
+    const shallow =
+      execFileSync('git', ['rev-parse', '--is-shallow-repository'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim() === 'true';
+    const dirtySearchSources = execFileSync(
+      'git',
+      ['status', '--porcelain=v1', '--untracked-files=all', '--', ...freshnessSourceRoots],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      },
+    ).trim();
+    return insideWorkTree && !shallow && !dirtySearchSources;
+  } catch {
+    return false;
+  }
+})();
+
+function gitLastModifiedIso(sourcePaths: string[]): string | null {
+  let latestTimestamp = 0;
+
+  for (const sourcePath of sourcePaths) {
+    try {
+      const value = execFileSync('git', ['log', '-1', '--format=%cI', '--', sourcePath], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      if (!value) continue;
+      const timestamp = Date.parse(value);
+      if (Number.isFinite(timestamp)) latestTimestamp = Math.max(latestTimestamp, timestamp);
+    } catch {
+      // Source archives may not include VCS metadata. Omit lastmod rather than
+      // inventing a build-time freshness signal that would mislead crawlers.
+    }
+  }
+
+  return latestTimestamp > 0 ? new Date(latestTimestamp).toISOString() : null;
+}
+
+function sitemapSourcePaths(url: string): string[] {
+  const pathname = new URL(url).pathname.replace(/\/+$/, '') || '/';
+  if (pathname === '/' || pathname === '/ar') {
+    return ['site/src/pages/index.tsx', 'site/src/content/homeCopy.ts'];
+  }
+
+  const match = pathname.match(/^\/(ar\/)?docs(?:\/([^/]+))?$/);
+  if (!match) return [];
+
+  const locale = match[1] ? 'ar' : 'en';
+  const id = match[2] ?? 'INTRO';
+  if (locale === 'ar') {
+    return [`site/i18n/ar/docusaurus-plugin-content-docs/current/${id}.md`];
+  }
+  if (id === 'SECURITY') return ['SECURITY.md'];
+  if (id === 'USING_FACTLANE_SKILL') return ['skills/using-factlane/SKILL.md'];
+  return [`docs/${id}.md`];
+}
 
 const configuredSiteUrl = process.env.FACTLANE_SITE_URL ?? 'https://factlane.local';
 const parsedSiteUrl = new URL(configuredSiteUrl);
@@ -149,6 +227,18 @@ const config: Config = {
           ? {
               changefreq: 'weekly',
               priority: 0.5,
+              createSitemapItems: async ({defaultCreateSitemapItems, ...params}) => {
+                const items = await defaultCreateSitemapItems(params);
+                return items.map((item) => {
+                  if (!gitFreshnessAvailable) return item;
+                  const sourcePaths = sitemapSourcePaths(item.url);
+                  const lastmod = gitLastModifiedIso(sourcePaths);
+                  if (!sourcePaths.length || !lastmod) {
+                    throw new Error(`Missing source-aware sitemap lastmod mapping for ${item.url}`);
+                  }
+                  return {...item, lastmod};
+                });
+              },
             }
           : false,
         theme: {

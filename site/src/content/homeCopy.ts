@@ -122,13 +122,13 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
         'Free, local-first governed MCP memory for compatible AI agents, built around bounded reusable facts with exact scope, provenance, freshness and trusted Candidate-to-Current verification.',
     },
     hero: {
-      kicker: 'Free · local-first · governed facts for MCP agents',
-      title: 'Give your agents reusable facts.',
-      titleMuted: ' Without letting memory declare itself truth.',
+      kicker: 'Free · local-first · governed memory for AI agents',
+      title: 'What should your agent remember?',
+      titleMuted: ' And what should it never treat as truth?',
       lead:
-        'FactLane is a narrow MCP layer for the small facts that should survive a session. Each fact carries scope, provenance and freshness; contributors can submit Candidates, but only trusted verification makes them Current.',
-      primaryCta: 'Start with your agent',
-      secondaryCta: 'Why FactLane is different',
+        'FactLane adds a small governed fact lane beside the memory you already use. Keep useful preferences, project facts and workflow rules across sessions with scope, provenance, freshness and Candidate → Current verification.',
+      primaryCta: 'See if FactLane fits',
+      secondaryCta: 'Give it to your agent',
       proofsLabel: 'FactLane at a glance',
       proofs: [
         {strong: 'Apache-2.0', rest: ' open source'},
@@ -347,13 +347,13 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
         'ذاكرة MCP محكومة ومجانية ومحلية لوكلاء الذكاء الاصطناعي المتوافقين، مبنية على حقائق محددة قابلة لإعادة الاستخدام مع نطاق ومصدر وحداثة وتحقّق موثوق بين Candidate وCurrent.',
     },
     hero: {
-      kicker: 'مجاني · محلي · حقائق محكومة لوكلاء MCP',
-      title: 'امنح وكلاءك حقائق قابلة لإعادة الاستخدام.',
-      titleMuted: ' من دون أن تعلن الذاكرة نفسها حقيقة حالية.',
+      kicker: 'مجاني · محلي · ذاكرة محكومة لوكلاء الذكاء الاصطناعي',
+      title: 'ما الذي يستحق أن يتذكره وكيلك؟',
+      titleMuted: ' وما الذي يجب ألا يعامله كحقيقة؟',
       lead:
-        'FactLane طبقة MCP ضيقة للحقائق الصغيرة التي يجب أن تعبر الجلسات. لكل حقيقة نطاق ومصدر وحداثة؛ يمكن للمساهم أن يقترح Candidate، لكن التحقّق الموثوق وحده يجعلها Current.',
-      primaryCta: 'ابدأ مع وكيلك',
-      secondaryCta: 'لماذا FactLane مختلف؟',
+        'يضيف FactLane مسارًا صغيرًا ومحكومًا للحقائق بجانب الذاكرة التي تستخدمها بالفعل. احتفظ بالتفضيلات وحقائق المشروع وقواعد العمل بين الجلسات مع scope ومصدر وحداثة وتحقّق Candidate → Current.',
+      primaryCta: 'اعرف هل FactLane مناسب لك',
+      secondaryCta: 'أعطه لوكيلك',
       proofsLabel: 'FactLane باختصار',
       proofs: [
         {strong: 'Apache-2.0', rest: ' مفتوح المصدر'},
@@ -565,6 +565,14 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
 };
 
 export type LandingExperience = {
+  fitCheck: {
+    eyebrow: string;
+    title: string;
+    intro: string;
+    items: Array<{title: string; body: string}>;
+    boundary: string;
+    action: string;
+  };
   differentiation: {
     eyebrow: string;
     title: string;
@@ -625,23 +633,46 @@ export type LandingExperience = {
 
 export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
   en: {
-    differentiation: {
-      eyebrow: 'Why FactLane is different',
-      title: 'FactLane has a narrower job: governed facts with a contributor / verifier split.',
+    fitCheck: {
+      eyebrow: 'Quick fit check',
+      title: 'Is this a FactLane problem?',
       intro:
-        'It does not try to become all of your memory. It gives reusable facts an explicit lifecycle and keeps memory separate from execution authority.',
+        'FactLane is useful when a small fact should survive a session, but you still need to know where it came from, how fresh it is and whether it is trusted as Current.',
+      items: [
+        {
+          title: 'Your agent keeps relearning the same small facts.',
+          body: 'Stable preferences, project facts and workflow rules matter again next session, but replaying the old conversation is wasteful.',
+        },
+        {
+          title: 'Remembered facts can become stale or misleading.',
+          body: 'You want provenance, freshness and an explicit Candidate → Current lifecycle instead of treating every saved fact as equally trustworthy.',
+        },
+        {
+          title: 'You want memory without giving memory authority.',
+          body: 'Current instructions, live project state and verified live sources must still outrank anything the agent remembers.',
+        },
+      ],
+      boundary:
+        'If you mainly want a full conversation archive, broad personal memory or a large knowledge graph, keep that system. FactLane is the narrower governed lane beside it.',
+      action: 'See the concrete use cases →',
+    },
+    differentiation: {
+      eyebrow: 'What is FactLane?',
+      title: 'A governed fact layer for AI agents that need memory across sessions.',
+      intro:
+        'FactLane is a free, open-source, local-first MCP memory layer for compatible AI-agent hosts. It keeps small reusable facts with scope, provenance and freshness; a contribution can be a Candidate without becoming verified Current state, and current instructions, live project state or verified live sources still win.',
       cards: [
         {
-          title: 'Bounded facts, not memory exhaust.',
-          body: 'FactLane keeps small reusable facts with exact scope, provenance and freshness instead of trying to absorb every document, transcript or thought.',
+          title: 'What problem does it solve?',
+          body: 'An agent can reuse a useful preference, project fact or workflow rule without replaying the old conversation — and without treating stale memory as current truth.',
         },
         {
-          title: 'Candidate is not Current.',
-          body: 'An agent may contribute something worth remembering without being allowed to declare its own contribution verified current truth.',
+          title: 'How is it different from built-in memory?',
+          body: 'Broad or native memory is good for rich recall and continuity. FactLane is the narrower governed lane for facts that need exact scope, provenance, freshness and Candidate → Current verification.',
         },
         {
-          title: 'Memory is not authority.',
-          body: 'Current user instructions, live project state and verified live sources outrank remembered facts. Tool visibility also does not grant write authority.',
+          title: 'What does it not replace?',
+          body: 'It does not replace your assistant, broad memory, a knowledge base or execution authority. It sits beside them and governs a small class of reusable facts.',
         },
       ],
       docsAction: 'Read the core concepts →',
@@ -773,23 +804,46 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
     },
   },
   ar: {
-    differentiation: {
-      eyebrow: 'لماذا FactLane مختلف؟',
-      title: 'مهمة FactLane أضيق: حقائق محكومة مع فصل بين المساهم والمتحقّق.',
+    fitCheck: {
+      eyebrow: 'اختبار ملاءمة سريع',
+      title: 'هل هذه مشكلة يحلها FactLane؟',
       intro:
-        'لا يحاول أن يصبح كل ذاكرتك. يمنح الحقائق القابلة لإعادة الاستخدام دورة حياة صريحة، ويفصل الذاكرة عن صلاحية التنفيذ.',
+        'تظهر قيمة FactLane عندما تكون هناك حقيقة صغيرة يجب أن تعبر الجلسات، لكنك ما زلت تحتاج معرفة مصدرها وحداثتها وهل أصبحت Current موثوقة فعلًا.',
+      items: [
+        {
+          title: 'وكيلك يعيد تعلّم الحقائق الصغيرة نفسها.',
+          body: 'تفضيلات ثابتة وحقائق مشروع وقواعد عمل تعود أهميتها في الجلسة التالية، لكن إعادة المحادثة القديمة كل مرة هدر للسياق.',
+        },
+        {
+          title: 'الحقائق المتذكَّرة قد تصبح قديمة أو مضلِّلة.',
+          body: 'تحتاج مصدرًا وحداثة ودورة Candidate → Current صريحة بدل معاملة كل ما تم حفظه كحقيقة موثوقة بالدرجة نفسها.',
+        },
+        {
+          title: 'تريد ذاكرة من دون أن تصبح الذاكرة سلطة.',
+          body: 'يجب أن تظل تعليمات المستخدم الحالية وحالة المشروع الحية والمصادر الحية المتحقَّق منها أعلى من أي شيء يتذكره الوكيل.',
+        },
+      ],
+      boundary:
+        'إذا كان احتياجك الأساسي أرشيف محادثات كاملًا أو ذاكرة شخصية واسعة أو knowledge graph كبيرًا، فأبقِ ذلك النظام. FactLane هو المسار الأضيق والمحكوم الذي يعمل بجانبه.',
+      action: 'شاهد حالات الاستخدام العملية →',
+    },
+    differentiation: {
+      eyebrow: 'ما هو FactLane؟',
+      title: 'طبقة حقائق محكومة لوكلاء الذكاء الاصطناعي الذين يحتاجون ذاكرة بين الجلسات.',
+      intro:
+        'FactLane طبقة ذاكرة MCP مجانية ومفتوحة المصدر ومحلية تعمل خلف AI-agent host متوافق. تحفظ حقائق صغيرة قابلة لإعادة الاستخدام مع scope ومصدر وحداثة؛ يمكن أن تكون المساهمة Candidate من دون أن تصبح Current متحقَّقًا منها، وتظل تعليمات المستخدم الحالية وحالة المشروع الحية والمصادر الحية المتحقَّق منها أعلى من الذاكرة.',
       cards: [
         {
-          title: 'حقائق محددة، لا تجميعًا شاملًا لكل السياق.',
-          body: 'يحفظ FactLane حقائق صغيرة قابلة لإعادة الاستخدام مع نطاق ومصدر وحداثة، بدل محاولة جمع كل وثيقة ومحادثة وسياق في مخزن واحد.',
+          title: 'ما المشكلة التي يحلها؟',
+          body: 'يمكن للوكيل إعادة استخدام تفضيل أو حقيقة مشروع أو قاعدة عمل مفيدة من دون إعادة المحادثة القديمة، ومن دون معاملة ذاكرة قديمة كحقيقة حالية.',
         },
         {
-          title: 'Candidate ليس Current.',
-          body: 'يمكن للوكيل أن يقترح معلومة تستحق الحفظ من دون أن يمتلك حق إعلان مساهمته حقيقة حالية متحقَّقًا منها.',
+          title: 'كيف يختلف عن الذاكرة المدمجة؟',
+          body: 'الذاكرة الواسعة أو الأصلية مناسبة للاستدعاء الغني والاستمرارية. أما FactLane فهو المسار الأضيق للحقائق التي تحتاج scope محددًا ومصدرًا وحداثة وتحقّق Candidate → Current.',
         },
         {
-          title: 'الذاكرة ليست سلطة.',
-          body: 'تعليماتك الحالية وحالة المشروع الحية والمصادر الحية المتحقَّق منها تتقدم على الذاكرة. وظهور الأداة لا يمنح صلاحية الكتابة.',
+          title: 'ما الذي لا يستبدله؟',
+          body: 'لا يستبدل مساعدك أو ذاكرتك الواسعة أو نظام معرفة أو صلاحية التنفيذ. يعمل بجانبها ويحكم فئة صغيرة من الحقائق القابلة لإعادة الاستخدام.',
         },
       ],
       docsAction: 'اقرأ المفاهيم الأساسية →',

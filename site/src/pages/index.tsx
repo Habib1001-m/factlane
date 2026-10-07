@@ -58,10 +58,10 @@ function Hero({copy}: {copy: HomeCopy}) {
           </Heading>
           <p className={styles.heroLead}>{copy.hero.lead}</p>
           <div className={styles.heroActions}>
-            <a className="button button--primary button--lg" href="#agent-onboarding">
+            <a className="button button--primary button--lg" href="#fit-check">
               {copy.hero.primaryCta}
             </a>
-            <a className="button button--secondary button--lg" href="#why-different">
+            <a className="button button--secondary button--lg" href="#agent-onboarding">
               {copy.hero.secondaryCta}
             </a>
           </div>
@@ -116,6 +116,35 @@ function Hero({copy}: {copy: HomeCopy}) {
         </figure>
       </div>
     </header>
+  );
+}
+
+function FitCheck({copy}: {copy: LandingExperience['fitCheck']}) {
+  return (
+    <section id="fit-check" className={styles.fitCheckSection}>
+      <div className={styles.container}>
+        <div className={styles.fitCheckPanel}>
+          <div className={styles.fitCheckHeading}>
+            <div className={styles.eyebrow}>{copy.eyebrow}</div>
+            <Heading as="h2">{copy.title}</Heading>
+            <p>{copy.intro}</p>
+          </div>
+          <div className={styles.fitCheckGrid}>
+            {copy.items.map((item, index) => (
+              <article key={item.title} className={styles.fitCheckCard}>
+                <span className={styles.fitCheckNumber}>0{index + 1}</span>
+                <Heading as="h3">{item.title}</Heading>
+                <p>{item.body}</p>
+              </article>
+            ))}
+          </div>
+          <div className={styles.fitCheckFooter}>
+            <p>{copy.boundary}</p>
+            <a href="#use-cases">{copy.action}</a>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -647,9 +676,10 @@ function ProductLanding({
   return (
     <>
       <Hero copy={copy} />
+      <FitCheck copy={experience.fitCheck} />
       <ProductDifference copy={experience.differentiation} />
-      <UseCases copy={copy} />
       <AgentOnboarding copy={experience.onboarding} />
+      <UseCases copy={copy} />
       <MemoryCoexistence copy={experience.coexistence} />
       <CompactTrust copy={experience.trust} />
       <EngineeringRigor copy={experience.rigor} whyNow={experience.whyNow} />

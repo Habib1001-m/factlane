@@ -71,6 +71,18 @@ async function sitemapUrls(file) {
   return new Set([...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((match) => decodeHtml(match[1])));
 }
 
+async function sitemapLastmods(file) {
+  const xml = await readFile(file, 'utf8');
+  return new Map(
+    [...xml.matchAll(/<url>([\s\S]*?)<\/url>/g)].map((match) => {
+      const block = match[1];
+      const loc = firstMatch(block, /<loc>([^<]+)<\/loc>/);
+      const lastmod = firstMatch(block, /<lastmod>([^<]+)<\/lastmod>/);
+      return [loc, lastmod];
+    }),
+  );
+}
+
 async function fileExists(file) {
   try {
     await readFile(file);
@@ -267,21 +279,43 @@ export default function seoRegressionGuard(context) {
 
       const robots = await readFile(path.join(outDir, 'robots.txt'), 'utf8');
       const sitemapPath = path.join(outDir, 'sitemap.xml');
+      const llmsPath = path.join(outDir, 'llms.txt');
       if (publicBuild) {
+        assert(robots.includes('User-agent: OAI-SearchBot'), 'public robots missing OAI-SearchBot policy');
         assert(robots.includes('Allow: /'), 'public robots.txt must allow crawling');
         assert(!robots.includes('Disallow: /'), 'public robots.txt must not block crawling');
         assert(robots.includes(`Sitemap: ${origin}/sitemap.xml`), 'public robots missing EN sitemap');
         assert(robots.includes(`Sitemap: ${origin}/ar/sitemap.xml`), 'public robots missing AR sitemap');
+        const llms = await readFile(llmsPath, 'utf8');
+        assert(llms.startsWith('# FactLane\n'), 'public llms.txt must identify FactLane');
+        assert(llms.includes(`${origin}/docs/CORE_CONCEPTS/`), 'public llms.txt missing EN core concepts');
+        assert(llms.includes(`${origin}/ar/docs/CORE_CONCEPTS/`), 'public llms.txt missing AR core concepts');
+        assert(llms.includes(`${origin}/docs/TOOLS/`), 'public llms.txt missing tool contract');
+        assert(llms.includes('v0.1.3'), 'public llms.txt missing supported release boundary');
+        assert(llms.includes('not a universal memory replacement'), 'public llms.txt missing product-scope boundary');
         const sitemap = await sitemapUrls(sitemapPath);
         const expectedSitemap = new Set(canonicalRoutes.map((route) => `${origin}${route}`));
         assert(
           JSON.stringify([...sitemap].sort()) === JSON.stringify([...expectedSitemap].sort()),
           `public sitemap route set mismatch for ${locale}`,
         );
+        const sitemapFreshness = await sitemapLastmods(sitemapPath);
+        const lastmods = [...sitemapFreshness.values()].filter(Boolean);
+        assert(
+          lastmods.length === 0 || lastmods.length === expectedSitemap.size,
+          `public sitemap lastmod coverage must be complete or absent for ${locale}`,
+        );
+        for (const [url, lastmod] of sitemapFreshness) {
+          if (!lastmod) continue;
+          const timestamp = Date.parse(lastmod);
+          assert(!Number.isNaN(timestamp), `invalid sitemap lastmod for ${url}: ${lastmod}`);
+          assert(timestamp <= Date.now() + 5 * 60 * 1000, `future sitemap lastmod for ${url}: ${lastmod}`);
+        }
       } else {
         assert(robots.includes('Disallow: /'), 'local robots.txt must block crawling');
         assert(!robots.includes('Sitemap:'), 'local robots.txt must not declare a sitemap');
         assert(!(await fileExists(sitemapPath)), `local sitemap must be absent for ${locale}`);
+        assert(!(await fileExists(llmsPath)), `local llms.txt must be absent for ${locale}`);
       }
 
       const errorHtml = await readFile(fileForRoute(outDir, locale, errorRoute(locale)), 'utf8');
