@@ -19,7 +19,8 @@
     "check:i18n": "node scripts/check-i18n.mjs",
     "check:seo:docs": "node scripts/check-doc-seo.mjs",
     "check:seo:answers": "node scripts/check-answer-authority.mjs",
-    "check:seo:urls": "node scripts/check-url-boundary.mjs"
+    "check:seo:urls": "node scripts/check-url-boundary.mjs",
+    "check:publication:readiness": "node scripts/check-publication-readiness.mjs"
   },
   "dependencies": {
     "@docusaurus/core": "3.10.2",
