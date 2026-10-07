@@ -171,6 +171,19 @@ function parseHtml(html) {
   const answerIds = [...html.matchAll(/data-answer-id=["']([^"']+)["']/gi)].map((match) =>
     decodeHtml(match[1]),
   );
+  const answerSections = {};
+  for (const match of html.matchAll(
+    /<article\b[^>]*data-answer-id=["']([^"']+)["'][^>]*>([\s\S]*?)<\/article>/gi,
+  )) {
+    const id = decodeHtml(match[1]);
+    const sectionHtml = match[2];
+    answerSections[id] = {
+      text: visibleText(sectionHtml),
+      hrefs: [...sectionHtml.matchAll(/<a\b[^>]+href=["']([^"']+)["'][^>]*>/gi)].map(
+        (hrefMatch) => decodeHtml(hrefMatch[1]),
+      ),
+    };
+  }
   const imageSources = [...html.matchAll(/<img\b[^>]+src=["']([^"']+)["'][^>]*>/gi)].map((match) =>
     decodeHtml(match[1]),
   );
@@ -208,6 +221,7 @@ function parseHtml(html) {
     twitterImageAlt: metaContent(metaTags, 'name', 'twitter:image:alt'),
     answerIds,
     answerIdsHash: hash(JSON.stringify(answerIds)),
+    answerSections,
   };
 }
 
@@ -508,12 +522,19 @@ for (const locale of ['en', 'ar']) {
   const page = canonicalBaseline.get(route)?.page;
   assert(page, `Answer page baseline missing: ${locale}`);
   for (const answer of authority[locale].answers) {
-    assert(page.answerIds.includes(answer.id), `Missing SSR answer section ${locale}#${answer.id}`);
-    assert(page.mainText.includes(answer.question), `Missing SSR answer question ${locale}#${answer.id}`);
-    assert(page.mainText.includes(answer.answer), `Missing SSR answer text ${locale}#${answer.id}`);
+    const section = page.answerSections[answer.id];
+    assert(section, `Missing SSR answer section ${locale}#${answer.id}`);
+    assert(
+      section.text.includes(answer.question),
+      `Missing SSR answer question ${locale}#${answer.id}`,
+    );
+    assert(section.text.includes(answer.answer), `Missing SSR answer text ${locale}#${answer.id}`);
     for (const source of answer.sources) {
       const href = localizedRoute(locale, source.to);
-      assert(page.hrefs.includes(href), `Missing answer source link ${locale}: ${href}`);
+      assert(
+        section.hrefs.includes(href),
+        `Missing answer source link ${locale}#${answer.id}: ${href}`,
+      );
       answerSourceTargets.add(href);
     }
   }
