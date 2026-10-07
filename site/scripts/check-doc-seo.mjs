@@ -126,7 +126,13 @@ for (const locale of locales) {
 assert(pages.length === 24, `Expected 24 documentation pages, found ${pages.length}`);
 
 const expectedRoutes = new Set(pages.map((page) => page.route));
-const expectedIndexableRoutes = new Set(['/', '/ar/', ...expectedRoutes]);
+const expectedIndexableRoutes = new Set([
+  '/',
+  '/ar/',
+  '/answers/',
+  '/ar/answers/',
+  ...expectedRoutes,
+]);
 const pagesByRoute = new Map(pages.map((page) => [page.route, page]));
 const titles = new Map();
 const descriptions = new Map();
@@ -243,10 +249,12 @@ if (mode === 'public') {
   const arSitemap = await sitemapUrls(path.join(buildRoot, 'ar', 'sitemap.xml'));
   const expectedEnSitemap = new Set([
     `${origin}/`,
+    `${origin}/answers/`,
     ...pages.filter((page) => page.locale === 'en').map((page) => page.canonical),
   ]);
   const expectedArSitemap = new Set([
     `${origin}/ar/`,
+    `${origin}/ar/answers/`,
     ...pages.filter((page) => page.locale === 'ar').map((page) => page.canonical),
   ]);
   assert(/(^|\n)Allow: \/($|\n)/.test(robots), 'Public robots.txt must Allow: /');

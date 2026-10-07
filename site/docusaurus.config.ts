@@ -14,6 +14,8 @@ const freshnessSourceRoots = [
   'site/i18n/ar/docusaurus-plugin-content-docs/current',
   'site/src/pages/index.tsx',
   'site/src/content/homeCopy.ts',
+  'site/src/pages/answers.tsx',
+  'site/src/content/answerAuthority.json',
 ];
 const gitFreshnessAvailable = (() => {
   try {
@@ -70,6 +72,9 @@ function sitemapSourcePaths(url: string): string[] {
   const pathname = new URL(url).pathname.replace(/\/+$/, '') || '/';
   if (pathname === '/' || pathname === '/ar') {
     return ['site/src/pages/index.tsx', 'site/src/content/homeCopy.ts'];
+  }
+  if (pathname === '/answers' || pathname === '/ar/answers') {
+    return ['site/src/pages/answers.tsx', 'site/src/content/answerAuthority.json'];
   }
 
   const match = pathname.match(/^\/(ar\/)?docs(?:\/([^/]+))?$/);

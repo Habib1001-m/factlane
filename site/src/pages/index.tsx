@@ -165,6 +165,7 @@ function ProductDifference({copy}: {copy: LandingExperience['differentiation']})
         ))}
       </div>
       <div className={styles.sectionCta}>
+        <Link className={styles.authorityLink} to="/answers/">{copy.answersAction}</Link>
         <Link to="/docs/CORE_CONCEPTS">{copy.docsAction}</Link>
       </div>
     </Section>

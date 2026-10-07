@@ -578,6 +578,7 @@ export type LandingExperience = {
     title: string;
     intro: string;
     cards: Array<{title: string; body: string}>;
+    answersAction: string;
     docsAction: string;
   };
   coexistence: {
@@ -675,6 +676,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
           body: 'It does not replace your assistant, broad memory, a knowledge base or execution authority. It sits beside them and governs a small class of reusable facts.',
         },
       ],
+      answersAction: 'Read the canonical product answers →',
       docsAction: 'Read the core concepts →',
     },
     coexistence: {
@@ -846,6 +848,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
           body: 'لا يستبدل مساعدك أو ذاكرتك الواسعة أو نظام معرفة أو صلاحية التنفيذ. يعمل بجانبها ويحكم فئة صغيرة من الحقائق القابلة لإعادة الاستخدام.',
         },
       ],
+      answersAction: 'اقرأ إجابات المنتج المرجعية →',
       docsAction: 'اقرأ المفاهيم الأساسية →',
     },
     coexistence: {

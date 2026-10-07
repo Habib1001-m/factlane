@@ -143,7 +143,7 @@ function duplicateSlashVariant(route) {
 }
 
 const indexFiles = await discoverIndexFiles(buildRoot);
-assert(indexFiles.length === 26, `Expected 26 index pages, found ${indexFiles.length}`);
+assert(indexFiles.length === 28, `Expected 28 index pages, found ${indexFiles.length}`);
 
 const canonicalPages = [];
 for (const file of indexFiles) {

@@ -1,0 +1,218 @@
+{
+  "en": {
+    "meta": {
+      "title": "FactLane answers: fit, trust, tools, and setup",
+      "description": "Direct, source-linked answers about what FactLane is, when it fits, Candidate to Current verification, authority limits, five MCP tools, supported environment, and read-only setup."
+    },
+    "eyebrow": "Canonical product answers",
+    "title": "FactLane, answered from the product contract.",
+    "intro": "Nine short answers for people, search engines, and AI hosts. Each answer points to the canonical FactLane documentation that supports it.",
+    "sourceCue": "These summaries do not replace the docs. Follow the source links for the full contract; the live MCP schema and factlane --help-tools remain authoritative for exact tool fields and enums.",
+    "factsLabel": "Verified product facts",
+    "facts": [
+      {"strong": "v0.1.3", "rest": " supported named release"},
+      {"strong": "5", "rest": " public MCP tools"},
+      {"strong": "stdio", "rest": " command-launched transport"},
+      {"strong": "local", "rest": " SQLite + supported Ollama profile"}
+    ],
+    "sourcesLabel": "Canonical sources",
+    "answers": [
+      {
+        "id": "what-is-factlane",
+        "question": "What is FactLane?",
+        "answer": "FactLane is a free, open-source, local-first MCP memory layer for compatible AI-agent hosts. It stores bounded reusable facts—not conversation transcripts—with scope, provenance, freshness, and a Candidate → Current lifecycle.",
+        "sources": [
+          {"label": "FactLane overview", "to": "/"},
+          {"label": "Documentation overview", "to": "/docs/"},
+          {"label": "Core concepts", "to": "/docs/CORE_CONCEPTS/"}
+        ]
+      },
+      {
+        "id": "who-is-it-for",
+        "question": "When is FactLane a good fit?",
+        "answer": "Use FactLane when preferences, project facts, workflow rules, or scoped tool and environment facts should survive sessions, while old memory must not silently overrule current instructions or verified live state.",
+        "sources": [
+          {"label": "Use cases", "to": "/docs/USE_CASES/"},
+          {"label": "FAQ", "to": "/docs/FAQ/"}
+        ]
+      },
+      {
+        "id": "when-not-fit",
+        "question": "When is FactLane not the right tool?",
+        "answer": "FactLane is not a transcript archive, arbitrary-corpus crawler or search index, backup service, managed remote memory cloud, or automatic permission system. In v0.1.3 it is also not an HTTP, SSE, or Streamable HTTP MCP server.",
+        "sources": [
+          {"label": "FAQ", "to": "/docs/FAQ/"},
+          {"label": "Environment and compatibility", "to": "/docs/ENVIRONMENT/"}
+        ]
+      },
+      {
+        "id": "memory-difference",
+        "question": "How is FactLane different from broad or built-in memory?",
+        "answer": "Broad or native memory is useful for rich recall and continuity. FactLane is narrower: it governs a small class of reusable facts with exact scope, provenance, freshness, separate verification, and explicit authority boundaries. It is designed to coexist with broader memory, not replace it.",
+        "sources": [
+          {"label": "FactLane overview", "to": "/"},
+          {"label": "Core concepts", "to": "/docs/CORE_CONCEPTS/"},
+          {"label": "FAQ", "to": "/docs/FAQ/"}
+        ]
+      },
+      {
+        "id": "candidate-current",
+        "question": "What does Candidate → Current mean?",
+        "answer": "Candidate means a fact is worth retaining for review; it does not mean trusted current truth. Current requires a separate trusted verification step, and even Current memory must yield to newer authoritative instructions or verified live sources.",
+        "sources": [
+          {"label": "Core concepts", "to": "/docs/CORE_CONCEPTS/"}
+        ]
+      },
+      {
+        "id": "authority-boundary",
+        "question": "What are FactLane's authority boundaries?",
+        "answer": "Memory is supporting evidence, not execution authority. Current user instructions, current repository or product state, and verified live sources can outrank remembered facts. Seeing a tool does not grant write authority, and an ordinary agent cannot grant itself verifier authority.",
+        "sources": [
+          {"label": "Core concepts", "to": "/docs/CORE_CONCEPTS/"},
+          {"label": "Security", "to": "/docs/SECURITY/"}
+        ]
+      },
+      {
+        "id": "five-tools",
+        "question": "What are the five public MCP tools?",
+        "answer": "The public MCP surface is exactly memory_search, memory_get, memory_store, memory_update, and memory_status. The live MCP schema and factlane --help-tools are authoritative for exact request fields, enums, and signatures.",
+        "sources": [
+          {"label": "Five MCP tools", "to": "/docs/TOOLS/"}
+        ]
+      },
+      {
+        "id": "supported-environment",
+        "question": "What environment does v0.1.3 support?",
+        "answer": "The qualified v0.1.3 profile uses Python 3.11+, linked SQLite 3.42.0+, command-launched local stdio MCP, local SQLite and SQLite-vec storage, supported local Ollama embeddings over loopback, and the documented local POSIX storage and recovery contract. There is no automatic remote embedding fallback.",
+        "sources": [
+          {"label": "Environment and compatibility", "to": "/docs/ENVIRONMENT/"},
+          {"label": "Architecture", "to": "/docs/ARCHITECTURE/"}
+        ]
+      },
+      {
+        "id": "read-only-start",
+        "question": "How should an agent start safely?",
+        "answer": "Connect a compatible MCP host in read-only mode first. The first safe success is: the host launches FactLane, exactly five tools are visible, and memory_status succeeds in an exact scope. Enable Candidate writes only after that connection works and only if they are needed.",
+        "sources": [
+          {"label": "Quick Start", "to": "/docs/QUICKSTART/"},
+          {"label": "Using FactLane safely", "to": "/docs/USING_FACTLANE_SKILL/"}
+        ]
+      }
+    ],
+    "cta": {
+      "eyebrow": "Next step",
+      "title": "Start from a read-only connection.",
+      "body": "If the fit above matches your use case, give the project to your agent or follow the exact v0.1.3 Quick Start.",
+      "agent": "Start with your agent",
+      "quickstart": "Open Quick Start"
+    }
+  },
+  "ar": {
+    "meta": {
+      "title": "إجابات FactLane: الملاءمة والثقة والأدوات والإعداد",
+      "description": "إجابات مباشرة وموثقة بالمصادر عن FactLane وملاءمته ودورة Candidate إلى Current وحدود الصلاحيات وأدوات MCP الخمس والبيئة المدعومة والبدء بوضع القراءة فقط."
+    },
+    "eyebrow": "إجابات المنتج المرجعية",
+    "title": "FactLane بإجابات مباشرة من عقد المنتج.",
+    "intro": "تسع إجابات قصيرة للبشر ومحركات البحث ومضيفي الذكاء الاصطناعي، مع رابط إلى وثائق FactLane المرجعية التي تسند كل إجابة.",
+    "sourceCue": "هذه الملخصات لا تستبدل الوثائق. ارجع إلى روابط المصادر للعقد الكامل؛ ويظل مخطط MCP الحي والأمر factlane --help-tools المرجع النهائي لحقول الأدوات وتعداداتها الدقيقة.",
+    "factsLabel": "حقائق منتج مؤكدة",
+    "facts": [
+      {"strong": "v0.1.3", "rest": " الإصدار المسمى المدعوم"},
+      {"strong": "5", "rest": " أدوات MCP عامة"},
+      {"strong": "stdio", "rest": " نقل يُشغَّل بأمر"},
+      {"strong": "محلي", "rest": " SQLite + ملف تعريف Ollama مدعوم"}
+    ],
+    "sourcesLabel": "المصادر المرجعية",
+    "answers": [
+      {
+        "id": "what-is-factlane",
+        "question": "ما هو FactLane؟",
+        "answer": "FactLane طبقة ذاكرة MCP مجانية ومفتوحة المصدر ومحلية تعمل خلف مضيف متوافق لوكيل ذكاء اصطناعي. تحفظ حقائق محدودة قابلة لإعادة الاستخدام، لا نصوص المحادثات الكاملة، مع نطاق ومصدر وحداثة ودورة Candidate → Current.",
+        "sources": [
+          {"label": "نظرة FactLane العامة", "to": "/"},
+          {"label": "نظرة عامة على الوثائق", "to": "/docs/"},
+          {"label": "المفاهيم الأساسية", "to": "/docs/CORE_CONCEPTS/"}
+        ]
+      },
+      {
+        "id": "who-is-it-for",
+        "question": "متى يكون FactLane مناسبًا؟",
+        "answer": "يكون مناسبًا عندما تحتاج تفضيلات أو حقائق مشروع أو قواعد سير عمل أو حقائق مرتبطة بأداة أو بيئة إلى البقاء بين الجلسات، من دون أن تتجاوز ذاكرة قديمة تعليماتك الحالية أو حالة حية متحققًا منها.",
+        "sources": [
+          {"label": "حالات الاستخدام", "to": "/docs/USE_CASES/"},
+          {"label": "الأسئلة الشائعة", "to": "/docs/FAQ/"}
+        ]
+      },
+      {
+        "id": "when-not-fit",
+        "question": "متى لا يكون FactLane هو الأداة المناسبة؟",
+        "answer": "FactLane ليس أرشيفًا لنصوص المحادثات، ولا crawler أو فهرس بحث لمجموعات محتوى عشوائية، ولا خدمة نسخ احتياطي، ولا سحابة ذاكرة مُدارة عن بُعد، ولا نظامًا تلقائيًا لصلاحيات الوكيل. وفي v0.1.3 ليس خادم MCP عبر HTTP أو SSE أو Streamable HTTP.",
+        "sources": [
+          {"label": "الأسئلة الشائعة", "to": "/docs/FAQ/"},
+          {"label": "البيئة والتوافق", "to": "/docs/ENVIRONMENT/"}
+        ]
+      },
+      {
+        "id": "memory-difference",
+        "question": "كيف يختلف FactLane عن الذاكرة الواسعة أو المدمجة؟",
+        "answer": "الذاكرة الواسعة أو الأصلية مناسبة للاستدعاء الغني والاستمرارية. أما FactLane فأضيق: يحكم فئة صغيرة من الحقائق القابلة لإعادة الاستخدام بنطاق دقيق، ومنشأ مصدر، وحداثة، وتحقق منفصل، وحدود صلاحيات صريحة. صُمم ليعمل بجانب الذاكرة الأوسع لا ليستبدلها.",
+        "sources": [
+          {"label": "نظرة FactLane العامة", "to": "/"},
+          {"label": "المفاهيم الأساسية", "to": "/docs/CORE_CONCEPTS/"},
+          {"label": "الأسئلة الشائعة", "to": "/docs/FAQ/"}
+        ]
+      },
+      {
+        "id": "candidate-current",
+        "question": "ماذا تعني دورة Candidate → Current؟",
+        "answer": "تعني Candidate أن الحقيقة تستحق الاحتفاظ بها للمراجعة، لا أنها حقيقة حالية موثوقة. ولا تصبح Current إلا بعد خطوة تحقق موثوقة ومنفصلة، وحتى Current لا تتقدم على تعليمات أحدث ذات سلطة أو مصدر حي متحقق منه.",
+        "sources": [
+          {"label": "المفاهيم الأساسية", "to": "/docs/CORE_CONCEPTS/"}
+        ]
+      },
+      {
+        "id": "authority-boundary",
+        "question": "ما حدود الصلاحيات في FactLane؟",
+        "answer": "الذاكرة دليل مساند وليست صلاحية تنفيذ. يمكن لتعليمات المستخدم الحالية وحالة المستودع أو المنتج الحالية والمصادر الحية المتحقق منها أن تتقدم على الذاكرة. وظهور أداة لا يمنح صلاحية الكتابة، ولا يستطيع الوكيل العادي منح نفسه صلاحية المتحقق.",
+        "sources": [
+          {"label": "المفاهيم الأساسية", "to": "/docs/CORE_CONCEPTS/"},
+          {"label": "الأمان", "to": "/docs/SECURITY/"}
+        ]
+      },
+      {
+        "id": "five-tools",
+        "question": "ما أدوات MCP العامة الخمس؟",
+        "answer": "واجهة MCP العامة هي بالضبط memory_search وmemory_get وmemory_store وmemory_update وmemory_status. ويظل مخطط MCP الحي والأمر factlane --help-tools المرجع النهائي لحقول الطلبات والتعدادات والتواقيع الدقيقة.",
+        "sources": [
+          {"label": "أدوات MCP الخمس", "to": "/docs/TOOLS/"}
+        ]
+      },
+      {
+        "id": "supported-environment",
+        "question": "ما البيئة التي يدعمها v0.1.3؟",
+        "answer": "يستخدم ملف التعريف المحلي الموثق والمؤهّل في v0.1.3 Python 3.11+ وSQLite 3.42.0+ المرتبط وMCP محليًا عبر stdio يُشغَّل بأمر وتخزين SQLite وSQLite-vec محليًا وتضمينات Ollama محلية مدعومة عبر loopback وعقد التخزين والاستعادة المحلي الموثق على POSIX. ولا يوجد fallback تلقائي إلى تضمينات بعيدة.",
+        "sources": [
+          {"label": "البيئة والتوافق", "to": "/docs/ENVIRONMENT/"},
+          {"label": "المعمارية", "to": "/docs/ARCHITECTURE/"}
+        ]
+      },
+      {
+        "id": "read-only-start",
+        "question": "كيف يبدأ الوكيل بصورة آمنة؟",
+        "answer": "اربط مضيف MCP متوافقًا في وضع القراءة فقط أولًا. أول نجاح آمن هو أن يشغّل المضيف FactLane، وتظهر الأدوات الخمس بالضبط، وينجح memory_status ضمن نطاق محدد. لا تفعّل كتابة Candidate إلا بعد نجاح الاتصال وعند الحاجة إليها.",
+        "sources": [
+          {"label": "البدء السريع", "to": "/docs/QUICKSTART/"},
+          {"label": "استخدام FactLane بأمان", "to": "/docs/USING_FACTLANE_SKILL/"}
+        ]
+      }
+    ],
+    "cta": {
+      "eyebrow": "الخطوة التالية",
+      "title": "ابدأ باتصال للقراءة فقط.",
+      "body": "إذا طابقت الملاءمة أعلاه احتياجك، أعطِ المشروع لوكيلك أو اتبع خطوات الإعداد الدقيقة للإصدار v0.1.3.",
+      "agent": "ابدأ مع وكيلك",
+      "quickstart": "افتح البدء السريع"
+    }
+  }
+}

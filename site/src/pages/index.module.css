@@ -436,8 +436,20 @@
 }
 
 .sectionCta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem 1.1rem;
   margin-top: 1.6rem;
   font-weight: 750;
+}
+
+.authorityLink {
+  color: var(--factlane-blue);
+}
+
+.authorityLink:hover,
+.authorityLink:focus-visible {
+  color: var(--factlane-cyan);
 }
 
 .differenceGrid,

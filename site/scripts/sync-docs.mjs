@@ -167,48 +167,14 @@ for (const assetRelative of [
 await writeFile(
   path.join(staticOutput, 'robots.txt'),
   publicBuild
-    ? `User-agent: OAI-SearchBot\nAllow: /\n\nUser-agent: *\nAllow: /\nSitemap: ${siteUrl}/sitemap.xml\nSitemap: ${siteUrl}/ar/sitemap.xml\n`
+    ? `User-agent: OAI-SearchBot\nAllow: /\n\nUser-agent: Claude-SearchBot\nAllow: /\n\nUser-agent: Claude-User\nAllow: /\n\nUser-agent: *\nAllow: /\nSitemap: ${siteUrl}/sitemap.xml\nSitemap: ${siteUrl}/ar/sitemap.xml\n`
     : 'User-agent: *\nDisallow: /\n',
 );
 
-if (publicBuild) {
-  await writeFile(
-    path.join(staticOutput, 'llms.txt'),
-    `# FactLane
-
-> FactLane is a free, local-first governed MCP memory layer for compatible AI agents. It keeps bounded reusable facts with scope, provenance, freshness, and trusted Candidate → Current verification.
-
-FactLane is not a universal memory replacement or a general agent-safety system. Current user instructions, live project state, and verified live sources outrank remembered facts. The supported named release is v0.1.3 over command-launched stdio with a compatible MCP host.
-
-## Start here
-
-- [FactLane overview](${siteUrl}/): What FactLane is, when it fits, and the agent-assisted start path.
-- [Core concepts](${siteUrl}/docs/CORE_CONCEPTS/): Scope, provenance, freshness, Candidate, Current, and authority boundaries.
-- [Use cases](${siteUrl}/docs/USE_CASES/): The small reusable facts that belong in the governed lane.
-- [Quick Start](${siteUrl}/docs/QUICKSTART/): Install the supported v0.1.3 local profile and connect a compatible stdio MCP host.
-
-## Product contract
-
-- [Tools](${siteUrl}/docs/TOOLS/): The exact five-tool public MCP surface and its semantics.
-- [Architecture](${siteUrl}/docs/ARCHITECTURE/): Storage, lifecycle, host, and trust-boundary architecture.
-- [Environment](${siteUrl}/docs/ENVIRONMENT/): Supported runtime and local Ollama embedding profile.
-- [Security](${siteUrl}/docs/SECURITY/): Read-only defaults, write authority, and trust boundaries.
-- [Source repository](https://github.com/Habib1001-m/factlane): Apache-2.0 source for FactLane.
-
-## Arabic
-
-- [FactLane بالعربية](${siteUrl}/ar/): نظرة عامة ومسار البدء مع الوكيل.
-- [المفاهيم الأساسية](${siteUrl}/ar/docs/CORE_CONCEPTS/): النطاق والمصدر والحداثة ودورة Candidate → Current وحدود الصلاحيات.
-- [حالات الاستخدام](${siteUrl}/ar/docs/USE_CASES/): الحقائق الصغيرة التي تناسب المسار المحكوم.
-- [الإعداد السريع](${siteUrl}/ar/docs/QUICKSTART/): إعداد الإصدار v0.1.3 ضمن ملف التشغيل المحلي المدعوم.
-
-## Optional
-
-- [Project history](${siteUrl}/docs/PROJECT_HISTORY/): Project provenance and release history.
-- [Release operations](${siteUrl}/docs/RELEASE_OPERATIONS/): Documented release and operational procedures.
-`,
-  );
-}
+// llms.txt is emitted once at the public root by the post-build SEO guard.
+// Keeping it out of the localized static directory prevents Docusaurus from
+// copying an unintended duplicate to /ar/llms.txt.
+await rm(path.join(staticOutput, 'llms.txt'), {force: true});
 
 console.log(
   'Synced canonical FactLane docs and selected brand assets into generated site inputs',

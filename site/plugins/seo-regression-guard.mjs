@@ -1,4 +1,4 @@
-import {readFile} from 'node:fs/promises';
+import {readFile, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 
 const docIds = [
@@ -102,6 +102,10 @@ function landingRoute(locale) {
   return locale === 'en' ? '/' : '/ar/';
 }
 
+function answerRoute(locale) {
+  return locale === 'en' ? '/answers/' : '/ar/answers/';
+}
+
 function errorRoute(locale) {
   return locale === 'en' ? '/404.html' : '/ar/404.html';
 }
@@ -131,6 +135,50 @@ function expectedLandingAlternates(origin) {
   };
 }
 
+function expectedAnswerAlternates(origin) {
+  return {
+    en: `${origin}/answers/`,
+    ar: `${origin}/ar/answers/`,
+    'x-default': `${origin}/answers/`,
+  };
+}
+
+function localizedRoute(locale, route) {
+  if (locale === 'en' || !route.startsWith('/')) return route;
+  if (route === '/') return '/ar/';
+  return `/ar${route}`;
+}
+
+function llmsText(origin) {
+  return `# FactLane
+
+> FactLane is a free, local-first governed MCP memory layer for compatible AI agents. It keeps bounded reusable facts with scope, provenance, freshness, and trusted Candidate → Current verification.
+
+FactLane is not a universal memory replacement or a general agent-safety system. Current user instructions, live project state, and verified live sources outrank remembered facts. The supported named release is v0.1.3 over command-launched stdio with a compatible MCP host.
+
+## Canonical answers
+
+- [FactLane product answers](${origin}/answers/): Concise, source-linked answers about fit, non-fit, memory boundaries, Candidate → Current, authority, tools, environment, and read-only setup.
+- [إجابات FactLane المرجعية](${origin}/ar/answers/): الإجابات نفسها بالعربية مع روابط إلى الوثائق المرجعية.
+
+## Product contract
+
+- [Core concepts](${origin}/docs/CORE_CONCEPTS/): Scope, provenance, freshness, Candidate, Current, and authority boundaries.
+- [Five MCP tools](${origin}/docs/TOOLS/): The exact public MCP surface and tool semantics.
+- [Environment and compatibility](${origin}/docs/ENVIRONMENT/): Supported v0.1.3 runtime, storage, transport, and local Ollama profile.
+- [Quick Start](${origin}/docs/QUICKSTART/): Establish a supported read-only connection before enabling Candidate writes.
+- [Security](${origin}/docs/SECURITY/): Host identity, write authority, scope, and sensitive-memory boundaries.
+- [Source repository](https://github.com/Habib1001-m/factlane): Apache-2.0 source for FactLane.
+
+## Arabic product contract
+
+- [المفاهيم الأساسية](${origin}/ar/docs/CORE_CONCEPTS/): النطاق والمصدر والحداثة ودورة Candidate → Current وحدود الصلاحيات.
+- [أدوات MCP الخمس](${origin}/ar/docs/TOOLS/): الواجهة العامة الدقيقة للأدوات ودلالاتها.
+- [البيئة والتوافق](${origin}/ar/docs/ENVIRONMENT/): حدود التشغيل والتخزين والنقل وملف تعريف Ollama المحلي المدعوم في v0.1.3.
+- [البدء السريع](${origin}/ar/docs/QUICKSTART/): إنشاء اتصال مدعوم للقراءة فقط قبل تفعيل كتابة Candidate.
+`;
+}
+
 function internalRoute(href) {
   if (!href.startsWith('/')) return null;
   return href.split('#', 1)[0].split('?', 1)[0];
@@ -152,7 +200,11 @@ export default function seoRegressionGuard(context) {
       assert(['0', '1'].includes(publicFlag), 'FACTLANE_PUBLIC_BUILD must be exactly 0 or 1');
       const publicBuild = publicFlag === '1';
       const origin = new URL(siteConfig.url).origin;
-      const canonicalRoutes = [landingRoute(locale), ...docIds.map((id) => routePath(locale, id))].sort();
+      const canonicalRoutes = [
+        landingRoute(locale),
+        answerRoute(locale),
+        ...docIds.map((id) => routePath(locale, id)),
+      ].sort();
       const expectedRoutes = [...canonicalRoutes, errorRoute(locale)].sort();
       assert(
         JSON.stringify([...routesPaths].sort()) === JSON.stringify(expectedRoutes),
@@ -170,9 +222,58 @@ export default function seoRegressionGuard(context) {
       }
 
       const docSeo = JSON.parse(await readFile(path.join(siteRoot, 'src', 'content', 'docSeo.json'), 'utf8'));
+      const answerAuthority = JSON.parse(
+        await readFile(path.join(siteRoot, 'src', 'content', 'answerAuthority.json'), 'utf8'),
+      );
+      const requiredAnswerIds = [
+        'what-is-factlane',
+        'who-is-it-for',
+        'when-not-fit',
+        'memory-difference',
+        'candidate-current',
+        'authority-boundary',
+        'five-tools',
+        'supported-environment',
+        'read-only-start',
+      ];
+      for (const answerLocale of ['en', 'ar']) {
+        const answers = answerAuthority[answerLocale]?.answers ?? [];
+        assert(
+          JSON.stringify(answers.map((answer) => answer.id)) === JSON.stringify(requiredAnswerIds),
+          `answer authority ID set/order mismatch: ${answerLocale}`,
+        );
+      }
+      for (let index = 0; index < requiredAnswerIds.length; index += 1) {
+        const enSources = answerAuthority.en.answers[index].sources.map((source) => source.to);
+        const arSources = answerAuthority.ar.answers[index].sources.map((source) => source.to);
+        assert(
+          JSON.stringify(enSources) === JSON.stringify(arSources),
+          `answer authority source parity mismatch: ${requiredAnswerIds[index]}`,
+        );
+      }
+      for (const answerLocale of ['en', 'ar']) {
+        const byId = Object.fromEntries(
+          answerAuthority[answerLocale].answers.map((answer) => [answer.id, answer.answer]),
+        );
+        for (const tool of ['memory_search', 'memory_get', 'memory_store', 'memory_update', 'memory_status']) {
+          assert(byId['five-tools'].includes(tool), `answer authority missing ${tool}: ${answerLocale}`);
+        }
+        for (const token of ['v0.1.3', 'Python 3.11+', 'SQLite 3.42.0+', 'stdio', 'Ollama']) {
+          assert(
+            byId['supported-environment'].includes(token),
+            `answer authority environment missing ${token}: ${answerLocale}`,
+          );
+        }
+        assert(
+          byId['read-only-start'].includes('memory_status'),
+          `answer authority read-only start missing memory_status: ${answerLocale}`,
+        );
+      }
       const allIndexableRoutes = new Set([
         '/',
         '/ar/',
+        '/answers/',
+        '/ar/answers/',
         ...docIds.flatMap((id) => [routePath('en', id), routePath('ar', id)]),
       ]);
       const pages = new Map();
@@ -234,6 +335,37 @@ export default function seoRegressionGuard(context) {
           assert(items[0]?.item === expectedHome, `breadcrumb home URL mismatch: ${locale}/${id}`);
           assert(items.every((item, index) => item?.position === index + 1), `breadcrumb positions invalid: ${locale}/${id}`);
           assert(items.at(-1)?.item === expectedCanonical, `breadcrumb canonical mismatch: ${locale}/${id}`);
+        } else if (route === answerRoute(locale)) {
+          const expectedAnswer = answerAuthority[locale];
+          assert(expectedAnswer, `missing answer authority content: ${locale}`);
+          assert(
+            page.title === `${expectedAnswer.meta.title} | FactLane`,
+            `answer title mismatch: ${locale}`,
+          );
+          assert(page.description === expectedAnswer.meta.description, `answer description mismatch: ${locale}`);
+          assert(page.title.length >= 10 && page.title.length <= 75, `answer title length invalid: ${locale}`);
+          assert(
+            page.description.length >= 80 && page.description.length <= 190,
+            `answer description length invalid: ${locale}`,
+          );
+          assert(/[.!?؟]$/u.test(page.description), `answer description is not a complete sentence: ${locale}`);
+          if (locale === 'ar') {
+            assert(/[\u0600-\u06ff]/u.test(page.title), 'Arabic answer title fallback');
+            assert(/[\u0600-\u06ff]/u.test(page.description), 'Arabic answer description fallback');
+            assert(/[\u0600-\u06ff]/u.test(page.h1[0]), 'Arabic answer H1 fallback');
+          }
+          assert(
+            JSON.stringify(page.alternates) === JSON.stringify(expectedAnswerAlternates(origin)),
+            `answer hreflang mismatch: ${locale}`,
+          );
+          assert(page.jsonLd.length === 0, `answer route must not add decorative JSON-LD: ${locale}`);
+          for (const answer of expectedAnswer.answers) {
+            assert(page.ids.has(answer.id), `missing answer section ${locale}#${answer.id}`);
+            for (const source of answer.sources) {
+              const expectedHref = localizedRoute(locale, source.to);
+              assert(page.hrefs.includes(expectedHref), `missing answer source link ${locale}: ${expectedHref}`);
+            }
+          }
         } else {
           assert(route === landingRoute(locale), `unexpected canonical route: ${route}`);
           assert(
@@ -282,17 +414,31 @@ export default function seoRegressionGuard(context) {
       const llmsPath = path.join(outDir, 'llms.txt');
       if (publicBuild) {
         assert(robots.includes('User-agent: OAI-SearchBot'), 'public robots missing OAI-SearchBot policy');
+        assert(robots.includes('User-agent: Claude-SearchBot'), 'public robots missing Claude-SearchBot policy');
+        assert(robots.includes('User-agent: Claude-User'), 'public robots missing Claude-User policy');
         assert(robots.includes('Allow: /'), 'public robots.txt must allow crawling');
         assert(!robots.includes('Disallow: /'), 'public robots.txt must not block crawling');
         assert(robots.includes(`Sitemap: ${origin}/sitemap.xml`), 'public robots missing EN sitemap');
         assert(robots.includes(`Sitemap: ${origin}/ar/sitemap.xml`), 'public robots missing AR sitemap');
-        const llms = await readFile(llmsPath, 'utf8');
-        assert(llms.startsWith('# FactLane\n'), 'public llms.txt must identify FactLane');
-        assert(llms.includes(`${origin}/docs/CORE_CONCEPTS/`), 'public llms.txt missing EN core concepts');
-        assert(llms.includes(`${origin}/ar/docs/CORE_CONCEPTS/`), 'public llms.txt missing AR core concepts');
-        assert(llms.includes(`${origin}/docs/TOOLS/`), 'public llms.txt missing tool contract');
-        assert(llms.includes('v0.1.3'), 'public llms.txt missing supported release boundary');
-        assert(llms.includes('not a universal memory replacement'), 'public llms.txt missing product-scope boundary');
+        if (locale === 'en') {
+          const llms = llmsText(origin);
+          await writeFile(llmsPath, llms, 'utf8');
+          assert(llms.startsWith('# FactLane\n'), 'public llms.txt must identify FactLane');
+          assert(llms.includes(`${origin}/answers/`), 'public llms.txt missing EN canonical answers');
+          assert(llms.includes(`${origin}/ar/answers/`), 'public llms.txt missing AR canonical answers');
+          assert(llms.includes(`${origin}/docs/CORE_CONCEPTS/`), 'public llms.txt missing core concepts');
+          assert(llms.includes(`${origin}/docs/TOOLS/`), 'public llms.txt missing tool contract');
+          assert(llms.includes(`${origin}/docs/ENVIRONMENT/`), 'public llms.txt missing environment contract');
+          assert(llms.includes(`${origin}/docs/QUICKSTART/`), 'public llms.txt missing Quick Start');
+          assert(llms.includes(`${origin}/ar/docs/CORE_CONCEPTS/`), 'public llms.txt missing AR core concepts');
+          assert(llms.includes(`${origin}/ar/docs/TOOLS/`), 'public llms.txt missing AR tool contract');
+          assert(llms.includes(`${origin}/ar/docs/ENVIRONMENT/`), 'public llms.txt missing AR environment contract');
+          assert(llms.includes(`${origin}/ar/docs/QUICKSTART/`), 'public llms.txt missing AR Quick Start');
+          assert(llms.includes('v0.1.3'), 'public llms.txt missing supported release boundary');
+          assert(llms.includes('not a universal memory replacement'), 'public llms.txt missing product-scope boundary');
+        } else {
+          assert(!(await fileExists(llmsPath)), 'localized /ar/llms.txt must not be emitted');
+        }
         const sitemap = await sitemapUrls(sitemapPath);
         const expectedSitemap = new Set(canonicalRoutes.map((route) => `${origin}${route}`));
         assert(
