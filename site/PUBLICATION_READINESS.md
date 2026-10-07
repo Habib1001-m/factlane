@@ -21,6 +21,61 @@ npm run build
 non-public: HTML is `noindex,nofollow,noarchive`, `robots.txt` disallows crawling, and sitemaps plus
 `llms.txt` are absent.
 
+## Publication crossing preflight: reproducible artifact freeze
+
+Before any separately authorized deployment, bind the crossing to one exact site commit/tree and
+prove that the public artifact is reproducible from clean source state. Use two independent detached
+worktrees/checkouts of the same commit, the same approved HTTPS origin, the committed lockfile, and
+the same Node/npm toolchain. Do not reuse a previous `build/`, `.docusaurus/`, bundler cache, or
+publication artifact as an input.
+
+For each isolated source tree, install from the lockfile, clear Docusaurus build/cache state, and
+build with the same public environment:
+
+```bash
+npm ci --prefer-offline --no-audit --no-fund
+npm run clear
+FACTLANE_SITE_URL=https://<approved-public-origin> \
+FACTLANE_PUBLIC_BUILD=1 \
+npm run build -- --out-dir <fresh-public-artifact-dir>
+```
+
+Generate a byte manifest from each fresh artifact with paths relative to the artifact root:
+
+```bash
+(cd <artifact-a> && find . -type f -print0 | sort -z | xargs -0 sha256sum) > <manifest-a>
+(cd <artifact-b> && find . -type f -print0 | sort -z | xargs -0 sha256sum) > <manifest-b>
+cmp -s <manifest-a> <manifest-b>
+sha256sum <manifest-a> <manifest-b>
+```
+
+The reproducibility preflight is **PASS** only when the complete manifests are byte-identical. Any
+path, filename, or file-content difference is **HOLD** until its smallest cause is understood and
+fixed or the crossing is explicitly abandoned. Do not waive a mismatch merely because canonical,
+robots, or rendered text appear equivalent.
+
+Freeze exactly one of the identical artifacts. Record at minimum the commit, tree, approved origin,
+Node/npm/Docusaurus versions, `package-lock.json` SHA-256, complete artifact-manifest SHA-256, route
+inventory, and the checksums/paths for canonical HTML entry points, `robots.txt`, both sitemaps,
+root `llms.txt`, answer pages, publication icons/logo/social images, and generated CSS/JS entry
+assets. Reject any artifact containing an absolute development/worktree path or a reference to a
+missing local file.
+
+A deterministic archive may be used as the immutable crossing object. Normalize archive metadata
+and record its SHA-256, for example with GNU tar plus gzip:
+
+```bash
+SOURCE_DATE_EPOCH=$(git show -s --format=%ct <exact-site-commit>)
+tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
+  --format=gnu -C <artifact-dir> -cf - . | gzip -n > <frozen-public-artifact>.tar.gz
+sha256sum <frozen-public-artifact>.tar.gz
+```
+
+Before deployment, the operator must match the exact commit/tree, public origin, lockfile/toolchain
+provenance, complete manifest SHA-256, and frozen archive SHA-256 recorded by the accepted preflight.
+If any binding differs, publication is **HOLD** and a new local preflight is required. Deployment
+must consume the frozen artifact bytes; do not silently rebuild different bytes during the crossing.
+
 ## Hosting assumptions that must remain true
 
 The host/CDN must preserve the built artifact rather than reinterpret it as an SPA:
