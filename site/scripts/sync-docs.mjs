@@ -160,7 +160,9 @@ for (const assetRelative of [
   'logo/factlane-mark.svg',
   'social/factlane-github-social-preview.png',
 ]) {
-  const source = path.join(repoRoot, 'docs', 'assets', 'brand', assetRelative);
+  const source = assetRelative.startsWith('favicon/')
+    ? path.join(siteRoot, 'publication-assets', assetRelative)
+    : path.join(repoRoot, 'docs', 'assets', 'brand', assetRelative);
   const target = path.join(staticOutput, assetRelative);
   await mkdir(path.dirname(target), {recursive: true});
   await cp(source, target);

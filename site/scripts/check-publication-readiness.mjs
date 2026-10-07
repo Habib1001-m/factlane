@@ -333,11 +333,16 @@ async function fetchAsset(pathname, userAgent) {
   };
 }
 
-function pngDimensions(bytes, pathname) {
+function pngMetadata(bytes, pathname) {
   const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-  assert(bytes.length >= 24, `PNG asset is truncated: ${pathname}`);
+  assert(bytes.length >= 26, `PNG asset is truncated: ${pathname}`);
   assert(signature.every((value, index) => bytes[index] === value), `PNG signature mismatch: ${pathname}`);
-  return {width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20)};
+  return {
+    width: bytes.readUInt32BE(16),
+    height: bytes.readUInt32BE(20),
+    bitDepth: bytes[24],
+    colorType: bytes[25],
+  };
 }
 
 async function fetchChain(start, userAgent, maxRedirects = 3) {
@@ -550,10 +555,10 @@ const publicationAssetSpecs = [];
 for (const prefix of ['', '/ar']) {
   publicationAssetSpecs.push(
     {path: `${prefix}/logo/factlane-mark.svg`, type: 'image/svg+xml', svgViewBox: '0 0 512 512'},
-    {path: `${prefix}/favicon/favicon-16.png`, type: 'image/png', width: 16, height: 16},
-    {path: `${prefix}/favicon/favicon-32.png`, type: 'image/png', width: 32, height: 32},
-    {path: `${prefix}/favicon/favicon-256.png`, type: 'image/png', width: 256, height: 256},
-    {path: `${prefix}/social/factlane-github-social-preview.png`, type: 'image/png', width: 1280, height: 640},
+    {path: `${prefix}/favicon/favicon-16.png`, type: 'image/png', width: 16, height: 16, bitDepth: 8, alpha: true},
+    {path: `${prefix}/favicon/favicon-32.png`, type: 'image/png', width: 32, height: 32, bitDepth: 8, alpha: true},
+    {path: `${prefix}/favicon/favicon-256.png`, type: 'image/png', width: 256, height: 256, bitDepth: 8, alpha: true},
+    {path: `${prefix}/social/factlane-github-social-preview.png`, type: 'image/png', width: 1280, height: 640, bitDepth: 8},
   );
 }
 
@@ -565,8 +570,12 @@ for (const spec of publicationAssetSpecs) {
   assert(asset.contentType.includes(spec.type), `Publication asset content type mismatch: ${spec.path}`);
   assert(asset.bytes.length > 0, `Publication asset is empty: ${spec.path}`);
   if (spec.type === 'image/png') {
-    const size = pngDimensions(asset.bytes, spec.path);
-    assert(size.width === spec.width && size.height === spec.height, `Publication PNG dimensions mismatch: ${spec.path}`);
+    const metadata = pngMetadata(asset.bytes, spec.path);
+    assert(metadata.width === spec.width && metadata.height === spec.height, `Publication PNG dimensions mismatch: ${spec.path}`);
+    assert(metadata.bitDepth === spec.bitDepth, `Publication PNG bit depth mismatch: ${spec.path}`);
+    if (spec.alpha) {
+      assert([4, 6].includes(metadata.colorType), `Publication PNG must carry an alpha channel: ${spec.path}`);
+    }
   } else {
     const svg = asset.bytes.toString('utf8');
     assert(svg.includes(`viewBox="${spec.svgViewBox}"`), `Publication SVG viewBox mismatch: ${spec.path}`);
