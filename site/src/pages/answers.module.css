@@ -4,12 +4,12 @@
 }
 
 .container {
-  width: min(100% - 48px, 1180px);
+  width: min(100% - 48px, 1280px);
   margin: 0 auto;
 }
 
 .hero {
-  padding: 7rem 0 4rem;
+  padding: 5.5rem 0 3.5rem;
   border-bottom: 1px solid var(--answers-border);
   background:
     radial-gradient(circle at 15% 15%, rgba(22, 217, 244, 0.09), transparent 30%),
@@ -25,11 +25,12 @@
 }
 
 .hero h1 {
-  max-width: 920px;
+  max-width: 980px;
   margin: 0.55rem 0 1.2rem;
-  font-size: clamp(2.8rem, 6vw, 5.6rem);
-  line-height: 0.98;
-  letter-spacing: -0.055em;
+  font-size: clamp(2.75rem, 5vw, 4.6rem);
+  line-height: 1.02;
+  letter-spacing: -0.045em;
+  text-wrap: balance;
 }
 
 .intro,
@@ -69,7 +70,7 @@
 }
 
 .answersSection {
-  padding: 4.5rem 0 5.5rem;
+  padding: 4rem 0 4.5rem;
 }
 
 .answerGrid {
@@ -98,6 +99,7 @@
   font-size: clamp(1.45rem, 2.5vw, 2rem);
   line-height: 1.2;
   letter-spacing: -0.03em;
+  text-wrap: balance;
 }
 
 .answerText {
@@ -139,7 +141,7 @@
 }
 
 .cta {
-  padding: 0 0 7rem;
+  padding: 0 0 5.5rem;
 }
 
 .ctaPanel {

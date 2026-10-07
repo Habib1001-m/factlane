@@ -185,6 +185,24 @@ const config: Config = {
   staticDirectories: ['.generated-static'],
   headTags: [
     {
+      tagName: 'link',
+      attributes: {
+        rel: 'icon',
+        type: 'image/png',
+        sizes: '16x16',
+        href: '/favicon/favicon-16.png',
+      },
+    },
+    {
+      tagName: 'link',
+      attributes: {
+        rel: 'apple-touch-icon',
+        type: 'image/png',
+        sizes: '256x256',
+        href: '/favicon/favicon-256.png',
+      },
+    },
+    {
       tagName: 'meta',
       attributes: {name: 'theme-color', content: '#0a0f1a'},
     },
@@ -199,6 +217,32 @@ const config: Config = {
     {
       tagName: 'meta',
       attributes: {property: 'og:type', content: 'website'},
+    },
+    {
+      tagName: 'meta',
+      attributes: {property: 'og:image:type', content: 'image/png'},
+    },
+    {
+      tagName: 'meta',
+      attributes: {property: 'og:image:width', content: '1280'},
+    },
+    {
+      tagName: 'meta',
+      attributes: {property: 'og:image:height', content: '640'},
+    },
+    {
+      tagName: 'meta',
+      attributes: {
+        property: 'og:image:alt',
+        content: 'FactLane — governed memory for MCP agents',
+      },
+    },
+    {
+      tagName: 'meta',
+      attributes: {
+        name: 'twitter:image:alt',
+        content: 'FactLane — governed memory for MCP agents',
+      },
     },
     ...(!publicBuild
       ? [

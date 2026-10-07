@@ -29,6 +29,11 @@ The host/CDN must preserve the built artifact rather than reinterpret it as an S
 - Serve canonical directory routes such as `/docs/TOOLS/`, `/answers/`, and `/ar/answers/` as real
   HTML with HTTP 200. Slashless aliases may redirect to the slash form or return the same content,
   but their HTML canonical must point to the trailing-slash route.
+- Preserve the accepted static alias boundary for generated files: `.html` aliases, explicit
+  directory `index.html` aliases, duplicate-slash variants, and query-string variants may resolve
+  directly or through at most the accepted redirect bound, but must end on HTTP 200 content whose
+  canonical is the trailing-slash route. Directory-index serving must not create a second canonical
+  URL or bypass the 404/case boundary.
 - Unknown routes, default-locale `/en/` routes, and wrong-case route variants must return **HTTP
   404**, not a 200 SPA fallback. The rendered 404 must retain `noindex,nofollow,noarchive`.
 - Do not configure a catch-all rewrite to `/index.html`. That would destroy the accepted 404 and
@@ -77,9 +82,13 @@ bind `FACTLANE_EXPECTED_ORIGIN` to the canonical origin used for that build.
 The harness checks:
 
 - canonical route HTTP 200/status and redirect behavior;
-- trailing-slash aliases and query variants;
+- trailing-slash, `.html`, explicit `index.html`, duplicate-slash, and query variants, including the
+  accepted redirect bound and canonical convergence;
 - wrong-case, missing, and `/en/` routes as real HTTP 404 + noindex;
 - canonical, hreflang, locale direction, H1 and SSR `<main>` presence;
+- the SSR navbar product mark, primary favicon, Apple touch icon, Open Graph/Twitter image metadata,
+  and the publication-facing logo/favicon/social files themselves, including expected media type,
+  PNG dimensions and EN/AR byte parity;
 - absence of a public `X-Robots-Tag` that would impose `noindex`, `nofollow`, or `none`;
 - landing/docs/answers JSON-LD boundaries;
 - all nine EN/AR answer sections and their canonical source links;
@@ -103,11 +112,19 @@ Once publication itself is separately authorized and the final public origin exi
 2. Confirm the deployed artifact is static and the host does not apply an SPA fallback.
 3. Run the publication-readiness harness against the production origin.
 4. Manually spot-check `/`, `/ar/`, `/answers/`, `/ar/answers/`, one EN doc, one AR doc, a
-   wrong-case URL, and a definitely missing URL.
-5. Confirm production `robots.txt`, `/sitemap.xml`, `/ar/sitemap.xml`, root `/llms.txt`, and absent
+   slashless/`index.html`/duplicate-slash alias, a wrong-case URL, and a definitely missing URL.
+5. In EN and AR, inspect desktop and narrow/mobile layouts in light and dark modes: confirm the
+   FactLane mark is loaded (never a broken/default icon), headings and paragraphs reflow without
+   clipping or horizontal overflow, section spacing remains intentional, and primary actions remain
+   visually prominent.
+6. Confirm the favicon and Apple touch icon load directly and the social-preview URL resolves to the
+   expected 1280×640 PNG. Inspect a share-preview debugger only after publication when one is
+   available; do not treat external cache refresh as a build gate.
+7. Confirm production `robots.txt`, `/sitemap.xml`, `/ar/sitemap.xml`, root `/llms.txt`, and absent
    `/ar/llms.txt` match the expected deployment mode.
-6. Confirm the answer pages expose the direct SSR answers and source links before hydration.
-7. If canonical/robots/404/crawler parity is broken, treat publication as **HOLD** and fix or roll
+8. Confirm the answer pages expose the direct SSR answers and source links before hydration.
+9. If canonical/robots/404/crawler parity or publication-facing brand assets are broken, treat
+   publication as **HOLD** and fix or roll
    back the smallest hosting/deployment defect before any search-vendor submission.
 
 ## Evidence that comes later, not at build time

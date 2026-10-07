@@ -133,6 +133,13 @@ function hash(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function metaContent(metaTags, attributeName, attributeValue) {
+  const tag = metaTags.find(
+    (candidate) => attr(candidate, attributeName).toLowerCase() === attributeValue.toLowerCase(),
+  );
+  return tag ? attr(tag, 'content') : '';
+}
+
 function parseHtml(html) {
   const title = decodeHtml(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim() ?? '');
   const metaTags = [...html.matchAll(/<meta\b[^>]*>/gi)].map((match) => match[0]);
@@ -164,6 +171,15 @@ function parseHtml(html) {
   const answerIds = [...html.matchAll(/data-answer-id=["']([^"']+)["']/gi)].map((match) =>
     decodeHtml(match[1]),
   );
+  const imageSources = [...html.matchAll(/<img\b[^>]+src=["']([^"']+)["'][^>]*>/gi)].map((match) =>
+    decodeHtml(match[1]),
+  );
+  const iconHrefs = linkTags
+    .filter((tag) => attr(tag, 'rel').toLowerCase().split(/\s+/).includes('icon'))
+    .map((tag) => attr(tag, 'href'));
+  const appleTouchIconHrefs = linkTags
+    .filter((tag) => attr(tag, 'rel').toLowerCase() === 'apple-touch-icon')
+    .map((tag) => attr(tag, 'href'));
   return {
     title,
     description: descriptionTag ? attr(descriptionTag, 'content') : '',
@@ -179,6 +195,17 @@ function parseHtml(html) {
     mainHash: hash(visibleText(mainHtml)),
     hrefs,
     hrefsHash: hash(JSON.stringify(hrefs)),
+    imageSources,
+    imageSourcesHash: hash(JSON.stringify(imageSources)),
+    iconHrefs,
+    appleTouchIconHrefs,
+    ogImage: metaContent(metaTags, 'property', 'og:image'),
+    ogImageType: metaContent(metaTags, 'property', 'og:image:type'),
+    ogImageWidth: metaContent(metaTags, 'property', 'og:image:width'),
+    ogImageHeight: metaContent(metaTags, 'property', 'og:image:height'),
+    ogImageAlt: metaContent(metaTags, 'property', 'og:image:alt'),
+    twitterImage: metaContent(metaTags, 'name', 'twitter:image'),
+    twitterImageAlt: metaContent(metaTags, 'name', 'twitter:image:alt'),
     answerIds,
     answerIdsHash: hash(JSON.stringify(answerIds)),
   };
@@ -215,8 +242,27 @@ function localizedRoute(locale, route) {
   return `/ar${route}`;
 }
 
+function localizedAssetPath(route, assetPath) {
+  return route.startsWith('/ar/') ? `/ar${assetPath}` : assetPath;
+}
+
 function slashless(route) {
   return route !== '/' && route.endsWith('/') ? route.slice(0, -1) : null;
+}
+
+function htmlAlias(route) {
+  if (route === '/') return '/index.html';
+  return route.endsWith('/') ? `${route.slice(0, -1)}.html` : `${route}.html`;
+}
+
+function indexHtmlAlias(route) {
+  if (route === '/') return '/index.html';
+  return route.endsWith('/') ? `${route}index.html` : `${route}/index.html`;
+}
+
+function duplicateSlashVariant(route) {
+  if (route === '/') return '//';
+  return route.replace(/^\//, '//').replace('/docs/', '//docs//');
 }
 
 function wrongCase(route) {
@@ -230,7 +276,10 @@ function wrongCase(route) {
 }
 
 function requestUrl(pathname) {
-  return new URL(pathname, `${verifyBase}/`).toString();
+  assert(pathname.startsWith('/'), `Verification path must be root-relative: ${pathname}`);
+  // Concatenate instead of URL-resolving the path so a leading duplicate slash stays a path
+  // variant rather than being interpreted as a scheme-relative cross-origin URL.
+  return `${verifyBase}${pathname}`;
 }
 
 async function fetchOnce(pathname, userAgent) {
@@ -250,6 +299,31 @@ async function fetchOnce(pathname, userAgent) {
     xRobotsTag: response.headers.get('x-robots-tag') ?? '',
     body,
   };
+}
+
+async function fetchAsset(pathname, userAgent) {
+  const response = await fetch(requestUrl(pathname), {
+    redirect: 'manual',
+    headers: {
+      accept: '*/*',
+      'user-agent': userAgent,
+    },
+  });
+  const bytes = Buffer.from(await response.arrayBuffer());
+  return {
+    path: pathname,
+    status: response.status,
+    location: response.headers.get('location') ?? '',
+    contentType: response.headers.get('content-type') ?? '',
+    bytes,
+  };
+}
+
+function pngDimensions(bytes, pathname) {
+  const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  assert(bytes.length >= 24, `PNG asset is truncated: ${pathname}`);
+  assert(signature.every((value, index) => bytes[index] === value), `PNG signature mismatch: ${pathname}`);
+  return {width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20)};
 }
 
 async function fetchChain(start, userAgent, maxRedirects = 3) {
@@ -305,6 +379,22 @@ function assertCanonicalSnapshot(route, snap) {
     JSON.stringify(snap.page.alternates) === JSON.stringify(expectedAlternates(route)),
     `hreflang mismatch: ${route}`,
   );
+  const logoPath = localizedAssetPath(route, '/logo/factlane-mark.svg');
+  const faviconPath = localizedAssetPath(route, '/favicon/favicon-32.png');
+  const socialPath = localizedAssetPath(route, '/social/factlane-github-social-preview.png');
+  assert(snap.page.imageSources.includes(logoPath), `Navbar product mark missing from SSR: ${route}`);
+  assert(snap.page.iconHrefs.includes(faviconPath), `Primary favicon reference missing: ${route}`);
+  assert(
+    snap.page.appleTouchIconHrefs.includes('/favicon/favicon-256.png'),
+    `Apple touch icon reference missing: ${route}`,
+  );
+  assert(snap.page.ogImage === `${expectedOrigin}${socialPath}`, `Open Graph image mismatch: ${route}`);
+  assert(snap.page.twitterImage === `${expectedOrigin}${socialPath}`, `Twitter image mismatch: ${route}`);
+  assert(snap.page.ogImageType === 'image/png', `Open Graph image type mismatch: ${route}`);
+  assert(snap.page.ogImageWidth === '1280', `Open Graph image width mismatch: ${route}`);
+  assert(snap.page.ogImageHeight === '640', `Open Graph image height mismatch: ${route}`);
+  assert(snap.page.ogImageAlt.length > 0, `Open Graph image alt missing: ${route}`);
+  assert(snap.page.twitterImageAlt === snap.page.ogImageAlt, `Social image alt mismatch: ${route}`);
   if (mode === 'public') {
     assert(!snap.page.robots.toLowerCase().includes('noindex'), `Public route is noindex: ${route}`);
     assert(
@@ -350,6 +440,9 @@ const browserUa = standardUserAgents.browser;
 const canonicalBaseline = new Map();
 let alias200 = 0;
 let aliasRedirected = 0;
+let htmlAliasChecks = 0;
+let indexHtmlAliasChecks = 0;
+let duplicateSlashChecks = 0;
 let queryChecks = 0;
 let wrongCaseChecks = 0;
 
@@ -359,13 +452,27 @@ for (const route of canonicalRoutes) {
   assertCanonicalSnapshot(route, snap);
   canonicalBaseline.set(route, snap);
 
-  const noSlash = slashless(route);
-  if (noSlash) {
-    const alias = snapshot(await fetchChain(noSlash, browserUa));
-    assert(alias.status === 200, `Slashless alias did not resolve to canonical content: ${noSlash}`);
-    assert(alias.page?.canonical === `${expectedOrigin}${route}`, `Slashless alias canonical mismatch: ${noSlash}`);
+  const aliases = [
+    ['slashless', slashless(route)],
+    ['html', htmlAlias(route)],
+    ['indexHtml', indexHtmlAlias(route)],
+    ['duplicateSlash', duplicateSlashVariant(route)],
+  ];
+  const seenAliases = new Set();
+  for (const [kind, aliasPath] of aliases) {
+    if (!aliasPath || aliasPath === route || seenAliases.has(aliasPath)) continue;
+    seenAliases.add(aliasPath);
+    const alias = snapshot(await fetchChain(aliasPath, browserUa));
+    assert(alias.status === 200, `${kind} alias did not resolve to canonical content: ${aliasPath}`);
+    assert(
+      alias.page?.canonical === `${expectedOrigin}${route}`,
+      `${kind} alias canonical mismatch: ${aliasPath}`,
+    );
     if (alias.redirects === 0) alias200 += 1;
     else aliasRedirected += 1;
+    if (kind === 'html') htmlAliasChecks += 1;
+    if (kind === 'indexHtml') indexHtmlAliasChecks += 1;
+    if (kind === 'duplicateSlash') duplicateSlashChecks += 1;
   }
 
   const query = snapshot(await fetchChain(`${route}?factlane_readiness=1`, browserUa));
@@ -416,6 +523,46 @@ for (const target of answerSourceTargets) {
   const source = snapshot(await fetchChain(target, browserUa));
   assert(source.status === 200, `Answer source target is not 200: ${target}`);
   assert(source.page?.canonical === `${expectedOrigin}${target}`, `Answer source canonical mismatch: ${target}`);
+}
+
+const publicationAssetSpecs = [];
+for (const prefix of ['', '/ar']) {
+  publicationAssetSpecs.push(
+    {path: `${prefix}/logo/factlane-mark.svg`, type: 'image/svg+xml', svgViewBox: '0 0 512 512'},
+    {path: `${prefix}/favicon/favicon-16.png`, type: 'image/png', width: 16, height: 16},
+    {path: `${prefix}/favicon/favicon-32.png`, type: 'image/png', width: 32, height: 32},
+    {path: `${prefix}/favicon/favicon-256.png`, type: 'image/png', width: 256, height: 256},
+    {path: `${prefix}/social/factlane-github-social-preview.png`, type: 'image/png', width: 1280, height: 640},
+  );
+}
+
+const publicationAssetHashes = new Map();
+for (const spec of publicationAssetSpecs) {
+  const asset = await fetchAsset(spec.path, browserUa);
+  assert(asset.status === 200, `Publication asset must be 200: ${spec.path} -> ${asset.status}`);
+  assert(asset.location === '', `Publication asset must not redirect: ${spec.path} -> ${asset.location}`);
+  assert(asset.contentType.includes(spec.type), `Publication asset content type mismatch: ${spec.path}`);
+  assert(asset.bytes.length > 0, `Publication asset is empty: ${spec.path}`);
+  if (spec.type === 'image/png') {
+    const size = pngDimensions(asset.bytes, spec.path);
+    assert(size.width === spec.width && size.height === spec.height, `Publication PNG dimensions mismatch: ${spec.path}`);
+  } else {
+    const svg = asset.bytes.toString('utf8');
+    assert(svg.includes(`viewBox="${spec.svgViewBox}"`), `Publication SVG viewBox mismatch: ${spec.path}`);
+  }
+  publicationAssetHashes.set(spec.path, hash(asset.bytes));
+}
+for (const relative of [
+  '/logo/factlane-mark.svg',
+  '/favicon/favicon-16.png',
+  '/favicon/favicon-32.png',
+  '/favicon/favicon-256.png',
+  '/social/factlane-github-social-preview.png',
+]) {
+  assert(
+    publicationAssetHashes.get(relative) === publicationAssetHashes.get(`/ar${relative}`),
+    `Localized publication asset bytes diverged: ${relative}`,
+  );
 }
 
 const robots = await fetchOnce('/robots.txt', browserUa);
@@ -495,6 +642,7 @@ const parityFields = [
   'jsonLdHash',
   'mainHash',
   'hrefsHash',
+  'imageSourcesHash',
   'answerIdsHash',
 ];
 let crawlerRecords = 0;
@@ -537,8 +685,12 @@ const summary = {
   expectedOrigin,
   canonicalRoutes: canonicalRoutes.length,
   answerSourceTargets: answerSourceTargets.size,
-  slashlessAliases200: alias200,
-  slashlessAliasesRedirected: aliasRedirected,
+  publicationAssetChecks: publicationAssetSpecs.length,
+  aliasVariants200: alias200,
+  aliasVariantsRedirected: aliasRedirected,
+  htmlAliasChecks,
+  indexHtmlAliasChecks,
+  duplicateSlashChecks,
   queryChecks,
   wrongCaseChecks,
   sitemapLastmodMode,

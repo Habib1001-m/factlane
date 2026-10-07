@@ -154,7 +154,9 @@ await cp(
 );
 
 for (const assetRelative of [
+  'favicon/favicon-16.png',
   'favicon/favicon-32.png',
+  'favicon/favicon-256.png',
   'logo/factlane-mark.svg',
   'social/factlane-github-social-preview.png',
 ]) {
