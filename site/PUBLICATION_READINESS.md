@@ -76,6 +76,69 @@ provenance, complete manifest SHA-256, and frozen archive SHA-256 recorded by th
 If any binding differs, publication is **HOLD** and a new local preflight is required. Deployment
 must consume the frozen artifact bytes; do not silently rebuild different bytes during the crossing.
 
+The crossing handoff must also be usable by a consumer that receives the frozen package without the
+source checkout or its `node_modules`. Ship checksummed copies of the package verifier, the static
+rehearsal host, the publication-readiness harness, and the exact answer-authority snapshot required
+by that harness. The handoff package must document their SHA-256 values and the external
+`PACKAGE_CONTENTS.sha256` digest bound by the crossing authorization. A self-contained checksum file
+inside the package detects corruption but is not an authenticity trust anchor by itself; if the
+separately supplied expected package digest is absent or does not match, crossing is **HOLD**.
+
+Consumer rehearsal must start from the received frozen package only. Verify package contents first,
+preflight the archive before extraction, and reject symlinks, hardlinks/devices, absolute or `..`
+paths, hidden/dev/cache paths, unexpected permissions, missing or extra archive files, critical-file
+drift, and any route/provenance mismatch. Extract to a fresh path, then require the extracted regular
+file inventory to equal the complete artifact manifest exactly; an extra deploy file is a **HOLD**,
+not an ignored local convenience.
+
+The deploy root is the extracted artifact root itself: it must contain `index.html`, `404.html`,
+`robots.txt`, `sitemap.xml`, `llms.txt`, and `ar/index.html` directly at their reviewed locations.
+Do not deploy a parent directory that merely contains the artifact as a child directory, and do not
+serve an arbitrary subdirectory as `/`. The consumer verifier must also reject missing local
+HTML/CSS resource targets and absolute development-path references.
+
+Reference consumer commands from the received package directory:
+
+```bash
+EXPECTED_PACKAGE_CONTENTS_SHA256=<digest-from-crossing-authorization>
+ACTUAL_PACKAGE_CONTENTS_SHA256=$(sha256sum PACKAGE_CONTENTS.sha256 | awk '{print $1}')
+test "$ACTUAL_PACKAGE_CONTENTS_SHA256" = "$EXPECTED_PACKAGE_CONTENTS_SHA256" || {
+  echo "HOLD: package trust-anchor mismatch" >&2
+  exit 1
+}
+sha256sum -c PACKAGE_CONTENTS.sha256 || {
+  echo "HOLD: received package file checksum mismatch" >&2
+  exit 1
+}
+
+node consumer/scripts/verify-publication-package.mjs \
+  --package . \
+  --expected-package-contents-sha256 "$EXPECTED_PACKAGE_CONTENTS_SHA256" \
+  --extract ./verified-static-root
+
+node consumer/scripts/serve-publication-static.mjs \
+  --root ./verified-static-root \
+  --routes ./ROUTES.txt \
+  --host 127.0.0.1 \
+  --port 4260
+
+FACTLANE_VERIFY_BASE_URL=http://127.0.0.1:4260 \
+FACTLANE_EXPECTED_ORIGIN=https://<approved-public-origin> \
+FACTLANE_VERIFY_MODE=public \
+node consumer/scripts/check-publication-readiness.mjs
+```
+
+The `sha256sum` bootstrap above must run with a trusted system executable before any script carried
+inside the received package is executed. If the handoff arrives as an outer immutable archive, first
+compare that archive itself against the separately authorized outer-archive SHA-256 before
+extracting it, then perform the authenticated `PACKAGE_CONTENTS.sha256` bootstrap above. A package-
+contained verifier is defense in depth after trust is established; it is never the first trust
+anchor.
+
+The rehearsal static server is loopback verification tooling, not the production serving stack. It
+must fail to start when pointed at the wrong deploy-root nesting and must never add an SPA fallback.
+The production host is still governed by the hosting assumptions and post-deploy checks below.
+
 ## Hosting assumptions that must remain true
 
 The host/CDN must preserve the built artifact rather than reinterpret it as an SPA:
