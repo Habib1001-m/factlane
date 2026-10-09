@@ -60,6 +60,10 @@ profile. `delegated-candidate` permits an agent to submit a bounded `CANDIDATE` 
 provenance, a freshness policy, and an idempotency key. It does not permit that agent to
 mint `VALIDATED_CURRENT` by asserting a verifier identity in its request.
 
+That runtime grant is separate from content consent. Candidate content is eligible for submission
+only after an explicit user remember/store request or an agent proposal that the user explicitly
+authorizes. Content consent does not change the launcher profile or grant verifier authority.
+
 Promotion is a distinct `memory_update` operation: a trusted verifier uses `REVERIFY`, the
 expected revision, and the exact Candidate `expected_record_id`. Storage contract v2 keeps
 `contribution_origin` separate from verification and preserves it on promotion. The verifier

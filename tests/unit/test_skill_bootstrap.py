@@ -89,6 +89,8 @@ def test_skill_declares_consent_and_bootstrap_authority_boundaries() -> None:
 def test_readme_and_quickstart_remain_read_only_first() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     quickstart = Path("docs/QUICKSTART.md").read_text(encoding="utf-8")
+    architecture = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8")
+    tools = Path("docs/TOOLS.md").read_text(encoding="utf-8")
 
     readme_launch = readme.split("### Launch for a local stdio MCP host", 1)[1].split("## Five focused MCP tools", 1)[0]
     assert "--write-profile delegated-candidate" not in readme_launch
@@ -101,6 +103,9 @@ def test_readme_and_quickstart_remain_read_only_first() -> None:
     assert "read-only" in first_launch
     assert "references/host-bootstrap.md" in quickstart
     assert "content consent has two supported entry paths" in quickstart.casefold()
+    assert "runtime grant is separate from content consent" in architecture.casefold()
+    assert "content consent does not change the launcher profile" in architecture.casefold()
+    assert "runtime permission is not content consent" in tools.casefold()
 
 
 def test_wheel_and_sdist_preserve_complete_skill_reference_set(tmp_path: Path) -> None:

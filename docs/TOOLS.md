@@ -46,6 +46,10 @@ Use it to contribute one bounded fact when the launcher profile permits writing.
 An ordinary `delegated-candidate` connection can contribute a **Candidate**. The tool does not
 let that agent mint `VALIDATED_CURRENT` by asserting a privileged verifier identity.
 
+Runtime permission is not content consent. Store only after an explicit user remember/store
+request or after the user explicitly authorizes a bounded fact proposed by the agent. Neither path
+elevates launcher or verifier authority.
+
 A good contributed fact is:
 
 - bounded;
