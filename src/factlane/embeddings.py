@@ -6,7 +6,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Protocol
 
 from .contract import AdapterError, finite_vector
@@ -236,8 +236,7 @@ class OllamaLocalProvider:
         context_window = _context_length_from_model_info(model_info)
         if context_window is None or context_window < self.profile.minimum_context_window:
             raise AdapterError("SCHEMA_MISMATCH", "local model context window differs from the qualified profile")
-        # Digest and provider version are observed provenance, not semantic identity.
-        self.profile = replace(self.profile, model_digest=digest)
+        # Digest and provider version are observed provenance, not configured semantic identity.
         size = model_row.get("size")
         return {
             "local_only": True,

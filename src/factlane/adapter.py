@@ -6,7 +6,7 @@ import json
 import os
 import uuid
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .contract import (
@@ -35,7 +35,7 @@ from .contract import (
     validate_scope,
     supported_values,
 )
-from .embeddings import EmbeddingProvider, OllamaLocalProvider
+from .embeddings import EmbeddingProfile, EmbeddingProvider, OllamaLocalProvider
 from .embedding_compatibility import (
     CompatibilityProof,
     build_embedding_profile_metadata,
@@ -640,11 +640,14 @@ class MemoryAdapter:
         self.engine.require_embedding_compatibility()
         return self._embedding_runtime_fingerprint
 
-    async def _require_embedding_runtime_stable(self, expected_fingerprint: str | None) -> None:
-        """Discard an embedding result if Ollama provenance drifted while it was in flight."""
+    async def _require_embedding_runtime_stable(
+        self,
+        expected_fingerprint: str | None,
+    ) -> EmbeddingProfile | None:
+        """Return provenance bound to the embedding result or fail closed on runtime drift."""
 
         if expected_fingerprint is None or not isinstance(self.provider, OllamaLocalProvider):
-            return
+            return getattr(self.provider, "profile", None)
         try:
             provider_status = await asyncio.to_thread(self.provider.provider_status)
         except AdapterError as exc:
@@ -657,7 +660,18 @@ class MemoryAdapter:
                 "PROFILE_MISMATCH",
                 "embedding result was discarded because runtime stability could not be proven",
             ) from exc
-        self.engine.profile = self.provider.profile
+        observed_digest = provider_status.get("digest")
+        if not isinstance(observed_digest, str):
+            self.engine.set_embedding_compatibility(
+                "UNPROVEN",
+                reason="embedding runtime did not provide bounded model provenance after embedding",
+            )
+            raise AdapterError(
+                "PROFILE_MISMATCH",
+                "embedding result was discarded because runtime provenance was incomplete",
+            )
+        observed_profile = replace(self.provider.profile, model_digest=observed_digest)
+        self.engine.profile = observed_profile
         if runtime_fingerprint(provider_status) != expected_fingerprint:
             self.engine.set_embedding_compatibility(
                 "UNPROVEN",
@@ -667,6 +681,7 @@ class MemoryAdapter:
                 "PROFILE_MISMATCH",
                 "embedding result was discarded because runtime provenance changed in flight",
             )
+        return observed_profile
 
     def _get_write_lock(self) -> asyncio.Lock:
         if self._write_lock is None:
@@ -1301,7 +1316,9 @@ class MemoryAdapter:
                 last_verified_at = None
                 verified_by = "UNVERIFIED"
             embedding = (await asyncio.to_thread(self.provider.embed_documents, [fact]))[0]
-            await self._require_embedding_runtime_stable(embedding_runtime_fingerprint)
+            embedding_profile = await self._require_embedding_runtime_stable(embedding_runtime_fingerprint)
+            if embedding_profile is None:
+                raise AdapterError("PROFILE_MISMATCH", "embedding provider did not expose bounded profile provenance")
             record_id = str(uuid.uuid4())
             memory_id = str(uuid.uuid4())
             created_at = iso_now()
@@ -1334,9 +1351,9 @@ class MemoryAdapter:
                 "native_content_hash": stable_hash,
                 "payload_fingerprint": payload_fingerprint,
                 "idempotency_key": idempotency_key,
-                "embedding_profile_id": self.provider.profile.profile_id,
-                "embedding_model_digest": self.provider.profile.model_digest,
-                "embedding_output_dimension": self.provider.profile.output_dimension,
+                "embedding_profile_id": embedding_profile.profile_id,
+                "embedding_model_digest": embedding_profile.model_digest,
+                "embedding_output_dimension": embedding_profile.output_dimension,
             }
             try:
                 await self.engine.write_record(record, embedding)
@@ -1896,7 +1913,12 @@ class MemoryAdapter:
                 "embedding_output_dimension": self.provider.profile.output_dimension,
             }
             embedding = (await asyncio.to_thread(self.provider.embed_documents, [fact]))[0]
-            await self._require_embedding_runtime_stable(embedding_runtime_fingerprint)
+            embedding_profile = await self._require_embedding_runtime_stable(embedding_runtime_fingerprint)
+            if embedding_profile is None:
+                raise AdapterError("PROFILE_MISMATCH", "embedding provider did not expose bounded profile provenance")
+            record["embedding_profile_id"] = embedding_profile.profile_id
+            record["embedding_model_digest"] = embedding_profile.model_digest
+            record["embedding_output_dimension"] = embedding_profile.output_dimension
             try:
                 if candidate_promotion:
                     equivalent = await self.engine.promote_candidate(

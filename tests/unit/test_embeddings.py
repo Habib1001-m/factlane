@@ -142,11 +142,12 @@ class StatusProvider(OllamaLocalProvider):
 
 def test_provider_status_treats_digest_and_version_as_runtime_provenance() -> None:
     provider = StatusProvider(version="0.34.2", digest="b" * 64)
+    configured_digest = provider.profile.model_digest
     status = provider.provider_status()
     assert status["ollama_version"] == "0.34.2"
     assert status["digest"] == "b" * 64
     assert status["semantic_family"] == "gemma3"
-    assert provider.profile.model_digest == "b" * 64
+    assert provider.profile.model_digest == configured_digest
 
 
 def test_provider_status_rejects_unsupported_ollama_version() -> None:

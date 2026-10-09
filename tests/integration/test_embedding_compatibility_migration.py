@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from dataclasses import replace
 import json
 import sqlite3
 import struct
@@ -203,7 +202,6 @@ class DriftOllamaProvider(OllamaLocalProvider):
         self.drift_after_query_embed = False
 
     def provider_status(self) -> dict[str, object]:
-        self.profile = replace(self.profile, model_digest=self.current_digest)
         return {
             "local_only": True,
             "provider_kind": "OLLAMA_LOCAL",
@@ -602,6 +600,7 @@ def test_runtime_digest_drift_requalifies_known_space_and_preserves_per_record_p
             first = await store("a-first-runtime", "fact created before compatible runtime digest drift")
             provider.current_digest = "b" * 64
             second = await store("b-second-runtime", "fact created after compatible runtime digest drift")
+            assert provider.profile.model_digest == "a" * 64
             assert engine.embedding_compatibility_state == "COMPATIBLE"
             assert adapter._embedding_runtime_fingerprint != fingerprint
             first_rows = await engine.get_record(str(first["memory_id"]), validate_scope("PROJECT", "factlane", None, None, None), history=True)
