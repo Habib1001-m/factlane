@@ -98,6 +98,23 @@ for (const [route, expectedHash] of Object.entries(snapshot.contractMainText)) {
   if (digest !== expectedHash) routeDiffs.push(route);
 }
 
+const landingSectionDiffs = [];
+const currentLandingSections = {};
+for (const [route, sections] of Object.entries(snapshot.landingReleaseSections ?? {})) {
+  const html = await readFile(fileForRoute(route), 'utf8');
+  currentLandingSections[route] = {};
+  for (const [sectionId, expectedHash] of Object.entries(sections)) {
+    const escapedId = sectionId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const section = html.match(
+      new RegExp(`<section\\b[^>]*id=["']${escapedId}["'][^>]*>([\\s\\S]*?)<\\/section>`, 'i'),
+    )?.[1];
+    assert(section !== undefined, `Released landing section is missing: ${route}#${sectionId}`);
+    const digest = sha256Text(visibleText(section));
+    currentLandingSections[route][sectionId] = digest;
+    if (digest !== expectedHash) landingSectionDiffs.push(`${route}#${sectionId}`);
+  }
+}
+
 const publicClaimSources = [
   'src/content/homeCopy.ts',
   'src/content/answerAuthority.json',
@@ -130,6 +147,7 @@ for (const locale of ['en', 'ar']) {
 const releaseSnapshotStale = latestReachableReleaseTag !== authority.tag;
 const releaseClaimDrift =
   routeDiffs.length > 0 ||
+  landingSectionDiffs.length > 0 ||
   unexpectedNamedVersions.length > 0 ||
   softwareVersion !== authority.packageVersion;
 
@@ -161,10 +179,12 @@ const receipt = {
   releaseSnapshotStale,
   releaseClaimDrift,
   contractRouteDiffs: routeDiffs,
+  landingSectionDiffs,
   namedVersions: [...namedVersions].sort(),
   unexpectedNamedVersions,
   softwareVersion,
   contractMainText: currentContract,
+  landingReleaseSections: currentLandingSections,
 };
 
 await writeJson(receiptPath, receipt);

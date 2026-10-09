@@ -1,8 +1,11 @@
-import {readFile} from 'node:fs/promises';
+import {execFileSync} from 'node:child_process';
+import {mkdtemp, readFile, rm} from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
 import {
   assert,
+  manifestForRoot,
   parseArgs,
   readJson,
   sha256File,
@@ -28,6 +31,26 @@ assert(authorizationDigest === expectedDigest, 'Production authorization is not 
 
 const actualDigest = await sha256File(path.join(packageDir, 'PACKAGE_CONTENTS.sha256'));
 assert(actualDigest === expectedDigest, 'Package trust anchor does not match the owner-authorized digest');
+
+const expectedPackageFiles = new Map();
+for (const line of (await readFile(path.join(packageDir, 'PACKAGE_CONTENTS.sha256'), 'utf8')).split(/\r?\n/)) {
+  if (!line) continue;
+  const match = line.match(/^([0-9a-f]{64})  \.\/(.+)$/);
+  assert(match, `Malformed package checksum line: ${line}`);
+  assert(!expectedPackageFiles.has(match[2]), `Duplicate package checksum path: ${match[2]}`);
+  expectedPackageFiles.set(match[2], match[1]);
+}
+const packageTree = await manifestForRoot(packageDir);
+const actualPackageFiles = [...packageTree.manifest.keys()]
+  .filter((relative) => relative !== 'PACKAGE_CONTENTS.sha256')
+  .sort();
+assert(
+  JSON.stringify(actualPackageFiles) === JSON.stringify([...expectedPackageFiles.keys()].sort()),
+  'Package file inventory does not match authenticated PACKAGE_CONTENTS.sha256',
+);
+for (const [relative, digest] of expectedPackageFiles) {
+  assert(packageTree.manifest.get(relative) === digest, `Authenticated package file mismatch: ${relative}`);
+}
 
 const provenance = new Map();
 for (const line of (await readFile(path.join(packageDir, 'PROVENANCE.txt'), 'utf8')).split(/\r?\n/)) {
@@ -58,6 +81,19 @@ assert(
 const archive = provenance.get('FROZEN_ARCHIVE');
 const archiveSha256 = provenance.get('FROZEN_ARCHIVE_SHA256');
 assert(archive && archiveSha256, 'Frozen archive provenance is incomplete');
+assert(await sha256File(path.join(packageDir, archive)) === archiveSha256, 'Frozen archive digest does not match authenticated provenance');
+
+const verificationRoot = await mkdtemp(path.join(os.tmpdir(), 'factlane-crossing-verify-'));
+try {
+  execFileSync(process.execPath, [
+    path.join(packageDir, 'consumer', 'scripts', 'verify-publication-package.mjs'),
+    '--package', packageDir,
+    '--expected-package-contents-sha256', expectedDigest,
+    '--extract', verificationRoot,
+  ], {stdio: ['ignore', 'pipe', 'pipe']});
+} finally {
+  await rm(verificationRoot, {recursive: true, force: true});
+}
 
 console.log(JSON.stringify({
   status: 'PASS',

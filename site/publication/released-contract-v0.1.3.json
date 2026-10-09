@@ -44,5 +44,17 @@
     "/ar/docs/SECURITY/": "5998bacb0c597fa9c9fee986734832efff181560d6c47c4a5330f1b6d398fbe8",
     "/docs/RELEASE_OPERATIONS/": "f979c9660d25596e7a2b91ee8ef4384d1b1127366d8085c7cc97f9e5af60d391",
     "/ar/docs/RELEASE_OPERATIONS/": "0f1f97707118caa7008a1640a7ce2acb66e7606e43da808d9e0e765b252f1069"
+  },
+  "landingReleaseSections": {
+    "/": {
+      "agent-onboarding": "f2373a2eb2c457421fa800d6ea85874cd947ae95e98a42587eff39a6fc5ad63d",
+      "how-it-works": "0386c3086b151ce62c25a521227c9b4dca885875968c854ab6a8d1e00bd52988",
+      "engineering-rigor": "152d236c3e96c70231b99452ac18e673d09c32d703d34e0aea37cd35227c54bc"
+    },
+    "/ar/": {
+      "agent-onboarding": "2000b21b6e723a8346aef29c6a763133c215f0e8c3fca2fe92e2e38a9a601f0a",
+      "how-it-works": "3f17fa8c6cfdb3cfb619c30cfa9dc214102820dc3db707e9391b9ee236599567",
+      "engineering-rigor": "a53eac6b96cf2d4daf332dba397b6026fdfc25b95e9ec67f8e7528fc633583df"
+    }
   }
 }

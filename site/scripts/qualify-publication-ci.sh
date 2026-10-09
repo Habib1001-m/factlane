@@ -107,16 +107,19 @@ cmp -s "$base_manifest_a" "$base_manifest_b" || {
 )
 
 cp -a "$build_a" "$negative_build"
-python - "$negative_build/docs/TOOLS/index.html" <<'PY'
+python - "$negative_build/index.html" <<'PY'
 from pathlib import Path
+import re
 import sys
 
 path = Path(sys.argv[1])
 text = path.read_text()
 marker = '<p>FACTLANE_RELEASE_BOUND_NEGATIVE_SENTINEL</p>'
-if '</main>' not in text:
-    raise SystemExit('negative control could not find </main>')
-path.write_text(text.replace('</main>', f'{marker}</main>', 1))
+pattern = r'(<section\b[^>]*id="engineering-rigor"[^>]*>[\s\S]*?)(</section>)'
+updated, count = re.subn(pattern, rf'\1{marker}\2', text, count=1)
+if count != 1:
+    raise SystemExit('negative control could not find engineering-rigor section')
+path.write_text(updated)
 PY
 negative_eligibility="$tmp_root/NEGATIVE_PUBLICATION_ELIGIBILITY.json"
 (
