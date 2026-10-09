@@ -94,10 +94,12 @@ enabled = true
 
 أعد تحميل إعداد MCP في إصدار Codex المثبّت لديك وتأكد من ظهور أدوات FactLane الخمس.
 ينبغي أن يتبع استخدام الوكيل لهذه الأدوات Skill المحمول
-[`using-factlane`](USING_FACTLANE_SKILL.md)، المثبّت عبر آلية Skill التي يدعمها مضيفك.
-للفحص المحايد للمضيف، والفصل بين حالات التسجيل، وقالب تقرير الأدلة، اقرأ
-`skills/using-factlane/references/host-bootstrap.md` من مجلد Skill. لا تفترض أن Skill
-مسجّلة أو discoverable أو loaded لمجرد وجود ملفاتها.
+[`using-factlane`](USING_FACTLANE_SKILL.md)، المثبّت عبر آلية Skill التي يدعمها مضيفك. إصدار
+`v0.1.3` المحدد في الخطوة 1 يشحن `SKILL.md` فقط، ولا يشحن
+`references/host-bootstrap.md`. في مسار الإصدار المنشور هذا استخدم Skill المشحون وآلية المضيف
+المدعومة. أما مصدر Development الحالي غير المُصدر فيضيف `references/host-bootstrap.md` كمرجع
+محايد للمضيف للفحص والفصل بين حالات التسجيل وتقرير الأدلة. لا تفترض أن Skill مسجّلة أو
+discoverable أو loaded لمجرد وجود ملفاتها.
 
 ### Hermes (مضيف `stdio` مختبَر)
 

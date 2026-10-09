@@ -97,9 +97,11 @@ enabled = true
 Reload your installed Codex version's MCP configuration and confirm that the five FactLane tools
 appear. An agent's use of those tools should follow the portable
 [using-factlane Skill](../skills/using-factlane/SKILL.md), installed through your host's
-supported Skill mechanism. For host-neutral inspection, registration-state distinctions, and an
-evidence-report template, read `skills/using-factlane/references/host-bootstrap.md` from the Skill
-directory. Do not infer that the Skill is registered, discoverable, or loaded merely because its
+supported Skill mechanism. The exact `v0.1.3` release pinned in step 1 ships `SKILL.md` only; it
+does **not** include `references/host-bootstrap.md`. For that released path, use its shipped Skill
+with the host's supported mechanism. The current unreleased Development source adds
+`references/host-bootstrap.md` as the host-neutral inspection, registration-state, and evidence
+reference. Do not infer that the Skill is registered, discoverable, or loaded merely because its
 files exist.
 
 ### Hermes (tested stdio host)

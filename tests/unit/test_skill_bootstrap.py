@@ -102,6 +102,9 @@ def test_readme_and_quickstart_remain_read_only_first() -> None:
     assert "--write-profile delegated-candidate" not in first_launch
     assert "read-only" in first_launch
     assert "references/host-bootstrap.md" in quickstart
+    assert "v0.1.3` release pinned in step 1 ships `skill.md` only" in quickstart.casefold()
+    assert "does **not** include `references/host-bootstrap.md`" in quickstart.casefold()
+    assert "current unreleased development source" in quickstart.casefold()
     assert "content consent has two supported entry paths" in quickstart.casefold()
     assert "runtime grant is separate from content consent" in architecture.casefold()
     assert "content consent does not change the launcher profile" in architecture.casefold()
