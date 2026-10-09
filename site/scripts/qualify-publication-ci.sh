@@ -54,6 +54,7 @@ verified_root="$tmp_root/verified-root"
 negative_build="$tmp_root/negative-release-bound-build"
 negative_llms_build="$tmp_root/negative-llms-release-bound-build"
 negative_footer_build="$tmp_root/negative-footer-release-bound-build"
+negative_external_href_build="$tmp_root/negative-external-href-release-bound-build"
 negative_collision_base="$tmp_root/negative-overlay-collision-base"
 package_dir="$output_root/package"
 freeze_result="$output_root/FREEZE_RESULT.json"
@@ -274,6 +275,37 @@ negative_footer_eligibility="$tmp_root/NEGATIVE_FOOTER_PUBLICATION_ELIGIBILITY.j
 }
 [[ $(node -p "require('$negative_footer_eligibility').publicationEligibility") == HOLD_UNRELEASED_CONTRACT ]] || {
   echo 'HOLD: footer release-bound negative control did not fail closed for publication' >&2
+  exit 1
+}
+
+cp -a "$build_a" "$negative_external_href_build"
+python - "$negative_external_href_build/docs/RELEASE_OPERATIONS/index.html" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+old = 'https://github.com/Habib1001-m/factlane/releases/tag/v0.1.3'
+new = 'https://github.com/Habib1001-m/factlane/releases/tag/v9.9.9'
+if old not in text:
+    raise SystemExit('negative control could not find released GitHub target')
+path.write_text(text.replace(old, new, 1))
+PY
+negative_external_href_eligibility="$tmp_root/NEGATIVE_EXTERNAL_HREF_PUBLICATION_ELIGIBILITY.json"
+(
+  cd "$clone_a/site"
+  node scripts/check-publication-eligibility.mjs \
+    --build "$negative_external_href_build" \
+    --baseline-build "$baseline_build" \
+    --protected-base-commit "$protected_base_commit" \
+    --receipt "$negative_external_href_eligibility" >/dev/null
+)
+[[ $(node -p "require('$negative_external_href_eligibility').publicationClass") == RELEASE_BOUND ]] || {
+  echo 'HOLD: external-href release-bound negative control was not classified RELEASE_BOUND' >&2
+  exit 1
+}
+[[ $(node -p "require('$negative_external_href_eligibility').publicationEligibility") == HOLD_UNRELEASED_CONTRACT ]] || {
+  echo 'HOLD: external-href release-bound negative control did not fail closed for publication' >&2
   exit 1
 }
 

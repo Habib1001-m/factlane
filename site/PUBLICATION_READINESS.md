@@ -25,8 +25,9 @@ The qualification path is intentionally split into four controls:
    already belong to the protected/base history. CI then compares a generated public-claim
    projection for **all canonical routes** against a clean build of that derived baseline. The
    projection includes title, description, all rendered page text (including global chrome/footer),
-   JSON-LD and root `llms.txt`, so release/support claims cannot evade classification by moving
-   between sections or out of `<main>`. The baseline hashes are derived at qualification time from
+   JSON-LD, normalized external anchor targets and root `llms.txt`, so release/support claims or
+   their authoritative external targets cannot evade classification by moving between sections,
+   out of `<main>`, or changing only an `href`. The baseline hashes are derived at qualification time from
    immutable Git history; they are not editable snapshot values. A recognized release-bound
    Development change may keep the required `test` context green while the receipt records
    `HOLD_UNRELEASED_CONTRACT`; unknown/stale release authority is also publication HOLD.

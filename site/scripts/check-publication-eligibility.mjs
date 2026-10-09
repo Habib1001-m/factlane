@@ -200,11 +200,18 @@ async function routeProjection(root, route) {
   assert(main !== undefined, `Release projection route is missing SSR <main>: ${route}`);
   const jsonLd = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)]
     .map((match) => stableValue(JSON.parse(match[1])));
+  const externalHrefs = [...html.matchAll(/<a\b[^>]+href=["']([^"']+)["'][^>]*>/gi)]
+    .map((match) => decodeHtml(match[1]).trim())
+    .filter((href) => /^https?:\/\//i.test(href))
+    .map((href) => new URL(href).href)
+    .filter((href, index, values) => values.indexOf(href) === index)
+    .sort();
   const projection = {
     title,
     description,
     pageText: visibleText(html),
     jsonLd,
+    externalHrefs,
   };
   return {
     sha256: sha256Text(JSON.stringify(projection)),
