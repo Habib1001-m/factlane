@@ -4,6 +4,16 @@ This guide sets up a local FactLane MCP server and connects it to an agent. The 
 **stdio process started by the MCP host**, not a web service or an interactive terminal
 application. It stores bounded facts; it is not a transcript importer.
 
+## What success looks like
+
+For a first setup, keep the goal narrow. You are done when:
+
+1. the compatible MCP host can launch FactLane;
+2. exactly five FactLane tools appear;
+3. a read-only `memory_status` request succeeds for an exact scope.
+
+Start read-only. Enable Candidate writes only after basic connectivity works.
+
 ## 1. Install and check the runtime
 
 Install Python 3.11+, [`uv`](https://docs.astral.sh/uv/), and [Ollama](https://ollama.com/)
@@ -24,12 +34,9 @@ executable may report a *different* version. Below the floor, FactLane returns
 `BACKEND_COMPATIBILITY_MISMATCH` before creating or opening its database. Python version
 alone does not satisfy the storage contract.
 
-The command above intentionally checks out the versioned release tag rather than the moving
-`main` branch. The release runbook records the expected commit/tree and artifact digests so an
-operator can verify the tag and downloaded bytes instead of trusting the version name alone. To
-install from the published wheel/source distribution or move between versions, follow
-[Release operations](RELEASE_OPERATIONS.md). Package upgrade/rollback and database/schema
-migration are separate compatibility claims.
+The clone command intentionally pins the versioned `v0.1.3` release instead of moving `main`.
+For artifact digests, published-package installation, upgrades and rollback, use
+[Release operations](RELEASE_OPERATIONS.md).
 
 ## 2. Install a supported embedding model
 
@@ -56,30 +63,21 @@ SQLite file), `--host-id` (a stable non-secret label for the launcher), and an e
 `--profile` (it defaults to `nomic-768`, so set it explicitly when using the example
 model).
 
-For an MCP client that may contribute unverified Candidates, use arguments equivalent to:
+For the first connection, keep the launcher read-only by omitting `--write-profile`:
 
 ```bash
 uv run factlane \
   --db ./factlane.sqlite3 \
   --profile embeddinggemma-300m-768 \
-  --host-id example-host \
-  --write-profile delegated-candidate
+  --host-id example-host
 ```
 
 Do not run that command as a REPL; configure your MCP host to launch it over stdin/stdout.
 If the host starts FactLane from another working directory, use **absolute** executable and
 database paths.
 
-The `--write-profile` flag is a **trusted launcher setting**:
-
-| Launcher profile | What it permits |
-| --- | --- |
-| Omitted / `read-only` | Search, get, and status; no memory mutation. |
-| `delegated-candidate` | Normal agent can `memory_store` a `CANDIDATE`; it cannot self-verify or update. |
-| `owner-current`, `repo-verifier`, `automated-verifier` | Restricted trusted operator/verifier profiles; do not configure for an ordinary agent to acquire more authority. |
-
-An Owner's approval of content does not change the authorization of a running agent.
-Candidate promotion is a separate, trusted `memory_update` operation.
+Omitting `--write-profile` keeps this first connection read-only. Do not add a write profile until
+the read-only connectivity check in step 4 succeeds.
 
 ### Codex (tested stdio host)
 
@@ -91,14 +89,12 @@ command = "/absolute/path/to/factlane/.venv/bin/factlane"
 args = [
   "--db", "/absolute/path/to/state/factlane.sqlite3",
   "--profile", "embeddinggemma-300m-768",
-  "--host-id", "codex",
-  "--write-profile", "delegated-candidate"
+  "--host-id", "codex"
 ]
 enabled = true
 ```
 
-Remove the `--write-profile` argument pair if the connection should be read-only. Reload
-your installed Codex version's MCP configuration and confirm that the five FactLane tools
+Reload your installed Codex version's MCP configuration and confirm that the five FactLane tools
 appear. An agent's use of those tools should follow the portable
 [using-factlane Skill](../skills/using-factlane/SKILL.md), installed through your host's
 supported Skill mechanism.
@@ -118,12 +114,9 @@ mcp_servers:
       - "embeddinggemma-300m-768"
       - "--host-id"
       - "hermes"
-      - "--write-profile"
-      - "delegated-candidate"
 ```
 
-Use `read-only` or omit the write-profile pair for a connection that must not write. Reload
-Hermes's MCP configuration and check tool discovery. The portable Skill is included in
+Reload Hermes's MCP configuration and check tool discovery. The portable Skill is included in
 FactLane's source and package artifacts but is **not automatically registered** with either
 host by installing the wheel.
 
@@ -154,6 +147,13 @@ For a global-user check that does not require a project ID:
 {"scope":"GLOBAL_USER"}
 ```
 
+If that request succeeds, the safe first-run objective is complete: the host can launch FactLane,
+the public tool surface is visible, and a read-only request can cross the configured runtime path.
+
+### Identity and retrieval notes
+
+The examples below matter when you move beyond the first connectivity check.
+
 For an **unbound** project-scoped search, a request can look like this:
 
 ```json
@@ -183,6 +183,31 @@ Governed FactLane failures use the same MCP result channel as successful calls a
 `audit.retryable`. Branch on `error_code`; do not scrape exception prose. Unexpected internal
 exceptions are still transport errors rather than governed FactLane results.
 
+## 5. Enable Candidate writes only after read-only works
+
+The `--write-profile` flag is a **trusted launcher setting**:
+
+| Launcher profile | What it permits |
+| --- | --- |
+| Omitted / `read-only` | Search, get, and status; no memory mutation. |
+| `delegated-candidate` | Normal agent can `memory_store` a `CANDIDATE`; it cannot self-verify or update. |
+| `owner-current`, `repo-verifier`, `automated-verifier` | Restricted trusted operator/verifier profiles; do not configure for an ordinary agent to acquire more authority. |
+
+An Owner's approval of content does not change the authorization of a running agent. Candidate
+promotion is a separate, trusted `memory_update` operation.
+
+If the connected agent should be allowed to contribute **unverified Candidates**, add the trusted
+launcher setting:
+
+```text
+--write-profile delegated-candidate
+```
+
+That profile permits `memory_store` to contribute a Candidate. It does **not** let the ordinary
+agent verify or promote its own contribution.
+
+If the connection does not need to contribute memory, leave the write profile omitted/read-only.
+
 If search returns no result, do not treat that as permission to invent a fact. To contribute
 an actual Candidate, consult `factlane --help-tools` or the live MCP schema for the complete
 required `source_provenance`, `freshness_policy`, `memory_type`, and `idempotency_key`
@@ -195,21 +220,18 @@ approval in chat. `REVERIFY` refreshes verification without changing the memory'
 contradiction identity; use `REPLACE` rather than changing `memory_type` or subject when a
 semantic reclassification is intended.
 
-## Limits and next references
+## 6. Limits and next references
 
 Facts are limited to 2,000 UTF-8 bytes. FactLane is not a raw-corpus indexer, backup
 service, or remote embedding gateway. Reproduction on this example profile does not
 establish language quality or production-scale throughput for your data. Sensitive-memory
-recovery is a separate, operator-authorized procedure, **not** a public MCP tool.
-Normal runtime engines and that recovery operator coordinate through shared/exclusive locks on
-the database inodes themselves. Recovery locks both the old and replacement database inodes
-through promotion/postflight, so a normal runtime starting during recovery returns
-`MAINTENANCE_IN_PROGRESS` instead of attaching through the final promotion window. If the logical
-purge has committed but sealing is still incomplete, a durable interlock stored in the database
-continues returning `MAINTENANCE_IN_PROGRESS` across process restart until verified recovery clears it.
+recovery is a separate, operator-authorized procedure, **not** a public MCP tool; use
+[Security](../SECURITY.md) for the recovery trust boundary.
 
-See the [README](../README.md) for product orientation, [Architecture](ARCHITECTURE.md) for
-exact data flow, [Environment](ENVIRONMENT.md) for runtime and profiles,
+Continue with [Five MCP tools](TOOLS.md) for the developer-facing tool guide.
+
+For deeper evaluation, see [Architecture](ARCHITECTURE.md) for exact data flow,
+[Environment](ENVIRONMENT.md) for runtime and profiles,
 [Release operations](RELEASE_OPERATIONS.md) for versioned install/upgrade/rollback, and
 [Security](../SECURITY.md) for trust and recovery boundaries. The live MCP schema and
 `--help-tools` output are authoritative for request signatures and enums.

@@ -1,0 +1,30 @@
+{
+  "title": {
+    "message": "FactLane",
+    "description": "The title in the navbar"
+  },
+  "logo.alt": {
+    "message": "FactLane",
+    "description": "The alt text of navbar logo"
+  },
+  "item.label.Use cases": {
+    "message": "حالات الاستخدام",
+    "description": "Navbar item with label Use cases"
+  },
+  "item.label.How it works": {
+    "message": "كيف يعمل",
+    "description": "Navbar item with label How it works"
+  },
+  "item.label.Docs": {
+    "message": "التوثيق",
+    "description": "Navbar item with label Docs"
+  },
+  "item.label.GitHub": {
+    "message": "GitHub",
+    "description": "Navbar item with label GitHub"
+  },
+  "item.label.Get started": {
+    "message": "الإعداد اليدوي",
+    "description": "Navbar item with label Get started"
+  }
+}

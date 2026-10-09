@@ -1,0 +1,43 @@
+{
+  "name": "factlane-site",
+  "private": true,
+  "version": "0.0.0-local-ar-i18n-r1",
+  "scripts": {
+    "sync:site": "node scripts/sync-docs.mjs",
+    "sync:docs": "npm run sync:site",
+    "prestart": "npm run sync:site",
+    "start": "docusaurus start",
+    "start:ar": "npm run sync:site && docusaurus start --locale ar",
+    "prebuild": "npm run sync:site && npm run check:i18n",
+    "build": "docusaurus build",
+    "build:en": "npm run sync:site && npm run check:i18n && docusaurus build --locale en",
+    "build:ar": "npm run sync:site && npm run check:i18n && docusaurus build --locale ar",
+    "serve": "docusaurus serve",
+    "clear": "docusaurus clear",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run build",
+    "check:i18n": "node scripts/check-i18n.mjs",
+    "check:seo:docs": "node scripts/check-doc-seo.mjs",
+    "check:seo:answers": "node scripts/check-answer-authority.mjs",
+    "check:seo:urls": "node scripts/check-url-boundary.mjs",
+    "check:publication:readiness": "node scripts/check-publication-readiness.mjs"
+  },
+  "dependencies": {
+    "@docusaurus/core": "3.10.2",
+    "@docusaurus/preset-classic": "3.10.2",
+    "@mdx-js/react": "3.1.1",
+    "clsx": "^2.1.1",
+    "prism-react-renderer": "^2.4.1",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@docusaurus/module-type-aliases": "3.10.2",
+    "@docusaurus/tsconfig": "3.10.2",
+    "@docusaurus/types": "3.10.2",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "version.label": {
+    "message": "الحالي",
+    "description": "The label for version current"
+  },
+  "sidebar.docs.category.Start here": {
+    "message": "ابدأ من هنا",
+    "description": "The label for category 'Start here' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.For developers": {
+    "message": "للمطورين",
+    "description": "The label for category 'For developers' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Evaluate and operate": {
+    "message": "التقييم والتشغيل",
+    "description": "The label for category 'Evaluate and operate' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Background": {
+    "message": "الخلفية",
+    "description": "The label for category 'Background' in sidebar 'docs'"
+  }
+}

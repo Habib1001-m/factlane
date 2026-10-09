@@ -1,0 +1,102 @@
+{
+  "en": {
+    "INTRO": {
+      "title": "Governed MCP memory docs for AI agents",
+      "description": "Learn how FactLane stores bounded local facts for MCP agents, separates Candidate from Current, and keeps current instructions and live state above memory."
+    },
+    "USE_CASES": {
+      "title": "Use cases: durable AI agent memory without transcripts",
+      "description": "See where bounded local memory helps AI agents reuse preferences, project facts, and workflow rules without letting old memory override current truth."
+    },
+    "FAQ": {
+      "title": "FAQ: fit, setup, data, and trust boundaries",
+      "description": "Check whether FactLane fits your workflow: setup requirements, local data, non-goals, Candidate verification, shared hosts, and current-truth precedence."
+    },
+    "CORE_CONCEPTS": {
+      "title": "Core concepts: Candidate, Current, scope, freshness",
+      "description": "Understand Candidate vs Current, exact scope, freshness, provenance, and why current instructions or verified live state outrank FactLane memory."
+    },
+    "QUICKSTART": {
+      "title": "Quick Start: local MCP server setup",
+      "description": "Install FactLane v0.1.3 locally, connect a command-launched stdio MCP host, verify the five-tool surface in read-only mode, then enable Candidate writes only if needed."
+    },
+    "TOOLS": {
+      "title": "Five MCP tools",
+      "description": "Reference FactLane’s five MCP tools for search, retrieval, Candidate contribution, governed updates, and status checks within exact authority boundaries."
+    },
+    "USING_FACTLANE_SKILL": {
+      "title": "Using FactLane safely with MCP agents",
+      "description": "Use when an agent needs to search, read, store, or update bounded FactLane memory through MCP."
+    },
+    "ARCHITECTURE": {
+      "title": "Architecture: MCP gateway, scope, and storage",
+      "description": "Explore FactLane’s local stdio MCP architecture: launcher bindings, exact scopes, Candidate verification, retrieval, SQLite-vec storage, and recovery."
+    },
+    "ENVIRONMENT": {
+      "title": "Environment and compatibility requirements",
+      "description": "Check FactLane v0.1.3 requirements: Python 3.11+, linked SQLite 3.42.0+, local stdio MCP, Ollama profiles, storage isolation, and support limits."
+    },
+    "SECURITY": {
+      "title": "Security policy",
+      "description": "Review FactLane trust boundaries for host identity, write authority, exact scopes, local providers, sensitive-memory recovery, and upgrade/rollback safety."
+    },
+    "RELEASE_OPERATIONS": {
+      "title": "Release operations: install, upgrade, rollback",
+      "description": "Verify and operate FactLane releases with exact v0.1.3 identity, artifact hashes, install paths, upgrade checks, rollback boundaries, and reverification."
+    },
+    "PROJECT_HISTORY": {
+      "title": "Project history and design evolution",
+      "description": "Follow FactLane’s evolution from scoped reusable facts to a five-tool local MCP contract, separate verifier authority, and the bounded v0.1.3 profile."
+    }
+  },
+  "ar": {
+    "INTRO": {
+      "title": "توثيق ذاكرة MCP المحكومة لوكلاء AI",
+      "description": "تعرّف إلى FactLane كطبقة ذاكرة محلية لحقائق محدودة لوكلاء MCP، مع فصل Candidate عن Current وبقاء التعليمات والحالة الحية أعلى من الذاكرة."
+    },
+    "USE_CASES": {
+      "title": "حالات استخدام ذاكرة وكلاء AI بلا نصوص محادثات",
+      "description": "تعرّف إلى حالات استخدام FactLane للتفضيلات وحقائق المشاريع وقواعد سير العمل، من دون السماح للذاكرة القديمة بتجاوز الحقيقة الحالية."
+    },
+    "FAQ": {
+      "title": "الأسئلة الشائعة: الملاءمة والإعداد والبيانات وحدود الثقة",
+      "description": "تحقق من ملاءمة FactLane لسير عملك: متطلبات الإعداد، ومكان البيانات، وما لا يهدف إليه المنتج، والتحقق من Candidate، وحدود صلاحية الوكلاء."
+    },
+    "CORE_CONCEPTS": {
+      "title": "المفاهيم الأساسية: Candidate وCurrent والنطاق والحداثة",
+      "description": "افهم Candidate وCurrent والنطاق والحداثة والمصدر، ولماذا تتقدم تعليمات المستخدم الحالية والحالة الحية المتحقق منها على ذاكرة FactLane."
+    },
+    "QUICKSTART": {
+      "title": "البدء السريع: إعداد خادم MCP محلي",
+      "description": "ثبّت FactLane v0.1.3 محليًا، واربط مضيف MCP عبر stdio، وتحقق من الأدوات الخمس بوضع read-only قبل تفعيل كتابة Candidate عند الحاجة."
+    },
+    "TOOLS": {
+      "title": "أدوات MCP الخمس",
+      "description": "مرجع لأدوات FactLane الخمس عبر MCP: البحث والجلب وإضافة Candidate والتحديث المحكوم والحالة، مع حدود النطاق وصلاحية المتحقق."
+    },
+    "USING_FACTLANE_SKILL": {
+      "title": "استخدام FactLane بأمان مع وكلاء MCP",
+      "description": "يُستخدم عندما يحتاج وكيل إلى البحث في ذاكرة FactLane المحدودة أو قراءتها أو تخزينها أو تحديثها عبر MCP."
+    },
+    "ARCHITECTURE": {
+      "title": "المعمارية: بوابة MCP والنطاق والتخزين",
+      "description": "استعرض معمارية FactLane عبر stdio MCP: ربط المشغّل الموثوق، والنطاقات الدقيقة، والتحقق من Candidate، والاسترجاع، وSQLite-vec، والاستعادة."
+    },
+    "ENVIRONMENT": {
+      "title": "البيئة ومتطلبات التوافق",
+      "description": "راجع متطلبات FactLane v0.1.3: Python 3.11+ وSQLite 3.42.0+ المرتبط وstdio MCP المحلي وملفات تعريف Ollama وحدود التخزين والدعم."
+    },
+    "SECURITY": {
+      "title": "سياسة الأمان",
+      "description": "راجع حدود أمان FactLane لهوية المضيف وصلاحية الكتابة وعزل النطاق والمزوّدات المحلية واستعادة الذاكرة الحساسة وأمان الترقية والتراجع."
+    },
+    "RELEASE_OPERATIONS": {
+      "title": "عمليات الإصدار: التثبيت والترقية والتراجع",
+      "description": "تحقق من إصدارات FactLane وشغّلها باستخدام هوية v0.1.3 الدقيقة وبصمات الحزم ومسارات التثبيت وفحوص الترقية وحدود التراجع وإعادة التحقق."
+    },
+    "PROJECT_HISTORY": {
+      "title": "تاريخ المشروع وتطور التصميم",
+      "description": "تتبّع تطور FactLane من حقائق قابلة لإعادة الاستخدام ومحددة النطاق إلى عقد MCP محلي بخمس أدوات وصلاحية تحقق منفصلة وملف v0.1.3 المحدود."
+    }
+  }
+}
