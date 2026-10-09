@@ -18,6 +18,7 @@ const repoRoot = path.resolve(siteRoot, '..');
 const args = parseArgs(process.argv.slice(2));
 const buildRoot = path.resolve(args.build ?? '');
 const baselineBuildRoot = path.resolve(args['baseline-build'] ?? '');
+const protectedBaseCommit = args['protected-base-commit'] ?? '';
 const receiptPath = path.resolve(args.receipt ?? path.join(buildRoot, '..', 'PUBLICATION_ELIGIBILITY.json'));
 const snapshotPath = path.resolve(
   args.snapshot ?? path.join(siteRoot, 'publication', 'released-contract-v0.1.3.json'),
@@ -25,6 +26,7 @@ const snapshotPath = path.resolve(
 
 assert(args.build, '--build is required');
 assert(args['baseline-build'], '--baseline-build is required');
+assert(/^[0-9a-f]{40}$/.test(protectedBaseCommit), '--protected-base-commit must be an exact lowercase Git SHA');
 const snapshot = await readJson(snapshotPath);
 assert(snapshot.schemaVersion === 1, `Unsupported released-contract schema: ${snapshot.schemaVersion}`);
 const authority = snapshot.releaseAuthority;
@@ -32,29 +34,60 @@ const baseline = snapshot.releasedPublicationBaseline;
 assert(authority && typeof authority === 'object', 'Released-contract snapshot is missing releaseAuthority');
 assert(baseline && typeof baseline === 'object', 'Released-contract snapshot is missing releasedPublicationBaseline');
 
+const snapshotRepoRelative = path.relative(repoRoot, snapshotPath).split(path.sep).join('/');
+assert(
+  snapshotRepoRelative && !snapshotRepoRelative.startsWith('../') && !path.isAbsolute(snapshotRepoRelative),
+  'Released-contract snapshot must live inside the repository',
+);
+const introductionCommits = git(repoRoot, [
+  'log', '--diff-filter=A', '--format=%H', '--reverse', '--', snapshotRepoRelative,
+]).split(/\r?\n/).filter(Boolean);
+assert(introductionCommits.length === 1, `Expected one historical introduction for ${snapshotRepoRelative}`);
+const controlIntroductionCommit = introductionCommits[0];
+const derivedAcceptedMainCommit = git(repoRoot, ['rev-parse', `${controlIntroductionCommit}^`]);
+const derivedAcceptedMainTree = git(repoRoot, ['rev-parse', `${derivedAcceptedMainCommit}^{tree}`]);
+assert(
+  git(repoRoot, ['rev-parse', `${protectedBaseCommit}^{commit}`]) === protectedBaseCommit,
+  'Protected/base authority commit is unavailable in the checkout',
+);
+assert(
+  git(repoRoot, ['merge-base', protectedBaseCommit, 'HEAD']) === protectedBaseCommit,
+  'Protected/base authority is not an ancestor of the candidate',
+);
+
+let snapshotExistedAtProtectedBase = true;
+try {
+  git(repoRoot, ['show', `${protectedBaseCommit}:${snapshotRepoRelative}`]);
+} catch {
+  snapshotExistedAtProtectedBase = false;
+}
+if (!snapshotExistedAtProtectedBase) {
+  assert(
+    derivedAcceptedMainCommit === protectedBaseCommit,
+    'Bootstrap publication baseline must equal the externally supplied protected/base commit',
+  );
+} else {
+  assert(
+    git(repoRoot, ['merge-base', controlIntroductionCommit, protectedBaseCommit]) === controlIntroductionCommit,
+    'Historical publication-control introduction is not part of the protected/base authority',
+  );
+}
+
 const tagRef = `refs/tags/${authority.tag}`;
 assert(git(repoRoot, ['cat-file', '-t', tagRef]) === 'tag', `Released authority tag is not annotated: ${authority.tag}`);
 assert(git(repoRoot, ['rev-parse', tagRef]) === authority.tagObject, `Released tag object drift: ${authority.tag}`);
 assert(git(repoRoot, ['rev-parse', `${authority.tag}^{commit}`]) === authority.commit, `Released commit drift: ${authority.tag}`);
 assert(git(repoRoot, ['rev-parse', `${authority.tag}^{tree}`]) === authority.tree, `Released tree drift: ${authority.tag}`);
 assert(
-  git(repoRoot, ['rev-parse', `${baseline.acceptedMainCommit}^{commit}`]) === baseline.acceptedMainCommit,
-  'Accepted publication baseline commit is unavailable',
-);
-assert(
-  git(repoRoot, ['rev-parse', `${baseline.acceptedMainCommit}^{tree}`]) === baseline.acceptedMainTree,
-  'Accepted publication baseline tree drifted',
-);
-assert(
-  baseline.acceptedMainTree === baseline.productionSourceTree,
+  derivedAcceptedMainTree === baseline.productionSourceTree,
   'Accepted main baseline and Production source tree must remain identical',
 );
 assert(
-  git(repoRoot, ['merge-base', authority.commit, baseline.acceptedMainCommit]) === authority.commit,
+  git(repoRoot, ['merge-base', authority.commit, derivedAcceptedMainCommit]) === authority.commit,
   'Accepted publication baseline is not descended from the released product authority',
 );
 assert(
-  git(repoRoot, ['merge-base', baseline.acceptedMainCommit, 'HEAD']) === baseline.acceptedMainCommit,
+  git(repoRoot, ['merge-base', derivedAcceptedMainCommit, 'HEAD']) === derivedAcceptedMainCommit,
   'Current source is not descended from the accepted publication baseline',
 );
 
@@ -170,12 +203,12 @@ async function routeProjection(root, route) {
   const projection = {
     title,
     description,
-    mainText: visibleText(main),
+    pageText: visibleText(html),
     jsonLd,
   };
   return {
     sha256: sha256Text(JSON.stringify(projection)),
-    mainChars: projection.mainText.length,
+    pageChars: projection.pageText.length,
   };
 }
 
@@ -183,10 +216,19 @@ async function buildProjection(root) {
   const routes = await routesFromBuild(root);
   const byRoute = {};
   for (const route of routes) byRoute[route] = await routeProjection(root, route);
-  const hashes = Object.fromEntries(routes.map((route) => [route, byRoute[route].sha256]));
+  const nonHtml = {};
+  for (const relative of ['llms.txt']) {
+    const text = await readFile(path.join(root, relative), 'utf8');
+    nonHtml[relative] = sha256Text(text);
+  }
+  const hashes = {
+    routes: Object.fromEntries(routes.map((route) => [route, byRoute[route].sha256])),
+    nonHtml,
+  };
   return {
     routes,
     byRoute,
+    nonHtml,
     sha256: sha256Text(JSON.stringify(hashes)),
   };
 }
@@ -198,6 +240,12 @@ const [releasedProjection, currentProjection] = await Promise.all([
 const routeSetDrift = JSON.stringify(currentProjection.routes) !== JSON.stringify(releasedProjection.routes);
 const projectionRouteDiffs = [...new Set([...releasedProjection.routes, ...currentProjection.routes])]
   .filter((route) => releasedProjection.byRoute[route]?.sha256 !== currentProjection.byRoute[route]?.sha256)
+  .sort();
+const projectionFileDiffs = [...new Set([
+  ...Object.keys(releasedProjection.nonHtml),
+  ...Object.keys(currentProjection.nonHtml),
+])]
+  .filter((relative) => releasedProjection.nonHtml[relative] !== currentProjection.nonHtml[relative])
   .sort();
 
 const publicClaimSources = [
@@ -233,6 +281,7 @@ const releaseSnapshotStale = latestReachableReleaseTag !== authority.tag;
 const releaseClaimDrift =
   routeSetDrift ||
   projectionRouteDiffs.length > 0 ||
+  projectionFileDiffs.length > 0 ||
   unexpectedNamedVersions.length > 0 ||
   softwareVersion !== authority.packageVersion;
 
@@ -258,13 +307,21 @@ const receipt = {
     latestReachableReleaseTag,
     snapshotSha256: await sha256File(snapshotPath),
   },
-  releasedPublicationBaseline: baseline,
+  releasedPublicationBaseline: {
+    ...baseline,
+    controlIntroductionCommit,
+    derivedAcceptedMainCommit,
+    derivedAcceptedMainTree,
+    protectedBaseCommit,
+    snapshotExistedAtProtectedBase,
+  },
   publicationClass,
   publicationEligibility,
   releaseSnapshotStale,
   releaseClaimDrift,
   routeSetDrift,
   projectionRouteDiffs,
+  projectionFileDiffs,
   releasedProjectionSha256: releasedProjection.sha256,
   currentProjectionSha256: currentProjection.sha256,
   releasedProjectionRoutes: releasedProjection.routes.length,

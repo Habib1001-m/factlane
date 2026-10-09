@@ -18,15 +18,18 @@ The qualification path is intentionally split into four controls:
    source-aware sitemap `lastmod` uses Git history, so tree equality alone does not identify the
    publication bytes after a squash or history rewrite.
 2. `scripts/check-publication-eligibility.mjs` derives the current RELEASED product authority from
-   the exact annotated release tag, then compares a generated public-claim projection for **all
-   canonical routes** against a clean build of the accepted publication-baseline commit. The
-   projection includes title, description, SSR `<main>` text and JSON-LD, so release/support claims
-   cannot evade classification by moving between landing sections or docs. The baseline hashes are
-   derived at qualification time from that immutable Git commit; they are not editable snapshot
-   values. A recognized release-bound Development change may keep the required `test` context green
-   while the receipt records `HOLD_UNRELEASED_CONTRACT`; unknown/stale release authority is also
-   publication HOLD. This keeps protected `main` as DEVELOPMENT truth without allowing unreleased
-   claims into Production.
+   the exact annotated release tag. The publication baseline is **not selected by the candidate
+   snapshot**: it is derived from the parent of the historical commit that first introduced the
+   release-control file, and bootstrap qualification requires that parent to equal the externally
+   supplied protected/base SHA. Later qualifications require that historical introduction to
+   already belong to the protected/base history. CI then compares a generated public-claim
+   projection for **all canonical routes** against a clean build of that derived baseline. The
+   projection includes title, description, all rendered page text (including global chrome/footer),
+   JSON-LD and root `llms.txt`, so release/support claims cannot evade classification by moving
+   between sections or out of `<main>`. The baseline hashes are derived at qualification time from
+   immutable Git history; they are not editable snapshot values. A recognized release-bound
+   Development change may keep the required `test` context green while the receipt records
+   `HOLD_UNRELEASED_CONTRACT`; unknown/stale release authority is also publication HOLD.
 3. `scripts/compose-publication-artifact.mjs` overlays only the manifest-bound hosting/discovery
    inputs under `site/publication/`. Stable host redirects are separated from GSC/Bing/IndexNow
    ownership files. Path collisions, missing files, digest drift, redirect collisions, origin drift,
@@ -43,6 +46,7 @@ The CI entry point is:
 ```bash
 FACTLANE_SITE_URL=https://factlane.pages.dev \
 FACTLANE_PUBLIC_BUILD=1 \
+FACTLANE_PROTECTED_BASE_COMMIT=<fresh-protected-base-sha> \
 npm run check:publication:ci
 ```
 

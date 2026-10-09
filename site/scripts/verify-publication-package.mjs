@@ -337,6 +337,22 @@ assert(
   eligibility.publicationEligibility === provenance.get('PUBLICATION_ELIGIBILITY'),
   'Publication eligibility provenance mismatch',
 );
+assert(
+  eligibility.releasedPublicationBaseline?.derivedAcceptedMainCommit === provenance.get('RELEASED_PUBLICATION_BASELINE_COMMIT'),
+  'Released publication baseline commit provenance mismatch',
+);
+assert(
+  eligibility.releasedPublicationBaseline?.derivedAcceptedMainTree === provenance.get('RELEASED_PUBLICATION_BASELINE_TREE'),
+  'Released publication baseline tree provenance mismatch',
+);
+assert(
+  eligibility.releasedPublicationBaseline?.controlIntroductionCommit === provenance.get('PUBLICATION_CONTROL_INTRODUCTION_COMMIT'),
+  'Publication control introduction provenance mismatch',
+);
+assert(
+  eligibility.releasedPublicationBaseline?.protectedBaseCommit === provenance.get('QUALIFICATION_PROTECTED_BASE_COMMIT'),
+  'Qualification protected/base provenance mismatch',
+);
 assert(composition.publicOrigin === provenance.get('PUBLIC_ORIGIN'), 'Overlay composition origin mismatch');
 assert(readiness.expectedOrigin === provenance.get('PUBLIC_ORIGIN'), 'Readiness origin mismatch');
 assert(provenance.get('PRODUCTION_AUTHORIZED') === 'NO', 'Qualified package must not self-authorize Production');

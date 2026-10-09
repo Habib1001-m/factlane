@@ -24,17 +24,21 @@ jobs:
       - run: uv run python -c "import factlane; print(factlane.__name__)"
       - run: uv run factlane --help
       - uses: actions/setup-node@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         with:
           node-version: "22.22.3"
           cache: npm
           cache-dependency-path: site/package-lock.json
       - name: Qualify public site artifact
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         env:
           FACTLANE_SITE_URL: https://factlane.pages.dev
           FACTLANE_PUBLIC_BUILD: "1"
           FACTLANE_PUBLICATION_CI_OUTPUT: ${{ github.workspace }}/site/.publication-ci
+          FACTLANE_PROTECTED_BASE_COMMIT: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: bash site/scripts/qualify-publication-ci.sh
       - name: Record publication qualification
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         run: |
           {
             echo '### FactLane public-site qualification'
@@ -44,6 +48,7 @@ jobs:
             echo 'This artifact is qualification evidence only; CI never deploys Production.'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload qualified publication package
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
           name: factlane-site-publication-${{ github.event.pull_request.head.sha || github.sha }}

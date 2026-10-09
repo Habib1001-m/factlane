@@ -20,8 +20,6 @@
     ]
   },
   "releasedPublicationBaseline": {
-    "acceptedMainCommit": "3ab643c1f7977a71f7415516366279edcb995db4",
-    "acceptedMainTree": "722c4348d63837e010829794678c8073c63d2a2f",
     "productionSourceCommit": "4eb06988172098ef669370b2040ea6d30d4f0684",
     "productionSourceTree": "722c4348d63837e010829794678c8073c63d2a2f",
     "productionDeploymentId": "a802a42c-329f-4a01-99b3-9cf34b0b6c5d",

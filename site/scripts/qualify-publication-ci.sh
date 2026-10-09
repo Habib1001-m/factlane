@@ -7,6 +7,7 @@ repo_root=$(cd -- "$site_root/.." && pwd)
 public_origin=${FACTLANE_SITE_URL:-https://factlane.pages.dev}
 output_root=${FACTLANE_PUBLICATION_CI_OUTPUT:-$site_root/.publication-ci}
 safe_output_root=$site_root/.publication-ci
+protected_base_commit=${FACTLANE_PROTECTED_BASE_COMMIT:-}
 
 output_root=$(node -e 'const path=require("node:path"); process.stdout.write(path.resolve(process.argv[1]))' "$output_root")
 safe_output_root=$(node -e 'const path=require("node:path"); process.stdout.write(path.resolve(process.argv[1]))' "$safe_output_root")
@@ -17,6 +18,11 @@ fi
 
 if [[ ${FACTLANE_PUBLIC_BUILD:-1} != 1 ]]; then
   echo 'HOLD: publication CI must run with FACTLANE_PUBLIC_BUILD=1' >&2
+  exit 1
+fi
+
+if [[ ! "$protected_base_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  echo 'HOLD: FACTLANE_PROTECTED_BASE_COMMIT must be the exact externally supplied protected/base SHA' >&2
   exit 1
 fi
 
@@ -46,6 +52,8 @@ eligibility="$tmp_root/PUBLICATION_ELIGIBILITY.json"
 readiness="$tmp_root/READINESS_RESULT.json"
 verified_root="$tmp_root/verified-root"
 negative_build="$tmp_root/negative-release-bound-build"
+negative_llms_build="$tmp_root/negative-llms-release-bound-build"
+negative_footer_build="$tmp_root/negative-footer-release-bound-build"
 negative_collision_base="$tmp_root/negative-overlay-collision-base"
 package_dir="$output_root/package"
 freeze_result="$output_root/FREEZE_RESULT.json"
@@ -78,13 +86,29 @@ mkdir -p "$output_root"
 echo "PUBLICATION_CI_SOURCE_COMMIT=$source_commit"
 echo "PUBLICATION_CI_SOURCE_TREE=$source_tree"
 echo "PUBLICATION_CI_ORIGIN=$public_origin"
+echo "PUBLICATION_CI_PROTECTED_BASE_COMMIT=$protected_base_commit"
 
 released_snapshot="$site_root/publication/released-contract-v0.1.3.json"
-released_baseline_commit=$(node -p "require('$released_snapshot').releasedPublicationBaseline.acceptedMainCommit")
-released_baseline_tree=$(node -p "require('$released_snapshot').releasedPublicationBaseline.acceptedMainTree")
-actual_released_baseline_tree=$(git -C "$repo_root" rev-parse "$released_baseline_commit^{tree}")
-[[ "$actual_released_baseline_tree" == "$released_baseline_tree" ]] || {
-  echo 'HOLD: accepted released-publication baseline tree drifted' >&2
+released_snapshot_relative=${released_snapshot#"$repo_root/"}
+control_introduction_commit=$(git -C "$repo_root" log --diff-filter=A --format=%H --reverse -- "$released_snapshot_relative" | head -n 1)
+[[ "$control_introduction_commit" =~ ^[0-9a-f]{40}$ ]] || {
+  echo 'HOLD: could not derive the historical publication-control introduction commit' >&2
+  exit 1
+}
+released_baseline_commit=$(git -C "$repo_root" rev-parse "$control_introduction_commit^")
+if git -C "$repo_root" cat-file -e "$protected_base_commit:$released_snapshot_relative" 2>/dev/null; then
+  [[ $(git -C "$repo_root" merge-base "$control_introduction_commit" "$protected_base_commit") == "$control_introduction_commit" ]] || {
+    echo 'HOLD: publication-control introduction is not part of the externally supplied protected/base history' >&2
+    exit 1
+  }
+else
+  [[ "$released_baseline_commit" == "$protected_base_commit" ]] || {
+    echo 'HOLD: bootstrap publication baseline must equal the externally supplied protected/base SHA' >&2
+    exit 1
+  }
+fi
+[[ $(git -C "$repo_root" merge-base "$protected_base_commit" "$source_commit") == "$protected_base_commit" ]] || {
+  echo 'HOLD: externally supplied protected/base SHA is not an ancestor of the candidate' >&2
   exit 1
 }
 
@@ -160,6 +184,7 @@ cmp -s "$base_manifest_a" "$base_manifest_b" || {
   node scripts/check-publication-eligibility.mjs \
     --build "$build_a" \
     --baseline-build "$baseline_build" \
+    --protected-base-commit "$protected_base_commit" \
     --receipt "$eligibility"
   node scripts/compose-publication-artifact.mjs \
     --base "$build_a" \
@@ -188,6 +213,7 @@ negative_eligibility="$tmp_root/NEGATIVE_PUBLICATION_ELIGIBILITY.json"
   node scripts/check-publication-eligibility.mjs \
     --build "$negative_build" \
     --baseline-build "$baseline_build" \
+    --protected-base-commit "$protected_base_commit" \
     --receipt "$negative_eligibility" >/dev/null
 )
 [[ $(node -p "require('$negative_eligibility').publicationClass") == RELEASE_BOUND ]] || {
@@ -196,6 +222,58 @@ negative_eligibility="$tmp_root/NEGATIVE_PUBLICATION_ELIGIBILITY.json"
 }
 [[ $(node -p "require('$negative_eligibility').publicationEligibility") == HOLD_UNRELEASED_CONTRACT ]] || {
   echo 'HOLD: release-bound negative control did not fail closed for publication' >&2
+  exit 1
+}
+
+cp -a "$build_a" "$negative_llms_build"
+printf '\nFactLane v9.9.9 is now universally supported.\n' >> "$negative_llms_build/llms.txt"
+negative_llms_eligibility="$tmp_root/NEGATIVE_LLMS_PUBLICATION_ELIGIBILITY.json"
+(
+  cd "$clone_a/site"
+  node scripts/check-publication-eligibility.mjs \
+    --build "$negative_llms_build" \
+    --baseline-build "$baseline_build" \
+    --protected-base-commit "$protected_base_commit" \
+    --receipt "$negative_llms_eligibility" >/dev/null
+)
+[[ $(node -p "require('$negative_llms_eligibility').publicationClass") == RELEASE_BOUND ]] || {
+  echo 'HOLD: llms.txt release-bound negative control was not classified RELEASE_BOUND' >&2
+  exit 1
+}
+[[ $(node -p "require('$negative_llms_eligibility').publicationEligibility") == HOLD_UNRELEASED_CONTRACT ]] || {
+  echo 'HOLD: llms.txt release-bound negative control did not fail closed for publication' >&2
+  exit 1
+}
+
+cp -a "$build_a" "$negative_footer_build"
+python - "$negative_footer_build/ar/index.html" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+pattern = r'(<footer\b[\s\S]*?)FactLane v0\.1\.3([\s\S]*?</footer>)'
+updated, count = re.subn(pattern, r'\1FactLane v9.9.9\2', text, count=1, flags=re.I)
+if count != 1:
+    raise SystemExit('negative control could not find Arabic global footer release claim')
+path.write_text(updated)
+PY
+negative_footer_eligibility="$tmp_root/NEGATIVE_FOOTER_PUBLICATION_ELIGIBILITY.json"
+(
+  cd "$clone_a/site"
+  node scripts/check-publication-eligibility.mjs \
+    --build "$negative_footer_build" \
+    --baseline-build "$baseline_build" \
+    --protected-base-commit "$protected_base_commit" \
+    --receipt "$negative_footer_eligibility" >/dev/null
+)
+[[ $(node -p "require('$negative_footer_eligibility').publicationClass") == RELEASE_BOUND ]] || {
+  echo 'HOLD: footer release-bound negative control was not classified RELEASE_BOUND' >&2
+  exit 1
+}
+[[ $(node -p "require('$negative_footer_eligibility').publicationEligibility") == HOLD_UNRELEASED_CONTRACT ]] || {
+  echo 'HOLD: footer release-bound negative control did not fail closed for publication' >&2
   exit 1
 }
 
@@ -316,6 +394,7 @@ cp "$readiness" "$output_root/READINESS_RESULT.json"
 cat > "$output_root/QUALIFICATION.env" <<EOF
 SOURCE_COMMIT=$source_commit
 SOURCE_TREE=$source_tree
+PROTECTED_BASE_COMMIT=$protected_base_commit
 PUBLIC_ORIGIN=$public_origin
 PACKAGE_CONTENTS_SHA256=$expected_package_digest
 PUBLICATION_CLASS=$(node -p "require('$eligibility').publicationClass")
