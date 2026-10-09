@@ -2,13 +2,27 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from .contract import AdapterError, finite_vector
+
+
+EMBEDDING_COMPATIBILITY_REVISION = 1
+MIN_OLLAMA_VERSION = (0, 22, 1)
+
+
+def _parse_semver(value: object) -> tuple[int, int, int] | None:
+    if not isinstance(value, str):
+        return None
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$", value.strip())
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
 
 
 def _context_length_from_model_info(model_info: dict[str, object]) -> int | None:
@@ -62,6 +76,23 @@ class EmbeddingProfile:
     projection_version: str
     document_prefix: str
     query_prefix: str
+    semantic_family: str = "UNSPECIFIED"
+    compatibility_revision: int = EMBEDDING_COMPATIBILITY_REVISION
+    minimum_context_window: int = 1
+
+    def semantic_identity(self) -> dict[str, object]:
+        return {
+            "base_model_identity": self.base_model_identity,
+            "semantic_family": self.semantic_family,
+            "source_dimension": self.source_dimension,
+            "output_dimension": self.output_dimension,
+            "document_prefix": self.document_prefix,
+            "query_prefix": self.query_prefix,
+            "normalization_policy": self.normalization_policy,
+            "distance_metric": self.distance_metric,
+            "projection_version": self.projection_version,
+            "compatibility_revision": self.compatibility_revision,
+        }
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -76,6 +107,9 @@ class EmbeddingProfile:
             "projection_version": self.projection_version,
             "document_prefix": self.document_prefix,
             "query_prefix": self.query_prefix,
+            "semantic_family": self.semantic_family,
+            "compatibility_revision": self.compatibility_revision,
+            "minimum_context_window": self.minimum_context_window,
         }
 
 
@@ -104,6 +138,8 @@ class OllamaLocalProvider:
         model_digest: str,
         document_prefix: str = "",
         query_prefix: str = "",
+        semantic_family: str = "UNSPECIFIED",
+        minimum_context_window: int = 1,
         base_url: str = "http://127.0.0.1:11434",
         timeout: float = 120.0,
     ) -> None:
@@ -133,6 +169,8 @@ class OllamaLocalProvider:
             projection_version="ollama-dimensions-v1",
             document_prefix=document_prefix,
             query_prefix=query_prefix,
+            semantic_family=semantic_family,
+            minimum_context_window=minimum_context_window,
         )
 
     def _request(self, path: str, payload: dict[str, object] | None = None) -> dict[str, object]:
@@ -155,6 +193,17 @@ class OllamaLocalProvider:
         return value
 
     def provider_status(self) -> dict[str, object]:
+        version_payload = self._request("/api/version")
+        version = version_payload.get("version")
+        parsed_version = _parse_semver(version)
+        if parsed_version is None:
+            raise AdapterError("SCHEMA_MISMATCH", "local embedding provider version is invalid")
+        if parsed_version < MIN_OLLAMA_VERSION:
+            required = ".".join(str(part) for part in MIN_OLLAMA_VERSION)
+            raise AdapterError(
+                "EMBEDDING_UNAVAILABLE",
+                f"local embedding provider requires Ollama >= {required}",
+            )
         tags = self._request("/api/tags")
         models = tags.get("models")
         if not isinstance(models, list):
@@ -165,8 +214,15 @@ class OllamaLocalProvider:
         digest = model_row.get("digest")
         if not isinstance(digest, str) or len(digest) != 64:
             raise AdapterError("SCHEMA_MISMATCH", "local model digest is unavailable")
-        if digest != self.profile.model_digest:
-            raise AdapterError("SCHEMA_MISMATCH", "local model digest changed from the pinned profile")
+        if any(character not in "0123456789abcdef" for character in digest):
+            raise AdapterError("SCHEMA_MISMATCH", "local model digest is invalid")
+        details = model_row.get("details")
+        family = details.get("family") if isinstance(details, dict) else None
+        if (
+            self.profile.semantic_family != "UNSPECIFIED"
+            and family != self.profile.semantic_family
+        ):
+            raise AdapterError("SCHEMA_MISMATCH", "local model semantic family differs from the profile")
         show = self._request("/api/show", {"name": self.model})
         model_info = show.get("model_info")
         if not isinstance(model_info, dict):
@@ -177,12 +233,19 @@ class OllamaLocalProvider:
         capabilities = show.get("capabilities")
         if not isinstance(capabilities, list) or "embedding" not in capabilities:
             raise AdapterError("EMBEDDING_UNAVAILABLE", "local model does not advertise embedding capability")
+        context_window = _context_length_from_model_info(model_info)
+        if context_window is None or context_window < self.profile.minimum_context_window:
+            raise AdapterError("SCHEMA_MISMATCH", "local model context window differs from the qualified profile")
+        # Digest and provider version are observed provenance, not semantic identity.
+        self.profile = replace(self.profile, model_digest=digest)
         size = model_row.get("size")
         return {
             "local_only": True,
             "provider_kind": self.profile.provider_kind,
             "model": self.model,
             "digest": digest,
+            "ollama_version": str(version),
+            "semantic_family": family,
             "size_bytes": size if isinstance(size, int) else None,
             "native_dimension": native,
             "output_dimension": self.profile.output_dimension,
@@ -190,7 +253,7 @@ class OllamaLocalProvider:
             "document_prefix": self.document_prefix,
             "query_prefix": self.query_prefix,
             "distance_metric": "cosine",
-            "effective_context_window": _context_length_from_model_info(model_info),
+            "effective_context_window": context_window,
             "truncate_policy": "FAIL_CLOSED_PROVIDER_REJECTION",
         }
 

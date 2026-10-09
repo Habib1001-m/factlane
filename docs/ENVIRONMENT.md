@@ -34,9 +34,11 @@ version eligibility does not bypass feature detection.
 
 ## Model profiles
 
-FactLane checks the model identity and digest, native/output dimensions, context capability,
-and input-size policy against the selected profile. It does not download a model implicitly.
-Install the model in your local Ollama instance before launching the server.
+FactLane checks the model identity/family, native/output dimensions, context capability, and
+input-size policy against the selected profile. Ollama must be **0.22.1 or newer**. The observed
+Ollama version and model digest are runtime provenance rather than, by themselves, proof that an
+existing vector space is semantically compatible. FactLane does not download a model implicitly;
+install the model in your local Ollama instance before launching the server.
 
 | Built-in profile | Ollama model | Notes |
 | --- | --- | --- |
@@ -64,6 +66,24 @@ The only shipped embedding-provider implementation communicates with Ollama on a
 URL** (by default `http://127.0.0.1:11434`). The provider interface permits future
 implementations, but a remote endpoint, automatic cloud fallback, or hosted embedding
 service is **not** a supported current configuration.
+
+The current **unreleased Development** compatibility binding records semantic identity separately
+from runtime provenance. Semantic identity includes the base model/family, source/output dimensions,
+document/query prefixes, normalization policy, cosine metric, projection revision, and FactLane
+embedding-compatibility revision. For the known v0.1.3 `embeddinggemma-300m-768` space, an
+integrity-bound qualified anchor set compares candidate document/query vectors directly with frozen
+legacy vectors before migration. The bundle itself is packaged as release material and is verified
+by SHA-256 before use.
+The historical Ollama version in that bundle comes from the frozen release-environment provenance;
+it is runtime provenance, not a direct per-request version attestation or a semantic-compatibility key.
+
+When that legacy proof passes, migration is metadata-only: existing vectors and each record's
+`embedding_profile_id`, `embedding_model_digest`, and `embedding_output_dimension` are preserved.
+If compatibility is missing, unknown, mixed, or fails qualification, durable facts remain readable
+through `memory_get`, `EXACT`, and `KEYWORD`, and `memory_status` can report the degraded state; semantic
+or hybrid retrieval, writes, and vector-mutating maintenance fail with `PROFILE_MISMATCH`. There is
+no automatic transform or re-embedding fallback. Re-embedding is an explicit operator/release
+migration decision, not a startup side effect.
 
 ## Host and storage isolation
 

@@ -25,10 +25,12 @@ from .contract import (
     validate_scope,
 )
 from .embeddings import EmbeddingProfile
+from .embedding_compatibility import parse_embedding_profile_metadata
 
 STORAGE_CONTRACT_VERSION = 2
 MIN_SQLITE_VERSION = (3, 42, 0)
-_WRITER_FUNCTION = "factlane_contract_v2_writer"
+_WRITER_FUNCTION = "factlane_contract_v2_compat_writer"
+_LEGACY_WRITER_FUNCTION = "factlane_contract_v2_writer"
 _CASEFOLD_FUNCTION = "factlane_unicode_casefold"
 _LEGACY_ORIGIN_JSON = canonical_json({"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None})
 _MAINTENANCE_CAPABILITY_SECRET = object()
@@ -370,8 +372,19 @@ class RecordUniquenessConflict(RuntimeError):
 
 
 def register_storage_v2_writer(conn: sqlite3.Connection) -> None:
-    """Mark one trusted FactLane connection as an authorized storage-v2 writer."""
+    """Mark one trusted FactLane connection as a compatibility-aware storage-v2 writer."""
     conn.create_function(_WRITER_FUNCTION, 0, lambda: 1)
+    # Legacy v0.1.3 trigger bodies may still name the old writer function while
+    # the database is being inspected. Resolve that function fail-closed so a
+    # no-op schema normalization can open the DB without granting legacy write
+    # authority before compatibility is proven and the fences are replaced.
+    conn.create_function(_LEGACY_WRITER_FUNCTION, 0, lambda: 0)
+    conn.create_function(_CASEFOLD_FUNCTION, 1, lambda value: str(value).casefold(), deterministic=True)
+
+
+def register_storage_legacy_maintenance_writer(conn: sqlite3.Connection) -> None:
+    """Permit a maintenance-only connection to operate on pre-compatibility v2 trigger fences."""
+    conn.create_function(_LEGACY_WRITER_FUNCTION, 0, lambda: 1)
     conn.create_function(_CASEFOLD_FUNCTION, 1, lambda value: str(value).casefold(), deterministic=True)
 
 
@@ -432,6 +445,14 @@ class SQLiteVecEngine:
         self.storage: Any = None
         self.conn: sqlite3.Connection | None = None
         self.native_columns: set[str] = set()
+        self.vector_dimension: int | None = None
+        self.embedding_store_key = profile.profile_id
+        # Fresh, unbound engines are provisionally usable by internal storage tests and
+        # maintenance setup. Existing materialized databases are downgraded to UNPROVEN
+        # during metadata inspection until the adapter establishes runtime compatibility.
+        self.embedding_compatibility_state = "COMPATIBLE"
+        self.embedding_compatibility_reason: str | None = None
+        self.embedding_profile_metadata: dict[str, object] | None = None
         self._closed = False
         self._maintenance_lease_handle: Any = None
         self._maintenance_capability: _MaintenanceCapability | None = None
@@ -488,23 +509,20 @@ class SQLiteVecEngine:
                 storage.embedding_backend_degraded = False
 
             bind_deferred_embedding_initializer(storage, defer_native_embedding)
-            await storage.initialize(strict_dimension_check=True)
+            await storage.initialize(strict_dimension_check=False)
             self.conn = storage.conn
             if self.conn is None:
                 raise AdapterError("BACKEND_UNAVAILABLE", "SQLite-vec backend did not expose a connection")
             _assert_required_sqlite_pragmas(self.conn)
             register_storage_v2_writer(self.conn)
-            actual_dimension = await self._run(self._read_dimension)
-            if actual_dimension != self.profile.output_dimension:
-                await self.close()
-                raise AdapterError("SCHEMA_MISMATCH", "pilot database dimension does not match the embedding profile")
+            self.vector_dimension = await self._run(self._read_dimension)
             self.native_columns = await self._run(self._read_native_columns)
             required = {"content_hash", "content", "metadata", "created_at", "updated_at"}
             if not required.issubset(self.native_columns):
                 await self.close()
                 raise AdapterError("SCHEMA_MISMATCH", "pinned backend schema is missing required columns")
             await self._run(self._create_adapter_schema)
-            await self._run(self._check_profile)
+            await self._run(self._inspect_profile_metadata)
         except asyncio.CancelledError:
             await self.close()
             raise
@@ -655,30 +673,152 @@ class SQLiteVecEngine:
             self.conn.rollback()
             raise
 
-    def _check_profile(self) -> None:
+    def _inspect_profile_metadata(self) -> None:
         assert self.conn is not None
-        expected = {
-            "profile_id": self.profile.profile_id,
-            "provider_kind": self.profile.provider_kind,
-            "base_model_identity": self.profile.base_model_identity,
-            "model_digest": self.profile.model_digest,
-            "source_dimension": self.profile.source_dimension,
-            "output_dimension": self.profile.output_dimension,
-            "normalization_policy": self.profile.normalization_policy,
-            "distance_metric": self.profile.distance_metric,
-            "projection_version": self.profile.projection_version,
-        }
         row = self.conn.execute("SELECT value FROM adapter_meta WHERE key='embedding_profile'").fetchone()
-        if row:
-            try:
-                actual = json.loads(row[0])
-            except json.JSONDecodeError as exc:
-                raise AdapterError("SCHEMA_MISMATCH", "adapter profile metadata is invalid") from exc
-            if actual != expected:
-                raise AdapterError("PROFILE_MISMATCH", "pilot database contains a different embedding profile")
-        else:
-            self.conn.execute("INSERT INTO adapter_meta(key, value) VALUES (?, ?)", ("embedding_profile", canonical_json(expected)))
+        if row is None:
+            self.embedding_profile_metadata = None
+            materialized = sum(
+                int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in ("adapter_records", "memories", "memory_embeddings")
+            )
+            if materialized:
+                self.embedding_compatibility_state = "UNPROVEN"
+                self.embedding_compatibility_reason = (
+                    "existing database has materialized records without embedding profile metadata"
+                )
+            return
+        try:
+            actual = json.loads(row[0])
+        except json.JSONDecodeError as exc:
+            raise AdapterError("SCHEMA_MISMATCH", "adapter profile metadata is invalid") from exc
+        if not isinstance(actual, dict):
+            raise AdapterError("SCHEMA_MISMATCH", "adapter profile metadata is invalid")
+        self.embedding_profile_metadata = actual
+        self.embedding_compatibility_state = "UNPROVEN"
+        self.embedding_compatibility_reason = "stored embedding profile requires runtime compatibility proof"
+        parsed = parse_embedding_profile_metadata(actual)
+        if parsed is not None:
+            self.embedding_store_key = str(parsed["store_key"])
+
+    def _compatibility_snapshot(self) -> dict[str, object]:
+        assert self.conn is not None
+        def distinct(sql: str) -> list[object]:
+            return [row[0] for row in self.conn.execute(sql).fetchall()]
+
+        adapter_count = int(self.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0])
+        memory_count = int(self.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+        vector_count = int(self.conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0])
+        return {
+            "profile_metadata": self.embedding_profile_metadata,
+            "adapter_count": adapter_count,
+            "memory_count": memory_count,
+            "vector_count": vector_count,
+            "vector_dimension": self.vector_dimension,
+            "adapter_profile_ids": distinct("SELECT DISTINCT embedding_profile_id FROM adapter_records ORDER BY embedding_profile_id"),
+            "adapter_model_digests": distinct("SELECT DISTINCT embedding_model_digest FROM adapter_records ORDER BY embedding_model_digest"),
+            "adapter_output_dimensions": distinct("SELECT DISTINCT embedding_output_dimension FROM adapter_records ORDER BY embedding_output_dimension"),
+            "native_stores": distinct("SELECT DISTINCT store FROM memories WHERE deleted_at IS NULL ORDER BY store"),
+            "vector_stores": distinct("SELECT DISTINCT store FROM memory_embeddings ORDER BY store"),
+        }
+
+    async def compatibility_snapshot(self) -> dict[str, object]:
+        return await self._run(self._compatibility_snapshot)
+
+    def set_embedding_compatibility(
+        self,
+        state: str,
+        *,
+        reason: str | None,
+        store_key: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        self.embedding_compatibility_state = state
+        self.embedding_compatibility_reason = reason
+        if store_key:
+            self.embedding_store_key = store_key
+        if metadata is not None:
+            self.embedding_profile_metadata = metadata
+
+    def _replace_writer_fences(self) -> None:
+        assert self.conn is not None
+        for name, action in (
+            ("factlane_v2_adapter_insert_fence", "INSERT"),
+            ("factlane_v2_adapter_update_fence", "UPDATE"),
+            ("factlane_v2_adapter_delete_fence", "DELETE"),
+        ):
+            self.conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            self.conn.execute(
+                f"CREATE TRIGGER {name} BEFORE {action} ON adapter_records "
+                f"WHEN {_WRITER_FUNCTION}() != 1 BEGIN "
+                "SELECT RAISE(ABORT, 'FACTLANE_STORAGE_V2_COMPAT_WRITER_REQUIRED'); END"
+            )
+
+    def _bind_embedding_profile(
+        self,
+        metadata: dict[str, object],
+        expected_profile: dict[str, object] | None,
+        preserve_legacy_profile: bool,
+        expect_missing: bool,
+    ) -> None:
+        assert self.conn is not None
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute("SELECT value FROM adapter_meta WHERE key='embedding_profile'").fetchone()
+            current: object | None = None
+            if row is not None:
+                try:
+                    current = json.loads(row[0])
+                except json.JSONDecodeError as exc:
+                    raise AdapterError("SCHEMA_MISMATCH", "adapter profile metadata is invalid") from exc
+            if expect_missing and current is not None:
+                raise AdapterError("PROFILE_MISMATCH", "embedding profile was initialized concurrently")
+            if expected_profile is not None and current != expected_profile:
+                raise AdapterError("PROFILE_MISMATCH", "embedding profile changed during compatibility proof")
+            if preserve_legacy_profile and expected_profile is not None:
+                self.conn.execute(
+                    "INSERT INTO adapter_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                    ("embedding_profile_legacy_v1", canonical_json(expected_profile)),
+                )
+            self.conn.execute(
+                "INSERT INTO adapter_meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("embedding_profile", canonical_json(metadata)),
+            )
+            self._migration_checkpoint("after_embedding_profile_binding")
+            self._replace_writer_fences()
+            self._migration_checkpoint("after_embedding_writer_fence")
             self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    async def bind_embedding_profile(
+        self,
+        metadata: dict[str, object],
+        *,
+        expected_profile: dict[str, object] | None = None,
+        preserve_legacy_profile: bool = False,
+        expect_missing: bool = False,
+    ) -> None:
+        await self._run(
+            self._bind_embedding_profile,
+            metadata,
+            expected_profile,
+            preserve_legacy_profile,
+            expect_missing,
+        )
+        self.embedding_profile_metadata = metadata
+        self.embedding_store_key = str(metadata["store_key"])
+        self.embedding_compatibility_state = "COMPATIBLE"
+        self.embedding_compatibility_reason = None
+
+    def require_embedding_compatibility(self) -> None:
+        if self.embedding_compatibility_state != "COMPATIBLE":
+            raise AdapterError(
+                "PROFILE_MISMATCH",
+                self.embedding_compatibility_reason or "embedding compatibility is not proven",
+            )
 
     @staticmethod
     def _scope_where(scope: ScopeContext, alias: str = "a") -> tuple[str, list[Any]]:
@@ -797,7 +937,7 @@ class SQLiteVecEngine:
             "memory_type": record["memory_type"], "metadata": native_metadata,
             "created_at": parse_iso(record["created_at"], required=True).timestamp(),
             "updated_at": parse_iso(record["created_at"], required=True).timestamp(),
-            "created_at_iso": record["created_at"], "updated_at_iso": record["created_at"], "store": self.profile.profile_id,
+            "created_at_iso": record["created_at"], "updated_at_iso": record["created_at"], "store": self.embedding_store_key,
         }
         if "confidence" in self.native_columns:
             native_values["confidence"] = record["confidence"]
@@ -813,7 +953,7 @@ class SQLiteVecEngine:
         from sqlite_vec import serialize_float32
         self.conn.execute(
             "INSERT INTO memory_embeddings (rowid, content_embedding, store) VALUES (?, ?, ?)",
-            (cursor.lastrowid, serialize_float32(embedding), self.profile.profile_id),
+            (cursor.lastrowid, serialize_float32(embedding), self.embedding_store_key),
         )
 
     async def write_record(
@@ -822,6 +962,7 @@ class SQLiteVecEngine:
         embedding: list[float],
         supersede_record_id: str | None = None,
     ) -> None:
+        self.require_embedding_compatibility()
         def transaction() -> None:
             assert self.conn is not None
             now = time.time()
@@ -981,7 +1122,7 @@ class SQLiteVecEngine:
                     "updated_at": parse_iso(record["created_at"], required=True).timestamp(),
                     "created_at_iso": record["created_at"],
                     "updated_at_iso": record["created_at"],
-                    "store": self.profile.profile_id,
+                    "store": self.embedding_store_key,
                 }
                 if "confidence" in self.native_columns:
                     native_values["confidence"] = record["confidence"]
@@ -1000,7 +1141,7 @@ class SQLiteVecEngine:
 
                 self.conn.execute(
                     "INSERT INTO memory_embeddings (rowid, content_embedding, store) VALUES (?, ?, ?)",
-                    (rowid, serialize_float32(embedding), self.profile.profile_id),
+                    (rowid, serialize_float32(embedding), self.embedding_store_key),
                 )
                 if supersede_record_id is not None:
                     self.conn.execute(
@@ -1038,6 +1179,7 @@ class SQLiteVecEngine:
         expected_revision: int,
     ) -> dict[str, Any] | None:
         """Atomically promote one exact Candidate lineage parent to validated current."""
+        self.require_embedding_compatibility()
         where, params = self._scope_where(scope)
 
         def transaction() -> dict[str, Any] | None:
@@ -1114,6 +1256,7 @@ class SQLiteVecEngine:
 
     async def compact_superseded_record(self, record_id: str) -> bool:
         """Compact one fully materialized superseded record into history."""
+        self.require_embedding_compatibility()
 
         def transaction() -> bool:
             assert self.conn is not None
@@ -1135,7 +1278,7 @@ class SQLiteVecEngine:
                 vector = (
                     self.conn.execute(
                         "SELECT 1 FROM memory_embeddings WHERE rowid = ? AND store = ?",
-                        (native_id, self.profile.profile_id),
+                        (native_id, self.embedding_store_key),
                     ).fetchone()
                     if native_id is not None
                     else None
@@ -1173,7 +1316,7 @@ class SQLiteVecEngine:
                     raise AdapterError("COMPACTION_NOT_ELIGIBLE", "record is no longer superseded")
                 self.conn.execute(
                     "DELETE FROM memory_embeddings WHERE rowid = ? AND store = ?",
-                    (native_id, self.profile.profile_id),
+                    (native_id, self.embedding_store_key),
                 )
                 self.conn.execute(
                     "DELETE FROM memory_graph WHERE source_hash = ? OR target_hash = ?",
@@ -1324,7 +1467,7 @@ class SQLiteVecEngine:
                 "JOIN memory_embeddings e ON e.rowid = m.id AND e.store = ? "
                 f"WHERE {where} AND a.lifecycle_state = 'SUPERSEDED' "
                 "ORDER BY a.created_at, a.record_id LIMIT ?",
-                [self.profile.profile_id, *params, max_records],
+                [self.embedding_store_key, *params, max_records],
             ).fetchall()
             return [str(row[0]) for row in rows]
 
@@ -1392,6 +1535,7 @@ class SQLiteVecEngine:
         limit: int,
         history: bool,
     ) -> list[tuple[dict[str, Any], float]]:
+        self.require_embedding_compatibility()
         where, params = self._scope_where(scope)
 
         def query() -> list[tuple[dict[str, Any], float]]:
@@ -1407,7 +1551,7 @@ class SQLiteVecEngine:
                     "WHERE content_embedding MATCH ? AND k = ? AND store = ?) e ON e.rowid = m.id "
                     f"WHERE m.deleted_at IS NULL AND {where} "
                     "ORDER BY e.distance ASC LIMIT ?",
-                    [serialize_float32(vector), max(limit * 4, limit), self.profile.profile_id, *params, limit],
+                    [serialize_float32(vector), max(limit * 4, limit), self.embedding_store_key, *params, limit],
                 ).fetchall()
             else:
                 eligible_where, eligible_params = self._scope_where(scope, alias="eligible")
@@ -1424,7 +1568,7 @@ class SQLiteVecEngine:
                     "AND k = ? AND store = ?) e ON e.rowid = m.id "
                     f"WHERE m.deleted_at IS NULL AND {where} AND a.lifecycle_state = 'VALIDATED_CURRENT' "
                     "ORDER BY e.distance ASC LIMIT ?",
-                    [serialize_float32(vector), *eligible_params, limit, self.profile.profile_id, *params, limit],
+                    [serialize_float32(vector), *eligible_params, limit, self.embedding_store_key, *params, limit],
                 ).fetchall()
             return [(self._row_to_dict(row[:-1]), float(row[-1])) for row in rows]
 
@@ -1469,7 +1613,7 @@ class SQLiteVecEngine:
                 "LEFT JOIN memory_embeddings e ON e.rowid = m.id AND e.store = ? "
                 f"WHERE {where} AND a.lifecycle_state = 'HISTORICAL' "
                 "AND (m.id IS NULL OR e.rowid IS NULL) LIMIT 1",
-                [self.profile.profile_id, *params],
+                [self.embedding_store_key, *params],
             ).fetchone()
             return row is not None
 
@@ -1545,7 +1689,7 @@ class SQLiteVecEngine:
                 FROM adapter_records a
                 {superseded_suffix}
                 """,
-                [self.profile.profile_id, *params],
+                [self.embedding_store_key, *params],
             ).fetchone()
             superseded_total = int(superseded_total)
             compaction_ready = int(compaction_ready)
@@ -1582,6 +1726,13 @@ class SQLiteVecEngine:
                 "available": True,
                 "backend": "sqlite_vec",
                 "profile": self.profile.to_dict(),
+                "embedding_compatibility": {
+                    "state": self.embedding_compatibility_state,
+                    "reason": self.embedding_compatibility_reason,
+                    "store_key": self.embedding_store_key,
+                    "vector_dimension": self.vector_dimension,
+                    "binding": self.embedding_profile_metadata,
+                },
                 "counts": counts,
                 "native_columns": sorted(self.native_columns),
                 "retention": {

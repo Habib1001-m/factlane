@@ -82,9 +82,11 @@ Storage contract v2 also blocks stale legacy writers from inserting, updating, o
 adapter records through an untrusted raw SQLite connection. The trusted maintenance path has
 a separate authorization boundary; it does not make arbitrary direct SQL writes part of the
 public API. Because writer authorization is a connection-local SQLite function, an unregistered
-raw connection is rejected at function resolution with `no such function:
-factlane_contract_v2_writer`; the persistent trigger's own RAISE text is not reached on that
-connection, but the mutation remains fail-closed.
+raw connection against a compatibility-bound Development database is rejected at function
+resolution for `factlane_contract_v2_compat_writer`. When opening an exact legacy v0.1.3 database,
+the current runtime resolves the older `factlane_contract_v2_writer` as **deny** until compatibility
+is proven and the persistent fences are replaced atomically. Only the separately authorized
+maintenance/recovery path can enable that legacy writer capability for its bounded operation.
 
 ## Retrieval and history
 
@@ -124,10 +126,27 @@ required by sensitive-memory recovery. That operator also performs an independen
 probe before mutation.
 
 Embedding calls use an `EmbeddingProvider` contract. The currently shipped provider is
-Ollama over loopback HTTP; model digest, capability, dimension, and input-size checks fail
-closed. Potentially blocking provider calls are offloaded from the asyncio event loop. No
+Ollama over loopback HTTP; provider version, model family, capability, dimension, context, and
+input-size checks fail closed. Potentially blocking provider calls are offloaded from the asyncio event loop. No
 cloud embedding provider or automatic external fallback is shipped. See the
 [environment policy](ENVIRONMENT.md) for built-in profiles and exact prerequisites.
+
+The current **unreleased Development** compatibility layer treats vector-space identity separately
+from runtime provenance. Semantic identity binds model identity/family, source and output dimensions,
+document/query prefixes, normalization, distance metric, projection revision, and FactLane's
+embedding-compatibility revision. Observed Ollama version and model digest remain runtime provenance;
+they are recorded on the binding and the per-record digest is preserved rather than retroactively
+rewritten. A runtime change may therefore be accepted only when the semantic identity still matches
+and a qualified, integrity-bound cross-space anchor proves direct old-vector/new-vector compatibility.
+
+For the exact known v0.1.3 `embeddinggemma-300m-768` legacy profile, a successful proof performs a
+metadata-only migration: existing vectors and adapter-record embedding provenance remain byte-for-byte
+and value-for-value unchanged, while revisioned compatibility metadata and the new stale-writer fence
+are committed atomically. Missing, unknown, mixed, or incompatible legacy identity remains
+`UNPROVEN`/`INCOMPATIBLE`: `memory_get`, `EXACT`, `KEYWORD`, and read-only status remain available,
+but `SEMANTIC`, `HYBRID`, writes, and vector-mutating maintenance fail closed. FactLane does not apply
+an automatic rotation/projection repair and does not automatically re-embed durable facts; re-embedding
+is a separate explicit maintenance/migration boundary.
 
 ## Maintenance and incident recovery
 

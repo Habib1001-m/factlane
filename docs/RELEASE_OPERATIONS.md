@@ -264,6 +264,15 @@ Every later official release should use this checklist:
 9. Do not retarget a previous release tag or replace its published assets. Continue verifying
    historical releases by their recorded commit/tree and artifact digests. A documentation
    maintenance change on `main` does not rewrite a historical release.
+10. If a release accepts an existing embedding space across a runtime/provider transition, record
+    the semantic-compatibility revision and identity separately from runtime provenance, freeze the
+    qualified cross-space anchor bundle as integrity-bound release material, and require byte parity
+    for that bundle across source, wheel, and source distribution.
+11. For every supported legacy embedding transition, prove whether migration is metadata-only or
+    requires explicit re-embedding. A metadata-only transition must demonstrate zero vector rewrite
+    and preservation of per-record embedding provenance. An incompatible or unprovable transition
+    must preserve durable facts and fail semantic/vector-mutating operations closed until an explicit
+    re-embedding or verified restore path is authorized.
 
 See [Quick Start](QUICKSTART.md) for first-time host setup, [Environment](ENVIRONMENT.md) for
 runtime requirements, [Architecture](ARCHITECTURE.md) for storage and contract boundaries, and

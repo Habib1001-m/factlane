@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
+from factlane.adapter import MemoryAdapter, _establish_embedding_compatibility, trusted_write_context_for_profile
 from factlane.contract import AdapterError, PUBLIC_TOOL_NAMES, ScopeContext
 from factlane.embeddings import EmbeddingProfile
 from factlane.recovery import MaintenanceLease, PM0, PM1, RecoveryHold, RecoveryPlan, RecoveryScope, RecoveryTarget, SensitiveMemoryRecoveryOperator
@@ -49,13 +49,28 @@ class FixedProvider:
         return [0.0] * (self.profile.output_dimension - 1) + [1.0]
 
 
+def _provider_status(p: EmbeddingProfile) -> dict[str, object]:
+    return {
+        "provider_kind": p.provider_kind,
+        "model": p.base_model_identity,
+        "digest": p.model_digest,
+        "ollama_version": "test-fixture",
+        "semantic_family": p.semantic_family,
+        "native_dimension": p.source_dimension,
+        "output_dimension": p.output_dimension,
+        "effective_context_window": p.minimum_context_window,
+    }
+
+
 async def _open_adapter(tmp_path: Path, filename: str = "memory.db") -> tuple[SQLiteVecEngine, MemoryAdapter]:
     p = profile()
     engine = SQLiteVecEngine(str(tmp_path / filename), p)
     await engine.open()
+    provider = FixedProvider(p)
+    await _establish_embedding_compatibility(engine, provider, _provider_status(p))
     return engine, MemoryAdapter(
         engine,
-        FixedProvider(p),  # type: ignore[arg-type]
+        provider,  # type: ignore[arg-type]
         trusted_write_context=trusted_write_context_for_profile(
             "owner-current",
             contributor_ref="sensitive-recovery-tests",

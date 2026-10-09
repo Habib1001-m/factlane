@@ -349,14 +349,14 @@ def test_storage_v2_raw_legacy_writer_cannot_mutate_adapter_records(tmp_path) ->
                 insert_values.append("'raw-insert-idempotency'")
             else:
                 insert_values.append(column)
-        with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v2_writer"):
+        with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v2_compat_writer"):
             raw.execute(
                 f"INSERT INTO adapter_records ({','.join(columns)}) SELECT {','.join(insert_values)} "
                 "FROM adapter_records WHERE record_id=?",
                 (record_id,),
             )
         for sql, params in (("UPDATE adapter_records SET fact='stale-writer' WHERE record_id=?", (record_id,)), ("DELETE FROM adapter_records WHERE record_id=?", (record_id,))):
-            with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v2_writer"):
+            with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v2_compat_writer"):
                 raw.execute(sql, params)
     finally:
         raw.close()

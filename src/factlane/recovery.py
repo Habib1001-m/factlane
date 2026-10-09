@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .contract import PUBLIC_TOOL_NAMES, AdapterError, canonical_json
+from .embedding_compatibility import parse_embedding_profile_metadata
 from .embeddings import EmbeddingProfile
 from .storage import (
     SQLiteVecEngine,
@@ -21,6 +22,7 @@ from .storage import (
     _open_database_lease_handle,
     _same_inode,
     assert_supported_sqlite_runtime,
+    register_storage_legacy_maintenance_writer,
     register_storage_v2_writer,
 )
 
@@ -180,6 +182,39 @@ def _profile_projection(profile: EmbeddingProfile) -> dict[str, Any]:
         "normalization_policy": profile.normalization_policy, "distance_metric": profile.distance_metric,
         "projection_version": profile.projection_version,
     }
+
+
+def _recovery_store_key(conn: sqlite3.Connection, plan: RecoveryPlan) -> str:
+    profile_row = conn.execute("SELECT value FROM adapter_meta WHERE key='embedding_profile'").fetchone()
+    if not profile_row:
+        raise RecoveryHold("HOLD_PROFILE_MISMATCH_NO_MUTATION", "embedding profile metadata is missing")
+    try:
+        actual_profile = json.loads(str(profile_row[0]))
+    except json.JSONDecodeError as exc:
+        raise RecoveryHold("HOLD_PROFILE_MISMATCH_NO_MUTATION", "embedding profile metadata is invalid") from exc
+    parsed = parse_embedding_profile_metadata(actual_profile)
+    if parsed is not None:
+        if parsed.get("semantic_identity") != plan.profile.semantic_identity():
+            raise RecoveryHold(
+                "HOLD_PROFILE_MISMATCH_NO_MUTATION",
+                "embedding semantic identity does not match the frozen recovery plan",
+            )
+        proof = parsed.get("compatibility_proof")
+        if not isinstance(proof, dict) or proof.get("state") != "COMPATIBLE":
+            raise RecoveryHold(
+                "HOLD_PROFILE_MISMATCH_NO_MUTATION",
+                "embedding compatibility is not proven for sensitive recovery",
+            )
+        store_key = parsed.get("store_key")
+        if not isinstance(store_key, str) or not store_key:
+            raise RecoveryHold("HOLD_PROFILE_MISMATCH_NO_MUTATION", "embedding store binding is invalid")
+        return store_key
+    if actual_profile == _profile_projection(plan.profile):
+        # Exact legacy metadata is sufficient for an exact destructive purge because
+        # recovery does not perform semantic retrieval, vector generation, migration,
+        # or re-embedding. Unknown/missing legacy metadata still fails closed above.
+        return plan.profile.profile_id
+    raise RecoveryHold("HOLD_PROFILE_MISMATCH_NO_MUTATION", "embedding profile does not match the frozen plan")
 
 
 def _plan_binding(plan: RecoveryPlan) -> str:
@@ -514,6 +549,7 @@ class SensitiveMemoryRecoveryOperator:
         conn = sqlite3.connect(db_path, timeout=5.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         register_storage_v2_writer(conn)
+        register_storage_legacy_maintenance_writer(conn)
         conn.execute("PRAGMA busy_timeout=5000")
         try:
             import sqlite_vec
@@ -642,15 +678,7 @@ class SensitiveMemoryRecoveryOperator:
                 "FTS5 secure-delete is unavailable",
             ) from exc
 
-        profile_row = conn.execute("SELECT value FROM adapter_meta WHERE key='embedding_profile'").fetchone()
-        if not profile_row:
-            raise RecoveryHold("HOLD_PROFILE_MISMATCH_NO_MUTATION", "embedding profile metadata is missing")
-        try:
-            actual_profile = json.loads(str(profile_row[0]))
-        except json.JSONDecodeError as exc:
-            raise RecoveryHold("HOLD_PROFILE_MISMATCH_NO_MUTATION", "embedding profile metadata is invalid") from exc
-        if actual_profile != _profile_projection(plan.profile):
-            raise RecoveryHold("HOLD_PROFILE_MISMATCH_NO_MUTATION", "embedding profile does not match the frozen plan")
+        _recovery_store_key(conn, plan)
 
         checkpoint = tuple(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
         if checkpoint != (0, 0, 0):
@@ -703,7 +731,7 @@ class SensitiveMemoryRecoveryOperator:
                         (native_rowid,),
                     ).fetchall()
                 ]
-                actual = PM1 if stores == [plan.profile.profile_id] else PM2
+                actual = PM1 if stores == [_recovery_store_key(conn, plan)] else PM2
         else:
             orphan_vectors = int(
                 conn.execute(
@@ -918,7 +946,7 @@ class SensitiveMemoryRecoveryOperator:
                 if item.native_rowid is not None:
                     removed = conn.execute(
                         "DELETE FROM memory_embeddings WHERE rowid = ? AND store = ?",
-                        (item.native_rowid, plan.profile.profile_id),
+                        (item.native_rowid, _recovery_store_key(conn, plan)),
                     )
                     if item.materialization == PM1 and removed.rowcount != 1:
                         raise RecoveryHold(
@@ -1114,11 +1142,10 @@ class SensitiveMemoryRecoveryOperator:
                 ) from exc
             verify.execute("PRAGMA secure_delete=ON")
             self._verify_db_health_and_fts(verify)
-            profile_row = verify.execute(
-                "SELECT value FROM adapter_meta WHERE key='embedding_profile'"
-            ).fetchone()
-            if not profile_row or json.loads(str(profile_row[0])) != _profile_projection(plan.profile):
-                raise RecoveryHold(_SEALING_INCOMPLETE, "sanitized image profile drifted")
+            try:
+                _recovery_store_key(verify, plan)
+            except RecoveryHold as exc:
+                raise RecoveryHold(_SEALING_INCOMPLETE, "sanitized image profile drifted") from exc
             self._verify_survivors(verify, plan, survivor_snapshot)
             for target in plan.targets:
                 row = verify.execute(

@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
+from factlane.adapter import MemoryAdapter, _establish_embedding_compatibility, trusted_write_context_for_profile
 from factlane.embeddings import EmbeddingProfile
 from factlane.storage import SQLiteVecEngine
 
@@ -46,13 +46,28 @@ class _FixedProvider:
         return [0.0] * (self.profile.output_dimension - 1) + [1.0]
 
 
+def _provider_status(p: EmbeddingProfile) -> dict[str, object]:
+    return {
+        "provider_kind": p.provider_kind,
+        "model": p.base_model_identity,
+        "digest": p.model_digest,
+        "ollama_version": "test-fixture",
+        "semantic_family": p.semantic_family,
+        "native_dimension": p.source_dimension,
+        "output_dimension": p.output_dimension,
+        "effective_context_window": p.minimum_context_window,
+    }
+
+
 async def _open_adapter(tmp_path, filename: str = "memory.db") -> tuple[SQLiteVecEngine, MemoryAdapter]:
     embedding_profile = _profile()
     engine = SQLiteVecEngine(str(tmp_path / filename), embedding_profile)
     await engine.open()
+    provider = _FixedProvider(embedding_profile)
+    await _establish_embedding_compatibility(engine, provider, _provider_status(embedding_profile))
     return engine, MemoryAdapter(
         engine,
-        _FixedProvider(embedding_profile),
+        provider,
         trusted_write_context=trusted_write_context_for_profile("owner-current"),
     )  # type: ignore[arg-type]
 
@@ -167,7 +182,10 @@ def test_status_adds_retention_and_capacity_without_dropping_backend_keys(tmp_pa
         try:
             status = await engine.status(_scope(adapter))
             assert {"available", "backend", "profile", "counts", "native_columns"} <= status.keys()
-            assert set(status) == {"available", "backend", "profile", "counts", "native_columns", "retention", "capacity"}
+            assert set(status) == {
+                "available", "backend", "profile", "counts", "native_columns", "retention", "capacity",
+                "embedding_compatibility",
+            }
             assert status["retention"]["policy_version"] == 1
             assert status["retention"]["automatic_housekeeping"] is False
         finally:

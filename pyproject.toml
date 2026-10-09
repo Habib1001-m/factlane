@@ -31,6 +31,9 @@ factlane = "factlane.server:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+factlane = ["data/embedding_compatibility/*.json"]
+
 [tool.setuptools.data-files]
 "share/factlane/skills/using-factlane" = ["skills/using-factlane/SKILL.md"]
 "share/factlane/skills/using-factlane/references" = ["skills/using-factlane/references/host-bootstrap.md"]

@@ -78,6 +78,13 @@ An ordinary delegated agent does not gain verifier authority simply because this
 
 Use it for bounded, read-only observations about a scope's storage and embedding-profile state.
 
+In current **unreleased Development**, the backend status also reports the persisted embedding
+compatibility state/binding and whether the observed runtime fingerprint still matches that binding.
+`memory_status` does not run a compatibility migration or silently requalify a changed runtime.
+When a legacy database is `UNPROVEN` or `INCOMPATIBLE`, safe non-semantic reads (`memory_get`,
+`EXACT`, `KEYWORD`) remain available while `SEMANTIC`, `HYBRID`, `memory_store`, and `memory_update`
+fail closed with `PROFILE_MISMATCH` until an explicit compatible migration/re-embedding path exists.
+
 It is not a full monitoring platform, backup facility, or maintenance daemon.
 
 ## Governed failures
