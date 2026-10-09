@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "releaseAuthority": {
+    "tag": "v0.1.3",
+    "tagObject": "d922fcceae7cfbfda239666182e61a5a58278809",
+    "commit": "59173b7d9fa3af924c373176411882caa04a6c1d",
+    "tree": "93db940802432b6f9ca2f5513916fd2b84c6393a",
+    "packageVersion": "0.1.3",
+    "pythonRequires": ">=3.11",
+    "linkedSqliteMinimum": "3.42.0",
+    "publicContractRevision": 2,
+    "transport": "stdio",
+    "embeddingProvider": "Ollama",
+    "tools": [
+      "memory_search",
+      "memory_get",
+      "memory_store",
+      "memory_update",
+      "memory_status"
+    ]
+  },
+  "releasedPublicationBaseline": {
+    "sourceCommit": "4eb06988172098ef669370b2040ea6d30d4f0684",
+    "sourceTree": "722c4348d63837e010829794678c8073c63d2a2f",
+    "productionDeploymentId": "a802a42c-329f-4a01-99b3-9cf34b0b6c5d",
+    "productionArtifactManifestSha256": "a69aae94b76d314d0b13435acb47c7cba9a97c0365977ff4b7ff662694789a35"
+  },
+  "allowedNamedVersions": [
+    "v0.1.2",
+    "v0.1.3"
+  ],
+  "contractMainText": {
+    "/answers/": "65b449a3a1814363ddb64f10ff03284ddec97b54a4312388d0f4182bf9283764",
+    "/ar/answers/": "9f1732dcbab51fa9ddaa324c3e155c0eb4a5a497fbdf3006de3a38449020f7f1",
+    "/docs/CORE_CONCEPTS/": "fe262f7605c2f807d38cb747c0d2f5f3b1b4cf74bf8b35888be0b69581578382",
+    "/ar/docs/CORE_CONCEPTS/": "49f3064848e6ff202f723ea1ac65245e6f20ddd093a97fcccf9d1edd684f798c",
+    "/docs/TOOLS/": "9b75515e4be1c567a1ba4217c971f3edb920b3444a2f24f2343ccdfdbcb602f1",
+    "/ar/docs/TOOLS/": "34058a543852fcdb5138ab414422a7b2b1bf45682b191a6c734a151109d7c768",
+    "/docs/ENVIRONMENT/": "635d3319c8fcc227e40b479a0fdd9d3a9f5d19b7421fac47ad5735379757c906",
+    "/ar/docs/ENVIRONMENT/": "aa3d0a8eaa4f3ce935aac9712a3d0dbd8bf06a6a229e91d713d776ad6c036596",
+    "/docs/QUICKSTART/": "43aabe04714ab85e46fb5b5151b4a7b425a215e7a4cf62c872d4e50c15487ade",
+    "/ar/docs/QUICKSTART/": "39c06214a9f1cd08075c41f2688fc80d8ac7420aa0aa0e319cbedad2b769fd7f",
+    "/docs/SECURITY/": "d5ff4f4d951168801b1d94231c010630a6f50e1775b3a576e74befafddd09a50",
+    "/ar/docs/SECURITY/": "5998bacb0c597fa9c9fee986734832efff181560d6c47c4a5330f1b6d398fbe8",
+    "/docs/RELEASE_OPERATIONS/": "f979c9660d25596e7a2b91ee8ef4384d1b1127366d8085c7cc97f9e5af60d391",
+    "/ar/docs/RELEASE_OPERATIONS/": "0f1f97707118caa7008a1640a7ce2acb66e7606e43da808d9e0e765b252f1069"
+  }
+}

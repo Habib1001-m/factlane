@@ -12,6 +12,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: astral-sh/setup-uv@v6
       - uses: actions/setup-python@v5
         with:
@@ -20,3 +23,30 @@ jobs:
       - run: uv run pytest -q
       - run: uv run python -c "import factlane; print(factlane.__name__)"
       - run: uv run factlane --help
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.3"
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - name: Qualify public site artifact
+        env:
+          FACTLANE_SITE_URL: https://factlane.pages.dev
+          FACTLANE_PUBLIC_BUILD: "1"
+          FACTLANE_PUBLICATION_CI_OUTPUT: ${{ github.workspace }}/site/.publication-ci
+        run: bash site/scripts/qualify-publication-ci.sh
+      - name: Record publication qualification
+        run: |
+          {
+            echo '### FactLane public-site qualification'
+            echo '```text'
+            cat site/.publication-ci/QUALIFICATION.env
+            echo '```'
+            echo 'This artifact is qualification evidence only; CI never deploys Production.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload qualified publication package
+        uses: actions/upload-artifact@v4
+        with:
+          name: factlane-site-publication-${{ github.event.pull_request.head.sha || github.sha }}
+          path: site/.publication-ci/
+          if-no-files-found: error
+          retention-days: 14

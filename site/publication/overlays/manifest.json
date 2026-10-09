@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "publicOrigin": "https://factlane.pages.dev",
+  "redirectFragments": [
+    {
+      "kind": "DISCOVERY_OWNERSHIP",
+      "source": "discovery/gsc.redirects",
+      "sha256": "905a02f01b4689bb482495fe3e15a1a54856358e20bbb0302a79dc6c7698129b",
+      "expectedRuleCount": 1
+    },
+    {
+      "kind": "HOST_STABLE",
+      "source": "../host/redirects.txt",
+      "sha256": "5260ded049a08409062d8c12fd176b3148f61e40cdd8282697c71af8b526ce92",
+      "expectedRuleCount": 28
+    }
+  ],
+  "files": [
+    {
+      "kind": "INDEXNOW_KEY",
+      "source": "discovery/1d226189096d15c62deace5c0bb3ade7.txt",
+      "target": "1d226189096d15c62deace5c0bb3ade7.txt",
+      "sha256": "98f7e33ad9acdfb7e977b511aa1fc201abc6187cf2464a698b5e6461089610aa"
+    },
+    {
+      "kind": "GOOGLE_SEARCH_CONSOLE_VERIFICATION",
+      "source": "discovery/google0227effcabf0f657.html",
+      "target": "google0227effcabf0f657.html",
+      "sha256": "428f3fc721514384de5d6a3d9c2dc73abb1eb42e9e9efeaeedee2ebe4c2acbd1"
+    },
+    {
+      "kind": "BING_WEBMASTER_VERIFICATION",
+      "source": "discovery/BingSiteAuth.xml",
+      "target": "BingSiteAuth.xml",
+      "sha256": "4259eb43c0bb56498ef2b61e16e68ccdcc9aa9b7e790affb993a47eec5ccb2ec"
+    }
+  ]
+}

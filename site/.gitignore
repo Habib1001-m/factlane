@@ -3,3 +3,5 @@ build/
 .docusaurus/
 .generated-docs/
 .generated-static/
+.publication-ci/
+.wrangler/

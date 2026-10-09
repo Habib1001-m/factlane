@@ -20,7 +20,12 @@
     "check:seo:docs": "node scripts/check-doc-seo.mjs",
     "check:seo:answers": "node scripts/check-answer-authority.mjs",
     "check:seo:urls": "node scripts/check-url-boundary.mjs",
-    "check:publication:readiness": "node scripts/check-publication-readiness.mjs"
+    "check:publication:readiness": "node scripts/check-publication-readiness.mjs",
+    "check:publication:eligibility": "node scripts/check-publication-eligibility.mjs",
+    "compose:publication": "node scripts/compose-publication-artifact.mjs",
+    "freeze:publication": "node scripts/freeze-publication-package.mjs",
+    "check:publication:crossing": "node scripts/check-publication-crossing.mjs",
+    "check:publication:ci": "bash scripts/qualify-publication-ci.sh"
   },
   "dependencies": {
     "@docusaurus/core": "3.10.2",
@@ -35,7 +40,8 @@
     "@docusaurus/module-type-aliases": "3.10.2",
     "@docusaurus/tsconfig": "3.10.2",
     "@docusaurus/types": "3.10.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "wrangler": "4.148.0"
   },
   "engines": {
     "node": ">=20"

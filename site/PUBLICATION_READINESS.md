@@ -3,6 +3,57 @@
 This is an operational runbook for the already accepted site semantics. It is not a new SEO/GEO
 cycle, does not authorize publication, and does not change the R19 product/search contract.
 
+## Public-site CI and controlled publication boundary
+
+The protected GitHub `test` context now includes public-site qualification. CI checks Development
+correctness and produces an immutable publication-candidate package; it never deploys Cloudflare
+Pages, creates or promotes a release, or grants Production authority.
+
+The qualification path is intentionally split into four controls:
+
+1. Two independent clean checkouts of the exact source commit build the public site with the
+   committed lockfile, Node `22.22.3`, pinned Wrangler `4.148.0`, the approved HTTPS origin and
+   `FACTLANE_PUBLIC_BUILD=1`.
+   Complete base manifests must be byte-identical. Source **commit and tree are both provenance**:
+   source-aware sitemap `lastmod` uses Git history, so tree equality alone does not identify the
+   publication bytes after a squash or history rewrite.
+2. `scripts/check-publication-eligibility.mjs` compares the release-bound public contract surface
+   with the immutable current RELEASED authority snapshot. A recognized release-bound Development
+   change may keep the required `test` context green while the receipt records
+   `HOLD_UNRELEASED_CONTRACT`; unknown/stale release authority is also publication HOLD. This keeps
+   protected `main` as DEVELOPMENT truth without allowing unreleased claims into Production.
+3. `scripts/compose-publication-artifact.mjs` overlays only the manifest-bound hosting/discovery
+   inputs under `site/publication/`. Stable host redirects are separated from GSC/Bing/IndexNow
+   ownership files. Path collisions, missing files, digest drift, redirect collisions, origin drift,
+   or nondeterministic composition fail closed. The verification files are operational publication
+   inputs, not product/source authority. The exact composed root is exercised through
+   `wrangler pages dev` before freeze so the `_redirects` behavior is tested against the Pages local
+   runtime rather than inferred only from a generic static server.
+4. `scripts/freeze-publication-package.mjs` requires byte-identical composed artifacts, a PASS
+   publication-readiness receipt and exact commit/tree/release/overlay provenance before producing
+   the checksummed consumer handoff. The package always records `PRODUCTION_AUTHORIZED=NO`.
+
+The CI entry point is:
+
+```bash
+FACTLANE_SITE_URL=https://factlane.pages.dev \
+FACTLANE_PUBLIC_BUILD=1 \
+npm run check:publication:ci
+```
+
+Its `.publication-ci/` output is transportable qualification evidence. GitHub Actions may retain
+that directory as a CI artifact, but an Actions artifact is not itself the trust anchor. A future
+Production crossing must bind owner authorization to the exact SHA-256 of the candidate package's
+`PACKAGE_CONTENTS.sha256`, authenticate that digest with trusted tooling, verify the package, and
+consume the frozen archive bytes without rebuilding them.
+
+`scripts/check-publication-crossing.mjs` is a non-deploying final local gate. It requires the owner-
+authorized package digest to equal the exact candidate digest and rejects publication when the
+eligibility receipt is HOLD. Passing that gate still does **not** deploy anything; the operator must
+separately re-check live Cloudflare project/deployment state before Direct Upload. Production
+rollback is likewise never automatic and requires explicit or pre-approved incident/runbook
+authority.
+
 ## Reviewed publication shape
 
 The reviewed deployment artifact is the static `site/build/` output at the public origin root.
