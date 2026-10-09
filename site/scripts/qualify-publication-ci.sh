@@ -53,11 +53,21 @@ consumer_readiness="$output_root/CONSUMER_READINESS_RESULT.json"
 crossing_result="$output_root/CROSSING_GATE_RESULT.json"
 server_pid=''
 
-cleanup() {
+stop_server() {
   if [[ -n "$server_pid" ]]; then
-    kill "$server_pid" 2>/dev/null || true
+    kill -TERM -- "-$server_pid" 2>/dev/null || kill -TERM "$server_pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      if ! kill -0 "$server_pid" 2>/dev/null; then break; fi
+      sleep 0.1
+    done
+    kill -KILL -- "-$server_pid" 2>/dev/null || kill -KILL "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
+    server_pid=''
   fi
+}
+
+cleanup() {
+  stop_server
   rm -rf "$tmp_root"
 }
 trap cleanup EXIT
@@ -79,16 +89,30 @@ actual_released_baseline_tree=$(git -C "$repo_root" rev-parse "$released_baselin
 }
 
 probe_loopback() {
-  curl --connect-timeout 1 --max-time 2 -fsS "$1" >/dev/null 2>&1
+  curl --connect-timeout 1 --max-time 3 -fsS "$1" >/dev/null 2>&1
 }
 
 wait_for_loopback() {
   local url=$1
-  for _ in $(seq 1 30); do
+  local timeout_seconds=${2:-90}
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
     if probe_loopback "$url"; then return 0; fi
-    sleep 0.2
+    sleep 0.5
   done
   return 1
+}
+
+allocate_loopback_port() {
+  node - <<'NODE'
+const net = require('node:net');
+const server = net.createServer();
+server.unref();
+server.listen(0, '127.0.0.1', () => {
+  process.stdout.write(String(server.address().port));
+  server.close();
+});
+NODE
 }
 
 git clone --quiet --local --no-hardlinks "$repo_root" "$clone_a"
@@ -204,28 +228,24 @@ cmp -s "$routes_a" "$routes_b" || {
   exit 1
 }
 
-(
-  cd "$clone_a/site"
-  exec env WRANGLER_SEND_METRICS=false npx wrangler pages dev "$composed_a" \
-    --ip 127.0.0.1 \
-    --port 4260
-) > "$tmp_root/pages-runtime.log" 2>&1 &
+pages_port=$(allocate_loopback_port)
+setsid bash -c 'cd "$1" && exec env WRANGLER_SEND_METRICS=false npx wrangler pages dev "$2" --ip 127.0.0.1 --port "$3"' \
+  _ "$clone_a/site" "$composed_a" "$pages_port" > "$tmp_root/pages-runtime.log" 2>&1 &
 server_pid=$!
-wait_for_loopback http://127.0.0.1:4260/ || {
+wait_for_loopback "http://127.0.0.1:$pages_port/" 90 || {
   echo 'HOLD: Wrangler Pages runtime did not become ready within bounded probe window' >&2
+  tail -n 80 "$tmp_root/pages-runtime.log" >&2 || true
   exit 1
 }
-probe_loopback http://127.0.0.1:4260/
+probe_loopback "http://127.0.0.1:$pages_port/"
 (
   cd "$clone_a/site"
-  FACTLANE_VERIFY_BASE_URL=http://127.0.0.1:4260 \
+  FACTLANE_VERIFY_BASE_URL="http://127.0.0.1:$pages_port" \
   FACTLANE_EXPECTED_ORIGIN="$public_origin" \
   FACTLANE_VERIFY_MODE=public \
   node scripts/check-publication-readiness.mjs > "$readiness"
 )
-kill "$server_pid" 2>/dev/null || true
-wait "$server_pid" 2>/dev/null || true
-server_pid=''
+stop_server
 
 (
   cd "$clone_a/site"
@@ -270,24 +290,24 @@ fi
     --expected-project factlane > "$crossing_result"
 )
 
-node "$package_dir/consumer/scripts/serve-publication-static.mjs" \
+consumer_port=$(allocate_loopback_port)
+setsid node "$package_dir/consumer/scripts/serve-publication-static.mjs" \
   --root "$verified_root" \
   --routes "$package_dir/ROUTES.txt" \
   --host 127.0.0.1 \
-  --port 4261 > "$tmp_root/consumer-static-host.log" 2>&1 &
+  --port "$consumer_port" > "$tmp_root/consumer-static-host.log" 2>&1 &
 server_pid=$!
-wait_for_loopback http://127.0.0.1:4261/ || {
+wait_for_loopback "http://127.0.0.1:$consumer_port/" 90 || {
   echo 'HOLD: consumer static host did not become ready within bounded probe window' >&2
+  tail -n 80 "$tmp_root/consumer-static-host.log" >&2 || true
   exit 1
 }
-probe_loopback http://127.0.0.1:4261/
-FACTLANE_VERIFY_BASE_URL=http://127.0.0.1:4261 \
+probe_loopback "http://127.0.0.1:$consumer_port/"
+FACTLANE_VERIFY_BASE_URL="http://127.0.0.1:$consumer_port" \
 FACTLANE_EXPECTED_ORIGIN="$public_origin" \
 FACTLANE_VERIFY_MODE=public \
 node "$package_dir/consumer/scripts/check-publication-readiness.mjs" > "$consumer_readiness"
-kill "$server_pid" 2>/dev/null || true
-wait "$server_pid" 2>/dev/null || true
-server_pid=''
+stop_server
 
 cp "$eligibility" "$output_root/PUBLICATION_ELIGIBILITY.json"
 cp "$receipt_a" "$output_root/OVERLAY_COMPOSITION.json"
