@@ -391,14 +391,33 @@ if (
   exit 1
 fi
 
-(
-  cd "$clone_a/site"
-  node scripts/check-publication-crossing.mjs \
-    --package "$package_dir" \
-    --expected-package-contents-sha256 "$expected_package_digest" \
-    --expected-origin "$public_origin" \
-    --expected-project factlane > "$crossing_result"
-)
+publication_eligibility=$(node -p "require('$eligibility').publicationEligibility")
+if [[ "$publication_eligibility" == ELIGIBLE_PENDING_OTHER_GATES ]]; then
+  (
+    cd "$clone_a/site"
+    node scripts/check-publication-crossing.mjs \
+      --package "$package_dir" \
+      --expected-package-contents-sha256 "$expected_package_digest" \
+      --expected-origin "$public_origin" \
+      --expected-project factlane > "$crossing_result"
+  )
+elif [[ "$publication_eligibility" == HOLD_UNRELEASED_CONTRACT ]]; then
+  if (
+    cd "$clone_a/site"
+    node scripts/check-publication-crossing.mjs \
+      --package "$package_dir" \
+      --expected-package-contents-sha256 "$expected_package_digest" \
+      --expected-origin "$public_origin" \
+      --expected-project factlane > "$tmp_root/unreleased-crossing-unexpected.json" 2>&1
+  ); then
+    echo 'HOLD: release-bound Development artifact unexpectedly passed Production crossing' >&2
+    exit 1
+  fi
+  node -e 'const fs=require("node:fs"); fs.writeFileSync(process.argv[1], JSON.stringify({status:"HOLD_EXPECTED", gate:"PRODUCTION_CROSSING", reason:"HOLD_UNRELEASED_CONTRACT", productionDeploymentPerformed:false}, null, 2)+"\n")' "$crossing_result"
+else
+  echo "HOLD: unexpected publication eligibility state: $publication_eligibility" >&2
+  exit 1
+fi
 
 consumer_port=$(allocate_loopback_port)
 setsid node "$package_dir/consumer/scripts/serve-publication-static.mjs" \

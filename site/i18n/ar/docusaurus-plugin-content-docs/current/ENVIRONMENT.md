@@ -84,7 +84,10 @@ uv run factlane --help
 
 تحمل حزمة مصدر FactLane وwheel أيضًا Skill المحمول
 [`using-factlane`](USING_FACTLANE_SKILL.md). تثبيت الحزمة لا يضبط مضيفًا بعينه
-ولا يسجّل ذلك Skill تلقائيًا.
+ولا يسجّل ذلك Skill تلقائيًا. يحدد `references/host-bootstrap.md` داخل Skill تسلسل
+الفحص/التسجيل المحايد للمضيف، ويحافظ على `installed` و`configured` و`present`
+و`registered` و`discoverable` و`loaded` كحالات أدلة منفصلة بدل اعتبار وجود الملف
+دليلًا على تفعيل المضيف.
 
 ## الانتقال بين الإصدارات
 

@@ -90,7 +90,10 @@ verifies the effective pragmas after backend initialization.
 
 FactLane's source package and wheel also carry the portable
 [`using-factlane` Skill](../skills/using-factlane/SKILL.md). Installing the package does
-not configure a particular host or auto-register that Skill.
+not configure a particular host or auto-register that Skill. The Skill's
+`references/host-bootstrap.md` defines the host-neutral inspection/registration sequence and keeps
+`installed`, `configured`, `present`, `registered`, `discoverable`, and `loaded` as distinct
+evidence states rather than treating file presence as host activation.
 
 ## Version transitions
 

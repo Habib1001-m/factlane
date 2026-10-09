@@ -33,6 +33,7 @@ where = ["src"]
 
 [tool.setuptools.data-files]
 "share/factlane/skills/using-factlane" = ["skills/using-factlane/SKILL.md"]
+"share/factlane/skills/using-factlane/references" = ["skills/using-factlane/references/host-bootstrap.md"]
 
 [tool.uv]
 package = true

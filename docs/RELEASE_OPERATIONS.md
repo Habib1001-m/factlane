@@ -205,6 +205,10 @@ Before enabling writes, verify the release as installed:
    `1c28bc370af0dd89499f8121fb7b611afb4c83773207ce546136abd8018f3e24`.
    A source checkout synchronized with `uv sync --frozen` keeps the authoritative Skill in the
    source tree and need not copy that data file under the virtual-environment prefix.
+   Later releases that add Skill references must treat the Skill as a reference set, not a single
+   file: record and verify the relative path plus SHA-256 for `SKILL.md` and every shipped
+   `references/*` file, and require source/wheel/sdist byte parity for that complete set. File
+   presence does not prove host registration or loaded state.
 5. Start the configured stdio host in the intended write profile and confirm tool discovery
    matches the release contract. Tool visibility does not grant write authority.
 6. When validating a new deployment path, prefer a disposable database for smoke tests. If a
@@ -246,7 +250,8 @@ Every later official release should use this checklist:
 3. If data/schema changes exist, document backup prerequisites, forward migration, post-migration
    integrity checks, and the supported rollback or restore path before release.
 4. Freeze one exact release tree; build wheel and source distribution from that tree; verify clean
-   installation, package metadata, runtime-source parity, and portable Skill parity.
+   installation, package metadata, runtime-source parity, and complete portable Skill reference-set
+   parity (relative paths plus SHA-256, not `SKILL.md` alone).
 5. Reverify the configured MCP host and the exact public tool set before publication.
 6. Publish the tag and assets only after the release gates pass. Do not change an already-published
    tag or replace its assets to make later documentation agree with it.

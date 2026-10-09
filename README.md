@@ -21,7 +21,10 @@
 
 FactLane is a local-first memory service for agents that communicate over the Model Context Protocol (MCP). It stores **bounded facts** with provenance, scope, and freshness metadata so agents can reuse durable information without treating a past conversation, an unverified contribution, or the memory store itself as authority over the current task.
 
-A normal agent may propose a fact as a **Candidate**. A separately trusted verifier decides whether it becomes **Current**. Current retrieval admits only eligible, validated, fresh facts.
+A user may explicitly ask to remember a bounded fact, or an agent may propose a reusable fact and
+ask for explicit authorization. With the active launcher authority, approved content may be stored
+as a **Candidate**. A separately trusted verifier decides whether it becomes **Current**. Current
+retrieval admits only eligible, validated, fresh facts.
 
 That distinction is the core of FactLane: **remembered context can support a decision without silently becoming current truth.**
 
@@ -44,7 +47,8 @@ That distinction is the core of FactLane: **remembered context can support a dec
 
 The key boundary is the transition from **Candidate** to **Current**:
 
-- an ordinary `delegated-candidate` agent can contribute a Candidate;
+- an ordinary `delegated-candidate` agent can contribute a Candidate only after explicit content
+  consent; that consent does not grant or elevate launcher authority;
 - it cannot self-promote by claiming privileged authority;
 - trusted promotion uses `memory_update` with `REVERIFY`, revision checks, and the Candidate's expected record identity;
 - `CURRENT` retrieval excludes unverified Candidates, even when they are a closer semantic match.
@@ -83,11 +87,14 @@ For exact tag/tree verification, published wheel and source-distribution digests
 uv run factlane \
   --db ./factlane.sqlite3 \
   --profile embeddinggemma-300m-768 \
-  --host-id local-dev \
-  --write-profile delegated-candidate
+  --host-id local-dev
 ```
 
-This example allows the connected agent to contribute **Candidates**. It does **not** let the agent validate its own facts. Omit `--write-profile` for the fail-closed read-only default. Trusted verifier authority is configured separately by the operator.
+This first connection is intentionally **read-only**. Confirm the host can launch FactLane,
+discover exactly five tools, and complete a read-only `memory_status` call before considering any
+write profile. If Candidate contribution is later needed, `delegated-candidate` is a separate
+trusted launcher change; it still does not let the agent validate its own facts. Trusted verifier
+authority is configured separately by the operator.
 
 > [!TIP]
 > FactLane is a **stdio process launched by the MCP host**, not a web service or an interactive REPL. If your host starts it from another working directory, use absolute executable and database paths.
@@ -210,7 +217,11 @@ Use [Release operations](docs/RELEASE_OPERATIONS.md) for:
 
 FactLane ships a portable [`using-factlane` Skill](skills/using-factlane/SKILL.md) alongside the Python runtime.
 
-The Skill teaches agents when memory is useful, how to select an exact scope, and how to respect Candidate/Current and authority boundaries. Installing the Python package does **not** automatically register or activate the Skill in an MCP host.
+The Skill teaches agents when memory is useful, how to select an exact scope, how user-authorized
+Candidate capture works, and how to respect Candidate/Current and authority boundaries. Its
+host-neutral bootstrap reference distinguishes runtime installation, MCP configuration, Skill
+presence, registration, discoverability, and loaded state. Installing the Python package does
+**not** automatically register or activate the Skill in an MCP host.
 
 ## Security and sensitive-memory recovery
 
