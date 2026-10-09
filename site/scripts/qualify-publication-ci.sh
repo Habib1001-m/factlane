@@ -6,6 +6,14 @@ site_root=$(cd -- "$script_dir/.." && pwd)
 repo_root=$(cd -- "$site_root/.." && pwd)
 public_origin=${FACTLANE_SITE_URL:-https://factlane.pages.dev}
 output_root=${FACTLANE_PUBLICATION_CI_OUTPUT:-$site_root/.publication-ci}
+safe_output_root=$site_root/.publication-ci
+
+output_root=$(node -e 'const path=require("node:path"); process.stdout.write(path.resolve(process.argv[1]))' "$output_root")
+safe_output_root=$(node -e 'const path=require("node:path"); process.stdout.write(path.resolve(process.argv[1]))' "$safe_output_root")
+if [[ "$output_root" != "$safe_output_root" ]]; then
+  echo "HOLD: FACTLANE_PUBLICATION_CI_OUTPUT must be exactly $safe_output_root" >&2
+  exit 1
+fi
 
 if [[ ${FACTLANE_PUBLIC_BUILD:-1} != 1 ]]; then
   echo 'HOLD: publication CI must run with FACTLANE_PUBLIC_BUILD=1' >&2
@@ -109,17 +117,13 @@ cmp -s "$base_manifest_a" "$base_manifest_b" || {
 cp -a "$build_a" "$negative_build"
 python - "$negative_build/index.html" <<'PY'
 from pathlib import Path
-import re
 import sys
 
 path = Path(sys.argv[1])
 text = path.read_text()
-marker = '<p>FACTLANE_RELEASE_BOUND_NEGATIVE_SENTINEL</p>'
-pattern = r'(<section\b[^>]*id="engineering-rigor"[^>]*>[\s\S]*?)(</section>)'
-updated, count = re.subn(pattern, rf'\1{marker}\2', text, count=1)
-if count != 1:
-    raise SystemExit('negative control could not find engineering-rigor section')
-path.write_text(updated)
+if 'Five tools' not in text:
+    raise SystemExit('negative control could not find Hero five-tool proof')
+path.write_text(text.replace('Five tools', 'Six tools', 1))
 PY
 negative_eligibility="$tmp_root/NEGATIVE_PUBLICATION_ELIGIBILITY.json"
 (
@@ -213,12 +217,11 @@ if (
   cd "$clone_a/site"
   node scripts/check-publication-crossing.mjs \
     --package "$package_dir" \
-    --expected-package-contents-sha256 "$expected_package_digest" \
-    --production-authorization-sha256 0000000000000000000000000000000000000000000000000000000000000000 \
+    --expected-package-contents-sha256 0000000000000000000000000000000000000000000000000000000000000000 \
     --expected-origin "$public_origin" \
     --expected-project factlane >/dev/null 2>&1
 ); then
-  echo 'HOLD: unauthorized crossing negative control unexpectedly passed' >&2
+  echo 'HOLD: wrong package trust-anchor negative control unexpectedly passed' >&2
   exit 1
 fi
 

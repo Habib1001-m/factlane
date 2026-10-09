@@ -268,6 +268,7 @@ try {
     `PUBLICATION_ELIGIBILITY=${eligibility.publicationEligibility}`,
     `RELEASE_CONTRACT_ROUTE_DIFFS=${eligibility.contractRouteDiffs.length}`,
     `RELEASE_CONTRACT_LANDING_DIFFS=${eligibility.landingSectionDiffs.length}`,
+    `RELEASE_CONTRACT_HEADER_DIFFS=${eligibility.landingHeaderDiffs.length}`,
     'OVERLAY_COMPOSITION=PASS',
     `OVERLAY_FILES=${composition.overlayFiles.length}`,
     `REDIRECT_RULES=${composition.redirects.rules}`,

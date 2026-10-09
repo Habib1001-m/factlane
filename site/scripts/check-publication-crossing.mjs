@@ -15,7 +15,6 @@ const args = parseArgs(process.argv.slice(2));
 for (const name of [
   'package',
   'expected-package-contents-sha256',
-  'production-authorization-sha256',
   'expected-origin',
   'expected-project',
 ]) {
@@ -24,13 +23,10 @@ for (const name of [
 
 const packageDir = path.resolve(args.package);
 const expectedDigest = args['expected-package-contents-sha256'];
-const authorizationDigest = args['production-authorization-sha256'];
 assert(/^[0-9a-f]{64}$/.test(expectedDigest), 'Expected package digest must be lowercase SHA-256');
-assert(/^[0-9a-f]{64}$/.test(authorizationDigest), 'Production authorization digest must be lowercase SHA-256');
-assert(authorizationDigest === expectedDigest, 'Production authorization is not bound to this exact package digest');
 
 const actualDigest = await sha256File(path.join(packageDir, 'PACKAGE_CONTENTS.sha256'));
-assert(actualDigest === expectedDigest, 'Package trust anchor does not match the owner-authorized digest');
+assert(actualDigest === expectedDigest, 'Package trust anchor does not match the expected digest');
 
 const expectedPackageFiles = new Map();
 for (const line of (await readFile(path.join(packageDir, 'PACKAGE_CONTENTS.sha256'), 'utf8')).split(/\r?\n/)) {
@@ -63,8 +59,8 @@ for (const line of (await readFile(path.join(packageDir, 'PROVENANCE.txt'), 'utf
 }
 const eligibility = await readJson(path.join(packageDir, 'PUBLICATION_ELIGIBILITY.json'));
 
-assert(provenance.get('PUBLIC_ORIGIN') === args['expected-origin'], 'Authorized Production origin mismatch');
-assert(provenance.get('CLOUDFLARE_PROJECT') === args['expected-project'], 'Authorized Cloudflare project mismatch');
+assert(provenance.get('PUBLIC_ORIGIN') === args['expected-origin'], 'Expected Production origin mismatch');
+assert(provenance.get('CLOUDFLARE_PROJECT') === args['expected-project'], 'Expected Cloudflare project mismatch');
 assert(provenance.get('CLOUDFLARE_DEPLOYMENT_METHOD') === 'PAGES_DIRECT_UPLOAD', 'Deployment primitive drifted');
 assert(provenance.get('CLOUDFLARE_GIT_SOURCE_REQUIRED') === 'NO', 'Qualified package unexpectedly requires Git-connected deployment');
 assert(provenance.get('PRODUCTION_AUTHORIZED') === 'NO', 'Package must never self-authorize Production');
@@ -97,7 +93,9 @@ try {
 
 console.log(JSON.stringify({
   status: 'PASS',
-  gate: 'OWNER_AUTHORIZED_EXACT_PACKAGE_READY_FOR_PREDEPLOY_EXTERNAL_STATE_CHECKS',
+  gate: 'EXACT_PACKAGE_INTEGRITY_AND_ELIGIBILITY_PASS',
+  externalProductionAuthorizationRequired: true,
+  externalProductionAuthorizationAuthenticatedByThisScript: false,
   packageContentsSha256: actualDigest,
   sourceCommit: provenance.get('SOURCE_COMMIT'),
   sourceTree: provenance.get('SOURCE_TREE'),

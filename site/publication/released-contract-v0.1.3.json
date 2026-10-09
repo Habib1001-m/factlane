@@ -56,5 +56,9 @@
       "how-it-works": "3f17fa8c6cfdb3cfb619c30cfa9dc214102820dc3db707e9391b9ee236599567",
       "engineering-rigor": "a53eac6b96cf2d4daf332dba397b6026fdfc25b95e9ec67f8e7528fc633583df"
     }
+  },
+  "landingReleaseHeaders": {
+    "/": "b2c66c72cc680a9af175dd293601b1d48430a14abc1d624aea988bcf41623b5a",
+    "/ar/": "203b147f1c598847d5d608ed63be5ec72fd8e49fe4b94c45dbe4f942369deba2"
   }
 }

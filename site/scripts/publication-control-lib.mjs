@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
-import {chmod, cp, lstat, mkdir, readFile, readdir, rm, writeFile} from 'node:fs/promises';
+import {chmod, cp, lstat, mkdir, readFile, readdir, realpath, rm, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 
 export function fail(message) {
@@ -146,4 +146,14 @@ export async function regularFile(target, label = target) {
   const stat = await lstat(target);
   assert(stat.isFile() && !stat.isSymbolicLink(), `${label} must be a regular file`);
   return stat;
+}
+
+export async function confinedRegularFile(target, root, label = target) {
+  await regularFile(target, label);
+  const [actualTarget, actualRoot] = await Promise.all([realpath(target), realpath(root)]);
+  assert(
+    actualTarget.startsWith(`${actualRoot}${path.sep}`),
+    `${label} resolved outside its controlled root`,
+  );
+  return actualTarget;
 }

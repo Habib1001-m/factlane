@@ -115,6 +115,17 @@ for (const [route, sections] of Object.entries(snapshot.landingReleaseSections ?
   }
 }
 
+const landingHeaderDiffs = [];
+const currentLandingHeaders = {};
+for (const [route, expectedHash] of Object.entries(snapshot.landingReleaseHeaders ?? {})) {
+  const html = await readFile(fileForRoute(route), 'utf8');
+  const header = html.match(/<header\b[^>]*>([\s\S]*?)<\/header>/i)?.[1];
+  assert(header !== undefined, `Released landing header is missing: ${route}`);
+  const digest = sha256Text(visibleText(header));
+  currentLandingHeaders[route] = digest;
+  if (digest !== expectedHash) landingHeaderDiffs.push(route);
+}
+
 const publicClaimSources = [
   'src/content/homeCopy.ts',
   'src/content/answerAuthority.json',
@@ -148,6 +159,7 @@ const releaseSnapshotStale = latestReachableReleaseTag !== authority.tag;
 const releaseClaimDrift =
   routeDiffs.length > 0 ||
   landingSectionDiffs.length > 0 ||
+  landingHeaderDiffs.length > 0 ||
   unexpectedNamedVersions.length > 0 ||
   softwareVersion !== authority.packageVersion;
 
@@ -180,11 +192,13 @@ const receipt = {
   releaseClaimDrift,
   contractRouteDiffs: routeDiffs,
   landingSectionDiffs,
+  landingHeaderDiffs,
   namedVersions: [...namedVersions].sort(),
   unexpectedNamedVersions,
   softwareVersion,
   contractMainText: currentContract,
   landingReleaseSections: currentLandingSections,
+  landingReleaseHeaders: currentLandingHeaders,
 };
 
 await writeJson(receiptPath, receipt);

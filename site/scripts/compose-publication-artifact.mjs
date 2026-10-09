@@ -5,6 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {
   assert,
   checksumText,
+  confinedRegularFile,
   copyFresh,
   exists,
   manifestForRoot,
@@ -57,7 +58,7 @@ await copyFresh(baseRoot, outputRoot);
 const overlayFiles = [];
 for (const entry of control.files) {
   const source = path.resolve(overlayRoot, safeRelative(entry.source, 'overlay source'));
-  assert(source.startsWith(`${publicationRoot}${path.sep}`), `Overlay source escaped publication control root: ${entry.source}`);
+  await confinedRegularFile(source, publicationRoot, `overlay source ${entry.source}`);
   const target = safeRelative(entry.target, 'overlay target');
   assert(await sha256File(source) === entry.sha256, `Overlay source digest mismatch: ${entry.source}`);
   const destination = path.join(outputRoot, target);
@@ -73,7 +74,7 @@ const redirectLines = [];
 const redirectFragments = [];
 for (const fragment of control.redirectFragments) {
   const source = path.resolve(overlayRoot, fragment.source);
-  assert(source.startsWith(`${publicationRoot}${path.sep}`), `Redirect source escaped publication control root: ${fragment.source}`);
+  await confinedRegularFile(source, publicationRoot, `redirect source ${fragment.source}`);
   const text = await readFile(source, 'utf8');
   assert(await sha256File(source) === fragment.sha256, `Redirect fragment digest mismatch: ${fragment.source}`);
   const lines = text.split(/\r?\n/).filter(Boolean);

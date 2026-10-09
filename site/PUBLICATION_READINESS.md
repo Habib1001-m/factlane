@@ -47,12 +47,14 @@ Production crossing must bind owner authorization to the exact SHA-256 of the ca
 `PACKAGE_CONTENTS.sha256`, authenticate that digest with trusted tooling, verify the package, and
 consume the frozen archive bytes without rebuilding them.
 
-`scripts/check-publication-crossing.mjs` is a non-deploying final local gate. It requires the owner-
-authorized package digest to equal the exact candidate digest and rejects publication when the
-eligibility receipt is HOLD. Passing that gate still does **not** deploy anything; the operator must
-separately re-check live Cloudflare project/deployment state before Direct Upload. Production
-rollback is likewise never automatic and requires explicit or pre-approved incident/runbook
-authority.
+`scripts/check-publication-crossing.mjs` is a non-deploying package-integrity and eligibility gate.
+It authenticates the exact candidate against the expected package digest supplied by the caller,
+verifies every package member plus the frozen archive and consumer verifier, and rejects a HOLD
+eligibility receipt. The script **does not authenticate owner authorization** and never labels its
+own PASS as authorization. A Production crossing still requires a separately authenticated owner
+approval bound externally to the exact accepted package digest, followed by fresh live Cloudflare
+project/deployment-state checks before Direct Upload. Production rollback is likewise never
+automatic and requires explicit or pre-approved incident/runbook authority.
 
 ## Reviewed publication shape
 
