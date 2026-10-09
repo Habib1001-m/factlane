@@ -17,22 +17,46 @@ const siteRoot = path.resolve(here, '..');
 const repoRoot = path.resolve(siteRoot, '..');
 const args = parseArgs(process.argv.slice(2));
 const buildRoot = path.resolve(args.build ?? '');
+const baselineBuildRoot = path.resolve(args['baseline-build'] ?? '');
 const receiptPath = path.resolve(args.receipt ?? path.join(buildRoot, '..', 'PUBLICATION_ELIGIBILITY.json'));
 const snapshotPath = path.resolve(
   args.snapshot ?? path.join(siteRoot, 'publication', 'released-contract-v0.1.3.json'),
 );
 
 assert(args.build, '--build is required');
+assert(args['baseline-build'], '--baseline-build is required');
 const snapshot = await readJson(snapshotPath);
 assert(snapshot.schemaVersion === 1, `Unsupported released-contract schema: ${snapshot.schemaVersion}`);
 const authority = snapshot.releaseAuthority;
+const baseline = snapshot.releasedPublicationBaseline;
 assert(authority && typeof authority === 'object', 'Released-contract snapshot is missing releaseAuthority');
+assert(baseline && typeof baseline === 'object', 'Released-contract snapshot is missing releasedPublicationBaseline');
 
 const tagRef = `refs/tags/${authority.tag}`;
 assert(git(repoRoot, ['cat-file', '-t', tagRef]) === 'tag', `Released authority tag is not annotated: ${authority.tag}`);
 assert(git(repoRoot, ['rev-parse', tagRef]) === authority.tagObject, `Released tag object drift: ${authority.tag}`);
 assert(git(repoRoot, ['rev-parse', `${authority.tag}^{commit}`]) === authority.commit, `Released commit drift: ${authority.tag}`);
 assert(git(repoRoot, ['rev-parse', `${authority.tag}^{tree}`]) === authority.tree, `Released tree drift: ${authority.tag}`);
+assert(
+  git(repoRoot, ['rev-parse', `${baseline.acceptedMainCommit}^{commit}`]) === baseline.acceptedMainCommit,
+  'Accepted publication baseline commit is unavailable',
+);
+assert(
+  git(repoRoot, ['rev-parse', `${baseline.acceptedMainCommit}^{tree}`]) === baseline.acceptedMainTree,
+  'Accepted publication baseline tree drifted',
+);
+assert(
+  baseline.acceptedMainTree === baseline.productionSourceTree,
+  'Accepted main baseline and Production source tree must remain identical',
+);
+assert(
+  git(repoRoot, ['merge-base', authority.commit, baseline.acceptedMainCommit]) === authority.commit,
+  'Accepted publication baseline is not descended from the released product authority',
+);
+assert(
+  git(repoRoot, ['merge-base', baseline.acceptedMainCommit, 'HEAD']) === baseline.acceptedMainCommit,
+  'Current source is not descended from the accepted publication baseline',
+);
 
 const releasedPyproject = git(repoRoot, ['show', `${authority.tag}:pyproject.toml`]);
 const releasedContract = git(repoRoot, ['show', `${authority.tag}:src/factlane/contract.py`]);
@@ -60,6 +84,20 @@ const reachableTags = git(repoRoot, ['tag', '--merged', 'HEAD', '--sort=-version
   .filter((value) => /^v\d+\.\d+\.\d+$/.test(value));
 assert(reachableTags.length > 0, 'No reachable semantic release tag found');
 const latestReachableReleaseTag = reachableTags[0];
+const authorityVersionParts = authority.tag.slice(1).split('.').map(Number);
+function atOrBeforeAuthority(tag) {
+  const parts = tag.slice(1).split('.').map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    if (parts[index] < authorityVersionParts[index]) return true;
+    if (parts[index] > authorityVersionParts[index]) return false;
+  }
+  return true;
+}
+const allowedNamedVersions = new Set(
+  git(repoRoot, ['tag', '--list', 'v*'])
+    .split(/\r?\n/)
+    .filter((value) => /^v\d+\.\d+\.\d+$/.test(value) && atOrBeforeAuthority(value)),
+);
 
 function decodeHtml(value) {
   return value
@@ -82,49 +120,85 @@ function visibleText(fragment) {
   );
 }
 
-function fileForRoute(route) {
-  if (route === '/') return path.join(buildRoot, 'index.html');
-  return path.join(buildRoot, route.replace(/^\//, ''), 'index.html');
+function attr(tag, name) {
+  const match = tag.match(new RegExp(`\\b${name}=["']([^"']*)["']`, 'i'));
+  return match ? decodeHtml(match[1]) : '';
 }
 
-const routeDiffs = [];
-const currentContract = {};
-for (const [route, expectedHash] of Object.entries(snapshot.contractMainText)) {
-  const html = await readFile(fileForRoute(route), 'utf8');
-  const main = html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i)?.[1];
-  assert(main !== undefined, `Released-contract route is missing SSR <main>: ${route}`);
-  const digest = sha256Text(visibleText(main));
-  currentContract[route] = digest;
-  if (digest !== expectedHash) routeDiffs.push(route);
-}
-
-const landingSectionDiffs = [];
-const currentLandingSections = {};
-for (const [route, sections] of Object.entries(snapshot.landingReleaseSections ?? {})) {
-  const html = await readFile(fileForRoute(route), 'utf8');
-  currentLandingSections[route] = {};
-  for (const [sectionId, expectedHash] of Object.entries(sections)) {
-    const escapedId = sectionId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const section = html.match(
-      new RegExp(`<section\\b[^>]*id=["']${escapedId}["'][^>]*>([\\s\\S]*?)<\\/section>`, 'i'),
-    )?.[1];
-    assert(section !== undefined, `Released landing section is missing: ${route}#${sectionId}`);
-    const digest = sha256Text(visibleText(section));
-    currentLandingSections[route][sectionId] = digest;
-    if (digest !== expectedHash) landingSectionDiffs.push(`${route}#${sectionId}`);
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, nested]) => [key, stableValue(nested)]),
+    );
   }
+  return value;
 }
 
-const landingHeaderDiffs = [];
-const currentLandingHeaders = {};
-for (const [route, expectedHash] of Object.entries(snapshot.landingReleaseHeaders ?? {})) {
-  const html = await readFile(fileForRoute(route), 'utf8');
-  const header = html.match(/<header\b[^>]*>([\s\S]*?)<\/header>/i)?.[1];
-  assert(header !== undefined, `Released landing header is missing: ${route}`);
-  const digest = sha256Text(visibleText(header));
-  currentLandingHeaders[route] = digest;
-  if (digest !== expectedHash) landingHeaderDiffs.push(route);
+function fileForRoute(root, route) {
+  if (route === '/') return path.join(root, 'index.html');
+  return path.join(root, route.replace(/^\//, ''), 'index.html');
 }
+
+async function routesFromBuild(root) {
+  const routes = [];
+  for (const relative of ['sitemap.xml', 'ar/sitemap.xml']) {
+    const xml = await readFile(path.join(root, relative), 'utf8');
+    for (const match of xml.matchAll(/<loc>([^<]+)<\/loc>/g)) {
+      const parsed = new URL(match[1].trim());
+      routes.push(parsed.pathname);
+    }
+  }
+  const unique = [...new Set(routes)].sort();
+  assert(unique.length === routes.length, `Duplicate canonical route in ${root}`);
+  assert(unique.length > 0, `No canonical routes found in ${root}`);
+  return unique;
+}
+
+async function routeProjection(root, route) {
+  const html = await readFile(fileForRoute(root, route), 'utf8');
+  const title = decodeHtml(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim() ?? '');
+  const metaTags = [...html.matchAll(/<meta\b[^>]*>/gi)].map((match) => match[0]);
+  const descriptionTag = metaTags.find((tag) => attr(tag, 'name').toLowerCase() === 'description');
+  const description = descriptionTag ? attr(descriptionTag, 'content') : '';
+  const main = html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i)?.[1];
+  assert(main !== undefined, `Release projection route is missing SSR <main>: ${route}`);
+  const jsonLd = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)]
+    .map((match) => stableValue(JSON.parse(match[1])));
+  const projection = {
+    title,
+    description,
+    mainText: visibleText(main),
+    jsonLd,
+  };
+  return {
+    sha256: sha256Text(JSON.stringify(projection)),
+    mainChars: projection.mainText.length,
+  };
+}
+
+async function buildProjection(root) {
+  const routes = await routesFromBuild(root);
+  const byRoute = {};
+  for (const route of routes) byRoute[route] = await routeProjection(root, route);
+  const hashes = Object.fromEntries(routes.map((route) => [route, byRoute[route].sha256]));
+  return {
+    routes,
+    byRoute,
+    sha256: sha256Text(JSON.stringify(hashes)),
+  };
+}
+
+const [releasedProjection, currentProjection] = await Promise.all([
+  buildProjection(baselineBuildRoot),
+  buildProjection(buildRoot),
+]);
+const routeSetDrift = JSON.stringify(currentProjection.routes) !== JSON.stringify(releasedProjection.routes);
+const projectionRouteDiffs = [...new Set([...releasedProjection.routes, ...currentProjection.routes])]
+  .filter((route) => releasedProjection.byRoute[route]?.sha256 !== currentProjection.byRoute[route]?.sha256)
+  .sort();
 
 const publicClaimSources = [
   'src/content/homeCopy.ts',
@@ -140,7 +214,7 @@ for (const relative of publicClaimSources) {
   for (const match of text.matchAll(/\bv\d+\.\d+\.\d+\b/g)) namedVersions.add(match[0]);
 }
 const unexpectedNamedVersions = [...namedVersions]
-  .filter((value) => !snapshot.allowedNamedVersions.includes(value))
+  .filter((value) => !allowedNamedVersions.has(value))
   .sort();
 
 const indexSource = await readFile(path.join(siteRoot, 'src', 'pages', 'index.tsx'), 'utf8');
@@ -157,9 +231,8 @@ for (const locale of ['en', 'ar']) {
 
 const releaseSnapshotStale = latestReachableReleaseTag !== authority.tag;
 const releaseClaimDrift =
-  routeDiffs.length > 0 ||
-  landingSectionDiffs.length > 0 ||
-  landingHeaderDiffs.length > 0 ||
+  routeSetDrift ||
+  projectionRouteDiffs.length > 0 ||
   unexpectedNamedVersions.length > 0 ||
   softwareVersion !== authority.packageVersion;
 
@@ -185,20 +258,20 @@ const receipt = {
     latestReachableReleaseTag,
     snapshotSha256: await sha256File(snapshotPath),
   },
-  releasedPublicationBaseline: snapshot.releasedPublicationBaseline,
+  releasedPublicationBaseline: baseline,
   publicationClass,
   publicationEligibility,
   releaseSnapshotStale,
   releaseClaimDrift,
-  contractRouteDiffs: routeDiffs,
-  landingSectionDiffs,
-  landingHeaderDiffs,
+  routeSetDrift,
+  projectionRouteDiffs,
+  releasedProjectionSha256: releasedProjection.sha256,
+  currentProjectionSha256: currentProjection.sha256,
+  releasedProjectionRoutes: releasedProjection.routes.length,
+  currentProjectionRoutes: currentProjection.routes.length,
   namedVersions: [...namedVersions].sort(),
   unexpectedNamedVersions,
   softwareVersion,
-  contractMainText: currentContract,
-  landingReleaseSections: currentLandingSections,
-  landingReleaseHeaders: currentLandingHeaders,
 };
 
 await writeJson(receiptPath, receipt);

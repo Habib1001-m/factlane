@@ -299,6 +299,7 @@ function requestUrl(pathname) {
 async function fetchOnce(pathname, userAgent) {
   const response = await fetch(requestUrl(pathname), {
     redirect: 'manual',
+    signal: AbortSignal.timeout(5000),
     headers: {
       accept: '*/*',
       'user-agent': userAgent,
@@ -318,6 +319,7 @@ async function fetchOnce(pathname, userAgent) {
 async function fetchAsset(pathname, userAgent) {
   const response = await fetch(requestUrl(pathname), {
     redirect: 'manual',
+    signal: AbortSignal.timeout(5000),
     headers: {
       accept: '*/*',
       'user-agent': userAgent,

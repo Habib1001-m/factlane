@@ -79,7 +79,8 @@ const archiveSha256 = provenance.get('FROZEN_ARCHIVE_SHA256');
 assert(archive && archiveSha256, 'Frozen archive provenance is incomplete');
 assert(await sha256File(path.join(packageDir, archive)) === archiveSha256, 'Frozen archive digest does not match authenticated provenance');
 
-const verificationRoot = await mkdtemp(path.join(os.tmpdir(), 'factlane-crossing-verify-'));
+const verificationParent = await mkdtemp(path.join(os.tmpdir(), 'factlane-crossing-verify-'));
+const verificationRoot = path.join(verificationParent, 'verified-static-root');
 try {
   execFileSync(process.execPath, [
     path.join(packageDir, 'consumer', 'scripts', 'verify-publication-package.mjs'),
@@ -88,7 +89,7 @@ try {
     '--extract', verificationRoot,
   ], {stdio: ['ignore', 'pipe', 'pipe']});
 } finally {
-  await rm(verificationRoot, {recursive: true, force: true});
+  await rm(verificationParent, {recursive: true, force: true});
 }
 
 console.log(JSON.stringify({

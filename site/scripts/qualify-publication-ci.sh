@@ -32,8 +32,10 @@ short_commit=${source_commit:0:8}
 tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/factlane-publication-ci.${short_commit}.XXXXXX")
 clone_a="$tmp_root/source-a"
 clone_b="$tmp_root/source-b"
+baseline_clone="$tmp_root/released-baseline-source"
 build_a="$tmp_root/build-a"
 build_b="$tmp_root/build-b"
+baseline_build="$tmp_root/released-baseline-build"
 composed_a="$tmp_root/composed-a"
 composed_b="$tmp_root/composed-b"
 receipt_a="$tmp_root/OVERLAY_COMPOSITION_A.json"
@@ -48,6 +50,7 @@ negative_collision_base="$tmp_root/negative-overlay-collision-base"
 package_dir="$output_root/package"
 freeze_result="$output_root/FREEZE_RESULT.json"
 consumer_readiness="$output_root/CONSUMER_READINESS_RESULT.json"
+crossing_result="$output_root/CROSSING_GATE_RESULT.json"
 server_pid=''
 
 cleanup() {
@@ -66,10 +69,34 @@ echo "PUBLICATION_CI_SOURCE_COMMIT=$source_commit"
 echo "PUBLICATION_CI_SOURCE_TREE=$source_tree"
 echo "PUBLICATION_CI_ORIGIN=$public_origin"
 
+released_snapshot="$site_root/publication/released-contract-v0.1.3.json"
+released_baseline_commit=$(node -p "require('$released_snapshot').releasedPublicationBaseline.acceptedMainCommit")
+released_baseline_tree=$(node -p "require('$released_snapshot').releasedPublicationBaseline.acceptedMainTree")
+actual_released_baseline_tree=$(git -C "$repo_root" rev-parse "$released_baseline_commit^{tree}")
+[[ "$actual_released_baseline_tree" == "$released_baseline_tree" ]] || {
+  echo 'HOLD: accepted released-publication baseline tree drifted' >&2
+  exit 1
+}
+
+probe_loopback() {
+  curl --connect-timeout 1 --max-time 2 -fsS "$1" >/dev/null 2>&1
+}
+
+wait_for_loopback() {
+  local url=$1
+  for _ in $(seq 1 30); do
+    if probe_loopback "$url"; then return 0; fi
+    sleep 0.2
+  done
+  return 1
+}
+
 git clone --quiet --local --no-hardlinks "$repo_root" "$clone_a"
 git clone --quiet --local --no-hardlinks "$repo_root" "$clone_b"
+git clone --quiet --local --no-hardlinks "$repo_root" "$baseline_clone"
 git -C "$clone_a" checkout --quiet --detach "$source_commit"
 git -C "$clone_b" checkout --quiet --detach "$source_commit"
+git -C "$baseline_clone" checkout --quiet --detach "$released_baseline_commit"
 
 build_one() {
   local clone=$1
@@ -90,6 +117,7 @@ build_one() {
   FACTLANE_SITE_URL="$public_origin" FACTLANE_PUBLIC_BUILD=1 npm run build -- --out-dir "$build_a"
 )
 build_one "$clone_b" "$build_b"
+build_one "$baseline_clone" "$baseline_build"
 
 base_manifest_a="$tmp_root/base-a.sha256"
 base_manifest_b="$tmp_root/base-b.sha256"
@@ -105,7 +133,10 @@ cmp -s "$base_manifest_a" "$base_manifest_b" || {
   cd "$clone_a/site"
   FACTLANE_BUILD_DIR="$build_a" FACTLANE_SEO_MODE=public FACTLANE_SITE_URL="$public_origin" node scripts/check-doc-seo.mjs
   FACTLANE_BUILD_DIR="$build_a" FACTLANE_SEO_MODE=public FACTLANE_SITE_URL="$public_origin" node scripts/check-answer-authority.mjs
-  node scripts/check-publication-eligibility.mjs --build "$build_a" --receipt "$eligibility"
+  node scripts/check-publication-eligibility.mjs \
+    --build "$build_a" \
+    --baseline-build "$baseline_build" \
+    --receipt "$eligibility"
   node scripts/compose-publication-artifact.mjs \
     --base "$build_a" \
     --output "$composed_a" \
@@ -121,14 +152,19 @@ import sys
 
 path = Path(sys.argv[1])
 text = path.read_text()
-if 'Five tools' not in text:
-    raise SystemExit('negative control could not find Hero five-tool proof')
-path.write_text(text.replace('Five tools', 'Six tools', 1))
+old = 'Codex and Hermes are tested stdio hosts.'
+new = 'Codex, Hermes and ExampleHost are tested stdio hosts.'
+if old not in text:
+    raise SystemExit('negative control could not find tested-host support claim')
+path.write_text(text.replace(old, new, 1))
 PY
 negative_eligibility="$tmp_root/NEGATIVE_PUBLICATION_ELIGIBILITY.json"
 (
   cd "$clone_a/site"
-  node scripts/check-publication-eligibility.mjs --build "$negative_build" --receipt "$negative_eligibility" >/dev/null
+  node scripts/check-publication-eligibility.mjs \
+    --build "$negative_build" \
+    --baseline-build "$baseline_build" \
+    --receipt "$negative_eligibility" >/dev/null
 )
 [[ $(node -p "require('$negative_eligibility').publicationClass") == RELEASE_BOUND ]] || {
   echo 'HOLD: release-bound negative control was not classified RELEASE_BOUND' >&2
@@ -175,11 +211,11 @@ cmp -s "$routes_a" "$routes_b" || {
     --port 4260
 ) > "$tmp_root/pages-runtime.log" 2>&1 &
 server_pid=$!
-for _ in $(seq 1 100); do
-  if curl -fsS http://127.0.0.1:4260/ >/dev/null 2>&1; then break; fi
-  sleep 0.1
-done
-curl -fsS http://127.0.0.1:4260/ >/dev/null
+wait_for_loopback http://127.0.0.1:4260/ || {
+  echo 'HOLD: Wrangler Pages runtime did not become ready within bounded probe window' >&2
+  exit 1
+}
+probe_loopback http://127.0.0.1:4260/
 (
   cd "$clone_a/site"
   FACTLANE_VERIFY_BASE_URL=http://127.0.0.1:4260 \
@@ -225,17 +261,26 @@ if (
   exit 1
 fi
 
+(
+  cd "$clone_a/site"
+  node scripts/check-publication-crossing.mjs \
+    --package "$package_dir" \
+    --expected-package-contents-sha256 "$expected_package_digest" \
+    --expected-origin "$public_origin" \
+    --expected-project factlane > "$crossing_result"
+)
+
 node "$package_dir/consumer/scripts/serve-publication-static.mjs" \
   --root "$verified_root" \
   --routes "$package_dir/ROUTES.txt" \
   --host 127.0.0.1 \
   --port 4261 > "$tmp_root/consumer-static-host.log" 2>&1 &
 server_pid=$!
-for _ in $(seq 1 100); do
-  if curl -fsS http://127.0.0.1:4261/ >/dev/null 2>&1; then break; fi
-  sleep 0.1
-done
-curl -fsS http://127.0.0.1:4261/ >/dev/null
+wait_for_loopback http://127.0.0.1:4261/ || {
+  echo 'HOLD: consumer static host did not become ready within bounded probe window' >&2
+  exit 1
+}
+probe_loopback http://127.0.0.1:4261/
 FACTLANE_VERIFY_BASE_URL=http://127.0.0.1:4261 \
 FACTLANE_EXPECTED_ORIGIN="$public_origin" \
 FACTLANE_VERIFY_MODE=public \

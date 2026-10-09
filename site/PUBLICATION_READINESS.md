@@ -17,11 +17,16 @@ The qualification path is intentionally split into four controls:
    Complete base manifests must be byte-identical. Source **commit and tree are both provenance**:
    source-aware sitemap `lastmod` uses Git history, so tree equality alone does not identify the
    publication bytes after a squash or history rewrite.
-2. `scripts/check-publication-eligibility.mjs` compares the release-bound public contract surface
-   with the immutable current RELEASED authority snapshot. A recognized release-bound Development
-   change may keep the required `test` context green while the receipt records
-   `HOLD_UNRELEASED_CONTRACT`; unknown/stale release authority is also publication HOLD. This keeps
-   protected `main` as DEVELOPMENT truth without allowing unreleased claims into Production.
+2. `scripts/check-publication-eligibility.mjs` derives the current RELEASED product authority from
+   the exact annotated release tag, then compares a generated public-claim projection for **all
+   canonical routes** against a clean build of the accepted publication-baseline commit. The
+   projection includes title, description, SSR `<main>` text and JSON-LD, so release/support claims
+   cannot evade classification by moving between landing sections or docs. The baseline hashes are
+   derived at qualification time from that immutable Git commit; they are not editable snapshot
+   values. A recognized release-bound Development change may keep the required `test` context green
+   while the receipt records `HOLD_UNRELEASED_CONTRACT`; unknown/stale release authority is also
+   publication HOLD. This keeps protected `main` as DEVELOPMENT truth without allowing unreleased
+   claims into Production.
 3. `scripts/compose-publication-artifact.mjs` overlays only the manifest-bound hosting/discovery
    inputs under `site/publication/`. Stable host redirects are separated from GSC/Bing/IndexNow
    ownership files. Path collisions, missing files, digest drift, redirect collisions, origin drift,
