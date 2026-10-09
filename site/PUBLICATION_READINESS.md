@@ -59,10 +59,14 @@ consume the frozen archive bytes without rebuilding them.
 
 `scripts/check-publication-crossing.mjs` is a non-deploying package-integrity and eligibility gate.
 It authenticates the exact candidate against the expected package digest supplied by the caller,
-verifies every package member plus the frozen archive and consumer verifier, and rejects a HOLD
-eligibility receipt. The script **does not authenticate owner authorization** and never labels its
-own PASS as authorization. A Production crossing still requires a separately authenticated owner
-approval bound externally to the exact accepted package digest, followed by fresh live Cloudflare
+verifies every package member plus the frozen archive and consumer verifier, and requires the exact
+eligibility state named by the caller. The default requires `ELIGIBLE_PENDING_OTHER_GATES`; CI may
+instead require `HOLD_UNRELEASED_CONTRACT` to prove that a release-bound Development artifact is
+intact **and still not Production-crossing eligible**. That expected-HOLD mode reports
+`productionCrossingEligible=false`; it does not turn the HOLD into authorization. The script **does
+not authenticate owner authorization** and never labels its own PASS as authorization. A Production
+crossing still requires a separately authenticated owner approval bound externally to the exact
+accepted package digest, followed by fresh live Cloudflare
 project/deployment-state checks before Direct Upload. Production rollback is likewise never
 automatic and requires explicit or pre-approved incident/runbook authority.
 

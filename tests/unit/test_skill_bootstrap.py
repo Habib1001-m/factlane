@@ -22,6 +22,22 @@ def _source_bytes() -> dict[str, bytes]:
 
 def test_skill_reference_set_is_tracked_and_packaged_by_configuration() -> None:
     assert all(path.is_file() for path in EXPECTED_REFERENCE_SET.values())
+    actual_source_files = {
+        path.relative_to(SKILL_ROOT).as_posix()
+        for path in SKILL_ROOT.rglob("*")
+        if path.is_file()
+    }
+    assert actual_source_files == set(EXPECTED_REFERENCE_SET)
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "skills/using-factlane"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert set(tracked) == {
+        str(SKILL_ROOT / relative) for relative in EXPECTED_REFERENCE_SET
+    }
 
     project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     data_files = project["tool"]["setuptools"]["data-files"]

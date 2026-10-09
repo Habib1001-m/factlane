@@ -402,18 +402,19 @@ if [[ "$publication_eligibility" == ELIGIBLE_PENDING_OTHER_GATES ]]; then
       --expected-project factlane > "$crossing_result"
   )
 elif [[ "$publication_eligibility" == HOLD_UNRELEASED_CONTRACT ]]; then
-  if (
+  (
     cd "$clone_a/site"
     node scripts/check-publication-crossing.mjs \
       --package "$package_dir" \
       --expected-package-contents-sha256 "$expected_package_digest" \
       --expected-origin "$public_origin" \
-      --expected-project factlane > "$tmp_root/unreleased-crossing-unexpected.json" 2>&1
-  ); then
-    echo 'HOLD: release-bound Development artifact unexpectedly passed Production crossing' >&2
+      --expected-project factlane \
+      --expected-publication-eligibility HOLD_UNRELEASED_CONTRACT > "$crossing_result"
+  )
+  node -e 'const x=require(process.argv[1]); if (x.status!=="PASS" || x.expectedPublicationEligibility!=="HOLD_UNRELEASED_CONTRACT" || x.publicationClass!=="RELEASE_BOUND" || x.productionCrossingEligible!==false || x.productionDeploymentPerformed!==false) process.exit(1)' "$crossing_result" || {
+    echo 'HOLD: unreleased-contract crossing receipt did not prove the expected fail-closed state' >&2
     exit 1
-  fi
-  node -e 'const fs=require("node:fs"); fs.writeFileSync(process.argv[1], JSON.stringify({status:"HOLD_EXPECTED", gate:"PRODUCTION_CROSSING", reason:"HOLD_UNRELEASED_CONTRACT", productionDeploymentPerformed:false}, null, 2)+"\n")' "$crossing_result"
+  }
 else
   echo "HOLD: unexpected publication eligibility state: $publication_eligibility" >&2
   exit 1

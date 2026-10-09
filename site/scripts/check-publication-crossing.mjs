@@ -23,7 +23,12 @@ for (const name of [
 
 const packageDir = path.resolve(args.package);
 const expectedDigest = args['expected-package-contents-sha256'];
+const expectedEligibility = args['expected-publication-eligibility'] ?? 'ELIGIBLE_PENDING_OTHER_GATES';
 assert(/^[0-9a-f]{64}$/.test(expectedDigest), 'Expected package digest must be lowercase SHA-256');
+assert(
+  ['ELIGIBLE_PENDING_OTHER_GATES', 'HOLD_UNRELEASED_CONTRACT'].includes(expectedEligibility),
+  `Unsupported expected publication eligibility: ${expectedEligibility}`,
+);
 
 const actualDigest = await sha256File(path.join(packageDir, 'PACKAGE_CONTENTS.sha256'));
 assert(actualDigest === expectedDigest, 'Package trust anchor does not match the expected digest');
@@ -66,13 +71,20 @@ assert(provenance.get('CLOUDFLARE_GIT_SOURCE_REQUIRED') === 'NO', 'Qualified pac
 assert(provenance.get('PRODUCTION_AUTHORIZED') === 'NO', 'Package must never self-authorize Production');
 assert(eligibility.status === 'PASS', 'Publication eligibility evaluation did not complete');
 assert(
-  eligibility.publicationEligibility === 'ELIGIBLE_PENDING_OTHER_GATES',
-  `Publication is HOLD: ${eligibility.publicationEligibility}`,
+  eligibility.publicationEligibility === expectedEligibility,
+  `Publication eligibility mismatch: expected ${expectedEligibility}, got ${eligibility.publicationEligibility}`,
 );
-assert(
-  ['RELEASE_NEUTRAL'].includes(eligibility.publicationClass),
-  `Publication class is not deploy-eligible under the current released authority: ${eligibility.publicationClass}`,
-);
+if (expectedEligibility === 'ELIGIBLE_PENDING_OTHER_GATES') {
+  assert(
+    eligibility.publicationClass === 'RELEASE_NEUTRAL',
+    `Deploy-eligible package must be RELEASE_NEUTRAL, got ${eligibility.publicationClass}`,
+  );
+} else {
+  assert(
+    eligibility.publicationClass === 'RELEASE_BOUND',
+    `Unreleased-contract HOLD must be RELEASE_BOUND, got ${eligibility.publicationClass}`,
+  );
+}
 
 const archive = provenance.get('FROZEN_ARCHIVE');
 const archiveSha256 = provenance.get('FROZEN_ARCHIVE_SHA256');
@@ -94,7 +106,12 @@ try {
 
 console.log(JSON.stringify({
   status: 'PASS',
-  gate: 'EXACT_PACKAGE_INTEGRITY_AND_ELIGIBILITY_PASS',
+  gate: expectedEligibility === 'ELIGIBLE_PENDING_OTHER_GATES'
+    ? 'EXACT_PACKAGE_INTEGRITY_AND_ELIGIBILITY_PASS'
+    : 'EXACT_PACKAGE_INTEGRITY_AND_EXPECTED_UNRELEASED_HOLD_PASS',
+  expectedPublicationEligibility: expectedEligibility,
+  publicationClass: eligibility.publicationClass,
+  productionCrossingEligible: expectedEligibility === 'ELIGIBLE_PENDING_OTHER_GATES',
   externalProductionAuthorizationRequired: true,
   externalProductionAuthorizationAuthenticatedByThisScript: false,
   packageContentsSha256: actualDigest,
