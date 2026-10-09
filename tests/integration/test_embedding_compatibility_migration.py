@@ -423,6 +423,117 @@ def test_missing_legacy_profile_with_materialized_data_preserves_nonsemantic_rea
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("invalid_profile", ["{not-json", "[]"])
+def test_invalid_profile_metadata_preserves_nonsemantic_reads_and_blocks_semantic_or_write(
+    tmp_path: Path,
+    invalid_profile: str,
+) -> None:
+    async def run() -> None:
+        path = tmp_path / "invalid-profile.db"
+        record, before_vector = await _seed_database(path, install_legacy_profile=True)
+        conn = _raw_connection(path)
+        try:
+            conn.execute(
+                "UPDATE adapter_meta SET value=? WHERE key='embedding_profile'",
+                (invalid_profile,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        engine = SQLiteVecEngine(str(path), _profile())
+        await engine.open()
+        provider = NonRuntimeProvider()
+        adapter = MemoryAdapter(
+            engine,
+            provider,
+            trusted_write_context=trusted_write_context_for_profile(
+                "delegated-candidate", contributor_ref="invalid-profile-test"
+            ),
+        )
+        try:
+            assert engine.embedding_compatibility_state == "UNPROVEN"
+            assert engine.embedding_profile_metadata_invalid is True
+            status = await adapter.status(scope="PROJECT", project_id="factlane")
+            compatibility = status["backend_status"]["embedding_compatibility"]
+            assert compatibility["state"] == "UNPROVEN"
+            assert compatibility["binding"] is None
+            assert "invalid" in str(compatibility["reason"])
+
+            got = await adapter.get(
+                memory_id=str(record["memory_id"]),
+                scope="PROJECT",
+                project_id="factlane",
+                retrieval_mode="CURRENT",
+            )
+            assert got["results"][0]["fact"] == record["fact"]
+            exact = await adapter.search(
+                query=str(record["fact"]),
+                intent_class="CURRENT_PROJECT_STATE",
+                scope="PROJECT",
+                project_id="factlane",
+                retrieval_mode="CURRENT",
+                retrieval_mode_kind="EXACT",
+            )
+            assert exact["results"][0]["fact"] == record["fact"]
+            keyword = await adapter.search(
+                query="durable",
+                intent_class="CURRENT_PROJECT_STATE",
+                scope="PROJECT",
+                project_id="factlane",
+                retrieval_mode="CURRENT",
+                retrieval_mode_kind="KEYWORD",
+            )
+            assert keyword["results"]
+            with pytest.raises(AdapterError) as semantic_error:
+                await adapter.search(
+                    query="legacy durable",
+                    intent_class="CURRENT_PROJECT_STATE",
+                    scope="PROJECT",
+                    project_id="factlane",
+                    retrieval_mode="CURRENT",
+                    retrieval_mode_kind="SEMANTIC",
+                )
+            assert semantic_error.value.code == "PROFILE_MISMATCH"
+            with pytest.raises(AdapterError) as write_error:
+                await adapter.store(
+                    fact="invalid metadata must not be silently relabeled",
+                    scope="PROJECT",
+                    project_id="factlane",
+                    memory_type="PROJECT_FACT",
+                    source_provenance={
+                        "source_class": "TEST",
+                        "source_ref": "invalid-profile-test",
+                        "source_hash": "f" * 64,
+                        "review_ref": "invalid-profile-test",
+                        "extraction_method": "test",
+                    },
+                    freshness_policy={"kind": "manual"},
+                    idempotency_key="invalid-profile-write",
+                )
+            assert write_error.value.code == "PROFILE_MISMATCH"
+        finally:
+            await engine.close()
+
+        conn = _raw_connection(path)
+        try:
+            assert conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='embedding_profile'"
+            ).fetchone()[0] == invalid_profile
+            rowid = conn.execute(
+                "SELECT id FROM memories WHERE content_hash=?",
+                (record["native_content_hash"],),
+            ).fetchone()[0]
+            after_vector = bytes(
+                conn.execute("SELECT content_embedding FROM memory_embeddings WHERE rowid=?", (rowid,)).fetchone()[0]
+            )
+            assert after_vector == before_vector
+        finally:
+            conn.close()
+
+    asyncio.run(run())
+
+
 def test_legacy_provenance_mismatch_fails_closed_without_relabeling(tmp_path: Path) -> None:
     async def run() -> None:
         path = tmp_path / "mixed-provenance.db"

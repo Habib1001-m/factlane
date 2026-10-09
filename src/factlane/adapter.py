@@ -326,6 +326,12 @@ async def _establish_embedding_compatibility(
     fingerprint = runtime_fingerprint(provider_status)
     snapshot = await engine.compatibility_snapshot()
     raw_profile = snapshot.get("profile_metadata")
+    if snapshot.get("profile_metadata_invalid") is True:
+        engine.set_embedding_compatibility(
+            "UNPROVEN",
+            reason="stored embedding profile metadata is invalid and cannot prove semantic compatibility",
+        )
+        return fingerprint
     parsed = parse_embedding_profile_metadata(raw_profile)
 
     if parsed is not None:

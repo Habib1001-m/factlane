@@ -453,6 +453,7 @@ class SQLiteVecEngine:
         self.embedding_compatibility_state = "COMPATIBLE"
         self.embedding_compatibility_reason: str | None = None
         self.embedding_profile_metadata: dict[str, object] | None = None
+        self.embedding_profile_metadata_invalid = False
         self._closed = False
         self._maintenance_lease_handle: Any = None
         self._maintenance_capability: _MaintenanceCapability | None = None
@@ -678,6 +679,7 @@ class SQLiteVecEngine:
         row = self.conn.execute("SELECT value FROM adapter_meta WHERE key='embedding_profile'").fetchone()
         if row is None:
             self.embedding_profile_metadata = None
+            self.embedding_profile_metadata_invalid = False
             materialized = sum(
                 int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
                 for table in ("adapter_records", "memories", "memory_embeddings")
@@ -690,10 +692,19 @@ class SQLiteVecEngine:
             return
         try:
             actual = json.loads(row[0])
-        except json.JSONDecodeError as exc:
-            raise AdapterError("SCHEMA_MISMATCH", "adapter profile metadata is invalid") from exc
+        except json.JSONDecodeError:
+            self.embedding_profile_metadata = None
+            self.embedding_profile_metadata_invalid = True
+            self.embedding_compatibility_state = "UNPROVEN"
+            self.embedding_compatibility_reason = "stored embedding profile metadata is invalid"
+            return
         if not isinstance(actual, dict):
-            raise AdapterError("SCHEMA_MISMATCH", "adapter profile metadata is invalid")
+            self.embedding_profile_metadata = None
+            self.embedding_profile_metadata_invalid = True
+            self.embedding_compatibility_state = "UNPROVEN"
+            self.embedding_compatibility_reason = "stored embedding profile metadata is invalid"
+            return
+        self.embedding_profile_metadata_invalid = False
         self.embedding_profile_metadata = actual
         self.embedding_compatibility_state = "UNPROVEN"
         self.embedding_compatibility_reason = "stored embedding profile requires runtime compatibility proof"
@@ -711,6 +722,7 @@ class SQLiteVecEngine:
         vector_count = int(self.conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0])
         return {
             "profile_metadata": self.embedding_profile_metadata,
+            "profile_metadata_invalid": self.embedding_profile_metadata_invalid,
             "adapter_count": adapter_count,
             "memory_count": memory_count,
             "vector_count": vector_count,
