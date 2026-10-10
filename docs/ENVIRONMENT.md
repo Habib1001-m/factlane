@@ -34,9 +34,11 @@ version eligibility does not bypass feature detection.
 
 ## Model profiles
 
-FactLane checks the model identity and digest, native/output dimensions, context capability,
-and input-size policy against the selected profile. It does not download a model implicitly.
-Install the model in your local Ollama instance before launching the server.
+FactLane checks the model identity/family, native/output dimensions, context capability, and
+input-size policy against the selected profile. Ollama must be **0.22.1 or newer**. The observed
+Ollama version and model digest are runtime provenance rather than, by themselves, proof that an
+existing vector space is semantically compatible. FactLane does not download a model implicitly;
+install the model in your local Ollama instance before launching the server.
 
 | Built-in profile | Ollama model | Notes |
 | --- | --- | --- |
@@ -65,6 +67,24 @@ URL** (by default `http://127.0.0.1:11434`). The provider interface permits futu
 implementations, but a remote endpoint, automatic cloud fallback, or hosted embedding
 service is **not** a supported current configuration.
 
+The `v0.1.4` compatibility binding records semantic identity separately
+from runtime provenance. Semantic identity includes the base model/family, source/output dimensions,
+document/query prefixes, normalization policy, cosine metric, projection revision, and FactLane
+embedding-compatibility revision. For the known v0.1.3 `embeddinggemma-300m-768` space, an
+integrity-bound qualified anchor set compares candidate document/query vectors directly with frozen
+legacy vectors before migration. The bundle itself is packaged as release material and is verified
+by SHA-256 before use.
+The historical Ollama version in that bundle comes from the frozen release-environment provenance;
+it is runtime provenance, not a direct per-request version attestation or a semantic-compatibility key.
+
+When that legacy proof passes, migration is metadata-only: existing vectors and each record's
+`embedding_profile_id`, `embedding_model_digest`, and `embedding_output_dimension` are preserved.
+If compatibility is missing, unknown, mixed, or fails qualification, durable facts remain readable
+through `memory_get`, `EXACT`, and `KEYWORD`, and `memory_status` can report the degraded state; semantic
+or hybrid retrieval, writes, and vector-mutating maintenance fail with `PROFILE_MISMATCH`. There is
+no automatic transform or re-embedding fallback. Re-embedding is an explicit operator/release
+migration decision, not a startup side effect.
+
 ## Host and storage isolation
 
 Use the FactLane executable and dependencies installed for this project rather than
@@ -90,7 +110,10 @@ verifies the effective pragmas after backend initialization.
 
 FactLane's source package and wheel also carry the portable
 [`using-factlane` Skill](../skills/using-factlane/SKILL.md). Installing the package does
-not configure a particular host or auto-register that Skill.
+not configure a particular host or auto-register that Skill. The Skill's
+`references/host-bootstrap.md` defines the host-neutral inspection/registration sequence and keeps
+`installed`, `configured`, `present`, `registered`, `discoverable`, and `loaded` as distinct
+evidence states rather than treating file presence as host activation.
 
 ## Version transitions
 
@@ -114,7 +137,16 @@ crawler, transcript repository, or bulk document index. Very large source collec
 separate ingestion/extraction stage, which may have different throughput and provider
 requirements; no terabyte-scale ingestion rate is claimed here.
 
-FactLane 0.1.3 is production-qualified for the documented local profile: Python 3.11+,
+The `v0.1.4` standard runtime is qualified on native Windows x64/AMD64
+with Python 3.11+, linked SQLite 3.42.0+, the pinned sqlite-vec Windows AMD64 artifact, command-
+launched stdio MCP, and the same five-tool authority model. Qualification covers default read-only,
+Candidate contribution, verifier promotion, WAL/busy behavior, cross-process CAS/concurrency,
+fresh-process durability, and valid Windows paths. Sensitive-memory recovery maintenance is still
+POSIX-only because its exclusion contract requires `fcntl`/`flock`; on Windows that maintenance
+capability fails closed before mutation without preventing normal package import, startup, or test
+collection. No Windows ARM64 support claim is made by this qualification.
+
+FactLane 0.1.4 is production-qualified for the documented local profile: Python 3.11+,
 linked SQLite 3.42.0+, command-launched stdio MCP, supported local Ollama embeddings, and
 the documented local POSIX storage/recovery contract. Qualification includes backup/restore
 compatibility, bounded concurrent operation, crash/restart rollback, configured host startup,

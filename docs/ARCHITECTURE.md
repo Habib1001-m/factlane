@@ -60,6 +60,10 @@ profile. `delegated-candidate` permits an agent to submit a bounded `CANDIDATE` 
 provenance, a freshness policy, and an idempotency key. It does not permit that agent to
 mint `VALIDATED_CURRENT` by asserting a verifier identity in its request.
 
+That runtime grant is separate from content consent. Candidate content is eligible for submission
+only after an explicit user remember/store request or an agent proposal that the user explicitly
+authorizes. Content consent does not change the launcher profile or grant verifier authority.
+
 Promotion is a distinct `memory_update` operation: a trusted verifier uses `REVERIFY`, the
 expected revision, and the exact Candidate `expected_record_id`. Storage contract v2 keeps
 `contribution_origin` separate from verification and preserves it on promotion. The verifier
@@ -78,9 +82,11 @@ Storage contract v2 also blocks stale legacy writers from inserting, updating, o
 adapter records through an untrusted raw SQLite connection. The trusted maintenance path has
 a separate authorization boundary; it does not make arbitrary direct SQL writes part of the
 public API. Because writer authorization is a connection-local SQLite function, an unregistered
-raw connection is rejected at function resolution with `no such function:
-factlane_contract_v2_writer`; the persistent trigger's own RAISE text is not reached on that
-connection, but the mutation remains fail-closed.
+raw connection against a compatibility-bound Development database is rejected at function
+resolution for `factlane_contract_v2_compat_writer`. When opening an exact legacy v0.1.3 database,
+the current runtime resolves the older `factlane_contract_v2_writer` as **deny** until compatibility
+is proven and the persistent fences are replaced atomically. Only the separately authorized
+maintenance/recovery path can enable that legacy writer capability for its bounded operation.
 
 ## Retrieval and history
 
@@ -120,10 +126,27 @@ required by sensitive-memory recovery. That operator also performs an independen
 probe before mutation.
 
 Embedding calls use an `EmbeddingProvider` contract. The currently shipped provider is
-Ollama over loopback HTTP; model digest, capability, dimension, and input-size checks fail
-closed. Potentially blocking provider calls are offloaded from the asyncio event loop. No
+Ollama over loopback HTTP; provider version, model family, capability, dimension, context, and
+input-size checks fail closed. Potentially blocking provider calls are offloaded from the asyncio event loop. No
 cloud embedding provider or automatic external fallback is shipped. See the
 [environment policy](ENVIRONMENT.md) for built-in profiles and exact prerequisites.
+
+The `v0.1.4` compatibility layer treats vector-space identity separately
+from runtime provenance. Semantic identity binds model identity/family, source and output dimensions,
+document/query prefixes, normalization, distance metric, projection revision, and FactLane's
+embedding-compatibility revision. Observed Ollama version and model digest remain runtime provenance;
+they are recorded on the binding and the per-record digest is preserved rather than retroactively
+rewritten. A runtime change may therefore be accepted only when the semantic identity still matches
+and a qualified, integrity-bound cross-space anchor proves direct old-vector/new-vector compatibility.
+
+For the exact known v0.1.3 `embeddinggemma-300m-768` legacy profile, a successful proof performs a
+metadata-only migration: existing vectors and adapter-record embedding provenance remain byte-for-byte
+and value-for-value unchanged, while revisioned compatibility metadata and the new stale-writer fence
+are committed atomically. Missing, unknown, mixed, or incompatible legacy identity remains
+`UNPROVEN`/`INCOMPATIBLE`: `memory_get`, `EXACT`, `KEYWORD`, and read-only status remain available,
+but `SEMANTIC`, `HYBRID`, writes, and vector-mutating maintenance fail closed. FactLane does not apply
+an automatic rotation/projection repair and does not automatically re-embed durable facts; re-embedding
+is a separate explicit maintenance/migration boundary.
 
 ## Maintenance and incident recovery
 
@@ -157,10 +180,14 @@ service. Process exit releases those descriptors; the sealing-incomplete state s
 operator reconciliation.
 
 The exclusion guarantee is bounded to supported local POSIX filesystems with reliable `flock`
-semantics; it does not extend to Windows or unvalidated network/FUSE locking behavior. It is a
-cooperative FactLane-runtime boundary, not a defense against arbitrary raw filesystem replacement
-by a privileged external process, so the independent quiescence inventory/full-stop procedure is
-still part of recovery.
+semantics; sensitive-memory recovery maintenance remains unsupported on Windows and on unvalidated
+network/FUSE locking behavior. The `v0.1.4` standard runtime is qualified
+separately on native Windows x64/AMD64 for normal import/startup, stdio MCP, SQLite WAL/busy/CAS,
+process concurrency, durability, and valid Windows paths. That Windows qualification does not add a
+Windows recovery implementation: recovery imports safely but fails closed before mutation when the
+POSIX `fcntl`/`flock` capability is unavailable. The recovery exclusion boundary is cooperative,
+not a defense against arbitrary raw filesystem replacement by a privileged external process, so the
+independent quiescence inventory/full-stop procedure is still part of recovery.
 
 ## Version and migration boundary
 
@@ -181,7 +208,15 @@ published release. The exact release-identity and transition procedure lives in
 
 ## Qualification boundary
 
-FactLane 0.1.3 is production-qualified for the documented local configuration: the packaged
+The `v0.1.4` qualification includes native Windows x64/AMD64 standard
+runtime behavior: package import, command startup, stdio discovery of exactly five public tools,
+default read-only authority, Candidate-only delegated contribution, verifier promotion, SQLite
+3.42.0+ with sqlite-vec, WAL/busy handling, cross-process CAS/concurrency, fresh-process durability,
+and valid Windows path handling. The pinned sqlite-vec dependency is qualified here on x64/AMD64;
+this is not a Windows ARM64 claim. Sensitive-memory recovery maintenance remains the POSIX-only
+capability described above.
+
+FactLane 0.1.4 is production-qualified for the documented local configuration: the packaged
 Python runtime, linked SQLite/SQLite-vec storage contract, stdio MCP surface, supported local
 embedding profile, and configured local host integrations. The qualification exercised
 backup/restore compatibility, bounded concurrent operation, crash/restart rollback,

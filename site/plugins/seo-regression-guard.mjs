@@ -154,7 +154,7 @@ function llmsText(origin) {
 
 > FactLane is a free, local-first governed MCP memory layer for compatible AI agents. It keeps bounded reusable facts with scope, provenance, freshness, and trusted Candidate → Current verification.
 
-FactLane is not a universal memory replacement or a general agent-safety system. Current user instructions, live project state, and verified live sources outrank remembered facts. The supported named release is v0.1.3 over command-launched stdio with a compatible MCP host.
+FactLane is not a universal memory replacement or a general agent-safety system. Current user instructions, live project state, and verified live sources outrank remembered facts. The supported named release is v0.1.4 over command-launched stdio with a compatible MCP host.
 
 ## Canonical answers
 
@@ -165,7 +165,7 @@ FactLane is not a universal memory replacement or a general agent-safety system.
 
 - [Core concepts](${origin}/docs/CORE_CONCEPTS/): Scope, provenance, freshness, Candidate, Current, and authority boundaries.
 - [Five MCP tools](${origin}/docs/TOOLS/): The exact public MCP surface and tool semantics.
-- [Environment and compatibility](${origin}/docs/ENVIRONMENT/): Supported v0.1.3 runtime, storage, transport, and local Ollama profile.
+- [Environment and compatibility](${origin}/docs/ENVIRONMENT/): Supported v0.1.4 runtime, storage, transport, and local Ollama profile.
 - [Quick Start](${origin}/docs/QUICKSTART/): Establish a supported read-only connection before enabling Candidate writes.
 - [Security](${origin}/docs/SECURITY/): Host identity, write authority, scope, and sensitive-memory boundaries.
 - [Source repository](https://github.com/Habib1001-m/factlane): Apache-2.0 source for FactLane.
@@ -174,7 +174,7 @@ FactLane is not a universal memory replacement or a general agent-safety system.
 
 - [المفاهيم الأساسية](${origin}/ar/docs/CORE_CONCEPTS/): النطاق والمصدر والحداثة ودورة Candidate → Current وحدود الصلاحيات.
 - [أدوات MCP الخمس](${origin}/ar/docs/TOOLS/): الواجهة العامة الدقيقة للأدوات ودلالاتها.
-- [البيئة والتوافق](${origin}/ar/docs/ENVIRONMENT/): حدود التشغيل والتخزين والنقل وملف تعريف Ollama المحلي المدعوم في v0.1.3.
+- [البيئة والتوافق](${origin}/ar/docs/ENVIRONMENT/): حدود التشغيل والتخزين والنقل وملف تعريف Ollama المحلي المدعوم في v0.1.4.
 - [البدء السريع](${origin}/ar/docs/QUICKSTART/): إنشاء اتصال مدعوم للقراءة فقط قبل تفعيل كتابة Candidate.
 `;
 }
@@ -258,7 +258,7 @@ export default function seoRegressionGuard(context) {
         for (const tool of ['memory_search', 'memory_get', 'memory_store', 'memory_update', 'memory_status']) {
           assert(byId['five-tools'].includes(tool), `answer authority missing ${tool}: ${answerLocale}`);
         }
-        for (const token of ['v0.1.3', 'Python 3.11+', 'SQLite 3.42.0+', 'stdio', 'Ollama']) {
+        for (const token of ['v0.1.4', 'Python 3.11+', 'SQLite 3.42.0+', 'stdio', 'Ollama']) {
           assert(
             byId['supported-environment'].includes(token),
             `answer authority environment missing ${token}: ${answerLocale}`,
@@ -434,7 +434,7 @@ export default function seoRegressionGuard(context) {
           assert(llms.includes(`${origin}/ar/docs/TOOLS/`), 'public llms.txt missing AR tool contract');
           assert(llms.includes(`${origin}/ar/docs/ENVIRONMENT/`), 'public llms.txt missing AR environment contract');
           assert(llms.includes(`${origin}/ar/docs/QUICKSTART/`), 'public llms.txt missing AR Quick Start');
-          assert(llms.includes('v0.1.3'), 'public llms.txt missing supported release boundary');
+          assert(llms.includes('v0.1.4'), 'public llms.txt missing supported release boundary');
           assert(llms.includes('not a universal memory replacement'), 'public llms.txt missing product-scope boundary');
         } else {
           assert(!(await fileExists(llmsPath)), 'localized /ar/llms.txt must not be emitted');

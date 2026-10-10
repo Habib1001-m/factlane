@@ -299,6 +299,7 @@ function requestUrl(pathname) {
 async function fetchOnce(pathname, userAgent) {
   const response = await fetch(requestUrl(pathname), {
     redirect: 'manual',
+    signal: AbortSignal.timeout(5000),
     headers: {
       accept: '*/*',
       'user-agent': userAgent,
@@ -318,6 +319,7 @@ async function fetchOnce(pathname, userAgent) {
 async function fetchAsset(pathname, userAgent) {
   const response = await fetch(requestUrl(pathname), {
     redirect: 'manual',
+    signal: AbortSignal.timeout(5000),
     headers: {
       accept: '*/*',
       'user-agent': userAgent,
@@ -618,7 +620,7 @@ if (mode === 'public') {
   assert(llms.contentType.includes('text/plain'), `Public llms.txt must be text/plain: ${llms.contentType}`);
   assert(llms.body.includes(`${expectedOrigin}/answers/`), 'llms.txt missing EN answer surface');
   assert(llms.body.includes(`${expectedOrigin}/ar/answers/`), 'llms.txt missing AR answer surface');
-  assert(llms.body.includes('v0.1.3'), 'llms.txt missing supported release boundary');
+  assert(llms.body.includes('v0.1.4'), 'llms.txt missing supported release boundary');
   assert(llms.body.includes('not a universal memory replacement'), 'llms.txt missing product-scope boundary');
   assert(arLlms.status === 404, `Public /ar/llms.txt must remain absent/404, got ${arLlms.status}`);
 

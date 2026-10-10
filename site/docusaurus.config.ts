@@ -372,7 +372,7 @@ const config: Config = {
         },
       ],
       copyright:
-        'FactLane v0.1.3 · Local-first governed memory for AI agents.',
+        'FactLane v0.1.4 · Local-first governed memory for AI agents.',
     },
     prism: {
       additionalLanguages: ['bash', 'json', 'toml', 'yaml'],

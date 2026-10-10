@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import uuid
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .contract import (
@@ -34,7 +35,17 @@ from .contract import (
     validate_scope,
     supported_values,
 )
-from .embeddings import EmbeddingProvider, OllamaLocalProvider
+from .embeddings import EmbeddingProfile, EmbeddingProvider, OllamaLocalProvider
+from .embedding_compatibility import (
+    CompatibilityProof,
+    build_embedding_profile_metadata,
+    evaluate_qualified_anchor,
+    map_legacy_profile,
+    parse_embedding_profile_metadata,
+    qualified_anchor_available,
+    runtime_fingerprint,
+    semantic_identity,
+)
 from .router import TruthRouter
 from .storage import RecordUniquenessConflict, SQLiteVecEngine
 
@@ -234,6 +245,8 @@ PROFILE_DEFINITIONS = {
         "source_dimension": 768,
         "document_prefix": "search_document: ",
         "query_prefix": "search_query: ",
+        "semantic_family": "nomic-bert",
+        "minimum_context_window": 2048,
     },
     "nomic-512": {
         "model": "nomic-embed-text:latest",
@@ -241,6 +254,8 @@ PROFILE_DEFINITIONS = {
         "source_dimension": 768,
         "document_prefix": "search_document: ",
         "query_prefix": "search_query: ",
+        "semantic_family": "nomic-bert",
+        "minimum_context_window": 2048,
     },
     "nomic-256": {
         "model": "nomic-embed-text:latest",
@@ -248,6 +263,8 @@ PROFILE_DEFINITIONS = {
         "source_dimension": 768,
         "document_prefix": "search_document: ",
         "query_prefix": "search_query: ",
+        "semantic_family": "nomic-bert",
+        "minimum_context_window": 2048,
     },
     "minilm-384": {
         "model": "all-minilm:l6-v2",
@@ -255,6 +272,8 @@ PROFILE_DEFINITIONS = {
         "source_dimension": 384,
         "document_prefix": "",
         "query_prefix": "",
+        "semantic_family": "bert",
+        "minimum_context_window": 512,
     },
     "embeddinggemma-300m-768": {
         "model": "embeddinggemma:300m",
@@ -262,8 +281,232 @@ PROFILE_DEFINITIONS = {
         "source_dimension": 768,
         "document_prefix": "title: none | text: ",
         "query_prefix": "task: search result | query: ",
+        "semantic_family": "gemma3",
+        "minimum_context_window": 2048,
     },
 }
+
+
+def _embedding_snapshot_reason(
+    snapshot: dict[str, object],
+    *,
+    store_key: str,
+    output_dimension: int,
+    legacy_profile_id: str | None = None,
+    legacy_model_digest: str | None = None,
+) -> str | None:
+    vector_count = int(snapshot.get("vector_count", 0))
+    vector_dimension = snapshot.get("vector_dimension")
+    if vector_count and vector_dimension != output_dimension:
+        return "stored vector dimension differs from the runtime semantic identity"
+    vector_stores = {value for value in snapshot.get("vector_stores", []) if isinstance(value, str)}
+    native_stores = {value for value in snapshot.get("native_stores", []) if isinstance(value, str)}
+    if vector_stores - {store_key} or native_stores - {store_key}:
+        return "stored vector partition differs from the bound embedding store"
+    adapter_dimensions = {value for value in snapshot.get("adapter_output_dimensions", []) if isinstance(value, int)}
+    if adapter_dimensions and adapter_dimensions != {output_dimension}:
+        return "record embedding dimensions are mixed or incompatible"
+    if legacy_profile_id is not None:
+        profile_ids = {value for value in snapshot.get("adapter_profile_ids", []) if isinstance(value, str)}
+        if profile_ids and profile_ids != {legacy_profile_id}:
+            return "legacy record profile provenance is mixed or incompatible"
+    if legacy_model_digest is not None:
+        digests = {value for value in snapshot.get("adapter_model_digests", []) if isinstance(value, str)}
+        if digests and digests != {legacy_model_digest}:
+            return "legacy record model provenance is mixed or incompatible"
+    return None
+
+
+async def _establish_embedding_compatibility(
+    engine: SQLiteVecEngine,
+    provider: OllamaLocalProvider,
+    provider_status: dict[str, object],
+) -> str:
+    identity = semantic_identity(provider.profile)
+    fingerprint = runtime_fingerprint(provider_status)
+    snapshot = await engine.compatibility_snapshot()
+    raw_profile = snapshot.get("profile_metadata")
+    if snapshot.get("profile_metadata_invalid") is True:
+        engine.set_embedding_compatibility(
+            "UNPROVEN",
+            reason="stored embedding profile metadata is invalid and cannot prove semantic compatibility",
+        )
+        return fingerprint
+    parsed = parse_embedding_profile_metadata(raw_profile)
+
+    if parsed is not None:
+        store_key = str(parsed["store_key"])
+        reason = _embedding_snapshot_reason(
+            snapshot,
+            store_key=store_key,
+            output_dimension=provider.profile.output_dimension,
+        )
+        if parsed.get("semantic_identity") != identity:
+            reason = "stored semantic identity differs from the configured embedding identity"
+        if reason is not None:
+            engine.set_embedding_compatibility("INCOMPATIBLE", reason=reason, store_key=store_key, metadata=parsed)
+            return fingerprint
+
+        if qualified_anchor_available(identity):
+            proof = await asyncio.to_thread(evaluate_qualified_anchor, provider, identity)
+            if not proof.compatible:
+                engine.set_embedding_compatibility(proof.state, reason=proof.reason, store_key=store_key, metadata=parsed)
+                return fingerprint
+            try:
+                post_proof_status = await asyncio.to_thread(provider.provider_status)
+            except AdapterError as exc:
+                state = "INCOMPATIBLE" if exc.code == "SCHEMA_MISMATCH" else "UNPROVEN"
+                engine.set_embedding_compatibility(
+                    state,
+                    reason="embedding runtime stability could not be proven across compatibility qualification",
+                    store_key=store_key,
+                    metadata=parsed,
+                )
+                return fingerprint
+            if runtime_fingerprint(post_proof_status) != fingerprint:
+                engine.set_embedding_compatibility(
+                    "UNPROVEN",
+                    reason="embedding runtime provenance changed during compatibility qualification",
+                    store_key=store_key,
+                    metadata=parsed,
+                )
+                return fingerprint
+            engine.profile = provider.profile
+            metadata = build_embedding_profile_metadata(
+                provider.profile,
+                store_key=store_key,
+                proof=proof,
+                provider_status=post_proof_status,
+            )
+            await engine.bind_embedding_profile(metadata, expected_profile=parsed)
+            return fingerprint
+
+        stored_proof = parsed.get("compatibility_proof")
+        if (
+            parsed.get("runtime_fingerprint") == fingerprint
+            and isinstance(stored_proof, dict)
+            and stored_proof.get("state") == "COMPATIBLE"
+            and stored_proof.get("basis") == "FRESH_EMPTY_RUNTIME_BINDING"
+        ):
+            engine.set_embedding_compatibility("COMPATIBLE", reason=None, store_key=store_key, metadata=parsed)
+        else:
+            engine.set_embedding_compatibility(
+                "UNPROVEN",
+                reason="runtime provenance changed and no qualified cross-space anchor exists for this embedding identity",
+                store_key=store_key,
+                metadata=parsed,
+            )
+        return fingerprint
+
+    legacy = map_legacy_profile(raw_profile)
+    if legacy is not None:
+        if legacy.semantic_identity != identity:
+            engine.set_embedding_compatibility(
+                "INCOMPATIBLE",
+                reason="legacy semantic identity differs from the configured embedding identity",
+                store_key=legacy.store_key,
+            )
+            return fingerprint
+        reason = _embedding_snapshot_reason(
+            snapshot,
+            store_key=legacy.store_key,
+            output_dimension=provider.profile.output_dimension,
+            legacy_profile_id=str(legacy.legacy_profile["profile_id"]),
+            legacy_model_digest=str(legacy.legacy_profile["model_digest"]),
+        )
+        if reason is not None:
+            engine.set_embedding_compatibility("INCOMPATIBLE", reason=reason, store_key=legacy.store_key)
+            return fingerprint
+        proof = await asyncio.to_thread(evaluate_qualified_anchor, provider, identity)
+        if not proof.compatible:
+            engine.set_embedding_compatibility(proof.state, reason=proof.reason, store_key=legacy.store_key)
+            return fingerprint
+        try:
+            post_proof_status = await asyncio.to_thread(provider.provider_status)
+        except AdapterError as exc:
+            state = "INCOMPATIBLE" if exc.code == "SCHEMA_MISMATCH" else "UNPROVEN"
+            engine.set_embedding_compatibility(
+                state,
+                reason="embedding runtime stability could not be proven across compatibility qualification",
+                store_key=legacy.store_key,
+            )
+            return fingerprint
+        if runtime_fingerprint(post_proof_status) != fingerprint:
+            engine.set_embedding_compatibility(
+                "UNPROVEN",
+                reason="embedding runtime provenance changed during compatibility qualification",
+                store_key=legacy.store_key,
+            )
+            return fingerprint
+        engine.profile = provider.profile
+        metadata = build_embedding_profile_metadata(
+            provider.profile,
+            store_key=legacy.store_key,
+            proof=proof,
+            provider_status=post_proof_status,
+        )
+        await engine.bind_embedding_profile(
+            metadata,
+            expected_profile=legacy.legacy_profile,
+            preserve_legacy_profile=True,
+        )
+        return fingerprint
+
+    has_materialized_data = any(int(snapshot.get(name, 0)) > 0 for name in ("adapter_count", "memory_count", "vector_count"))
+    if raw_profile is not None or has_materialized_data:
+        engine.set_embedding_compatibility(
+            "UNPROVEN",
+            reason="existing database embedding identity cannot be proven from qualified metadata",
+        )
+        return fingerprint
+    if snapshot.get("vector_dimension") != provider.profile.output_dimension:
+        engine.set_embedding_compatibility(
+            "INCOMPATIBLE",
+            reason="fresh database vector dimension differs from the configured embedding identity",
+        )
+        return fingerprint
+
+    if qualified_anchor_available(identity):
+        proof = await asyncio.to_thread(evaluate_qualified_anchor, provider, identity)
+        if not proof.compatible:
+            engine.set_embedding_compatibility(proof.state, reason=proof.reason)
+            return fingerprint
+        try:
+            post_proof_status = await asyncio.to_thread(provider.provider_status)
+        except AdapterError as exc:
+            state = "INCOMPATIBLE" if exc.code == "SCHEMA_MISMATCH" else "UNPROVEN"
+            engine.set_embedding_compatibility(
+                state,
+                reason="embedding runtime stability could not be proven across compatibility qualification",
+            )
+            return fingerprint
+        if runtime_fingerprint(post_proof_status) != fingerprint:
+            engine.set_embedding_compatibility(
+                "UNPROVEN",
+                reason="embedding runtime provenance changed during compatibility qualification",
+            )
+            return fingerprint
+        engine.profile = provider.profile
+    else:
+        post_proof_status = provider_status
+        proof = CompatibilityProof(
+            state="COMPATIBLE",
+            basis="FRESH_EMPTY_RUNTIME_BINDING",
+            reason=None,
+            anchor_bundle_id=None,
+            anchor_bundle_sha256=None,
+            minimum_document_cross_space_cosine=None,
+            minimum_query_match_cosine=None,
+            minimum_query_top1_margin=None,
+        )
+    metadata = build_embedding_profile_metadata(
+        provider.profile,
+        store_key=provider.profile.profile_id,
+        proof=proof,
+        provider_status=post_proof_status,
+    )
+    await engine.bind_embedding_profile(metadata, expect_missing=True)
+    return fingerprint
 
 
 class TokenCounter:
@@ -351,6 +594,7 @@ class MemoryAdapter:
         token_counter: TokenCounter | None = None,
         limits: AdapterLimits | None = None,
         runtime_agent_id: str = "factlane-local",
+        embedding_runtime_fingerprint: str | None = None,
     ) -> None:
         if not isinstance(trusted_write_context, TrustedWriteContext):
             raise AdapterError("INVALID_WRITE_CONTEXT", "MemoryAdapter requires an immutable TrustedWriteContext")
@@ -360,12 +604,84 @@ class MemoryAdapter:
         self.token_counter = token_counter or TokenCounter(None)
         self.limits = limits or AdapterLimits()
         self.runtime_agent_id = runtime_agent_id
+        self._embedding_runtime_fingerprint = embedding_runtime_fingerprint
         self.router = TruthRouter()
         self._write_lock: asyncio.Lock | None = None
         self._policy_decision_var: ContextVar[_PolicyDecision | None] = ContextVar(
             f"factlane_policy_decision_{id(self)}",
             default=None,
         )
+
+    async def _ensure_embedding_compatibility(self) -> str | None:
+        if not isinstance(self.engine, SQLiteVecEngine):
+            return None
+        if not isinstance(self.provider, OllamaLocalProvider):
+            self.engine.require_embedding_compatibility()
+            return None
+        try:
+            provider_status = await asyncio.to_thread(self.provider.provider_status)
+        except AdapterError as exc:
+            state = "INCOMPATIBLE" if exc.code == "SCHEMA_MISMATCH" else "UNPROVEN"
+            self.engine.set_embedding_compatibility(state, reason=exc.safe_message)
+            self.engine.require_embedding_compatibility()
+            raise AssertionError("unreachable")
+        self.engine.profile = self.provider.profile
+        fingerprint = runtime_fingerprint(provider_status)
+        if (
+            self.engine.embedding_compatibility_state == "COMPATIBLE"
+            and self._embedding_runtime_fingerprint == fingerprint
+        ):
+            return fingerprint
+        self._embedding_runtime_fingerprint = await _establish_embedding_compatibility(
+            self.engine,
+            self.provider,
+            provider_status,
+        )
+        self.engine.require_embedding_compatibility()
+        return self._embedding_runtime_fingerprint
+
+    async def _require_embedding_runtime_stable(
+        self,
+        expected_fingerprint: str | None,
+    ) -> EmbeddingProfile | None:
+        """Return provenance bound to the embedding result or fail closed on runtime drift."""
+
+        if expected_fingerprint is None or not isinstance(self.provider, OllamaLocalProvider):
+            return getattr(self.provider, "profile", None)
+        try:
+            provider_status = await asyncio.to_thread(self.provider.provider_status)
+        except AdapterError as exc:
+            state = "INCOMPATIBLE" if exc.code == "SCHEMA_MISMATCH" else "UNPROVEN"
+            self.engine.set_embedding_compatibility(
+                state,
+                reason="embedding runtime stability could not be proven after embedding",
+            )
+            raise AdapterError(
+                "PROFILE_MISMATCH",
+                "embedding result was discarded because runtime stability could not be proven",
+            ) from exc
+        observed_digest = provider_status.get("digest")
+        if not isinstance(observed_digest, str):
+            self.engine.set_embedding_compatibility(
+                "UNPROVEN",
+                reason="embedding runtime did not provide bounded model provenance after embedding",
+            )
+            raise AdapterError(
+                "PROFILE_MISMATCH",
+                "embedding result was discarded because runtime provenance was incomplete",
+            )
+        observed_profile = replace(self.provider.profile, model_digest=observed_digest)
+        self.engine.profile = observed_profile
+        if runtime_fingerprint(provider_status) != expected_fingerprint:
+            self.engine.set_embedding_compatibility(
+                "UNPROVEN",
+                reason="embedding runtime provenance changed while an embedding request was in flight",
+            )
+            raise AdapterError(
+                "PROFILE_MISMATCH",
+                "embedding result was discarded because runtime provenance changed in flight",
+            )
+        return observed_profile
 
     def _get_write_lock(self) -> asyncio.Lock:
         if self._write_lock is None:
@@ -655,18 +971,65 @@ class MemoryAdapter:
             model_digest=MODEL_DIGESTS[model],
             document_prefix=definition["document_prefix"],
             query_prefix=definition["query_prefix"],
+            semantic_family=definition["semantic_family"],
+            minimum_context_window=definition["minimum_context_window"],
             base_url=ollama_url,
         )
-        await asyncio.to_thread(provider.provider_status)
         engine = SQLiteVecEngine(db_path, provider.profile)
-        await engine.open()
-        return cls(
-            engine,
-            provider,
-            trusted_write_context=trusted_write_context,
-            token_counter=TokenCounter(tokenizer_path),
-            runtime_agent_id=runtime_agent_id,
-        )
+        try:
+            database_preexisted = os.path.isfile(db_path)
+            if not database_preexisted:
+                provider_status = await asyncio.to_thread(provider.provider_status)
+                await engine.open()
+            else:
+                await engine.open()
+                try:
+                    provider_status = await asyncio.to_thread(provider.provider_status)
+                except AdapterError as exc:
+                    if not hasattr(engine, "compatibility_snapshot"):
+                        raise
+                    snapshot = await engine.compatibility_snapshot()
+                    has_existing_state = snapshot.get("profile_metadata") is not None or any(
+                        int(snapshot.get(name, 0)) > 0
+                        for name in ("adapter_count", "memory_count", "vector_count")
+                    )
+                    if not has_existing_state:
+                        raise
+                    state = "INCOMPATIBLE" if exc.code == "SCHEMA_MISMATCH" else "UNPROVEN"
+                    engine.set_embedding_compatibility(state, reason=exc.safe_message)
+                    return cls(
+                        engine,
+                        provider,
+                        trusted_write_context=trusted_write_context,
+                        token_counter=TokenCounter(tokenizer_path),
+                        runtime_agent_id=runtime_agent_id,
+                        embedding_runtime_fingerprint=None,
+                    )
+            if hasattr(engine, "compatibility_snapshot"):
+                embedding_runtime_fingerprint = await _establish_embedding_compatibility(
+                    engine,
+                    provider,
+                    provider_status,
+                )
+            else:
+                # Narrow test-double seam: the production SQLiteVecEngine always
+                # exposes compatibility_snapshot. Keep concurrency probes focused
+                # on provider scheduling rather than requiring a storage fake to
+                # emulate the entire compatibility subsystem.
+                embedding_runtime_fingerprint = runtime_fingerprint(provider_status)
+            return cls(
+                engine,
+                provider,
+                trusted_write_context=trusted_write_context,
+                token_counter=TokenCounter(tokenizer_path),
+                runtime_agent_id=runtime_agent_id,
+                embedding_runtime_fingerprint=embedding_runtime_fingerprint,
+            )
+        except BaseException:
+            close = getattr(engine, "close", None)
+            if close is not None:
+                await close()
+            raise
 
     @staticmethod
     def _request_id(value: str | None) -> str:
@@ -865,6 +1228,7 @@ class MemoryAdapter:
             scope_context,
             {"requested_lifecycle_state": requested_lifecycle_state, "verified_by": verified_by},
         )
+        embedding_runtime_fingerprint = await self._ensure_embedding_compatibility()
         fact = validate_fact(fact)
         if memory_type not in MEMORY_TYPES:
             raise AdapterError("INVALID_ENUM", "memory_type is not supported")
@@ -952,6 +1316,9 @@ class MemoryAdapter:
                 last_verified_at = None
                 verified_by = "UNVERIFIED"
             embedding = (await asyncio.to_thread(self.provider.embed_documents, [fact]))[0]
+            embedding_profile = await self._require_embedding_runtime_stable(embedding_runtime_fingerprint)
+            if embedding_profile is None:
+                raise AdapterError("PROFILE_MISMATCH", "embedding provider did not expose bounded profile provenance")
             record_id = str(uuid.uuid4())
             memory_id = str(uuid.uuid4())
             created_at = iso_now()
@@ -984,9 +1351,9 @@ class MemoryAdapter:
                 "native_content_hash": stable_hash,
                 "payload_fingerprint": payload_fingerprint,
                 "idempotency_key": idempotency_key,
-                "embedding_profile_id": self.provider.profile.profile_id,
-                "embedding_model_digest": self.provider.profile.model_digest,
-                "embedding_output_dimension": self.provider.profile.output_dimension,
+                "embedding_profile_id": embedding_profile.profile_id,
+                "embedding_model_digest": embedding_profile.model_digest,
+                "embedding_output_dimension": embedding_profile.output_dimension,
             }
             try:
                 await self.engine.write_record(record, embedding)
@@ -1207,8 +1574,12 @@ class MemoryAdapter:
         envelope["budget"].update({"requested_top_k": requested_top_k, "max_bytes": max_bytes, "max_tokens": max_tokens})
         history = retrieval_mode == "REVIEW_HISTORY"
         history_semantic_partial = False
+        embedding_runtime_fingerprint: str | None = None
         if history and retrieval_mode_kind in {"SEMANTIC", "HYBRID"}:
+            embedding_runtime_fingerprint = await self._ensure_embedding_compatibility()
             history_semantic_partial = await self.engine.has_unmaterialized_history(scope_context)
+        elif retrieval_mode_kind in {"SEMANTIC", "HYBRID"}:
+            embedding_runtime_fingerprint = await self._ensure_embedding_compatibility()
         if retrieval_mode_kind == "EXACT":
             exact_rows = await self.engine.keyword_candidates(query.strip(), scope_context, limit=top_k * 4, history=history, exact=True)
             scored = [(row, 1.0) for row in exact_rows]
@@ -1217,6 +1588,7 @@ class MemoryAdapter:
             keyword_rows: list[dict[str, Any]] = []
             if retrieval_mode_kind in {"SEMANTIC", "HYBRID"}:
                 vector = await asyncio.to_thread(self.provider.embed_query, query.strip())
+                await self._require_embedding_runtime_stable(embedding_runtime_fingerprint)
                 vector_scored = await self.engine.vector_candidates(vector, scope_context, limit=max(top_k * 4, 16), history=history)
             if retrieval_mode_kind in {"KEYWORD", "HYBRID"}:
                 keyword_rows = await self.engine.keyword_candidates(query.strip(), scope_context, limit=max(top_k * 4, 16), history=history)
@@ -1285,6 +1657,7 @@ class MemoryAdapter:
             scope_context,
             {"mode": mode, "verification": verification, "replacement": replacement},
         )
+        embedding_runtime_fingerprint = await self._ensure_embedding_compatibility()
         if mode not in UPDATE_MODES:
             raise AdapterError(
                 "INVALID_ENUM",
@@ -1540,6 +1913,12 @@ class MemoryAdapter:
                 "embedding_output_dimension": self.provider.profile.output_dimension,
             }
             embedding = (await asyncio.to_thread(self.provider.embed_documents, [fact]))[0]
+            embedding_profile = await self._require_embedding_runtime_stable(embedding_runtime_fingerprint)
+            if embedding_profile is None:
+                raise AdapterError("PROFILE_MISMATCH", "embedding provider did not expose bounded profile provenance")
+            record["embedding_profile_id"] = embedding_profile.profile_id
+            record["embedding_model_digest"] = embedding_profile.model_digest
+            record["embedding_output_dimension"] = embedding_profile.output_dimension
             try:
                 if candidate_promotion:
                     equivalent = await self.engine.promote_candidate(
@@ -1595,8 +1974,29 @@ class MemoryAdapter:
         scope_context = None
         if scope is not None:
             scope_context = self._safe_scope(scope, project_id, worktree_id, workflow_id, agent_id)
+        provider_error: AdapterError | None = None
+        try:
+            provider_status = await asyncio.to_thread(self.provider.provider_status)
+        except AdapterError as exc:
+            provider_error = exc
+            provider_status = {
+                "available": False,
+                "error_code": exc.code,
+                "message": exc.safe_message,
+            }
+        else:
+            if isinstance(self.engine, SQLiteVecEngine) and isinstance(self.provider, OllamaLocalProvider):
+                self.engine.profile = self.provider.profile
         backend = await self.engine.status(scope_context)
-        provider_status = await asyncio.to_thread(self.provider.provider_status)
+        if isinstance(self.engine, SQLiteVecEngine):
+            compatibility = backend.get("embedding_compatibility")
+            if isinstance(compatibility, dict):
+                binding = compatibility.get("binding")
+                bound_fingerprint = binding.get("runtime_fingerprint") if isinstance(binding, dict) else None
+                compatibility["runtime_fingerprint_matches_bound"] = False if provider_error else (
+                    isinstance(bound_fingerprint, str)
+                    and runtime_fingerprint(provider_status) == bound_fingerprint
+                )
         envelope = self._base_envelope(request_id, "memory_status", scope_context)
         envelope["memory_needed"] = False
         envelope["status"] = "OK"

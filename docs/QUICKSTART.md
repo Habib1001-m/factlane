@@ -21,7 +21,7 @@ on the machine that will run FactLane. The Python environment used for FactLane 
 **SQLite 3.42.0+**.
 
 ```bash
-git clone --branch v0.1.3 --depth 1 https://github.com/Habib1001-m/factlane.git
+git clone --branch v0.1.4 --depth 1 https://github.com/Habib1001-m/factlane.git
 cd factlane
 uv sync --frozen
 uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
@@ -34,7 +34,7 @@ executable may report a *different* version. Below the floor, FactLane returns
 `BACKEND_COMPATIBILITY_MISMATCH` before creating or opening its database. Python version
 alone does not satisfy the storage contract.
 
-The clone command intentionally pins the versioned `v0.1.3` release instead of moving `main`.
+The clone command intentionally pins the versioned `v0.1.4` release instead of moving `main`.
 For artifact digests, published-package installation, upgrades and rollback, use
 [Release operations](RELEASE_OPERATIONS.md).
 
@@ -97,7 +97,10 @@ enabled = true
 Reload your installed Codex version's MCP configuration and confirm that the five FactLane tools
 appear. An agent's use of those tools should follow the portable
 [using-factlane Skill](../skills/using-factlane/SKILL.md), installed through your host's
-supported Skill mechanism.
+supported Skill mechanism. The exact `v0.1.4` release pinned in step 1 ships both `SKILL.md` and
+`references/host-bootstrap.md`. The bootstrap reference is host-neutral guidance for inspection,
+registration state, and evidence; it does not imply that a host registered or loaded the Skill. Do not infer that the Skill is registered, discoverable, or loaded merely because its
+files exist.
 
 ### Hermes (tested stdio host)
 
@@ -118,7 +121,8 @@ mcp_servers:
 
 Reload Hermes's MCP configuration and check tool discovery. The portable Skill is included in
 FactLane's source and package artifacts but is **not automatically registered** with either
-host by installing the wheel.
+host by installing the wheel. Use the host's supported Skill mechanism and report `present`,
+`registered`, `discoverable`, and `loaded` as separate observed states.
 
 ### Another MCP client
 
@@ -193,8 +197,11 @@ The `--write-profile` flag is a **trusted launcher setting**:
 | `delegated-candidate` | Normal agent can `memory_store` a `CANDIDATE`; it cannot self-verify or update. |
 | `owner-current`, `repo-verifier`, `automated-verifier` | Restricted trusted operator/verifier profiles; do not configure for an ordinary agent to acquire more authority. |
 
-An Owner's approval of content does not change the authorization of a running agent. Candidate
-promotion is a separate, trusted `memory_update` operation.
+User approval of content does not change the authorization of a running agent. Candidate promotion
+is a separate, trusted `memory_update` operation. Content consent has two supported entry paths:
+an explicit request such as “remember this,” or an agent-proposed reusable fact that the user then
+explicitly authorizes. Both authorize only the bounded Candidate content, subject to the active
+runtime/privacy boundary; neither authorizes changing the launcher profile or becoming a verifier.
 
 If the connected agent should be allowed to contribute **unverified Candidates**, add the trusted
 launcher setting:
@@ -212,6 +219,9 @@ If search returns no result, do not treat that as permission to invent a fact. T
 an actual Candidate, consult `factlane --help-tools` or the live MCP schema for the complete
 required `source_provenance`, `freshness_policy`, `memory_type`, and `idempotency_key`
 fields. Use one bounded, attributable fact, not a transcript or an arbitrary directory dump.
+If the proposed fact originated with the agent rather than an explicit user request, present the
+bounded fact and obtain explicit authorization before calling `memory_store`. Never perform
+autonomous post-turn storage.
 
 A trusted verifier reviewing a Candidate uses `REVIEW_HISTORY` to inspect it and
 `memory_update` with `mode=REVERIFY`, `expected_revision`, and the Candidate's

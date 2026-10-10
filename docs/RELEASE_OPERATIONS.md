@@ -9,6 +9,21 @@ Platform permissions can technically mutate those objects, so verify identities 
 trusting a name alone. The `main` branch may receive documentation or development changes after
 a release and must not be used as a substitute for a historical release identity.
 
+### Development package identity
+
+The moving Development source may temporarily retain the latest released package version in
+`pyproject.toml` while later changes are being qualified. That metadata does **not** make a local
+wheel or source distribution an official copy of the named release. If the source commit/tree does
+not exactly match the released authority, those artifacts are Development/qualification-only and
+must not be published or represented as the official release, even when their filenames contain the
+same version.
+
+Repository CI classifies this boundary with `scripts/check_release_surface.py`. The Development
+classification is intentionally fail-closed for release identity: it records that the source differs
+from the released tag and does not assign a successor version, release name, publication authority,
+or Production authority. A later official release must receive its own separately authorized
+version/tag and artifact digests before this boundary can be reconciled to released truth.
+
 ## Release identity contract
 
 For every official release, record all of the following before installation or upgrade:
@@ -62,6 +77,35 @@ behavior were exercised; a true kernel `ENOSPC` condition and a true `EROFS` mou
 that FactLane can name as a supported production rollback target. A package installer being
 able to replace one version with another is not evidence that an older runtime can safely open
 a database that a newer version has modified.
+
+## FactLane v0.1.4 release notes and v0.1.3 transition
+
+`v0.1.4` is the authorized successor to `v0.1.3`. It preserves Public Contract Revision 2 and
+exactly the same five public MCP tools. The release adds the qualified v0.1.3 embedding-space
+compatibility/migration path, native Windows x64 standard-runtime qualification, portable Skill
+bootstrap guidance, stronger package/release-surface controls, and the bilingual publication
+surface. Pi remains bounded to the previously accepted native-Windows read-path integration claim;
+no broader Pi write-host claim is introduced.
+
+### Migration from v0.1.3
+
+- Preserve an operator-owned backup before opening durable data with v0.1.4.
+- Exact known v0.1.3 `embeddinggemma-300m-768` data may migrate metadata-only **only after** the
+  integrity-bound compatibility proof passes; existing vectors and per-record embedding provenance
+  are preserved rather than rewritten.
+- Unknown, mixed, or incompatible embedding identity remains fail-closed for semantic/hybrid
+  retrieval and vector-mutating writes; safe exact/keyword/get paths remain available as documented.
+- Public Contract Revision remains `2`; the public tool set remains `memory_search`, `memory_get`,
+  `memory_store`, `memory_update`, `memory_status`.
+- Sensitive-memory recovery remains operator-only and POSIX-only; Windows standard runtime support
+  does not expand that recovery boundary.
+- Package/runtime rollback to v0.1.3 is not equivalent to a durable-data downgrade guarantee. Do not
+  open data modified under v0.1.4 with v0.1.3 unless the applicable data state is proven compatible
+  or restored from a verified pre-upgrade backup.
+
+The exact v0.1.4 annotated-tag object, public commit/tree, wheel/sdist names and SHA-256 digests are
+recorded only after the protected public crossing and release seal complete. They must not be
+invented in the candidate tree.
 
 ## Install an exact release
 
@@ -205,6 +249,10 @@ Before enabling writes, verify the release as installed:
    `1c28bc370af0dd89499f8121fb7b611afb4c83773207ce546136abd8018f3e24`.
    A source checkout synchronized with `uv sync --frozen` keeps the authoritative Skill in the
    source tree and need not copy that data file under the virtual-environment prefix.
+   Later releases that add Skill references must treat the Skill as a reference set, not a single
+   file: record and verify the relative path plus SHA-256 for `SKILL.md` and every shipped
+   `references/*` file, and require source/wheel/sdist byte parity for that complete set. File
+   presence does not prove host registration or loaded state.
 5. Start the configured stdio host in the intended write profile and confirm tool discovery
    matches the release contract. Tool visibility does not grant write authority.
 6. When validating a new deployment path, prefer a disposable database for smoke tests. If a
@@ -246,7 +294,12 @@ Every later official release should use this checklist:
 3. If data/schema changes exist, document backup prerequisites, forward migration, post-migration
    integrity checks, and the supported rollback or restore path before release.
 4. Freeze one exact release tree; build wheel and source distribution from that tree; verify clean
-   installation, package metadata, runtime-source parity, and portable Skill parity.
+   installation, package metadata, runtime-source parity, and complete portable Skill reference-set
+   parity (relative paths plus SHA-256, not `SKILL.md` alone).
+   Use `scripts/build_qualified_package.py` for qualification builds: it exports the exact committed
+   tree into a disposable directory before invoking `uv build`, so ignored or stale `build/` and
+   `*.egg-info/` state in a reused checkout cannot enter the release payload. Do not use a direct
+   `uv build --wheel` from a reused worktree as release evidence.
 5. Reverify the configured MCP host and the exact public tool set before publication.
 6. Publish the tag and assets only after the release gates pass. Do not change an already-published
    tag or replace its assets to make later documentation agree with it.
@@ -259,6 +312,15 @@ Every later official release should use this checklist:
 9. Do not retarget a previous release tag or replace its published assets. Continue verifying
    historical releases by their recorded commit/tree and artifact digests. A documentation
    maintenance change on `main` does not rewrite a historical release.
+10. If a release accepts an existing embedding space across a runtime/provider transition, record
+    the semantic-compatibility revision and identity separately from runtime provenance, freeze the
+    qualified cross-space anchor bundle as integrity-bound release material, and require byte parity
+    for that bundle across source, wheel, and source distribution.
+11. For every supported legacy embedding transition, prove whether migration is metadata-only or
+    requires explicit re-embedding. A metadata-only transition must demonstrate zero vector rewrite
+    and preservation of per-record embedding provenance. An incompatible or unprovable transition
+    must preserve durable facts and fail semantic/vector-mutating operations closed until an explicit
+    re-embedding or verified restore path is authorized.
 
 See [Quick Start](QUICKSTART.md) for first-time host setup, [Environment](ENVIRONMENT.md) for
 runtime requirements, [Architecture](ARCHITECTURE.md) for storage and contract boundaries, and

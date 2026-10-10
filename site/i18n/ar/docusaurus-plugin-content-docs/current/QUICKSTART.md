@@ -21,7 +21,7 @@
 **`SQLite 3.42.0+`**.
 
 ```bash
-git clone --branch v0.1.3 --depth 1 https://github.com/Habib1001-m/factlane.git
+git clone --branch v0.1.4 --depth 1 https://github.com/Habib1001-m/factlane.git
 cd factlane
 uv sync --frozen
 uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
@@ -34,7 +34,7 @@ uv run factlane --help-tools
 `BACKEND_COMPATIBILITY_MISMATCH` قبل إنشاء قاعدة البيانات أو فتحها. إصدار Python
 وحده لا يفي بعقد التخزين.
 
-يتعمد أمر النسخ تثبيت إصدار `v0.1.3` بدلًا من فرع `main` المتغير.
+يتعمد أمر النسخ تثبيت إصدار `v0.1.4` بدلًا من فرع `main` المتغير.
 للحصول على بصمات الملفات، وتثبيت الحزم المنشورة، والترقيات، والتراجع، استخدم
 [عمليات الإصدار](RELEASE_OPERATIONS.md).
 
@@ -94,7 +94,11 @@ enabled = true
 
 أعد تحميل إعداد MCP في إصدار Codex المثبّت لديك وتأكد من ظهور أدوات FactLane الخمس.
 ينبغي أن يتبع استخدام الوكيل لهذه الأدوات Skill المحمول
-[`using-factlane`](USING_FACTLANE_SKILL.md)، المثبّت عبر آلية Skill التي يدعمها مضيفك.
+[`using-factlane`](USING_FACTLANE_SKILL.md)، المثبّت عبر آلية Skill التي يدعمها مضيفك. إصدار
+`v0.1.4` المحدد في الخطوة 1 يشحن `SKILL.md` و`references/host-bootstrap.md`. المرجع الثاني
+محايد للمضيف للفحص والفصل بين حالات التسجيل وتقرير الأدلة؛ ولا يعني وجوده أن المضيف سجّل Skill
+أو حمّلها. لا تفترض أن Skill مسجّلة أو
+discoverable أو loaded لمجرد وجود ملفاتها.
 
 ### Hermes (مضيف `stdio` مختبَر)
 
@@ -115,6 +119,8 @@ mcp_servers:
 
 أعد تحميل إعداد Hermes وتحقق من اكتشاف الأدوات. Skill المحمول مضمن في مصدر FactLane
 وحزمته، لكنه **لا يُسجَّل تلقائيًا** مع أي من المضيفين بمجرد تثبيت wheel.
+استخدم آلية Skill التي يدعمها المضيف، وأبلغ عن `present` و`registered` و`discoverable`
+و`loaded` كحالات مرصودة منفصلة.
 
 ### عميل MCP آخر
 
@@ -187,8 +193,11 @@ memory_status
 | `delegated-candidate` | يستطيع الوكيل العادي استخدام `memory_store` للمساهمة بسجل `CANDIDATE`؛ ولا يستطيع التحقق منه ذاتيًا أو تحديثه. |
 | `owner-current`, `repo-verifier`, `automated-verifier` | ملفات تعريف مقيدة للمشغّل/المتحقق الموثوق؛ لا تضبطها لوكيل عادي ليكتسب صلاحية أكبر. |
 
-موافقة المالك على المحتوى لا تغيّر صلاحيات الوكيل العامل. ترقية Candidate هي عملية
-`memory_update` موثوقة ومنفصلة.
+موافقة المستخدم على المحتوى لا تغيّر صلاحيات الوكيل العامل. ترقية Candidate هي عملية
+`memory_update` موثوقة ومنفصلة. لموافقة المحتوى مساران مدعومان: طلب صريح مثل «تذكّر هذا»،
+أو حقيقة قابلة لإعادة الاستخدام يقترحها الوكيل ثم يفوضها المستخدم صراحة. كلاهما يصرح فقط
+بمحتوى Candidate المحدود ضمن حد runtime/privacy الفعّال؛ ولا يصرح بتغيير launcher profile
+أو باكتساب سلطة المتحقق.
 
 إذا كان يجب السماح للوكيل المتصل بالمساهمة بسجلات Candidate **غير متحقق منها**، فأضف إعداد المشغّل الموثوق:
 
@@ -205,6 +214,8 @@ memory_status
 راجع `factlane --help-tools` أو مخطط MCP الحي للحصول على الحقول المطلوبة كاملة:
 `source_provenance` و`freshness_policy` و`memory_type` و`idempotency_key`.
 استخدم حقيقة واحدة محدودة وقابلة للإسناد، وليس نص محادثة أو تفريغًا اعتباطيًا لمجلد.
+إذا كانت الحقيقة المقترحة قد نشأت من الوكيل بدل طلب مستخدم صريح، فاعرض الحقيقة المحدودة
+واحصل على تفويض صريح قبل استدعاء `memory_store`. ولا تنفّذ تخزينًا ذاتيًا بعد انتهاء الدور.
 
 يستخدم متحقق موثوق يراجع Candidate وضع `REVIEW_HISTORY` لفحصه، ثم يستخدم
 `memory_update` مع `mode=REVERIFY` و`expected_revision` و`expected_record_id` الخاص

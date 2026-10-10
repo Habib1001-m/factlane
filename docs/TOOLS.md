@@ -46,6 +46,10 @@ Use it to contribute one bounded fact when the launcher profile permits writing.
 An ordinary `delegated-candidate` connection can contribute a **Candidate**. The tool does not
 let that agent mint `VALIDATED_CURRENT` by asserting a privileged verifier identity.
 
+Runtime permission is not content consent. Store only after an explicit user remember/store
+request or after the user explicitly authorizes a bounded fact proposed by the agent. Neither path
+elevates launcher or verifier authority.
+
 A good contributed fact is:
 
 - bounded;
@@ -73,6 +77,13 @@ An ordinary delegated agent does not gain verifier authority simply because this
 ## `memory_status`
 
 Use it for bounded, read-only observations about a scope's storage and embedding-profile state.
+
+In `v0.1.4`, the backend status also reports the persisted embedding
+compatibility state/binding and whether the observed runtime fingerprint still matches that binding.
+`memory_status` does not run a compatibility migration or silently requalify a changed runtime.
+When a legacy database is `UNPROVEN` or `INCOMPATIBLE`, safe non-semantic reads (`memory_get`,
+`EXACT`, `KEYWORD`) remain available while `SEMANTIC`, `HYBRID`, `memory_store`, and `memory_update`
+fail closed with `PROFILE_MISMATCH` until an explicit compatible migration/re-embedding path exists.
 
 It is not a full monitoring platform, backup facility, or maintenance daemon.
 

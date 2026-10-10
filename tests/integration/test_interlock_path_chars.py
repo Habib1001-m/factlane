@@ -27,7 +27,15 @@ def profile() -> EmbeddingProfile:
     )
 
 
-_SPECIAL_PATHS = ["plain", "a#b", "a?b", "a%2Fb", "a%20b", "a b", "مرحبا_日本_Strasse"]
+_SPECIAL_PATHS = [
+    "plain",
+    "a#b",
+    pytest.param("a?b", marks=pytest.mark.skipif(os.name == "nt", reason="? is not a valid Windows path component")),
+    "a%2Fb",
+    "a%20b",
+    "a b",
+    "مرحبا_日本_Strasse",
+]
 
 
 @pytest.mark.parametrize("dirname", _SPECIAL_PATHS)

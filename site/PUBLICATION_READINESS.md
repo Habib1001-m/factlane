@@ -3,6 +3,73 @@
 This is an operational runbook for the already accepted site semantics. It is not a new SEO/GEO
 cycle, does not authorize publication, and does not change the R19 product/search contract.
 
+## Public-site CI and controlled publication boundary
+
+The protected GitHub `test` context now includes public-site qualification. CI checks Development
+correctness and produces an immutable publication-candidate package; it never deploys Cloudflare
+Pages, creates or promotes a release, or grants Production authority.
+
+The qualification path is intentionally split into four controls:
+
+1. Two independent clean checkouts of the exact source commit build the public site with the
+   committed lockfile, Node `22.22.3`, pinned Wrangler `4.148.0`, the approved HTTPS origin and
+   `FACTLANE_PUBLIC_BUILD=1`.
+   Complete base manifests must be byte-identical. Source **commit and tree are both provenance**:
+   source-aware sitemap `lastmod` uses Git history, so tree equality alone does not identify the
+   publication bytes after a squash or history rewrite.
+2. `scripts/check-publication-eligibility.mjs` derives the current RELEASED product authority from
+   the exact annotated release tag. The publication baseline is **not selected by the candidate
+   snapshot**: it is derived from the parent of the historical commit that first introduced the
+   release-control file, and bootstrap qualification requires that parent to equal the externally
+   supplied protected/base SHA. Later qualifications require that historical introduction to
+   already belong to the protected/base history. CI then compares a generated public-claim
+   projection for **all canonical routes** against a clean build of that derived baseline. The
+   projection includes title, description, all rendered page text (including global chrome/footer),
+   JSON-LD, normalized external anchor targets and root `llms.txt`, so release/support claims or
+   their authoritative external targets cannot evade classification by moving between sections,
+   out of `<main>`, or changing only an `href`. The baseline hashes are derived at qualification time from
+   immutable Git history; they are not editable snapshot values. A recognized release-bound
+   Development change may keep the required `test` context green while the receipt records
+   `HOLD_UNRELEASED_CONTRACT`; unknown/stale release authority is also publication HOLD.
+3. `scripts/compose-publication-artifact.mjs` overlays only the manifest-bound hosting/discovery
+   inputs under `site/publication/`. Stable host redirects are separated from GSC/Bing/IndexNow
+   ownership files. Path collisions, missing files, digest drift, redirect collisions, origin drift,
+   or nondeterministic composition fail closed. The verification files are operational publication
+   inputs, not product/source authority. The exact composed root is exercised through
+   `wrangler pages dev` before freeze so the `_redirects` behavior is tested against the Pages local
+   runtime rather than inferred only from a generic static server.
+4. `scripts/freeze-publication-package.mjs` requires byte-identical composed artifacts, a PASS
+   publication-readiness receipt and exact commit/tree/release/overlay provenance before producing
+   the checksummed consumer handoff. The package always records `PRODUCTION_AUTHORIZED=NO`.
+
+The CI entry point is:
+
+```bash
+FACTLANE_SITE_URL=https://factlane.pages.dev \
+FACTLANE_PUBLIC_BUILD=1 \
+FACTLANE_PROTECTED_BASE_COMMIT=<fresh-protected-base-sha> \
+npm run check:publication:ci
+```
+
+Its `.publication-ci/` output is transportable qualification evidence. GitHub Actions may retain
+that directory as a CI artifact, but an Actions artifact is not itself the trust anchor. A future
+Production crossing must bind owner authorization to the exact SHA-256 of the candidate package's
+`PACKAGE_CONTENTS.sha256`, authenticate that digest with trusted tooling, verify the package, and
+consume the frozen archive bytes without rebuilding them.
+
+`scripts/check-publication-crossing.mjs` is a non-deploying package-integrity and eligibility gate.
+It authenticates the exact candidate against the expected package digest supplied by the caller,
+verifies every package member plus the frozen archive and consumer verifier, and requires the exact
+eligibility state named by the caller. The default requires `ELIGIBLE_PENDING_OTHER_GATES`; CI may
+instead require `HOLD_UNRELEASED_CONTRACT` to prove that a release-bound Development artifact is
+intact **and still not Production-crossing eligible**. That expected-HOLD mode reports
+`productionCrossingEligible=false`; it does not turn the HOLD into authorization. The script **does
+not authenticate owner authorization** and never labels its own PASS as authorization. A Production
+crossing still requires a separately authenticated owner approval bound externally to the exact
+accepted package digest, followed by fresh live Cloudflare
+project/deployment-state checks before Direct Upload. Production rollback is likewise never
+automatic and requires explicit or pre-approved incident/runbook authority.
+
 ## Reviewed publication shape
 
 The reviewed deployment artifact is the static `site/build/` output at the public origin root.

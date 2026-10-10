@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "releaseAuthority": {
+    "tag": "v0.1.3",
+    "tagObject": "d922fcceae7cfbfda239666182e61a5a58278809",
+    "commit": "59173b7d9fa3af924c373176411882caa04a6c1d",
+    "tree": "93db940802432b6f9ca2f5513916fd2b84c6393a",
+    "packageVersion": "0.1.3",
+    "pythonRequires": ">=3.11",
+    "linkedSqliteMinimum": "3.42.0",
+    "publicContractRevision": 2,
+    "transport": "stdio",
+    "embeddingProvider": "Ollama",
+    "tools": [
+      "memory_search",
+      "memory_get",
+      "memory_store",
+      "memory_update",
+      "memory_status"
+    ]
+  },
+  "releasedPublicationBaseline": {
+    "productionSourceCommit": "4eb06988172098ef669370b2040ea6d30d4f0684",
+    "productionSourceTree": "722c4348d63837e010829794678c8073c63d2a2f",
+    "productionDeploymentId": "a802a42c-329f-4a01-99b3-9cf34b0b6c5d",
+    "productionArtifactManifestSha256": "a69aae94b76d314d0b13435acb47c7cba9a97c0365977ff4b7ff662694789a35"
+  }
+}

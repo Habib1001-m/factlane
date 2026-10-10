@@ -114,7 +114,7 @@ operator transition checklist.
 
 ## Known limits
 
-FactLane is a local service, not a distributed consensus system. Version 0.1.3 is
+FactLane is a local service, not a distributed consensus system. Version 0.1.4 is
 production-qualified for the documented local deployment profile, including authoritative
 backup/restore compatibility, bounded concurrent operation, crash/restart rollback, configured
 stdio host integration, and production-derived retrieval checks. Operators still need their

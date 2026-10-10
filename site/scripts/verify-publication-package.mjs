@@ -290,6 +290,10 @@ for (const required of [
   'ROUTES.txt',
   'VERIFICATION.txt',
   'READINESS_RESULT.json',
+  'PUBLICATION_ELIGIBILITY.json',
+  'OVERLAY_COMPOSITION.json',
+  'OVERLAY_CONTROL.json',
+  'RELEASED_CONTRACT_SNAPSHOT.json',
   'CONSUMER_HANDOFF.md',
   'consumer/scripts/verify-publication-package.mjs',
   'consumer/scripts/serve-publication-static.mjs',
@@ -300,6 +304,58 @@ for (const required of [
 }
 
 const provenance = parseKeyValue(await readFile(path.join(packageDir, 'PROVENANCE.txt'), 'utf8'), 'provenance');
+const eligibility = JSON.parse(await readFile(path.join(packageDir, 'PUBLICATION_ELIGIBILITY.json'), 'utf8'));
+const composition = JSON.parse(await readFile(path.join(packageDir, 'OVERLAY_COMPOSITION.json'), 'utf8'));
+const readiness = JSON.parse(await readFile(path.join(packageDir, 'READINESS_RESULT.json'), 'utf8'));
+assert(eligibility.status === 'PASS', 'Publication eligibility receipt did not complete successfully');
+assert(composition.status === 'PASS', 'Overlay composition receipt did not complete successfully');
+assert(readiness.status === 'PASS', 'Publication readiness receipt is not PASS');
+assert(
+  await sha256File(path.join(packageDir, 'PUBLICATION_ELIGIBILITY.json')) === provenance.get('PUBLICATION_ELIGIBILITY_SHA256'),
+  'Publication eligibility receipt digest mismatch',
+);
+assert(
+  await sha256File(path.join(packageDir, 'OVERLAY_COMPOSITION.json')) === provenance.get('OVERLAY_COMPOSITION_SHA256'),
+  'Overlay composition receipt digest mismatch',
+);
+assert(
+  await sha256File(path.join(packageDir, 'OVERLAY_CONTROL.json')) === provenance.get('OVERLAY_CONTROL_SHA256'),
+  'Overlay control manifest digest mismatch',
+);
+assert(
+  await sha256File(path.join(packageDir, 'RELEASED_CONTRACT_SNAPSHOT.json')) === provenance.get('RELEASED_CONTRACT_SNAPSHOT_SHA256'),
+  'Released-contract snapshot digest mismatch',
+);
+assert(
+  await sha256File(path.join(packageDir, 'READINESS_RESULT.json')) === provenance.get('READINESS_RESULT_SHA256'),
+  'Publication readiness receipt digest mismatch',
+);
+assert(eligibility.source?.commit === provenance.get('SOURCE_COMMIT'), 'Eligibility/source commit mismatch');
+assert(eligibility.source?.tree === provenance.get('SOURCE_TREE'), 'Eligibility/source tree mismatch');
+assert(eligibility.publicationClass === provenance.get('PUBLICATION_CLASS'), 'Publication class provenance mismatch');
+assert(
+  eligibility.publicationEligibility === provenance.get('PUBLICATION_ELIGIBILITY'),
+  'Publication eligibility provenance mismatch',
+);
+assert(
+  eligibility.releasedPublicationBaseline?.derivedAcceptedMainCommit === provenance.get('RELEASED_PUBLICATION_BASELINE_COMMIT'),
+  'Released publication baseline commit provenance mismatch',
+);
+assert(
+  eligibility.releasedPublicationBaseline?.derivedAcceptedMainTree === provenance.get('RELEASED_PUBLICATION_BASELINE_TREE'),
+  'Released publication baseline tree provenance mismatch',
+);
+assert(
+  eligibility.releasedPublicationBaseline?.controlIntroductionCommit === provenance.get('PUBLICATION_CONTROL_INTRODUCTION_COMMIT'),
+  'Publication control introduction provenance mismatch',
+);
+assert(
+  eligibility.releasedPublicationBaseline?.protectedBaseCommit === provenance.get('QUALIFICATION_PROTECTED_BASE_COMMIT'),
+  'Qualification protected/base provenance mismatch',
+);
+assert(composition.publicOrigin === provenance.get('PUBLIC_ORIGIN'), 'Overlay composition origin mismatch');
+assert(readiness.expectedOrigin === provenance.get('PUBLIC_ORIGIN'), 'Readiness origin mismatch');
+assert(provenance.get('PRODUCTION_AUTHORIZED') === 'NO', 'Qualified package must not self-authorize Production');
 for (const [relative, key] of [
   ['consumer/scripts/verify-publication-package.mjs', 'CONSUMER_PACKAGE_VERIFIER_SHA256'],
   ['consumer/scripts/serve-publication-static.mjs', 'CONSUMER_STATIC_HOST_SHA256'],
@@ -326,6 +382,17 @@ assert(await sha256File(routesPath) === provenance.get('ROUTE_INVENTORY_SHA256')
 const manifest = parseChecksumFile(await readFile(manifestPath, 'utf8'), 'artifact manifest');
 const critical = parseChecksumFile(await readFile(criticalPath, 'utf8'), 'critical manifest');
 const routes = routeInventory(await readFile(routesPath, 'utf8'), provenance.get('PUBLIC_ORIGIN'));
+assert(
+  composition.composedArtifact?.manifestSha256 === provenance.get('ARTIFACT_MANIFEST_SHA256'),
+  'Overlay composition is not bound to the frozen artifact manifest',
+);
+assert(composition.composedArtifact?.files === manifest.size, 'Overlay composition file count mismatch');
+assert(composition.routeInventorySha256 === provenance.get('ROUTE_INVENTORY_SHA256'), 'Overlay route inventory provenance mismatch');
+assert(composition.redirects?.sha256 === provenance.get('COMPOSED_REDIRECTS_SHA256'), 'Composed redirect provenance mismatch');
+assert(manifest.get('_redirects') === composition.redirects?.sha256, 'Frozen _redirects bytes do not match composition receipt');
+for (const overlay of composition.overlayFiles ?? []) {
+  assert(manifest.get(overlay.target) === overlay.sha256, `Frozen overlay file mismatch: ${overlay.target}`);
+}
 for (const [relative, digest] of critical) {
   assert(manifest.get(relative) === digest, `Critical file is missing or divergent in full manifest: ${relative}`);
 }
@@ -347,6 +414,10 @@ for (const required of [
   'logo/factlane-mark.svg',
   'social/factlane-github-social-preview.png',
   'ar/social/factlane-github-social-preview.png',
+  '_redirects',
+  '1d226189096d15c62deace5c0bb3ade7.txt',
+  'google0227effcabf0f657.html',
+  'BingSiteAuth.xml',
 ]) {
   assert(critical.has(required), `Critical freeze contract is missing required published file: ${required}`);
 }

@@ -456,6 +456,7 @@ def test_open_rejects_schema_qualified_hostile_pragma_before_db_creation(tmp_pat
     assert not db_path.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX fcntl/flock maintenance exclusion test")
 def test_maintenance_lock_noncontention_os_error_is_backend_unavailable(tmp_path, monkeypatch) -> None:
     import fcntl
 
@@ -472,6 +473,7 @@ def test_maintenance_lock_noncontention_os_error_is_backend_unavailable(tmp_path
     assert not (tmp_path / "lock-io.db").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX maintenance-lease setup error injection")
 def test_maintenance_lock_setup_permission_error_is_not_mislabeled_as_contention(
     tmp_path, monkeypatch
 ) -> None:

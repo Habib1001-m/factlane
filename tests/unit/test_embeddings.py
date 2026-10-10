@@ -96,7 +96,72 @@ def test_selected_embeddinggemma_profile_definition_is_exact() -> None:
         "source_dimension": 768,
         "document_prefix": "title: none | text: ",
         "query_prefix": "task: search result | query: ",
+        "semantic_family": "gemma3",
+        "minimum_context_window": 2048,
     }
+
+
+class StatusProvider(OllamaLocalProvider):
+    def __init__(self, *, version: str = "0.34.2", digest: str = "a" * 64, family: str = "gemma3") -> None:
+        super().__init__(
+            model="embeddinggemma:300m",
+            profile_id="embeddinggemma-300m-768",
+            output_dimension=768,
+            source_dimension=768,
+            model_digest=EMBEDDINGGEMMA_DIGEST,
+            document_prefix="title: none | text: ",
+            query_prefix="task: search result | query: ",
+            semantic_family="gemma3",
+            minimum_context_window=2048,
+        )
+        self.version = version
+        self.digest = digest
+        self.family = family
+
+    def _request(self, path: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+        if path == "/api/version":
+            return {"version": self.version}
+        if path == "/api/tags":
+            return {
+                "models": [
+                    {
+                        "name": self.model,
+                        "digest": self.digest,
+                        "size": 123,
+                        "details": {"family": self.family},
+                    }
+                ]
+            }
+        if path == "/api/show":
+            return {
+                "model_info": {"gemma3.embedding_length": 768, "gemma3.context_length": 2048},
+                "capabilities": ["embedding"],
+            }
+        raise AssertionError(path)
+
+
+def test_provider_status_treats_digest_and_version_as_runtime_provenance() -> None:
+    provider = StatusProvider(version="0.34.2", digest="b" * 64)
+    configured_digest = provider.profile.model_digest
+    status = provider.provider_status()
+    assert status["ollama_version"] == "0.34.2"
+    assert status["digest"] == "b" * 64
+    assert status["semantic_family"] == "gemma3"
+    assert provider.profile.model_digest == configured_digest
+
+
+def test_provider_status_rejects_unsupported_ollama_version() -> None:
+    provider = StatusProvider(version="0.22.0")
+    with pytest.raises(AdapterError) as error:
+        provider.provider_status()
+    assert error.value.code == "EMBEDDING_UNAVAILABLE"
+
+
+def test_provider_status_rejects_semantic_family_drift() -> None:
+    provider = StatusProvider(family="different-family")
+    with pytest.raises(AdapterError) as error:
+        provider.provider_status()
+    assert error.value.code == "SCHEMA_MISMATCH"
 
 
 class RejectingProvider(OllamaLocalProvider):
