@@ -78,6 +78,35 @@ that FactLane can name as a supported production rollback target. A package inst
 able to replace one version with another is not evidence that an older runtime can safely open
 a database that a newer version has modified.
 
+## FactLane v0.1.4 release notes and v0.1.3 transition
+
+`v0.1.4` is the authorized successor to `v0.1.3`. It preserves Public Contract Revision 2 and
+exactly the same five public MCP tools. The release adds the qualified v0.1.3 embedding-space
+compatibility/migration path, native Windows x64 standard-runtime qualification, portable Skill
+bootstrap guidance, stronger package/release-surface controls, and the bilingual publication
+surface. Pi remains bounded to the previously accepted native-Windows read-path integration claim;
+no broader Pi write-host claim is introduced.
+
+### Migration from v0.1.3
+
+- Preserve an operator-owned backup before opening durable data with v0.1.4.
+- Exact known v0.1.3 `embeddinggemma-300m-768` data may migrate metadata-only **only after** the
+  integrity-bound compatibility proof passes; existing vectors and per-record embedding provenance
+  are preserved rather than rewritten.
+- Unknown, mixed, or incompatible embedding identity remains fail-closed for semantic/hybrid
+  retrieval and vector-mutating writes; safe exact/keyword/get paths remain available as documented.
+- Public Contract Revision remains `2`; the public tool set remains `memory_search`, `memory_get`,
+  `memory_store`, `memory_update`, `memory_status`.
+- Sensitive-memory recovery remains operator-only and POSIX-only; Windows standard runtime support
+  does not expand that recovery boundary.
+- Package/runtime rollback to v0.1.3 is not equivalent to a durable-data downgrade guarantee. Do not
+  open data modified under v0.1.4 with v0.1.3 unless the applicable data state is proven compatible
+  or restored from a verified pre-upgrade backup.
+
+The exact v0.1.4 annotated-tag object, public commit/tree, wheel/sdist names and SHA-256 digests are
+recorded only after the protected public crossing and release seal complete. They must not be
+invented in the candidate tree.
+
 ## Install an exact release
 
 ### Option A: versioned source checkout

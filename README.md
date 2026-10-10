@@ -38,10 +38,9 @@ That distinction is the core of FactLane: **remembered context can support a dec
 
 > [!NOTE]
 > The moving Development source can contain accepted changes newer than the latest official
-> release. Until a successor release identity is separately assigned and published, a wheel or
-> source distribution built from Development is **qualification-only**, even if its package
-> metadata still reads `0.1.3`. Official `v0.1.3` means the exact tag, commit/tree, and published
-> artifact digests recorded in [Release operations](docs/RELEASE_OPERATIONS.md).
+> release. The successor identity is `v0.1.4`, but Development/RC artifacts remain **qualification-only**
+> until the annotated tag and published artifact digests are sealed. Official `v0.1.4` means the
+> exact tag, commit/tree, and published digests recorded in [Release operations](docs/RELEASE_OPERATIONS.md).
 
 ## How FactLane works
 
@@ -70,12 +69,12 @@ You need Python **3.11+**, a Python-linked SQLite runtime **3.42.0+**, [`uv`](ht
 
 FactLane is CPU-capable. Docker, a GPU, and external embedding APIs are not required for the supported local profile.
 
-### Install the exact `v0.1.3` release
+### Install the exact `v0.1.4` release
 
 Use the versioned release tag rather than the moving `main` branch:
 
 ```bash
-git clone --branch v0.1.3 --depth 1 https://github.com/Habib1001-m/factlane.git
+git clone --branch v0.1.4 --depth 1 https://github.com/Habib1001-m/factlane.git
 cd factlane
 uv sync --frozen
 uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
@@ -179,7 +178,7 @@ Read the full [Architecture](docs/ARCHITECTURE.md) for the exact request path, s
 
 ## Production-qualified profile
 
-**FactLane `v0.1.3` is the first official production release.** It is production-qualified for the documented local deployment profile:
+**FactLane `v0.1.4` is the current production release.** It is production-qualified for the documented local deployment profile:
 
 - Python **3.11+**;
 - linked SQLite **3.42.0+**;
@@ -207,13 +206,13 @@ See [Environment and compatibility](docs/ENVIRONMENT.md) for the supported runti
 
 A release is more than a version string. FactLane records an official release by its versioned tag together with the corresponding commit/tree and published artifact digests.
 
-`v0.1.3` is the first official production release, so there is **no earlier official production rollback target**.
+`v0.1.3` remains the first official production release and is the supported predecessor for the `v0.1.4` transition documented in Release operations.
 
 Package/runtime rollback and durable-data rollback are separate compatibility questions. A package manager being able to replace one installed version with another does not prove that an older runtime can safely open a database modified by a newer release.
 
 Use [Release operations](docs/RELEASE_OPERATIONS.md) for:
 
-- exact `v0.1.3` tag, commit, and tree identity;
+- exact release tag, commit, and tree identity;
 - wheel and source-distribution SHA-256 digests;
 - source vs packaged installation paths;
 - post-install reverification;

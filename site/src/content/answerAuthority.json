@@ -10,7 +10,7 @@
     "sourceCue": "These summaries do not replace the docs. Follow the source links for the full contract; the live MCP schema and factlane --help-tools remain authoritative for exact tool fields and enums.",
     "factsLabel": "Verified product facts",
     "facts": [
-      {"strong": "v0.1.3", "rest": " supported named release"},
+      {"strong": "v0.1.4", "rest": " supported named release"},
       {"strong": "5", "rest": " public MCP tools"},
       {"strong": "stdio", "rest": " command-launched transport"},
       {"strong": "local", "rest": " SQLite + supported Ollama profile"}
@@ -39,7 +39,7 @@
       {
         "id": "when-not-fit",
         "question": "When is FactLane not the right tool?",
-        "answer": "FactLane is not a transcript archive, arbitrary-corpus crawler or search index, backup service, managed remote memory cloud, or automatic permission system. In v0.1.3 it is also not an HTTP, SSE, or Streamable HTTP MCP server.",
+        "answer": "FactLane is not a transcript archive, arbitrary-corpus crawler or search index, backup service, managed remote memory cloud, or automatic permission system. In v0.1.4 it is also not an HTTP, SSE, or Streamable HTTP MCP server.",
         "sources": [
           {"label": "FAQ", "to": "/docs/FAQ/"},
           {"label": "Environment and compatibility", "to": "/docs/ENVIRONMENT/"}
@@ -82,8 +82,8 @@
       },
       {
         "id": "supported-environment",
-        "question": "What environment does v0.1.3 support?",
-        "answer": "The qualified v0.1.3 profile uses Python 3.11+, linked SQLite 3.42.0+, command-launched local stdio MCP, local SQLite and SQLite-vec storage, supported local Ollama embeddings over loopback, and the documented local POSIX storage and recovery contract. There is no automatic remote embedding fallback.",
+        "question": "What environment does v0.1.4 support?",
+        "answer": "The qualified v0.1.4 profile uses Python 3.11+, linked SQLite 3.42.0+, command-launched local stdio MCP, local SQLite and SQLite-vec storage, supported local Ollama embeddings over loopback, and the documented local POSIX storage and recovery contract. There is no automatic remote embedding fallback.",
         "sources": [
           {"label": "Environment and compatibility", "to": "/docs/ENVIRONMENT/"},
           {"label": "Architecture", "to": "/docs/ARCHITECTURE/"}
@@ -102,7 +102,7 @@
     "cta": {
       "eyebrow": "Next step",
       "title": "Start from a read-only connection.",
-      "body": "If the fit above matches your use case, give the project to your agent or follow the exact v0.1.3 Quick Start.",
+      "body": "If the fit above matches your use case, give the project to your agent or follow the exact v0.1.4 Quick Start.",
       "agent": "Start with your agent",
       "quickstart": "Open Quick Start"
     }
@@ -118,7 +118,7 @@
     "sourceCue": "هذه الملخصات لا تستبدل الوثائق. ارجع إلى روابط المصادر للعقد الكامل؛ ويظل مخطط MCP الحي والأمر factlane --help-tools المرجع النهائي لحقول الأدوات وتعداداتها الدقيقة.",
     "factsLabel": "حقائق منتج مؤكدة",
     "facts": [
-      {"strong": "v0.1.3", "rest": " الإصدار المسمى المدعوم"},
+      {"strong": "v0.1.4", "rest": " الإصدار المسمى المدعوم"},
       {"strong": "5", "rest": " أدوات MCP عامة"},
       {"strong": "stdio", "rest": " نقل يُشغَّل بأمر"},
       {"strong": "محلي", "rest": " SQLite + ملف تعريف Ollama مدعوم"}
@@ -147,7 +147,7 @@
       {
         "id": "when-not-fit",
         "question": "متى لا يكون FactLane هو الأداة المناسبة؟",
-        "answer": "FactLane ليس أرشيفًا لنصوص المحادثات، ولا crawler أو فهرس بحث لمجموعات محتوى عشوائية، ولا خدمة نسخ احتياطي، ولا سحابة ذاكرة مُدارة عن بُعد، ولا نظامًا تلقائيًا لصلاحيات الوكيل. وفي v0.1.3 ليس خادم MCP عبر HTTP أو SSE أو Streamable HTTP.",
+        "answer": "FactLane ليس أرشيفًا لنصوص المحادثات، ولا crawler أو فهرس بحث لمجموعات محتوى عشوائية، ولا خدمة نسخ احتياطي، ولا سحابة ذاكرة مُدارة عن بُعد، ولا نظامًا تلقائيًا لصلاحيات الوكيل. وفي v0.1.4 ليس خادم MCP عبر HTTP أو SSE أو Streamable HTTP.",
         "sources": [
           {"label": "الأسئلة الشائعة", "to": "/docs/FAQ/"},
           {"label": "البيئة والتوافق", "to": "/docs/ENVIRONMENT/"}
@@ -190,8 +190,8 @@
       },
       {
         "id": "supported-environment",
-        "question": "ما البيئة التي يدعمها v0.1.3؟",
-        "answer": "يستخدم ملف التعريف المحلي الموثق والمؤهّل في v0.1.3 Python 3.11+ وSQLite 3.42.0+ المرتبط وMCP محليًا عبر stdio يُشغَّل بأمر وتخزين SQLite وSQLite-vec محليًا وتضمينات Ollama محلية مدعومة عبر loopback وعقد التخزين والاستعادة المحلي الموثق على POSIX. ولا يوجد fallback تلقائي إلى تضمينات بعيدة.",
+        "question": "ما البيئة التي يدعمها v0.1.4؟",
+        "answer": "يستخدم ملف التعريف المحلي الموثق والمؤهّل في v0.1.4 Python 3.11+ وSQLite 3.42.0+ المرتبط وMCP محليًا عبر stdio يُشغَّل بأمر وتخزين SQLite وSQLite-vec محليًا وتضمينات Ollama محلية مدعومة عبر loopback وعقد التخزين والاستعادة المحلي الموثق على POSIX. ولا يوجد fallback تلقائي إلى تضمينات بعيدة.",
         "sources": [
           {"label": "البيئة والتوافق", "to": "/docs/ENVIRONMENT/"},
           {"label": "المعمارية", "to": "/docs/ARCHITECTURE/"}
@@ -210,7 +210,7 @@
     "cta": {
       "eyebrow": "الخطوة التالية",
       "title": "ابدأ باتصال للقراءة فقط.",
-      "body": "إذا طابقت الملاءمة أعلاه احتياجك، أعطِ المشروع لوكيلك أو اتبع خطوات الإعداد الدقيقة للإصدار v0.1.3.",
+      "body": "إذا طابقت الملاءمة أعلاه احتياجك، أعطِ المشروع لوكيلك أو اتبع خطوات الإعداد الدقيقة للإصدار v0.1.4.",
       "agent": "ابدأ مع وكيلك",
       "quickstart": "افتح البدء السريع"
     }

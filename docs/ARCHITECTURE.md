@@ -131,7 +131,7 @@ input-size checks fail closed. Potentially blocking provider calls are offloaded
 cloud embedding provider or automatic external fallback is shipped. See the
 [environment policy](ENVIRONMENT.md) for built-in profiles and exact prerequisites.
 
-The current **unreleased Development** compatibility layer treats vector-space identity separately
+The `v0.1.4` compatibility layer treats vector-space identity separately
 from runtime provenance. Semantic identity binds model identity/family, source and output dimensions,
 document/query prefixes, normalization, distance metric, projection revision, and FactLane's
 embedding-compatibility revision. Observed Ollama version and model digest remain runtime provenance;
@@ -181,7 +181,7 @@ operator reconciliation.
 
 The exclusion guarantee is bounded to supported local POSIX filesystems with reliable `flock`
 semantics; sensitive-memory recovery maintenance remains unsupported on Windows and on unvalidated
-network/FUSE locking behavior. The current **unreleased Development** standard runtime is qualified
+network/FUSE locking behavior. The `v0.1.4` standard runtime is qualified
 separately on native Windows x64/AMD64 for normal import/startup, stdio MCP, SQLite WAL/busy/CAS,
 process concurrency, durability, and valid Windows paths. That Windows qualification does not add a
 Windows recovery implementation: recovery imports safely but fails closed before mutation when the
@@ -208,7 +208,7 @@ published release. The exact release-identity and transition procedure lives in
 
 ## Qualification boundary
 
-The current **unreleased Development** qualification includes native Windows x64/AMD64 standard
+The `v0.1.4` qualification includes native Windows x64/AMD64 standard
 runtime behavior: package import, command startup, stdio discovery of exactly five public tools,
 default read-only authority, Candidate-only delegated contribution, verifier promotion, SQLite
 3.42.0+ with sqlite-vec, WAL/busy handling, cross-process CAS/concurrency, fresh-process durability,
@@ -216,7 +216,7 @@ and valid Windows path handling. The pinned sqlite-vec dependency is qualified h
 this is not a Windows ARM64 claim. Sensitive-memory recovery maintenance remains the POSIX-only
 capability described above.
 
-FactLane 0.1.3 is production-qualified for the documented local configuration: the packaged
+FactLane 0.1.4 is production-qualified for the documented local configuration: the packaged
 Python runtime, linked SQLite/SQLite-vec storage contract, stdio MCP surface, supported local
 embedding profile, and configured local host integrations. The qualification exercised
 backup/restore compatibility, bounded concurrent operation, crash/restart rollback,

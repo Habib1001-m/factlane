@@ -21,7 +21,7 @@
 **`SQLite 3.42.0+`**.
 
 ```bash
-git clone --branch v0.1.3 --depth 1 https://github.com/Habib1001-m/factlane.git
+git clone --branch v0.1.4 --depth 1 https://github.com/Habib1001-m/factlane.git
 cd factlane
 uv sync --frozen
 uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
@@ -34,7 +34,7 @@ uv run factlane --help-tools
 `BACKEND_COMPATIBILITY_MISMATCH` قبل إنشاء قاعدة البيانات أو فتحها. إصدار Python
 وحده لا يفي بعقد التخزين.
 
-يتعمد أمر النسخ تثبيت إصدار `v0.1.3` بدلًا من فرع `main` المتغير.
+يتعمد أمر النسخ تثبيت إصدار `v0.1.4` بدلًا من فرع `main` المتغير.
 للحصول على بصمات الملفات، وتثبيت الحزم المنشورة، والترقيات، والتراجع، استخدم
 [عمليات الإصدار](RELEASE_OPERATIONS.md).
 
@@ -95,10 +95,9 @@ enabled = true
 أعد تحميل إعداد MCP في إصدار Codex المثبّت لديك وتأكد من ظهور أدوات FactLane الخمس.
 ينبغي أن يتبع استخدام الوكيل لهذه الأدوات Skill المحمول
 [`using-factlane`](USING_FACTLANE_SKILL.md)، المثبّت عبر آلية Skill التي يدعمها مضيفك. إصدار
-`v0.1.3` المحدد في الخطوة 1 يشحن `SKILL.md` فقط، ولا يشحن
-`references/host-bootstrap.md`. في مسار الإصدار المنشور هذا استخدم Skill المشحون وآلية المضيف
-المدعومة. أما مصدر Development الحالي غير المُصدر فيضيف `references/host-bootstrap.md` كمرجع
-محايد للمضيف للفحص والفصل بين حالات التسجيل وتقرير الأدلة. لا تفترض أن Skill مسجّلة أو
+`v0.1.4` المحدد في الخطوة 1 يشحن `SKILL.md` و`references/host-bootstrap.md`. المرجع الثاني
+محايد للمضيف للفحص والفصل بين حالات التسجيل وتقرير الأدلة؛ ولا يعني وجوده أن المضيف سجّل Skill
+أو حمّلها. لا تفترض أن Skill مسجّلة أو
 discoverable أو loaded لمجرد وجود ملفاتها.
 
 ### Hermes (مضيف `stdio` مختبَر)

@@ -40,7 +40,7 @@ Instead of pasting a long project history into every session, a compatible host 
 eligible FactLane facts for the exact project scope.
 
 Facts that can become stale still need freshness and verification discipline. “Current release is
-v0.1.3” is not the same kind of memory as “I prefer concise answers.”
+v0.1.4” is not the same kind of memory as “I prefer concise answers.”
 
 ## Remember how I like recurring work handled
 
@@ -99,6 +99,6 @@ If these examples match the problem you are trying to solve, use the [FAQ](FAQ.m
 checkpoint. It covers fit, non-goals, where data lives, and what the current technical setup
 requires.
 
-One boundary is worth knowing now: v0.1.3 still needs someone to install FactLane and configure a
+One boundary is worth knowing now: v0.1.4 still needs someone to install FactLane and configure a
 compatible local host. If that is acceptable, continue with the [FAQ](FAQ.md), then
 [Core concepts](CORE_CONCEPTS.md).

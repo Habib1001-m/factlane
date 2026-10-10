@@ -67,7 +67,7 @@ URL** (by default `http://127.0.0.1:11434`). The provider interface permits futu
 implementations, but a remote endpoint, automatic cloud fallback, or hosted embedding
 service is **not** a supported current configuration.
 
-The current **unreleased Development** compatibility binding records semantic identity separately
+The `v0.1.4` compatibility binding records semantic identity separately
 from runtime provenance. Semantic identity includes the base model/family, source/output dimensions,
 document/query prefixes, normalization policy, cosine metric, projection revision, and FactLane
 embedding-compatibility revision. For the known v0.1.3 `embeddinggemma-300m-768` space, an
@@ -137,7 +137,7 @@ crawler, transcript repository, or bulk document index. Very large source collec
 separate ingestion/extraction stage, which may have different throughput and provider
 requirements; no terabyte-scale ingestion rate is claimed here.
 
-The current **unreleased Development** standard runtime is qualified on native Windows x64/AMD64
+The `v0.1.4` standard runtime is qualified on native Windows x64/AMD64
 with Python 3.11+, linked SQLite 3.42.0+, the pinned sqlite-vec Windows AMD64 artifact, command-
 launched stdio MCP, and the same five-tool authority model. Qualification covers default read-only,
 Candidate contribution, verifier promotion, WAL/busy behavior, cross-process CAS/concurrency,
@@ -146,7 +146,7 @@ POSIX-only because its exclusion contract requires `fcntl`/`flock`; on Windows t
 capability fails closed before mutation without preventing normal package import, startup, or test
 collection. No Windows ARM64 support claim is made by this qualification.
 
-FactLane 0.1.3 is production-qualified for the documented local profile: Python 3.11+,
+FactLane 0.1.4 is production-qualified for the documented local profile: Python 3.11+,
 linked SQLite 3.42.0+, command-launched stdio MCP, supported local Ollama embeddings, and
 the documented local POSIX storage/recovery contract. Qualification includes backup/restore
 compatibility, bounded concurrent operation, crash/restart rollback, configured host startup,

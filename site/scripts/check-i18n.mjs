@@ -112,7 +112,7 @@ const corpus = (
 ).join('\n');
 
 for (const invariant of [
-  'v0.1.3',
+  'v0.1.4',
   'memory_search',
   'memory_get',
   'memory_store',

@@ -27,7 +27,7 @@ jobs:
         if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/')
         run: >-
           uv run python scripts/check_release_surface.py
-          --expected-classification DEVELOPMENT_QUALIFICATION_ONLY
+          --expected-classification DEVELOPMENT_PENDING_RELEASE_AUTHORITY
           --snapshot site/publication/released-contract-v0.1.3.json
           --receipt "${{ runner.temp }}/factlane-release-surface.json"
       - name: Build exact-tree Python qualification artifacts

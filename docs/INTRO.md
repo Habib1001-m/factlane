@@ -27,7 +27,7 @@ Start with the outcome rather than the protocol:
 
 ### Do I need to be a developer to benefit from it?
 
-Not necessarily for normal use, but **the current v0.1.3 setup is still technical**.
+Not necessarily for normal use, but **the current v0.1.4 setup is still technical**.
 
 FactLane is not a separate chatbot. It runs locally as a memory service behind a compatible AI
 agent host. Someone must install and configure that connection. After it is connected, the useful
@@ -51,7 +51,7 @@ embedding details until you are ready to install it yourself.
 
 ## Current public release
 
-FactLane **v0.1.3** is the first official production release. Its qualified public profile is
+FactLane **v0.1.4** is the current production release. Its qualified public profile is
 intentionally bounded: Python 3.11+, linked SQLite 3.42.0+, command-launched stdio MCP, supported
 local Ollama embeddings, and the documented local POSIX storage/recovery contract.
 

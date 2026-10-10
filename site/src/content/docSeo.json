@@ -18,7 +18,7 @@
     },
     "QUICKSTART": {
       "title": "Quick Start: local MCP server setup",
-      "description": "Install FactLane v0.1.3 locally, connect a command-launched stdio MCP host, verify the five-tool surface in read-only mode, then enable Candidate writes only if needed."
+      "description": "Install FactLane v0.1.4 locally, connect a command-launched stdio MCP host, verify the five-tool surface in read-only mode, then enable Candidate writes only if needed."
     },
     "TOOLS": {
       "title": "Five MCP tools",
@@ -34,7 +34,7 @@
     },
     "ENVIRONMENT": {
       "title": "Environment and compatibility requirements",
-      "description": "Check FactLane v0.1.3 requirements: Python 3.11+, linked SQLite 3.42.0+, local stdio MCP, Ollama profiles, storage isolation, and support limits."
+      "description": "Check FactLane v0.1.4 requirements: Python 3.11+, linked SQLite 3.42.0+, local stdio MCP, Ollama profiles, storage isolation, and support limits."
     },
     "SECURITY": {
       "title": "Security policy",
@@ -42,11 +42,11 @@
     },
     "RELEASE_OPERATIONS": {
       "title": "Release operations: install, upgrade, rollback",
-      "description": "Verify and operate FactLane releases with exact v0.1.3 identity, artifact hashes, install paths, upgrade checks, rollback boundaries, and reverification."
+      "description": "Verify and operate FactLane releases with exact v0.1.4 identity, artifact hashes, install paths, upgrade checks, rollback boundaries, and reverification."
     },
     "PROJECT_HISTORY": {
       "title": "Project history and design evolution",
-      "description": "Follow FactLane’s evolution from scoped reusable facts to a five-tool local MCP contract, separate verifier authority, and the bounded v0.1.3 profile."
+      "description": "Follow FactLane’s evolution from scoped reusable facts to a five-tool local MCP contract, separate verifier authority, and the bounded v0.1.4 profile."
     }
   },
   "ar": {
@@ -68,7 +68,7 @@
     },
     "QUICKSTART": {
       "title": "البدء السريع: إعداد خادم MCP محلي",
-      "description": "ثبّت FactLane v0.1.3 محليًا، واربط مضيف MCP عبر stdio، وتحقق من الأدوات الخمس بوضع read-only قبل تفعيل كتابة Candidate عند الحاجة."
+      "description": "ثبّت FactLane v0.1.4 محليًا، واربط مضيف MCP عبر stdio، وتحقق من الأدوات الخمس بوضع read-only قبل تفعيل كتابة Candidate عند الحاجة."
     },
     "TOOLS": {
       "title": "أدوات MCP الخمس",
@@ -84,7 +84,7 @@
     },
     "ENVIRONMENT": {
       "title": "البيئة ومتطلبات التوافق",
-      "description": "راجع متطلبات FactLane v0.1.3: Python 3.11+ وSQLite 3.42.0+ المرتبط وstdio MCP المحلي وملفات تعريف Ollama وحدود التخزين والدعم."
+      "description": "راجع متطلبات FactLane v0.1.4: Python 3.11+ وSQLite 3.42.0+ المرتبط وstdio MCP المحلي وملفات تعريف Ollama وحدود التخزين والدعم."
     },
     "SECURITY": {
       "title": "سياسة الأمان",
@@ -92,11 +92,11 @@
     },
     "RELEASE_OPERATIONS": {
       "title": "عمليات الإصدار: التثبيت والترقية والتراجع",
-      "description": "تحقق من إصدارات FactLane وشغّلها باستخدام هوية v0.1.3 الدقيقة وبصمات الحزم ومسارات التثبيت وفحوص الترقية وحدود التراجع وإعادة التحقق."
+      "description": "تحقق من إصدارات FactLane وشغّلها باستخدام هوية v0.1.4 الدقيقة وبصمات الحزم ومسارات التثبيت وفحوص الترقية وحدود التراجع وإعادة التحقق."
     },
     "PROJECT_HISTORY": {
       "title": "تاريخ المشروع وتطور التصميم",
-      "description": "تتبّع تطور FactLane من حقائق قابلة لإعادة الاستخدام ومحددة النطاق إلى عقد MCP محلي بخمس أدوات وصلاحية تحقق منفصلة وملف v0.1.3 المحدود."
+      "description": "تتبّع تطور FactLane من حقائق قابلة لإعادة الاستخدام ومحددة النطاق إلى عقد MCP محلي بخمس أدوات وصلاحية تحقق منفصلة وملف v0.1.4 المحدود."
     }
   }
 }

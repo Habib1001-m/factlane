@@ -512,7 +512,7 @@ function Authority({copy}: {copy: HomeCopy}) {
 
 function QuickStart({copy}: {copy: HomeCopy}) {
   const command = [
-    'git clone --branch v0.1.3 --depth 1 \\',
+    'git clone --branch v0.1.4 --depth 1 \\',
     '  https://github.com/Habib1001-m/factlane.git',
     'cd factlane',
     'uv sync --frozen',
@@ -532,7 +532,7 @@ function QuickStart({copy}: {copy: HomeCopy}) {
         <div className={styles.codePanel}>
           <div className={styles.codeHeader}>
             <span>terminal</span>
-            <span>v0.1.3</span>
+            <span>v0.1.4</span>
           </div>
           <pre><code>{command}</code></pre>
         </div>
@@ -703,7 +703,7 @@ export default function Home(): ReactNode {
     codeRepository: 'https://github.com/Habib1001-m/factlane',
     programmingLanguage: 'Python',
     runtimePlatform: 'Python 3.11+',
-    softwareVersion: '0.1.3',
+    softwareVersion: '0.1.4',
     license: 'https://www.apache.org/licenses/LICENSE-2.0',
     inLanguage: locale,
     url: localeUrl,

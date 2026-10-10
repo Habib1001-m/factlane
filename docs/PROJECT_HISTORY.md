@@ -25,7 +25,7 @@ supported local deployment profile. That work covered package/install parity, au
 backup/restore compatibility, bounded concurrent operation, crash/restart behavior, configured
 stdio host integration, production-derived retrieval, and fail-closed SQLite capacity
 handling. The release remains local-first and keeps the five-tool public MCP contract at
-revision 2.
+revision 2. The 0.1.4 line preserves that contract while adding the qualified embedding-compatibility migration, native Windows standard-runtime evidence, host/bootstrap hardening, and release/publication controls.
 
 Qualification does not turn FactLane into a universal retrieval or deployment platform.
 Language and semantic-ranking quality remain workload-specific, and operators remain

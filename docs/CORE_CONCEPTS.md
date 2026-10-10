@@ -78,7 +78,7 @@ Some facts are long-lived:
 
 Others become stale quickly:
 
-> “The current release is v0.1.3.”
+> “The current release is v0.1.4.”
 
 FactLane stores freshness policy with memory so current-state retrieval can exclude facts that
 are no longer eligible.

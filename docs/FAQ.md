@@ -10,7 +10,7 @@ assistant or coding agent; the host connects it to FactLane's memory tools.
 
 ## Do I need to be a developer?
 
-Not necessarily for normal use after FactLane is connected, but **v0.1.3 setup is still
+Not necessarily for normal use after FactLane is connected, but **v0.1.4 setup is still
 technical**. Someone must install FactLane, provide a compatible command-launched stdio MCP host,
 and configure local storage and a supported local embedding model.
 
@@ -38,14 +38,14 @@ FactLane is not:
 - a general search/indexing system for arbitrary corpora;
 - a backup service;
 - a managed remote memory cloud;
-- an HTTP/SSE/Streamable HTTP MCP server in v0.1.3;
+- an HTTP/SSE/Streamable HTTP MCP server in v0.1.4;
 - an automatic permission system for an agent.
 
 Facts are bounded to 2,000 UTF-8 bytes.
 
 ## Where does the data live?
 
-The qualified v0.1.3 profile uses local SQLite/SQLite-vec storage and supported local Ollama
+The qualified v0.1.4 profile uses local SQLite/SQLite-vec storage and supported local Ollama
 embeddings. The shipped embedding path does not fall back to a remote provider automatically.
 
 Read [Environment and compatibility](ENVIRONMENT.md) for the exact supported profile.

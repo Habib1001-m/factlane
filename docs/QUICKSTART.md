@@ -21,7 +21,7 @@ on the machine that will run FactLane. The Python environment used for FactLane 
 **SQLite 3.42.0+**.
 
 ```bash
-git clone --branch v0.1.3 --depth 1 https://github.com/Habib1001-m/factlane.git
+git clone --branch v0.1.4 --depth 1 https://github.com/Habib1001-m/factlane.git
 cd factlane
 uv sync --frozen
 uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
@@ -34,7 +34,7 @@ executable may report a *different* version. Below the floor, FactLane returns
 `BACKEND_COMPATIBILITY_MISMATCH` before creating or opening its database. Python version
 alone does not satisfy the storage contract.
 
-The clone command intentionally pins the versioned `v0.1.3` release instead of moving `main`.
+The clone command intentionally pins the versioned `v0.1.4` release instead of moving `main`.
 For artifact digests, published-package installation, upgrades and rollback, use
 [Release operations](RELEASE_OPERATIONS.md).
 
@@ -97,11 +97,9 @@ enabled = true
 Reload your installed Codex version's MCP configuration and confirm that the five FactLane tools
 appear. An agent's use of those tools should follow the portable
 [using-factlane Skill](../skills/using-factlane/SKILL.md), installed through your host's
-supported Skill mechanism. The exact `v0.1.3` release pinned in step 1 ships `SKILL.md` only; it
-does **not** include `references/host-bootstrap.md`. For that released path, use its shipped Skill
-with the host's supported mechanism. The current unreleased Development source adds
-`references/host-bootstrap.md` as the host-neutral inspection, registration-state, and evidence
-reference. Do not infer that the Skill is registered, discoverable, or loaded merely because its
+supported Skill mechanism. The exact `v0.1.4` release pinned in step 1 ships both `SKILL.md` and
+`references/host-bootstrap.md`. The bootstrap reference is host-neutral guidance for inspection,
+registration state, and evidence; it does not imply that a host registered or loaded the Skill. Do not infer that the Skill is registered, discoverable, or loaded merely because its
 files exist.
 
 ### Hermes (tested stdio host)

@@ -132,7 +132,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       proofsLabel: 'FactLane at a glance',
       proofs: [
         {strong: 'Apache-2.0', rest: ' open source'},
-        {strong: 'v0.1.3', rest: ' production-qualified local profile'},
+        {strong: 'v0.1.4', rest: ' production-qualified local profile'},
         {strong: 'Five tools', rest: ' focused MCP surface'},
       ],
       developerLabel: 'Prefer manual setup?',
@@ -161,7 +161,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
         {
           eyebrow: 'Project state',
           title: 'Carry forward facts that change how work should continue.',
-          quote: '“The release is v0.1.3. Production changes still require owner approval.”',
+          quote: '“The release is v0.1.4. Production changes still require owner approval.”',
           note: 'Current retrieval can reuse the verified fact without replaying the project history.',
         },
         {
@@ -195,7 +195,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
         },
         {
           title: 'Setup today is still technical.',
-          body: 'FactLane v0.1.3 runs locally through a compatible MCP host. Someone must configure that connection, even though normal use afterward does not require thinking about databases or vector search.',
+          body: 'FactLane v0.1.4 runs locally through a compatible MCP host. Someone must configure that connection, even though normal use afterward does not require thinking about databases or vector search.',
         },
       ],
       beginnerCta: "I'm new — explain it simply",
@@ -276,7 +276,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       eyebrow: 'Ready to try it?',
       title: 'Start local. Keep the first run boring.',
       intro:
-        'Use the exact v0.1.3 release, verify the linked SQLite runtime, install a supported local embedding model, then connect your MCP host.',
+        'Use the exact v0.1.4 release, verify the linked SQLite runtime, install a supported local embedding model, then connect your MCP host.',
       panelTitle: 'New to the technical setup?',
       body: 'The Quick Start explains the prerequisites one step at a time, including what launches FactLane and why “five tools discovered” does not automatically mean “writes are allowed.”',
       cta: 'Follow the Quick Start',
@@ -285,7 +285,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       eyebrow: 'A bounded production claim',
       title: 'Production-qualified for one documented local profile — not marketed as universal infrastructure.',
       intro:
-        'FactLane v0.1.3 is the first official production release. The support statement is intentionally specific enough to verify and narrow enough to be honest.',
+        'FactLane v0.1.4 is the current production release. The support statement is intentionally specific enough to verify and narrow enough to be honest.',
       supportedLabel: 'Supported profile',
       supportedItems: [
         'Python 3.11+',
@@ -324,7 +324,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       intro:
         'The current supported profile is a command-launched stdio MCP server with local embeddings and local SQLite/SQLite-vec storage.',
       noteBodies: [
-        'No HTTP, SSE or Streamable HTTP server transport in v0.1.3.',
+        'No HTTP, SSE or Streamable HTTP server transport in v0.1.4.',
         'The shipped provider uses Ollama over loopback HTTP.',
         'The storage backend does not decide who is allowed to promote memory.',
       ],
@@ -357,7 +357,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       proofsLabel: 'FactLane باختصار',
       proofs: [
         {strong: 'Apache-2.0', rest: ' مفتوح المصدر'},
-        {strong: 'v0.1.3', rest: ' ملف محلي مؤهل إنتاجيًا'},
+        {strong: 'v0.1.4', rest: ' ملف محلي مؤهل إنتاجيًا'},
         {strong: 'خمس أدوات', rest: ' سطح MCP مركز'},
       ],
       developerLabel: 'تفضّل الإعداد بنفسك؟',
@@ -385,7 +385,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
         {
           eyebrow: 'حالة المشروع',
           title: 'انقل الحقائق التي تغيّر كيف يجب أن يستمر العمل.',
-          quote: '«الإصدار الحالي v0.1.3. تغييرات الإنتاج ما زالت تحتاج موافقة المالك.»',
+          quote: '«الإصدار الحالي v0.1.4. تغييرات الإنتاج ما زالت تحتاج موافقة المالك.»',
           note: 'يمكن للاسترجاع الحالي إعادة استخدام الحقيقة المتحقَّق منها من دون إعادة تاريخ المشروع كله.',
         },
         {
@@ -500,7 +500,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       eyebrow: 'جاهز للتجربة؟',
       title: 'ابدأ محليًا. واجعل التشغيل الأول بسيطًا ومملًا.',
       intro:
-        'استخدم إصدار v0.1.3 المحدد، وتحقق من SQLite المرتبط، وثبّت embedding model محليًا ومدعومًا، ثم صِل MCP host.',
+        'استخدم إصدار v0.1.4 المحدد، وتحقق من SQLite المرتبط، وثبّت embedding model محليًا ومدعومًا، ثم صِل MCP host.',
       panelTitle: 'جديد على الإعداد التقني؟',
       body: 'يشرح Quick Start المتطلبات خطوة بخطوة، بما في ذلك ما الذي يشغّل FactLane ولماذا ظهور «خمس أدوات» لا يعني تلقائيًا أن الكتابة مسموحة.',
       cta: 'اتبع Quick Start',
@@ -509,7 +509,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       eyebrow: 'ادعاء إنتاجي محدد',
       title: 'مؤهل إنتاجيًا لملف محلي موثق — وليس ادعاءً بأننا بنية تحتية مناسبة لكل بيئة.',
       intro:
-        'FactLane v0.1.3 هو أول إصدار إنتاج رسمي. تعمدنا أن يكون نطاق الدعم محددًا بما يكفي لإثباته وصريحًا بما يكفي لعدم المبالغة.',
+        'FactLane v0.1.4 هو الإصدار الإنتاجي الحالي. تعمدنا أن يكون نطاق الدعم محددًا بما يكفي لإثباته وصريحًا بما يكفي لعدم المبالغة.',
       supportedLabel: 'ملف التشغيل المدعوم',
       supportedItems: [
         'Python 3.11+',
@@ -548,7 +548,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       intro:
         'ملف التشغيل المدعوم حاليًا هو stdio MCP server يُشغَّل بالأمر، مع embeddings محلية وتخزين محلي SQLite/SQLite-vec.',
       noteBodies: [
-        'لا يوجد HTTP أو SSE أو Streamable HTTP server transport في v0.1.3.',
+        'لا يوجد HTTP أو SSE أو Streamable HTTP server transport في v0.1.4.',
         'الـprovider المرفق يستخدم Ollama عبر loopback HTTP.',
         'طبقة التخزين لا تقرر من يملك صلاحية ترقية الذاكرة.',
       ],
@@ -724,7 +724,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
         },
         {
           title: 'If the agent has access, install read-only',
-          body: 'Use the exact v0.1.3 release, the supported local profile and a compatible MCP host. Verify all five tools and a suitable memory_status call before enabling writes.',
+          body: 'Use the exact v0.1.4 release, the supported local profile and a compatible MCP host. Verify all five tools and a suitable memory_status call before enabling writes.',
         },
         {
           title: 'Enable contribution only after the boundary is clear',
@@ -733,7 +733,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
       ],
       promptLabel: 'Prompt for your agent',
       promptTitle: 'Copy this, then adapt it to your workflow.',
-      promptBody: `Official FactLane repository:\nhttps://github.com/Habib1001-m/factlane\n\nBefore changing anything on my machine:\n1) Read the project and official docs. Explain what FactLane adds beside the memory systems I already use and whether it fits my workflow.\n2) Give me concrete use cases, and explain Candidate, Current, freshness, scope and the authority boundary in plain language.\n3) If you have Terminal, file and MCP-host configuration access, inspect the prerequisites and install the exact supported v0.1.3 release. Configure it read-only first.\n4) Verify that my host discovers exactly five FactLane tools and that an appropriate memory_status request succeeds.\n5) Before enabling any write capability, explain delegated-candidate versus verifier authority and ask me before changing the write profile.\n\nIf you do not have the required machine or MCP-host access, do not claim you installed or configured anything. Explain and guide me instead.`,
+      promptBody: `Official FactLane repository:\nhttps://github.com/Habib1001-m/factlane\n\nBefore changing anything on my machine:\n1) Read the project and official docs. Explain what FactLane adds beside the memory systems I already use and whether it fits my workflow.\n2) Give me concrete use cases, and explain Candidate, Current, freshness, scope and the authority boundary in plain language.\n3) If you have Terminal, file and MCP-host configuration access, inspect the prerequisites and install the exact supported v0.1.4 release. Configure it read-only first.\n4) Verify that my host discovers exactly five FactLane tools and that an appropriate memory_status request succeeds.\n5) Before enabling any write capability, explain delegated-candidate versus verifier authority and ask me before changing the write profile.\n\nIf you do not have the required machine or MCP-host access, do not claim you installed or configured anything. Explain and guide me instead.`,
       copyAction: 'Copy prompt',
       copiedAction: 'Prompt copied',
       copyFailedAction: 'Automatic copy failed — select and copy the prompt manually',
@@ -772,7 +772,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
       eyebrow: 'Quality you can inspect',
       title: 'Free and open source. Production-qualified where we claim support.',
       intro:
-        'FactLane v0.1.3 is an official production release for a deliberately bounded local profile. The quality claim is tied to explicit contracts, fail-closed behavior and documented qualification — not adjectives.',
+        'FactLane v0.1.4 is an official production release for a deliberately bounded local profile. The quality claim is tied to explicit contracts, fail-closed behavior and documented qualification — not adjectives.',
       cards: [
         {
           title: 'Small public surface',
@@ -896,7 +896,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
         },
         {
           title: 'إن كان قادرًا، ثبّت read-only أولًا',
-          body: 'استخدم الإصدار v0.1.3 بالضبط وملف التشغيل المحلي المدعوم وMCP host متوافقًا. تحقّق من الأدوات الخمس وطلب memory_status مناسب قبل أي كتابة.',
+          body: 'استخدم الإصدار v0.1.4 بالضبط وملف التشغيل المحلي المدعوم وMCP host متوافقًا. تحقّق من الأدوات الخمس وطلب memory_status مناسب قبل أي كتابة.',
         },
         {
           title: 'فعّل المساهمة بعد فهم الحدود',
@@ -905,7 +905,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
       ],
       promptLabel: 'رسالة جاهزة لوكيلك',
       promptTitle: 'انسخها ثم عدّلها على حسب سير عملك.',
-      promptBody: `هذا رابط FactLane الرسمي:\nhttps://github.com/Habib1001-m/factlane\n\nقبل أن تغيّر أي شيء على جهازي:\n1) اقرأ المشروع والوثائق الرسمية. اشرح لي ماذا يضيف FactLane بجانب أنظمة الذاكرة التي أستخدمها وهل يناسب سير عملي.\n2) اقترح حالات استخدام عملية، واشرح ببساطة Candidate وCurrent والحداثة والنطاق وحدود الصلاحيات.\n3) إذا كنت تملك صلاحيات Terminal والملفات وإعداد MCP host، افحص المتطلبات وثبّت الإصدار المدعوم v0.1.3 بالضبط، واضبط الاتصال read-only أولًا.\n4) تحقّق من أن الـhost يكتشف أدوات FactLane الخمس وأن طلب memory_status مناسبًا ينجح.\n5) قبل أي كتابة، اشرح delegated-candidate مقابل verifier authority واطلب موافقتي قبل تغيير write profile.\n\nإذا لم تكن تملك الصلاحيات اللازمة على الجهاز أو إعداد MCP host، لا تدّع أنك ثبّت أو هيّأت شيئًا؛ اشرح وارشدني فقط.`,
+      promptBody: `هذا رابط FactLane الرسمي:\nhttps://github.com/Habib1001-m/factlane\n\nقبل أن تغيّر أي شيء على جهازي:\n1) اقرأ المشروع والوثائق الرسمية. اشرح لي ماذا يضيف FactLane بجانب أنظمة الذاكرة التي أستخدمها وهل يناسب سير عملي.\n2) اقترح حالات استخدام عملية، واشرح ببساطة Candidate وCurrent والحداثة والنطاق وحدود الصلاحيات.\n3) إذا كنت تملك صلاحيات Terminal والملفات وإعداد MCP host، افحص المتطلبات وثبّت الإصدار المدعوم v0.1.4 بالضبط، واضبط الاتصال read-only أولًا.\n4) تحقّق من أن الـhost يكتشف أدوات FactLane الخمس وأن طلب memory_status مناسبًا ينجح.\n5) قبل أي كتابة، اشرح delegated-candidate مقابل verifier authority واطلب موافقتي قبل تغيير write profile.\n\nإذا لم تكن تملك الصلاحيات اللازمة على الجهاز أو إعداد MCP host، لا تدّع أنك ثبّت أو هيّأت شيئًا؛ اشرح وارشدني فقط.`,
       copyAction: 'انسخ الرسالة',
       copiedAction: 'تم نسخ الرسالة',
       copyFailedAction: 'تعذّر النسخ تلقائيًا — حدّد النص وانسخه يدويًا',
@@ -944,7 +944,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
       eyebrow: 'جودة يمكنك فحصها',
       title: 'مجاني ومفتوح المصدر. ومؤهل إنتاجيًا ضمن نطاق الدعم المعلن.',
       intro:
-        'FactLane v0.1.3 إصدار إنتاج رسمي لملف محلي محدد عمدًا. ادعاء الجودة مربوط بعقود صريحة وفشل مغلق وتأهيل موثّق — لا بصفات تسويقية.',
+        'FactLane v0.1.4 إصدار إنتاج رسمي لملف محلي محدد عمدًا. ادعاء الجودة مربوط بعقود صريحة وفشل مغلق وتأهيل موثّق — لا بصفات تسويقية.',
       cards: [
         {
           title: 'سطح عام صغير',
