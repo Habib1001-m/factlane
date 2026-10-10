@@ -35,6 +35,11 @@ fi
 source_commit=$(git -C "$repo_root" rev-parse HEAD)
 source_tree=$(git -C "$repo_root" rev-parse 'HEAD^{tree}')
 short_commit=${source_commit:0:8}
+candidate_version=$(sed -n 's/^version = "\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p' "$repo_root/pyproject.toml" | head -n 1)
+[[ "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo 'HOLD: could not derive candidate package version from pyproject.toml' >&2
+  exit 1
+}
 tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/factlane-publication-ci.${short_commit}.XXXXXX")
 clone_a="$tmp_root/source-a"
 clone_b="$tmp_root/source-b"
@@ -247,14 +252,15 @@ negative_llms_eligibility="$tmp_root/NEGATIVE_LLMS_PUBLICATION_ELIGIBILITY.json"
 }
 
 cp -a "$build_a" "$negative_footer_build"
-python - "$negative_footer_build/ar/index.html" <<'PY'
+python - "$negative_footer_build/ar/index.html" "$candidate_version" <<'PY'
 from pathlib import Path
 import re
 import sys
 
 path = Path(sys.argv[1])
+version = re.escape(sys.argv[2])
 text = path.read_text()
-pattern = r'(<footer\b[\s\S]*?)FactLane v0\.1\.3([\s\S]*?</footer>)'
+pattern = rf'(<footer\b[\s\S]*?)FactLane v{version}([\s\S]*?</footer>)'
 updated, count = re.subn(pattern, r'\1FactLane v9.9.9\2', text, count=1, flags=re.I)
 if count != 1:
     raise SystemExit('negative control could not find Arabic global footer release claim')
