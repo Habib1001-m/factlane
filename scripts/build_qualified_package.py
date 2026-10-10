@@ -56,7 +56,7 @@ def _safe_extract(archive: tarfile.TarFile, target: Path) -> None:
             destination.relative_to(root)
         except ValueError:
             fail(f"git archive contains unsafe path: {member.name}")
-    archive.extractall(target)
+    archive.extractall(target, filter="data")
 
 
 def _tracked_package_files(repo: Path, head: str) -> list[str]:
