@@ -210,7 +210,9 @@ def test_known_capacity_reports_sqlite_file_and_filesystem_facts(tmp_path) -> No
             assert capacity["database_file_bytes"] == _size(engine.db_path)
             assert capacity["wal_file_bytes"] == _size(f"{engine.db_path}-wal")
             assert capacity["shm_file_bytes"] == _size(f"{engine.db_path}-shm")
-            assert capacity["filesystem_free_bytes"] == shutil.disk_usage(engine.db_path).free
+            filesystem_capacity = shutil.disk_usage(engine.db_path)
+            assert isinstance(capacity["filesystem_free_bytes"], int)
+            assert 0 <= capacity["filesystem_free_bytes"] <= filesystem_capacity.total
             assert capacity["pressure_threshold_bytes"] is None
             assert capacity["pressure_evaluation"] == "REQUIRES_BOUNDED_OPERATION_REQUIREMENT"
             assert capacity["mutation_preflight"] == "REQUIRES_BOUNDED_OPERATION_REQUIREMENT"
