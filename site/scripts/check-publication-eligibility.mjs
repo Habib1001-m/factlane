@@ -21,7 +21,7 @@ const baselineBuildRoot = path.resolve(args['baseline-build'] ?? '');
 const protectedBaseCommit = args['protected-base-commit'] ?? '';
 const receiptPath = path.resolve(args.receipt ?? path.join(buildRoot, '..', 'PUBLICATION_ELIGIBILITY.json'));
 const snapshotPath = path.resolve(
-  args.snapshot ?? path.join(siteRoot, 'publication', 'released-contract-v0.1.3.json'),
+  args.snapshot ?? path.join(siteRoot, 'publication', 'released-contract-v0.1.4.json'),
 );
 
 assert(args.build, '--build is required');
@@ -31,6 +31,7 @@ const snapshot = await readJson(snapshotPath);
 assert(snapshot.schemaVersion === 1, `Unsupported released-contract schema: ${snapshot.schemaVersion}`);
 const authority = snapshot.releaseAuthority;
 const baseline = snapshot.releasedPublicationBaseline;
+const releasedSiteBaseline = snapshot.releasedSiteBaseline ?? null;
 assert(authority && typeof authority === 'object', 'Released-contract snapshot is missing releaseAuthority');
 assert(baseline && typeof baseline === 'object', 'Released-contract snapshot is missing releasedPublicationBaseline');
 
@@ -44,8 +45,26 @@ const introductionCommits = git(repoRoot, [
 ]).split(/\r?\n/).filter(Boolean);
 assert(introductionCommits.length === 1, `Expected one historical introduction for ${snapshotRepoRelative}`);
 const controlIntroductionCommit = introductionCommits[0];
-const derivedAcceptedMainCommit = git(repoRoot, ['rev-parse', `${controlIntroductionCommit}^`]);
-const derivedAcceptedMainTree = git(repoRoot, ['rev-parse', `${derivedAcceptedMainCommit}^{tree}`]);
+const legacyDerivedAcceptedMainCommit = git(repoRoot, ['rev-parse', `${controlIntroductionCommit}^`]);
+const derivedAcceptedMainCommit = releasedSiteBaseline?.sourceCommit ?? legacyDerivedAcceptedMainCommit;
+const derivedAcceptedMainTree = releasedSiteBaseline?.sourceTree
+  ?? git(repoRoot, ['rev-parse', `${derivedAcceptedMainCommit}^{tree}`]);
+if (releasedSiteBaseline) {
+  assert(/^[0-9a-f]{40}$/.test(releasedSiteBaseline.sourceCommit ?? ''), 'Released-site baseline commit is invalid');
+  assert(/^[0-9a-f]{40}$/.test(releasedSiteBaseline.sourceTree ?? ''), 'Released-site baseline tree is invalid');
+  assert(
+    releasedSiteBaseline.sourceCommit === authority.commit,
+    'Released-site baseline commit must equal released product authority commit',
+  );
+  assert(
+    releasedSiteBaseline.sourceTree === authority.tree,
+    'Released-site baseline tree must equal released product authority tree',
+  );
+  assert(
+    git(repoRoot, ['rev-parse', `${releasedSiteBaseline.sourceCommit}^{tree}`]) === releasedSiteBaseline.sourceTree,
+    'Released-site baseline commit/tree binding is invalid',
+  );
+}
 assert(
   git(repoRoot, ['rev-parse', `${protectedBaseCommit}^{commit}`]) === protectedBaseCommit,
   'Protected/base authority commit is unavailable in the checkout',
@@ -78,10 +97,12 @@ assert(git(repoRoot, ['cat-file', '-t', tagRef]) === 'tag', `Released authority 
 assert(git(repoRoot, ['rev-parse', tagRef]) === authority.tagObject, `Released tag object drift: ${authority.tag}`);
 assert(git(repoRoot, ['rev-parse', `${authority.tag}^{commit}`]) === authority.commit, `Released commit drift: ${authority.tag}`);
 assert(git(repoRoot, ['rev-parse', `${authority.tag}^{tree}`]) === authority.tree, `Released tree drift: ${authority.tag}`);
-assert(
-  derivedAcceptedMainTree === baseline.productionSourceTree,
-  'Accepted main baseline and Production source tree must remain identical',
-);
+if (!releasedSiteBaseline) {
+  assert(
+    derivedAcceptedMainTree === baseline.productionSourceTree,
+    'Legacy accepted main baseline and Production source tree must remain identical',
+  );
+}
 assert(
   git(repoRoot, ['merge-base', authority.commit, derivedAcceptedMainCommit]) === authority.commit,
   'Accepted publication baseline is not descended from the released product authority',
@@ -269,10 +290,14 @@ const publicClaimSources = [
   'docusaurus.config.ts',
 ];
 const namedVersions = new Set();
+const releasedNamedVersions = new Set();
 for (const relative of publicClaimSources) {
   const text = await readFile(path.join(siteRoot, relative), 'utf8');
   for (const match of text.matchAll(/\bv\d+\.\d+\.\d+\b/g)) namedVersions.add(match[0]);
+  const releasedText = git(repoRoot, ['show', `${authority.tag}:site/${relative}`]);
+  for (const match of releasedText.matchAll(/\bv\d+\.\d+\.\d+\b/g)) releasedNamedVersions.add(match[0]);
 }
+for (const value of releasedNamedVersions) allowedNamedVersions.add(value);
 const unexpectedNamedVersions = [...namedVersions]
   .filter((value) => !allowedNamedVersions.has(value))
   .sort();
@@ -332,6 +357,12 @@ const receipt = {
     protectedBaseCommit,
     snapshotExistedAtProtectedBase,
   },
+  releasedSiteBaseline: {
+    sourceCommit: derivedAcceptedMainCommit,
+    sourceTree: derivedAcceptedMainTree,
+    explicit: Boolean(releasedSiteBaseline),
+  },
+  productionDeploymentBaseline: {...baseline},
   publicationClass,
   publicationEligibility,
   releaseSnapshotStale,
@@ -342,9 +373,10 @@ const receipt = {
   releasedProjectionSha256: releasedProjection.sha256,
   currentProjectionSha256: currentProjection.sha256,
   releasedProjectionRoutes: releasedProjection.routes.length,
-  currentProjectionRoutes: currentProjection.routes.length,
-  namedVersions: [...namedVersions].sort(),
-  unexpectedNamedVersions,
+    currentProjectionRoutes: currentProjection.routes.length,
+    namedVersions: [...namedVersions].sort(),
+    releasedNamedVersions: [...releasedNamedVersions].sort(),
+    unexpectedNamedVersions,
   currentPackageVersion,
   softwareVersion,
 };
