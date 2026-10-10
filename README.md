@@ -36,6 +36,13 @@ That distinction is the core of FactLane: **remembered context can support a dec
 > [!IMPORTANT]
 > FactLane memory is **supporting evidence**, not execution authority. Current user instructions, current repository or product state, and verified live sources outrank remembered facts.
 
+> [!NOTE]
+> The moving Development source can contain accepted changes newer than the latest official
+> release. Until a successor release identity is separately assigned and published, a wheel or
+> source distribution built from Development is **qualification-only**, even if its package
+> metadata still reads `0.1.3`. Official `v0.1.3` means the exact tag, commit/tree, and published
+> artifact digests recorded in [Release operations](docs/RELEASE_OPERATIONS.md).
+
 ## How FactLane works
 
 <p align="center">

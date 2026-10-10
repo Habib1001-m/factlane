@@ -9,6 +9,21 @@ Platform permissions can technically mutate those objects, so verify identities 
 trusting a name alone. The `main` branch may receive documentation or development changes after
 a release and must not be used as a substitute for a historical release identity.
 
+### Development package identity
+
+The moving Development source may temporarily retain the latest released package version in
+`pyproject.toml` while later changes are being qualified. That metadata does **not** make a local
+wheel or source distribution an official copy of the named release. If the source commit/tree does
+not exactly match the released authority, those artifacts are Development/qualification-only and
+must not be published or represented as the official release, even when their filenames contain the
+same version.
+
+Repository CI classifies this boundary with `scripts/check_release_surface.py`. The Development
+classification is intentionally fail-closed for release identity: it records that the source differs
+from the released tag and does not assign a successor version, release name, publication authority,
+or Production authority. A later official release must receive its own separately authorized
+version/tag and artifact digests before this boundary can be reconciled to released truth.
+
 ## Release identity contract
 
 For every official release, record all of the following before installation or upgrade:
