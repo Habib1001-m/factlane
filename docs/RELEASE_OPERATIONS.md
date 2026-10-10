@@ -267,6 +267,10 @@ Every later official release should use this checklist:
 4. Freeze one exact release tree; build wheel and source distribution from that tree; verify clean
    installation, package metadata, runtime-source parity, and complete portable Skill reference-set
    parity (relative paths plus SHA-256, not `SKILL.md` alone).
+   Use `scripts/build_qualified_package.py` for qualification builds: it exports the exact committed
+   tree into a disposable directory before invoking `uv build`, so ignored or stale `build/` and
+   `*.egg-info/` state in a reused checkout cannot enter the release payload. Do not use a direct
+   `uv build --wheel` from a reused worktree as release evidence.
 5. Reverify the configured MCP host and the exact public tool set before publication.
 6. Publish the tag and assets only after the release gates pass. Do not change an already-published
    tag or replace its assets to make later documentation agree with it.
