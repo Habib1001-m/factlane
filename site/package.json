@@ -41,7 +41,7 @@
     "@docusaurus/tsconfig": "3.10.2",
     "@docusaurus/types": "3.10.2",
     "typescript": "^5.9.3",
-    "wrangler": "4.148.0"
+    "wrangler": "4.149.0"
   },
   "engines": {
     "node": ">=20"
