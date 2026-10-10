@@ -94,14 +94,16 @@ echo "PUBLICATION_CI_SOURCE_TREE=$source_tree"
 echo "PUBLICATION_CI_ORIGIN=$public_origin"
 echo "PUBLICATION_CI_PROTECTED_BASE_COMMIT=$protected_base_commit"
 
-released_snapshot="$site_root/publication/released-contract-v0.1.3.json"
+released_snapshot="$site_root/publication/released-contract-v0.1.4.json"
 released_snapshot_relative=${released_snapshot#"$repo_root/"}
 control_introduction_commit=$(git -C "$repo_root" log --diff-filter=A --format=%H --reverse -- "$released_snapshot_relative" | head -n 1)
 [[ "$control_introduction_commit" =~ ^[0-9a-f]{40}$ ]] || {
   echo 'HOLD: could not derive the historical publication-control introduction commit' >&2
   exit 1
 }
-released_baseline_commit=$(git -C "$repo_root" rev-parse "$control_introduction_commit^")
+legacy_released_baseline_commit=$(git -C "$repo_root" rev-parse "$control_introduction_commit^")
+released_site_baseline_commit=$(node -p "const x=require('$released_snapshot'); x.releasedSiteBaseline?.sourceCommit || ''")
+released_baseline_commit=${released_site_baseline_commit:-$legacy_released_baseline_commit}
 if git -C "$repo_root" cat-file -e "$protected_base_commit:$released_snapshot_relative" 2>/dev/null; then
   [[ $(git -C "$repo_root" merge-base "$control_introduction_commit" "$protected_base_commit") == "$control_introduction_commit" ]] || {
     echo 'HOLD: publication-control introduction is not part of the externally supplied protected/base history' >&2

@@ -178,7 +178,7 @@ try {
 
   const archiveSha256 = archiveShaA;
   const overlayManifestPath = path.join(siteRoot, 'publication', 'overlays', 'manifest.json');
-  const releasedSnapshotPath = path.join(siteRoot, 'publication', 'released-contract-v0.1.3.json');
+  const releasedSnapshotPath = path.join(siteRoot, 'publication', 'released-contract-v0.1.4.json');
   await copyFile(overlayManifestPath, path.join(packageDir, 'OVERLAY_CONTROL.json'));
   await copyFile(releasedSnapshotPath, path.join(packageDir, 'RELEASED_CONTRACT_SNAPSHOT.json'));
   const packageJson = JSON.parse(await readFile(path.join(siteRoot, 'package.json'), 'utf8'));
