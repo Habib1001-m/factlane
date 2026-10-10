@@ -95,8 +95,10 @@ const releasedPyproject = git(repoRoot, ['show', `${authority.tag}:pyproject.tom
 const releasedContract = git(repoRoot, ['show', `${authority.tag}:src/factlane/contract.py`]);
 const releasedServer = git(repoRoot, ['show', `${authority.tag}:src/factlane/server.py`]);
 const releasedEnvironment = git(repoRoot, ['show', `${authority.tag}:docs/ENVIRONMENT.md`]);
+const currentPyproject = await readFile(path.join(repoRoot, 'pyproject.toml'), 'utf8');
 
 const releasedVersion = releasedPyproject.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+const currentPackageVersion = currentPyproject.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 const releasedPython = releasedPyproject.match(/^requires-python\s*=\s*"([^"]+)"/m)?.[1];
 const releasedRevision = Number(releasedContract.match(/^PUBLIC_CONTRACT_REVISION\s*=\s*(\d+)/m)?.[1]);
 const releasedTools = [...releasedServer.matchAll(/@server\.tool\(name="([^"]+)"/g)].map((match) => match[1]);
@@ -131,6 +133,9 @@ const allowedNamedVersions = new Set(
     .split(/\r?\n/)
     .filter((value) => /^v\d+\.\d+\.\d+$/.test(value) && atOrBeforeAuthority(value)),
 );
+if (/^\d+\.\d+\.\d+$/.test(currentPackageVersion ?? '')) {
+  allowedNamedVersions.add(`v${currentPackageVersion}`);
+}
 
 function decodeHtml(value) {
   return value
@@ -274,13 +279,18 @@ const unexpectedNamedVersions = [...namedVersions]
 
 const indexSource = await readFile(path.join(siteRoot, 'src', 'pages', 'index.tsx'), 'utf8');
 const softwareVersion = indexSource.match(/softwareVersion:\s*'([^']+)'/)?.[1];
+assert(
+  softwareVersion === authority.packageVersion || softwareVersion === currentPackageVersion,
+  `Published softwareVersion must match released authority ${authority.packageVersion} or current package ${currentPackageVersion}`,
+);
+const publishedVersionTag = `v${softwareVersion}`;
 const answerAuthority = await readJson(path.join(siteRoot, 'src', 'content', 'answerAuthority.json'));
 for (const locale of ['en', 'ar']) {
   const fiveTools = answerAuthority[locale]?.answers?.find((answer) => answer.id === 'five-tools')?.answer ?? '';
   for (const tool of authority.tools) assert(fiveTools.includes(tool), `Published ${locale} five-tool answer missing ${tool}`);
   const environment = answerAuthority[locale]?.answers?.find((answer) => answer.id === 'supported-environment')?.answer ?? '';
-  for (const token of [authority.tag, 'Python 3.11+', 'SQLite 3.42.0+', authority.transport, authority.embeddingProvider]) {
-    assert(environment.includes(token), `Published ${locale} environment answer missing released token ${token}`);
+  for (const token of [publishedVersionTag, 'Python 3.11+', 'SQLite 3.42.0+', authority.transport, authority.embeddingProvider]) {
+    assert(environment.includes(token), `Published ${locale} environment answer missing release-bound token ${token}`);
   }
 }
 
@@ -335,6 +345,7 @@ const receipt = {
   currentProjectionRoutes: currentProjection.routes.length,
   namedVersions: [...namedVersions].sort(),
   unexpectedNamedVersions,
+  currentPackageVersion,
   softwareVersion,
 };
 
