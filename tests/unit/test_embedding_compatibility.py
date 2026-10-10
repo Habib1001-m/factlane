@@ -130,6 +130,20 @@ def test_anchor_bundle_is_integrity_bound_and_complete() -> None:
     }
 
 
+def test_anchor_bundle_git_checkout_disables_text_eol_conversion() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    relative = ANCHOR_BUNDLE_PATH.resolve().relative_to(repo_root).as_posix()
+    result = subprocess.run(
+        ["git", "check-attr", "text", "--", relative],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == f"{relative}: text: unset"
+
+
 def test_exact_known_v013_profile_maps_to_qualified_legacy_space() -> None:
     legacy = {
         "profile_id": "embeddinggemma-300m-768",
