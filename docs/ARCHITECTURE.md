@@ -180,10 +180,14 @@ service. Process exit releases those descriptors; the sealing-incomplete state s
 operator reconciliation.
 
 The exclusion guarantee is bounded to supported local POSIX filesystems with reliable `flock`
-semantics; it does not extend to Windows or unvalidated network/FUSE locking behavior. It is a
-cooperative FactLane-runtime boundary, not a defense against arbitrary raw filesystem replacement
-by a privileged external process, so the independent quiescence inventory/full-stop procedure is
-still part of recovery.
+semantics; sensitive-memory recovery maintenance remains unsupported on Windows and on unvalidated
+network/FUSE locking behavior. The current **unreleased Development** standard runtime is qualified
+separately on native Windows x64/AMD64 for normal import/startup, stdio MCP, SQLite WAL/busy/CAS,
+process concurrency, durability, and valid Windows paths. That Windows qualification does not add a
+Windows recovery implementation: recovery imports safely but fails closed before mutation when the
+POSIX `fcntl`/`flock` capability is unavailable. The recovery exclusion boundary is cooperative,
+not a defense against arbitrary raw filesystem replacement by a privileged external process, so the
+independent quiescence inventory/full-stop procedure is still part of recovery.
 
 ## Version and migration boundary
 
@@ -203,6 +207,14 @@ published release. The exact release-identity and transition procedure lives in
 [Release operations](RELEASE_OPERATIONS.md).
 
 ## Qualification boundary
+
+The current **unreleased Development** qualification includes native Windows x64/AMD64 standard
+runtime behavior: package import, command startup, stdio discovery of exactly five public tools,
+default read-only authority, Candidate-only delegated contribution, verifier promotion, SQLite
+3.42.0+ with sqlite-vec, WAL/busy handling, cross-process CAS/concurrency, fresh-process durability,
+and valid Windows path handling. The pinned sqlite-vec dependency is qualified here on x64/AMD64;
+this is not a Windows ARM64 claim. Sensitive-memory recovery maintenance remains the POSIX-only
+capability described above.
 
 FactLane 0.1.3 is production-qualified for the documented local configuration: the packaged
 Python runtime, linked SQLite/SQLite-vec storage contract, stdio MCP surface, supported local

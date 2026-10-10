@@ -13,6 +13,12 @@ from typing import Any
 
 import pytest
 
+if os.name == "nt":
+    pytest.skip(
+        "sensitive-memory recovery maintenance requires POSIX fcntl/flock and is excluded from native Windows standard runtime",
+        allow_module_level=True,
+    )
+
 from factlane.adapter import MemoryAdapter, _establish_embedding_compatibility, trusted_write_context_for_profile
 from factlane.contract import AdapterError, PUBLIC_TOOL_NAMES, ScopeContext
 from factlane.embeddings import EmbeddingProfile

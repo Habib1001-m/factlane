@@ -137,6 +137,15 @@ crawler, transcript repository, or bulk document index. Very large source collec
 separate ingestion/extraction stage, which may have different throughput and provider
 requirements; no terabyte-scale ingestion rate is claimed here.
 
+The current **unreleased Development** standard runtime is qualified on native Windows x64/AMD64
+with Python 3.11+, linked SQLite 3.42.0+, the pinned sqlite-vec Windows AMD64 artifact, command-
+launched stdio MCP, and the same five-tool authority model. Qualification covers default read-only,
+Candidate contribution, verifier promotion, WAL/busy behavior, cross-process CAS/concurrency,
+fresh-process durability, and valid Windows paths. Sensitive-memory recovery maintenance is still
+POSIX-only because its exclusion contract requires `fcntl`/`flock`; on Windows that maintenance
+capability fails closed before mutation without preventing normal package import, startup, or test
+collection. No Windows ARM64 support claim is made by this qualification.
+
 FactLane 0.1.3 is production-qualified for the documented local profile: Python 3.11+,
 linked SQLite 3.42.0+, command-launched stdio MCP, supported local Ollama embeddings, and
 the documented local POSIX storage/recovery contract. Qualification includes backup/restore

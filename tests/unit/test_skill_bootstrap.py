@@ -36,7 +36,7 @@ def test_skill_reference_set_is_tracked_and_packaged_by_configuration() -> None:
         text=True,
     ).stdout.splitlines()
     assert set(tracked) == {
-        str(SKILL_ROOT / relative) for relative in EXPECTED_REFERENCE_SET
+        (SKILL_ROOT / relative).as_posix() for relative in EXPECTED_REFERENCE_SET
     }
 
     project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))

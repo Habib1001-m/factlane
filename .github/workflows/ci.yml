@@ -55,3 +55,26 @@ jobs:
           path: site/.publication-ci/
           if-no-files-found: error
           retention-days: 14
+
+  windows-runtime:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+      - run: uv sync --frozen --dev
+      - name: Verify native Windows x64 runtime prerequisites
+        shell: pwsh
+        run: |
+          uv run python -c "import os, platform, sqlite3, sys; assert sys.platform == 'win32' and os.name == 'nt'; assert platform.machine().lower() in {'amd64', 'x86_64'}; assert sqlite3.sqlite_version_info >= (3, 42, 0); print(sys.version); print(platform.platform()); print(sqlite3.sqlite_version)"
+          uv run python -c "import factlane, factlane.server, factlane.storage, factlane.recovery; print(factlane.__name__)"
+          uv run factlane --help
+          uv run factlane --help-tools
+      - name: Qualify native Windows standard runtime
+        run: uv run pytest -q

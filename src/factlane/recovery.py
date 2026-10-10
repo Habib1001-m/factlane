@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import hashlib
 import json
 import os
@@ -10,6 +9,11 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # Windows: sensitive-memory recovery maintenance is POSIX-only.
+    _fcntl = None
 
 from .contract import PUBLIC_TOOL_NAMES, AdapterError, canonical_json
 from .embedding_compatibility import parse_embedding_profile_metadata
@@ -68,6 +72,15 @@ class RecoveryHold(RuntimeError):
         super().__init__(safe_message)
         self.code = code
         self.safe_message = safe_message
+
+
+def _require_posix_recovery_locking() -> Any:
+    if _fcntl is None:
+        raise RecoveryHold(
+            "HOLD_UNSUPPORTED_PLATFORM_NO_MUTATION",
+            "sensitive-memory recovery maintenance requires POSIX fcntl/flock support",
+        )
+    return _fcntl
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +274,7 @@ class MaintenanceLease:
         self.capability: _MaintenanceCapability | None = None
 
     def __enter__(self) -> "MaintenanceLease":
+        fcntl = _require_posix_recovery_locking()
         try:
             handle, _ = _open_database_lease_handle(self.db_path, create=False)
         except FileNotFoundError as exc:
@@ -290,6 +304,7 @@ class MaintenanceLease:
 
     def promote_sanitized_image(self, sanitized: Path) -> None:
         """Lock the replacement inode before promotion and retain the old inode lock."""
+        fcntl = _require_posix_recovery_locking()
         try:
             replacement, _ = _open_database_lease_handle(str(sanitized), create=False)
         except OSError as exc:
@@ -333,6 +348,7 @@ class MaintenanceLease:
             self._retain_fail_closed = True
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        fcntl = _require_posix_recovery_locking() if (self._retired_handles or self._handle is not None) else None
         handles = [*self._retired_handles]
         if self._handle is not None:
             handles.append(self._handle)
@@ -349,6 +365,7 @@ class MaintenanceLease:
             return
         for handle in reversed(handles):
             try:
+                assert fcntl is not None
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             finally:
                 handle.close()
