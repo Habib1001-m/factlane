@@ -11,17 +11,16 @@
 
 ### هوية حزمة Development
 
-قد يحتفظ مصدر Development المتحرك مؤقتًا بأحدث رقم حزمة منشور في `pyproject.toml` أثناء
-تأهيل تغييرات لاحقة. ولا تجعل هذه metadata ملف wheel أو source distribution محليًا نسخة رسمية
-من الإصدار المسمى. فإذا لم يطابق commit/tree الخاصان بالمصدر سلطة الإصدار المنشور بدقة، فتكون
-هذه artifacts مخصصة لـDevelopment/qualification فقط، ويجب ألا تُنشر أو تُمثّل على أنها الإصدار
-الرسمي حتى لو احتوت أسماء ملفاتها رقم الإصدار نفسه.
+آخر إصدار إنتاج منشور هو `v0.1.4`. ويعلن خط المصدر/RC الحالي الآن `0.1.5` في `pyproject.toml`،
+لكن رقم الحزمة هذا يمثل **هوية Release Candidate محلية** إلى أن ينشئ عبور إصدار منفصل الـtag
+والartifacts المنشورة ويختمها. ولا يجوز تمثيل wheel أو source distribution محلي مبني من هذا
+المصدر على أنه إصدار `v0.1.5` رسمي.
 
 يصنّف CI الخاص بالمستودع هذا الحد بواسطة `scripts/check_release_surface.py`. ويكون تصنيف
 Development مغلقًا عمدًا أمام هوية الإصدار: فهو يسجل أن المصدر يختلف عن الوسم المنشور، ولا
-يعيّن إصدارًا لاحقًا أو اسم إصدار أو صلاحية نشر أو صلاحية Production. ويجب أن يحصل أي إصدار
-رسمي لاحق على version/tag وartifact digests خاصة به ومخوّلة بصورة منفصلة قبل مواءمة هذا الحد
-مع الحقيقة المنشورة.
+يعيّن صلاحية نشر أو صلاحية Production. وحتى رقم `0.1.5` المعلن في المصدر لا ينشئ tag باسم
+`v0.1.5` أو هوية release asset أو deployment أو صلاحية إصدار عامة. ويجب أن يحصل أي إصدار رسمي
+لاحق على tag وartifact digests مخولة بصورة منفصلة قبل مواءمة هذا الحد مع الحقيقة المنشورة.
 
 ## عقد هوية الإصدار
 
@@ -95,8 +94,82 @@ Windows x64 القياسية، وإرشادات bootstrap للـSkill، وضوا
 - تظل sensitive-memory recovery عملية للمشغّل فقط وPOSIX-only؛ تأهيل Windows لا يوسع هذا الحد.
 - الرجوع بحزمة التشغيل إلى v0.1.3 لا يثبت أمان خفض البيانات الدائمة تلقائيًا.
 
-لا تُسجل هوية tag/commit/tree أو بصمات wheel/sdist النهائية لـv0.1.4 إلا بعد اكتمال العبور العام
-المحمي وختم الإصدار؛ ولا تُختلق داخل شجرة المرشح.
+هوية v0.1.4 المنشورة مختومة ومسجلة الآن كما يلي:
+
+| العنصر | هوية v0.1.4 |
+| --- | --- |
+| Annotated tag | `v0.1.4` |
+| Tag object | `4276f3cbae14ebce89030d516f64682aabae59c9` |
+| Release commit | `4b2cf5b27d454799dd253c0306d83bd076c9369f` |
+| Release tree | `d9a69de5e63419bfb6aade745e25137e07857cbb` |
+| Wheel | `factlane-0.1.4-py3-none-any.whl` |
+| Wheel SHA-256 | `b1a256d124d74ffd6b9dba4338c171e35b95fa901e232bb1ed59ebd4f0316307` |
+| Source distribution | `factlane-0.1.4.tar.gz` |
+| Source distribution SHA-256 | `80c01dbf20dd5139350a9434c787c27a468f458397740fd0d85064394be1f5a3` |
+| Python | `>=3.11` |
+| Linked SQLite | `>=3.42.0` |
+| Public Contract Revision | `2` |
+| Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
+
+هذه حقائق إصدار تاريخية. ولا تمنح أي هوية أو صلاحية نشر لخط المصدر/RC الحالي `0.1.5`.
+
+## ملاحظات FactLane 0.1.5 RC المحلي والانتقال من v0.1.4
+
+يعلن خط المصدر الحالي package `0.1.5` وPublic Contract Revision 3 وعقد التخزين v3. ويظل مادة RC
+محلية: لا توجد بعد علامة `v0.1.5` منشورة أو بصمة wheel/sdist أو deployment أو صلاحية
+Production/publication.
+
+يحافظ الـRC على نقل MCP العام عبر **stdio فقط** وعلى سطح MCP العام عند الأدوات الخمس نفسها بالضبط.
+ويوسع Revision 3 أداة `memory_update` بوضعي `REVOKE`/`REJECT` بصلاحية Owner مباشرة، ويضيف سطح
+تحكم Owner المحكوم حول دورة الحياة المخزنة نفسها: `OwnerControlService` وCLI المرفق
+`factlane-owner` وlauncher المرفق `factlane-owner-webui` عبر loopback. يطبع launcher الـorigin
+المربوط وbootstrap token للاستخدام مرة واحدة؛ ويُتبادل الـtoken فقط عبر header
+`X-FactLane-Bootstrap` ولا يوضع في URL أو `localStorage`. والـWebUI طبقة عرض محلية للـOwner فوق
+الخدمة، وليس خادم MCP عبر HTTP ولا أداة MCP سادسة.
+
+يضيف storage v3 حالتي `REVOKED` و`REJECTED` المنطقيتين النهائيتين، وGroup CAS لمجموعة التناقض،
+وسجل lifecycle event/operation immutable، وإعادة فحص يدوية لحداثة `on_change`، وreadmission محكومًا.
+دورة الحياة النهائية منطقية ولا تدعي المحو المادي. والـreadmission عملية دورة حياة متحققة لذاكرة
+مؤهلة في `REVOKED`، وليست استعادة backup ولا إحياءً بعد sensitive-Recovery.
+
+ويظل `on_change` معتمدًا على الدليل بدل المراقبة الآلية. لا يشغّل الـRC watcher في الخلفية يعيد
+التحقق من المصدر. يقدم Owner ملاحظة حديثة ومحدودة لعملية إعادة الفحص اليدوية؛ والدليل changed أو
+unavailable أو indeterminate أو stale أو mismatched يفشل مغلقًا للمراجعة.
+
+### ترحيل التخزين المطلوب من v2 إلى v3
+
+لا يرحّل بدء v0.1.5 العادي قاعدة v0.1.4/storage-v2 بصمت. يفشل الـRC مغلقًا مع
+`MIGRATION_REQUIRED` حتى يكمل مشغّل الترحيل الموثوق الانتقال. أوقف FactLane أو ضعه في quiescence
+واختر مسار backup جديدًا يملكه المشغّل قبل التشغيل:
+
+```bash
+uv run factlane-migrate-storage-v3 migrate \
+  --db /absolute/path/to/factlane.sqlite3 \
+  --backup /absolute/path/to/backups/factlane-pre-v3.sqlite3
+```
+
+يتطلب المشغّل storage v2 دقيقًا، ويتحقق من integrity وlineage، وينشئ النسخة عبر مسار SQLite backup،
+ويعيد فتحها للتحقق من integrity والعقد v2 ويسجل SHA-256، ثم يطبّق مخطط الحوكمة v3 transactionally،
+ويرفع إصدار عقد التخزين في النهاية، ثم يتحقق من قاعدة الناتج كـv3. وترفض وجهة backup الموجودة مسبقًا.
+
+بعد الترحيل، احتفظ بمسار backup وSHA-256 المبلغ عنهما كدليل rollback، وأعد تشغيل فحوص وقت التشغيل
+العادية قبل تفعيل الكتابة.
+
+### rollback للبيانات من v3 إلى v2
+
+إذا كان يجب التراجع عن الترحيل قبل قبول حالة v3 كمرجعية دائمة، فأوقف/جمّد وقت تشغيل v0.1.5
+واستعد نسخة pre-v3 الدقيقة والموثقة عبر مشغّل الترحيل:
+
+```bash
+uv run factlane-migrate-storage-v3 restore \
+  --db /absolute/path/to/factlane.sqlite3 \
+  --backup /absolute/path/to/backups/factlane-pre-v3.sqlite3
+```
+
+يتحقق restore من أن backup هو storage contract v2، ويجهّز صورة الاستبدال وينفذ fsync لها، ويرقيها
+تحت maintenance lease، ويزيل WAL/SHM sidecars القديمة، ثم يتحقق من قاعدة البيانات المستعادة كـv2.
+ولا ينبغي للمشغّل التفكير في إعادة تشغيل v0.1.4 إلا بعد إثبات rollback للبيانات. تثبيت v0.1.4
+مباشرة فوق قاعدة storage-v3 ليس downgrade مدعومًا.
 
 ## تثبيت إصدار دقيق
 

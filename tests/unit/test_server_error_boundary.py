@@ -231,7 +231,7 @@ def test_e07_all_five_public_tools_share_the_same_structured_error_boundary(tool
     assert structured["error_code"] == "VERSION_CONFLICT"
     _assert_text_structured_parity(content, structured)
     assert [tool.name for tool in asyncio.run(server.list_tools())] == list(PUBLIC_TOOL_NAMES)
-    assert PUBLIC_CONTRACT_REVISION == 2
+    assert PUBLIC_CONTRACT_REVISION == 3
 
 
 def test_e08_success_path_shape_and_trusted_audit_remain_unchanged() -> None:

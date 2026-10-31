@@ -200,8 +200,8 @@ def test_delegated_current_store_is_denied_before_idempotency_lookup() -> None:
     assert engine.idempotency_calls == 0
 
 
-def test_public_contract_revision_two_exposes_candidate_parent_record_guard() -> None:
-    assert PUBLIC_CONTRACT_REVISION == 2
+def test_public_contract_revision_three_exposes_candidate_parent_record_guard() -> None:
+    assert PUBLIC_CONTRACT_REVISION == 3
     assert "expected_record_id" in request_schema("memory_update")["properties"]
 
 
@@ -305,6 +305,9 @@ def test_policy_decision_is_bound_to_validated_operation_and_payload() -> None:
             def __init__(self) -> None:
                 self.adapter: MemoryAdapter | None = None
                 self.idempotency_calls = 0
+
+            async def operation_by_idempotency(self, key: str):
+                return None
 
             async def find_idempotency(self, key: str):
                 self.idempotency_calls += 1

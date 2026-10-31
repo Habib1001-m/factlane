@@ -66,6 +66,14 @@ class _Engine:
         del scope
         return False
 
+    async def freshness_state(self, record_id: str, revision: int) -> dict[str, Any]:
+        del record_id, revision
+        return {
+            "freshness_gate_state": "NONE",
+            "latest_freshness_event_id": None,
+            "freshness_generation": 0,
+        }
+
 
 def _source_hash(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
@@ -314,4 +322,4 @@ def test_no_public_diversity_knob_tool_or_contract_revision_change() -> None:
         "memory_update",
         "memory_status",
     )
-    assert PUBLIC_CONTRACT_REVISION == 2
+    assert PUBLIC_CONTRACT_REVISION == 3

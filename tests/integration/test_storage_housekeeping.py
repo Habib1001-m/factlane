@@ -230,6 +230,8 @@ def _insert_vector_orphan(engine: SQLiteVecEngine, source_record_id: str) -> int
 
 def _insert_current_fork(engine: SQLiteVecEngine, record_id: str) -> str:
     assert engine.conn is not None
+    engine.conn.execute("DROP INDEX IF EXISTS uq_adapter_parent_record")
+    engine.conn.execute("DROP INDEX IF EXISTS uq_adapter_memory_revision")
     columns = [row[1] for row in engine.conn.execute("PRAGMA table_info(adapter_records)").fetchall()]
     values = list(engine.conn.execute("SELECT * FROM adapter_records WHERE record_id = ?", (record_id,)).fetchone())
     fork_id = f"{record_id}-fork"

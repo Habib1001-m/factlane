@@ -38,6 +38,25 @@ uv run factlane --help-tools
 للحصول على بصمات الملفات، وتثبيت الحزم المنشورة، والترقيات، والتراجع، استخدم
 [عمليات الإصدار](RELEASE_OPERATIONS.md).
 
+### تقييم خط المصدر/RC الحالي 0.1.5
+
+يعرّف مصدر المستودع الحالي نفسه باسم `0.1.5`، لكن لا توجد بعد هوية إصدار `v0.1.5` منشورة.
+إذا كنت تقيّم checkout محليًا للـRC جرى تزويدك به، فاستخدم ذلك checkout الدقيق بدل اختراع أو
+نسخ tag باسم `v0.1.5`:
+
+```bash
+uv sync --frozen
+uv run python -c 'from importlib.metadata import version; print(version("factlane"))'
+uv run factlane --help-tools
+uv run factlane-owner --help
+uv run factlane-migrate-storage-v3 --help
+```
+
+ينبغي أن يبلغ هذا المصدر عن package `0.1.5` وPublic Contract Revision 3 وعن أدوات MCP الخمس
+نفسها المذكورة أدناه. وهو يستخدم عقد التخزين v3. وإذا وجهته إلى قاعدة storage-v2، يفشل بدء التشغيل
+العادي في وضع مغلق مع `MIGRATION_REQUIRED`؛ استخدم إجراء الترحيل الصريح في
+[عمليات الإصدار](RELEASE_OPERATIONS.md) مع نسخة pre-v3 متحقق منها قبل الخدمة العادية.
+
 ## 2. ثبّت نموذج تضمين مدعومًا
 
 يستخدم المثال التالي ملف التعريف المضمّن `embeddinggemma-300m-768`:
@@ -222,6 +241,64 @@ memory_status
 بسجل Candidate لترقيته. لا يمتلك الوكيل المفوض صلاحية المتحقق، حتى مع موافقة المستخدم في المحادثة.
 يجدّد `REVERIFY` التحقق من دون تغيير هوية التناقض للذاكرة؛ استخدم `REPLACE` بدل تغيير
 `memory_type` أو `subject` عندما تكون إعادة تصنيف دلالية مطلوبة.
+
+### دورة حياة Owner وإعادة الفحص اليدوية في خط المصدر/RC 0.1.5
+
+يحافظ Public Contract Revision 3 على عدد أدوات MCP عند خمس أدوات، مع إضافة وضعي
+`REVOKE`/`REJECT` بصلاحية Owner مباشرة إلى `memory_update`. وللمراجعة التشغيلية، تُعرض
+`OwnerControlService` المحلية عبر `factlane-owner`. وتشمل أوامر القراءة `inventory` و`get` و
+`conflicts` و`status`، بينما تشمل أوامر التعديل `recheck` و`readmit` و`reverify` و`replace` و
+`revoke` و`reject` و`resolve`.
+
+اربط Owner CLI بالنطاق الموثوق الدقيق في وسيطات المشغّل. وقدّم دليل التعديل عبر ملف JSON محدود
+أو stdin حتى لا يحتاج الدليل إلى الظهور داخل وسيطات سطر الأوامر. على سبيل المثال، بعد أن يعيد
+inventory/detail مراجعة السجل الدقيقة وtoken مجموعة التناقض:
+
+```bash
+cat > revoke.json <<'JSON'
+{
+  "memory_id": "11111111-1111-4111-8111-111111111111",
+  "expected_record_id": "22222222-2222-4222-8222-222222222222",
+  "expected_revision": 3,
+  "observed_group_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "idempotency_key": "owner-revoke-example-1",
+  "reason_code": "OUTDATED"
+}
+JSON
+
+uv run factlane-owner \
+  --db ./factlane.sqlite3 \
+  --host-id local-owner \
+  --scope PROJECT \
+  --project-id example-project \
+  revoke --input revoke.json
+```
+
+الـtoken والمعرّفات في المثال placeholders؛ استخدم فقط القيم العائدة من مراجعة Owner الحالية
+الدقيقة. `REVOKED` و`REJECTED` حالتان منطقيتان نهائيتان وليستا حذفًا ماديًا.
+
+ولا تبدأ سياسة حداثة `on_change` watcher تلقائيًا للمصدر. ينفّذ Owner أمر `recheck` صريحًا بدليل
+حديث ومحدود. قد يجدّد الرصد unchanged الأهلية؛ أما changed أو unavailable أو indeterminate فيفشل
+في وضع مغلق للمراجعة. و`readmit` عملية Owner منفصلة لذاكرة منطقية مؤهلة في `REVOKED` مع تحقق جديد
+وGroup CAS. وهي ليست استعادة لقاعدة البيانات ولا تعيد إنشاء محتوى أزالته استعادة الذاكرة الحساسة.
+
+يُرفق مصدر 0.1.5 أيضًا launcher محليًا لـOwner WebUI مدعومًا من `OwnerControlService` نفسها:
+
+```bash
+uv run factlane-owner-webui \
+  --db ./factlane.sqlite3 \
+  --host-id local-owner \
+  --scope PROJECT \
+  --project-id example-project
+```
+
+يرتبط launcher بدقة عبر loopback `127.0.0.1` ويطبع كائن READY JSON واحدًا يحتوي `origin` الفعلي،
+ومسار `/owner/`، ومسار `/owner/bootstrap`، واسم bootstrap header، وbootstrap token للاستخدام مرة
+واحدة، والنطاق المربوط. استخدم الـtoken المطبوع فقط داخل header باسم `X-FactLane-Bootstrap` في
+`POST <origin>/owner/bootstrap`. **لا** تضف الـtoken إلى URL ولا تخزنه في `localStorage`. عند نجاح
+التبادل يُستهلك الـtoken، ويضبط الخادم session cookie من نوع `HttpOnly; SameSite=Strict`، ويعيد
+CSRF token؛ وتتطلب تعديلات Owner اللاحقة الجلسة الموثقة وCSRF header. يظل الـWebUI سطح Owner محليًا،
+وليس نقل MCP عبر HTTP، ولا يضيف أداة MCP ولا ينشئ أي هوية v0.1.5 منشورة أو deployed.
 
 ## 6. الحدود والمراجع التالية
 

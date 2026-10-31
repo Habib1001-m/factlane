@@ -338,9 +338,9 @@ def test_known_v013_legacy_database_migrates_metadata_only_and_fences_stale_writ
         trigger_sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='factlane_v2_adapter_update_fence'"
         ).fetchone()[0]
-        assert "factlane_contract_v2_compat_writer" in trigger_sql
+        assert "factlane_contract_v3_writer" in trigger_sql
         conn.create_function("factlane_contract_v2_writer", 0, lambda: 1)
-        with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v2_compat_writer"):
+        with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v3_writer"):
             conn.execute("UPDATE adapter_records SET fact=fact WHERE record_id=?", (record["record_id"],))
     finally:
         conn.close()
@@ -538,6 +538,7 @@ def test_legacy_provenance_mismatch_fails_closed_without_relabeling(tmp_path: Pa
         _, _ = await _seed_database(path, install_legacy_profile=True)
         conn = _raw_connection(path)
         try:
+            conn.create_function("factlane_contract_v3_writer", 0, lambda: 1)
             conn.create_function("factlane_contract_v2_writer", 0, lambda: 1)
             conn.execute("UPDATE adapter_records SET embedding_model_digest=?", ("c" * 64,))
             conn.commit()

@@ -320,7 +320,9 @@ for (const locale of ['en', 'ar']) {
 }
 
 const releaseSnapshotStale = latestReachableReleaseTag !== authority.tag;
+const sourcePackageDrift = currentPackageVersion !== authority.packageVersion;
 const releaseClaimDrift =
+  sourcePackageDrift ||
   routeSetDrift ||
   projectionRouteDiffs.length > 0 ||
   projectionFileDiffs.length > 0 ||
@@ -366,6 +368,7 @@ const receipt = {
   publicationClass,
   publicationEligibility,
   releaseSnapshotStale,
+  sourcePackageDrift,
   releaseClaimDrift,
   routeSetDrift,
   projectionRouteDiffs,

@@ -17,6 +17,18 @@ interpreter** determines whether the storage contract can run safely.
 A CPU-only setup is supported. A GPU, Docker, cloud LLM, remote embedding API, and always-on
 FactLane daemon are not prerequisites.
 
+The public support/version boundary is currently:
+
+| Surface | Published v0.1.4 | Current 0.1.5 source/RC |
+| --- | --- | --- |
+| Publication state | Latest published production release | Local release candidate/source line; no tag/artifact/deployment authority |
+| Public Contract | Revision 2 | Revision 3 |
+| MCP tools | Exactly five | Exactly five |
+| MCP transport | Command-launched stdio only | Command-launched stdio only |
+| Durable storage contract | v2 | v3; existing v2 requires explicit migration |
+| Normal Windows x64 runtime | Qualified bounded profile | Same normal-runtime boundary is retained for the RC |
+| Sensitive Recovery / v2→v3 maintenance | POSIX recovery contract | POSIX maintenance-lock contract; no Windows maintenance claim |
+
 After installing the project, inspect the SQLite version through the **same Python
 environment used by FactLane**:
 
@@ -130,6 +142,17 @@ cross-version production-data migration or downgrade guarantee is implied. See
 [Release operations](RELEASE_OPERATIONS.md) for the exact `v0.1.3` artifact identities and the
 reusable install/upgrade/rollback procedure for later versions.
 
+`v0.1.4` is the latest published production release. The current `0.1.5` source/RC is a storage
+contract transition from v2 to v3. Ordinary v0.1.5 startup inspects an existing database without
+silently migrating it and returns `MIGRATION_REQUIRED` for exact v2 state. The operator must run
+`factlane-migrate-storage-v3 migrate` with a separate backup destination. Migration verifies the v2
+database and lineage, creates and integrity-checks an exact v2 backup, applies the v3 schema and
+writer fences transactionally, advances the contract version last, and verifies v3 after commit.
+
+Rollback of that data transition means `factlane-migrate-storage-v3 restore` from the verified
+pre-v3 backup. Package rollback alone is not sufficient once durable data has reached contract v3.
+See [Release operations](RELEASE_OPERATIONS.md) for the exact command sequence.
+
 ## Data and deployment limits
 
 A FactLane fact is bounded to **2,000 UTF-8 bytes**. This interface is not a large-directory
@@ -137,7 +160,7 @@ crawler, transcript repository, or bulk document index. Very large source collec
 separate ingestion/extraction stage, which may have different throughput and provider
 requirements; no terabyte-scale ingestion rate is claimed here.
 
-The `v0.1.4` standard runtime is qualified on native Windows x64/AMD64
+The published `v0.1.4` standard runtime is qualified on native Windows x64/AMD64
 with Python 3.11+, linked SQLite 3.42.0+, the pinned sqlite-vec Windows AMD64 artifact, command-
 launched stdio MCP, and the same five-tool authority model. Qualification covers default read-only,
 Candidate contribution, verifier promotion, WAL/busy behavior, cross-process CAS/concurrency,
@@ -146,11 +169,21 @@ POSIX-only because its exclusion contract requires `fcntl`/`flock`; on Windows t
 capability fails closed before mutation without preventing normal package import, startup, or test
 collection. No Windows ARM64 support claim is made by this qualification.
 
-FactLane 0.1.4 is production-qualified for the documented local profile: Python 3.11+,
+The current `0.1.5` source/RC keeps the normal Windows x64 boundary separate from sensitive
+maintenance. The MCP server, normal SQLite runtime path, and local Owner service/CLI logic do not by
+themselves imply that sensitive-memory Recovery or v2→v3 migration/restore is supported on Windows.
+Those maintenance paths rely on the POSIX maintenance-lock contract. The Owner WebUI is loopback
+only and is a local operator surface, not an MCP transport or remotely supported admin service.
+
+FactLane 0.1.4 remains production-qualified for the documented local profile: Python 3.11+,
 linked SQLite 3.42.0+, command-launched stdio MCP, supported local Ollama embeddings, and
 the documented local POSIX storage/recovery contract. Qualification includes backup/restore
 compatibility, bounded concurrent operation, crash/restart rollback, configured host startup,
 production-derived retrieval, and fail-closed SQLite capacity behavior.
+
+The `0.1.5` source line is still a local RC. Its Rev3/storage-v3 behavior can be qualified from the
+source tree, but it must not be represented as a published production release until a separate
+release identity and publication crossing are authorized and sealed.
 
 This is a bounded support statement, not a universal deployment claim. Validate your own
 language/ranking workload and operational scale, and keep production data, backup retention,

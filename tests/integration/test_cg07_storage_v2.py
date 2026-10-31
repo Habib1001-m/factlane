@@ -190,16 +190,16 @@ def _database_snapshot(db_path: str) -> dict[str, object]:
         raw.close()
 
 
-def test_open_establishes_storage_contract_v2_and_contribution_origin(tmp_path) -> None:
+def test_open_establishes_storage_contract_v3_and_contribution_origin(tmp_path) -> None:
     async def run() -> None:
-        engine = SQLiteVecEngine(str(tmp_path / "storage-v2.db"), _profile())
+        engine = SQLiteVecEngine(str(tmp_path / "storage-v3.db"), _profile())
         await engine.open()
         try:
             assert engine.conn is not None
             version = engine.conn.execute(
                 "SELECT value FROM adapter_meta WHERE key='contract_version'"
             ).fetchone()
-            assert version is not None and version[0] == "2"
+            assert version is not None and version[0] == "3"
             columns = {row[1] for row in engine.conn.execute("PRAGMA table_info(adapter_records)")}
             assert "contribution_origin" in columns
             triggers = {
@@ -209,9 +209,9 @@ def test_open_establishes_storage_contract_v2_and_contribution_origin(tmp_path) 
                 )
             }
             assert {
-                "factlane_v2_adapter_insert_fence",
-                "factlane_v2_adapter_update_fence",
-                "factlane_v2_adapter_delete_fence",
+                "factlane_v3_adapter_insert_fence",
+                "factlane_v3_adapter_update_fence",
+                "factlane_v3_adapter_delete_fence",
             }.issubset(triggers)
         finally:
             await engine.close()
@@ -323,7 +323,7 @@ def test_current_knn_constrains_eligible_rowids_before_k(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_storage_v2_raw_legacy_writer_cannot_mutate_adapter_records(tmp_path) -> None:
+def test_storage_v3_raw_untrusted_writer_cannot_mutate_adapter_records(tmp_path) -> None:
     async def seed() -> tuple[str, str]:
         db_path = str(tmp_path / "writer-fence.db")
         engine = SQLiteVecEngine(db_path, _profile())
@@ -349,14 +349,14 @@ def test_storage_v2_raw_legacy_writer_cannot_mutate_adapter_records(tmp_path) ->
                 insert_values.append("'raw-insert-idempotency'")
             else:
                 insert_values.append(column)
-        with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v2_compat_writer"):
+        with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v3_writer"):
             raw.execute(
                 f"INSERT INTO adapter_records ({','.join(columns)}) SELECT {','.join(insert_values)} "
                 "FROM adapter_records WHERE record_id=?",
                 (record_id,),
             )
         for sql, params in (("UPDATE adapter_records SET fact='stale-writer' WHERE record_id=?", (record_id,)), ("DELETE FROM adapter_records WHERE record_id=?", (record_id,))):
-            with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v2_compat_writer"):
+            with pytest.raises(sqlite3.OperationalError, match="no such function: factlane_contract_v3_writer"):
                 raw.execute(sql, params)
     finally:
         raw.close()
@@ -1030,9 +1030,8 @@ def _downgrade_adapter_schema_to_v1(db_path: str) -> dict[str, object]:
     return snapshot
 
 
-@pytest.mark.parametrize("checkpoint", ["after_add_field", "after_backfill"])
-def test_storage_v1_to_v2_migration_failure_rolls_back_exact_v1(tmp_path, checkpoint: str) -> None:
-    db_path = str(tmp_path / f"migration-{checkpoint}.db")
+def test_storage_v1_is_refused_without_implicit_migration_or_byte_change(tmp_path) -> None:
+    db_path = str(tmp_path / "storage-v1-refused.db")
 
     async def seed_v2() -> None:
         engine = SQLiteVecEngine(db_path, _profile())
@@ -1046,16 +1045,11 @@ def test_storage_v1_to_v2_migration_failure_rolls_back_exact_v1(tmp_path, checkp
     asyncio.run(seed_v2())
     before = _downgrade_adapter_schema_to_v1(db_path)
 
-    class FailingMigrationEngine(SQLiteVecEngine):
-        def _migration_checkpoint(self, name: str) -> None:
-            if name == checkpoint:
-                raise RuntimeError(f"injected-{checkpoint}")
-
     async def attempt() -> None:
-        engine = FailingMigrationEngine(db_path, _profile())
+        engine = SQLiteVecEngine(db_path, _profile())
         with pytest.raises(AdapterError) as error:
             await engine.open()
-        assert error.value.code == "BACKEND_UNAVAILABLE"
+        assert error.value.code == "SCHEMA_MISMATCH"
 
     asyncio.run(attempt())
     after = _database_snapshot(db_path)
@@ -1072,7 +1066,7 @@ def test_unknown_future_storage_contract_version_fails_closed(tmp_path) -> None:
 
     asyncio.run(prepare())
     raw = sqlite3.connect(db_path)
-    raw.execute("UPDATE adapter_meta SET value='3' WHERE key='contract_version'")
+    raw.execute("UPDATE adapter_meta SET value='4' WHERE key='contract_version'")
     raw.commit()
     raw.close()
 
@@ -2077,8 +2071,8 @@ def test_equivalent_current_returns_already_current_without_promoting_candidate(
     asyncio.run(run())
 
 
-def test_successful_v1_to_v2_migration_preserves_materialized_state_and_backfills_legacy_origin(tmp_path) -> None:
-    db_path = str(tmp_path / "migration-success.db")
+def test_storage_v1_is_not_silently_chained_into_v3(tmp_path) -> None:
+    db_path = str(tmp_path / "migration-v1-refused.db")
 
     async def seed_v2() -> None:
         engine = SQLiteVecEngine(db_path, _profile())
@@ -2097,28 +2091,15 @@ def test_successful_v1_to_v2_migration_preserves_materialized_state_and_backfill
     asyncio.run(seed_v2())
     before = _downgrade_adapter_schema_to_v1(db_path)
 
-    async def migrate() -> list[dict[str, object]]:
+    async def attempt() -> None:
         engine = SQLiteVecEngine(db_path, _profile())
-        await engine.open()
-        try:
-            assert engine.conn is not None
-            assert engine.conn.execute("SELECT value FROM adapter_meta WHERE key='contract_version'").fetchone()[0] == "2"
-            origins = [json.loads(row[0]) for row in engine.conn.execute("SELECT contribution_origin FROM adapter_records")]
-            return origins
-        finally:
-            await engine.close()
+        with pytest.raises(AdapterError) as error:
+            await engine.open()
+        assert error.value.code == "SCHEMA_MISMATCH"
 
-    origins = asyncio.run(migrate())
+    asyncio.run(attempt())
     after = _database_snapshot(db_path)
-    assert "contribution_origin" in after["adapter_columns"]
-    assert after["adapter_rows_v1"] == before["adapter_rows_v1"]
-    assert after["native_columns"] == before["native_columns"]
-    assert after["native_rows"] == before["native_rows"]
-    assert after["vector_rows"] == before["vector_rows"]
-    assert tuple(item for item in after["meta"] if item[0] != "contract_version") == tuple(
-        item for item in before["meta"] if item[0] != "contract_version"
-    )
-    assert origins == [{"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None}]
+    assert after == before
 
 
 def test_review_history_discovers_candidate_while_current_retrieval_hides_it(tmp_path) -> None:

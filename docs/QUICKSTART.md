@@ -38,6 +38,25 @@ The clone command intentionally pins the versioned `v0.1.4` release instead of m
 For artifact digests, published-package installation, upgrades and rollback, use
 [Release operations](RELEASE_OPERATIONS.md).
 
+### Evaluating the current 0.1.5 source/RC
+
+The current repository source identifies itself as `0.1.5`, but there is no published `v0.1.5`
+release identity yet. If you are evaluating the local RC checkout supplied to you, use that exact
+checkout instead of inventing or cloning a `v0.1.5` tag:
+
+```bash
+uv sync --frozen
+uv run python -c 'from importlib.metadata import version; print(version("factlane"))'
+uv run factlane --help-tools
+uv run factlane-owner --help
+uv run factlane-migrate-storage-v3 --help
+```
+
+That source should report package `0.1.5`, Public Contract Revision 3, and exactly the same five MCP
+tools listed below. It uses storage contract v3. If you point it at a storage-v2 database, normal
+startup fails closed with `MIGRATION_REQUIRED`; use the explicit migration procedure in
+[Release operations](RELEASE_OPERATIONS.md) with a verified pre-v3 backup before normal service.
+
 ## 2. Install a supported embedding model
 
 The following example uses the built-in `embeddinggemma-300m-768` profile:
@@ -229,6 +248,68 @@ A trusted verifier reviewing a Candidate uses `REVIEW_HISTORY` to inspect it and
 approval in chat. `REVERIFY` refreshes verification without changing the memory's
 contradiction identity; use `REPLACE` rather than changing `memory_type` or subject when a
 semantic reclassification is intended.
+
+### Owner lifecycle and manual recheck in the 0.1.5 source/RC
+
+Public Contract Revision 3 keeps the MCP tool count at five while adding direct-Owner
+`REVOKE`/`REJECT` modes to `memory_update`. For operational review, the local
+`OwnerControlService` is exposed through `factlane-owner`. Read commands include `inventory`,
+`get`, `conflicts`, and `status`; mutation commands include `recheck`, `readmit`, `reverify`,
+`replace`, `revoke`, `reject`, and `resolve`.
+
+Bind the Owner CLI to the exact trusted scope in launcher arguments. Supply mutation proof through
+a bounded JSON file or stdin so evidence does not have to appear in command-line arguments. For
+example, after inventory/detail has returned the exact record revision and contradiction-group
+token:
+
+```bash
+cat > revoke.json <<'JSON'
+{
+  "memory_id": "11111111-1111-4111-8111-111111111111",
+  "expected_record_id": "22222222-2222-4222-8222-222222222222",
+  "expected_revision": 3,
+  "observed_group_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "idempotency_key": "owner-revoke-example-1",
+  "reason_code": "OUTDATED"
+}
+JSON
+
+uv run factlane-owner \
+  --db ./factlane.sqlite3 \
+  --host-id local-owner \
+  --scope PROJECT \
+  --project-id example-project \
+  revoke --input revoke.json
+```
+
+The example token and IDs are placeholders; use only values returned from the exact current Owner
+review. `REVOKED` and `REJECTED` are terminal logical lifecycle states, not physical deletion.
+
+An `on_change` freshness policy also does not start an automatic source watcher. The Owner performs
+an explicit `recheck` with fresh bounded evidence. An unchanged observation can renew eligibility;
+changed, unavailable, or indeterminate observations fail closed for review. `readmit` is a separate
+Owner operation for an eligible `REVOKED` logical memory with new verification and Group CAS. It is
+not database restore and does not recreate content removed by sensitive-memory recovery.
+
+The 0.1.5 source also packages a local Owner WebUI launcher backed by the same
+`OwnerControlService`:
+
+```bash
+uv run factlane-owner-webui \
+  --db ./factlane.sqlite3 \
+  --host-id local-owner \
+  --scope PROJECT \
+  --project-id example-project
+```
+
+The launcher binds exactly to loopback `127.0.0.1` and prints one READY JSON object containing the
+actual `origin`, `/owner/` path, `/owner/bootstrap` path, bootstrap header name, one-use bootstrap
+token, and bound scope. Use the printed token only as the `X-FactLane-Bootstrap` header on
+`POST <origin>/owner/bootstrap`. Do **not** append the token to the URL and do not put it in
+`localStorage`. A successful exchange consumes the token, sets an `HttpOnly; SameSite=Strict`
+session cookie, and returns a CSRF token; later Owner mutations require that authenticated session
+plus the CSRF header. The WebUI remains a local Owner surface, not an HTTP MCP transport, and does
+not add an MCP tool or create any published/deployed v0.1.5 identity.
 
 ## 6. Limits and next references
 

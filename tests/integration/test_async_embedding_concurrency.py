@@ -124,6 +124,9 @@ class MemoryStoreEngine(QueryEngine):
     async def find_idempotency(self, key: str) -> dict[str, Any] | None:
         return next((row for row in self.rows if row["idempotency_key"] == key), None)
 
+    async def operation_by_idempotency(self, key: str) -> None:
+        return None
+
     async def find_exact(self, native_content_hash: str) -> dict[str, Any] | None:
         return None
 

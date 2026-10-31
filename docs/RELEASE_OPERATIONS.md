@@ -11,18 +11,17 @@ a release and must not be used as a substitute for a historical release identity
 
 ### Development package identity
 
-The moving Development source may temporarily retain the latest released package version in
-`pyproject.toml` while later changes are being qualified. That metadata does **not** make a local
-wheel or source distribution an official copy of the named release. If the source commit/tree does
-not exactly match the released authority, those artifacts are Development/qualification-only and
-must not be published or represented as the official release, even when their filenames contain the
-same version.
+The latest published production release is `v0.1.4`. The current source/RC line now declares
+`0.1.5` in `pyproject.toml`, but that package version is a **local release-candidate identity** until
+a separate release crossing creates and seals its tag and published artifacts. A local wheel or
+source distribution built from this source must not be represented as an official `v0.1.5` release.
 
 Repository CI classifies this boundary with `scripts/check_release_surface.py`. The Development
 classification is intentionally fail-closed for release identity: it records that the source differs
-from the released tag and does not assign a successor version, release name, publication authority,
-or Production authority. A later official release must receive its own separately authorized
-version/tag and artifact digests before this boundary can be reconciled to released truth.
+from the released tag and does not assign publication or Production authority. The source-declared
+`0.1.5` version still does not create a `v0.1.5` tag, release asset identity, deployment, or public
+release authority. A later official release must receive its separately authorized tag and artifact
+digests before this boundary can be reconciled to released truth.
 
 ## Release identity contract
 
@@ -103,9 +102,87 @@ no broader Pi write-host claim is introduced.
   open data modified under v0.1.4 with v0.1.3 unless the applicable data state is proven compatible
   or restored from a verified pre-upgrade backup.
 
-The exact v0.1.4 annotated-tag object, public commit/tree, wheel/sdist names and SHA-256 digests are
-recorded only after the protected public crossing and release seal complete. They must not be
-invented in the candidate tree.
+The published v0.1.4 identity is now sealed and recorded as:
+
+| Item | v0.1.4 identity |
+| --- | --- |
+| Annotated tag | `v0.1.4` |
+| Tag object | `4276f3cbae14ebce89030d516f64682aabae59c9` |
+| Release commit | `4b2cf5b27d454799dd253c0306d83bd076c9369f` |
+| Release tree | `d9a69de5e63419bfb6aade745e25137e07857cbb` |
+| Wheel | `factlane-0.1.4-py3-none-any.whl` |
+| Wheel SHA-256 | `b1a256d124d74ffd6b9dba4338c171e35b95fa901e232bb1ed59ebd4f0316307` |
+| Source distribution | `factlane-0.1.4.tar.gz` |
+| Source distribution SHA-256 | `80c01dbf20dd5139350a9434c787c27a468f458397740fd0d85064394be1f5a3` |
+| Python | `>=3.11` |
+| Linked SQLite | `>=3.42.0` |
+| Public Contract Revision | `2` |
+| Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
+
+These are historical release facts. They do not provide any identity or publication authority to
+the current `0.1.5` source/RC.
+
+## FactLane 0.1.5 local RC notes and v0.1.4 transition
+
+The current source line declares package `0.1.5`, Public Contract Revision 3, and storage contract
+v3. It remains local RC material: there is no published `v0.1.5` tag, wheel/sdist digest, deployment,
+or Production/publication authority yet.
+
+The RC keeps the public MCP transport at **stdio only** and the public MCP surface at exactly the same
+five tools. Revision 3 extends `memory_update` with direct-Owner `REVOKE`/`REJECT` modes and adds the
+governed Owner control plane around the same stored lifecycle: `OwnerControlService`, the packaged
+`factlane-owner` CLI, and the packaged `factlane-owner-webui` loopback launcher. The launcher prints
+the bound origin and one-use bootstrap token; the token is exchanged only through the
+`X-FactLane-Bootstrap` header and never through a URL or `localStorage`. The WebUI is a local Owner
+presentation layer over that service, not an HTTP MCP server and not a sixth MCP tool.
+
+Storage v3 adds terminal logical states `REVOKED` and `REJECTED`, contradiction-group CAS, immutable
+lifecycle event/operation history, manual `on_change` freshness recheck, and governed readmission.
+Terminal lifecycle is logical; it does not claim physical erasure. Readmission is a verified
+lifecycle operation for an eligible `REVOKED` memory and is not backup restore or sensitive-Recovery
+resurrection.
+
+`on_change` remains evidence-driven rather than automatically monitored. The RC does not run a
+background watcher that revalidates a source. An Owner supplies a fresh bounded observation to the
+manual recheck operation; changed, unavailable, indeterminate, stale, or mismatched evidence fails
+closed for review.
+
+### Required v2 → v3 storage migration
+
+An existing v0.1.4 storage-v2 database is not silently upgraded by normal v0.1.5 startup. The RC
+fails closed with `MIGRATION_REQUIRED` until the trusted migration operator completes the transition.
+Stop/quiesce FactLane and choose a new operator-owned backup path before running:
+
+```bash
+uv run factlane-migrate-storage-v3 migrate \
+  --db /absolute/path/to/factlane.sqlite3 \
+  --backup /absolute/path/to/backups/factlane-pre-v3.sqlite3
+```
+
+The operator requires exact storage v2, verifies database integrity and lineage, creates the backup
+with SQLite's backup path, reopens that backup to verify integrity and contract v2, records its
+SHA-256, applies the v3 governance schema transactionally, advances the storage contract version
+last, then verifies the resulting database as v3. A pre-existing backup destination is rejected.
+
+After migration, preserve the reported backup path and SHA-256 as rollback evidence and re-run the
+normal runtime checks before enabling writes.
+
+### v2 → v3 data rollback
+
+If the migration must be rolled back before the v3 state becomes the accepted durable authority,
+stop/quiesce the v0.1.5 runtime and restore the exact verified pre-v3 backup through the migration
+operator:
+
+```bash
+uv run factlane-migrate-storage-v3 restore \
+  --db /absolute/path/to/factlane.sqlite3 \
+  --backup /absolute/path/to/backups/factlane-pre-v3.sqlite3
+```
+
+Restore verifies that the backup is storage contract v2, stages and fsyncs the replacement image,
+promotes it under the maintenance lease, removes stale WAL/SHM sidecars, and verifies the restored
+database as v2. Only after that data rollback is proven should an operator consider restarting a
+v0.1.4 runtime. Installing v0.1.4 directly over a storage-v3 database is not a supported downgrade.
 
 ## Install an exact release
 
