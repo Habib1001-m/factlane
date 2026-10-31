@@ -625,36 +625,12 @@ class OwnerWebUIRequestHandler(BaseHTTPRequestHandler):
         payload[route.route_field] = route.route_value
         return payload
 
-    def _require_displayed_and_fresh_group(
-        self,
-        session: _Session,
-        route: _MutationRoute,
-        payload: dict[str, Any],
-    ) -> None:
+    def _require_displayed_group(self, session: _Session, payload: dict[str, Any]) -> None:
         submitted = payload["observed_group_token"]
         if not session.has_observed_group_token(submitted):
             raise _transport_error(
                 "INVALID_ENVELOPE",
                 "observed_group_token was not displayed by an authenticated Owner inspection in this session",
-            )
-        inspection_memory_id = route.inspection_memory_id
-        if route.method_name == "resolve":
-            winner_memory_id = payload.get("winner_memory_id")
-            if not isinstance(winner_memory_id, str) or not winner_memory_id:
-                raise _transport_error("INVALID_ENVELOPE", "resolve winner_memory_id is invalid")
-            inspection_memory_id = winner_memory_id
-        detail = self._call_service("detail", memory_id=inspection_memory_id, **self._scope_kwargs())
-        group = detail.get("group_cas")
-        current = group.get("observed_group_token") if isinstance(group, dict) else None
-        if not isinstance(current, str) or not _is_group_token(current):
-            raise AdapterError(
-                "GROUP_VERSION_CONFLICT",
-                "The displayed contradiction group is no longer mutation-capable; inspect it again.",
-            )
-        if not secrets.compare_digest(current, submitted):
-            raise AdapterError(
-                "GROUP_VERSION_CONFLICT",
-                "The contradiction group changed; inspect it again before mutation.",
             )
 
     def _handle_bootstrap(self, query: str) -> None:
@@ -710,7 +686,7 @@ class OwnerWebUIRequestHandler(BaseHTTPRequestHandler):
                 )
             body = self._read_json_body()
             payload = self._validate_mutation_body(route, body)
-            self._require_displayed_and_fresh_group(session, route, payload)
+            self._require_displayed_group(session, payload)
             result = self._call_service(route.method_name, **payload, **self._scope_kwargs())
             self.state.observe_result(session, result)
             self._send_json(200, result)

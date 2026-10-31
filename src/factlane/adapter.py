@@ -1785,6 +1785,15 @@ class MemoryAdapter:
             "verification": verification or {},
             "contribution_origin": self._contribution_origin(),
         })
+        update_group_token: str | None = None
+        if observed_group_token is not None:
+            if (
+                not isinstance(observed_group_token, str)
+                or len(observed_group_token) != 64
+                or any(ch not in "0123456789abcdefABCDEF" for ch in observed_group_token)
+            ):
+                raise AdapterError("INVALID_ENVELOPE", f"{mode} observed_group_token must be an exact 64-hex token")
+            update_group_token = observed_group_token.lower()
         reserved_operation = await self.engine.operation_by_idempotency(idempotency_key)
         if reserved_operation is not None:
             raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by another governed write")
@@ -2043,6 +2052,7 @@ class MemoryAdapter:
                         scope_context,
                         expected_record_id=old["record_id"],
                         expected_revision=expected_revision,
+                        observed_group_token=update_group_token,
                     )
                     if equivalent is not None:
                         envelope = self._base_envelope(request_id, "memory_update", scope_context)
@@ -2050,7 +2060,12 @@ class MemoryAdapter:
                         envelope["results"] = [self._public(equivalent)]
                         return self._fit_budget(envelope)
                 else:
-                    await self.engine.write_record(record, embedding, supersede_record_id=old["record_id"])
+                    await self.engine.write_record(
+                        record,
+                        embedding,
+                        supersede_record_id=old["record_id"],
+                        observed_group_token=update_group_token,
+                    )
             except RecordUniquenessConflict:
                 if await self.engine.operation_by_idempotency(idempotency_key) is not None:
                     raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by another governed write")

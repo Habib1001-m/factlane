@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -35,6 +36,19 @@ def _profile() -> EmbeddingProfile:
 
 def _digest(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+
+
+def _assert_windows_maintenance_hold_no_mutation(db: Path, backup: Path) -> None:
+    """Windows qualifies the unsupported maintenance boundary, not POSIX migration execution."""
+    before = _digest(db)
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "MIGRATION_HOLD"
+    assert "POSIX fcntl/flock" in exc_info.value.safe_message
+    assert _digest(db) == before
+    assert not backup.exists()
+    assert not Path(str(backup) + ".factlane-v3-backup.json").exists()
+    assert inspect_storage_contract_version(str(db)) == 2
 
 
 def _seed_contract_only(path: Path, version: int) -> None:
@@ -368,6 +382,9 @@ def test_explicit_v2_to_v3_migration_creates_verified_backup_and_restores(tmp_pa
     db = tmp_path / "migrate.db"
     backup = tmp_path / "migrate.pre-v3.db"
     _seed_full_v2(db)
+    if os.name == "nt":
+        _assert_windows_maintenance_hold_no_mutation(db, backup)
+        return
     result = migrate_storage_v3(str(db), str(backup))
     assert result["status"] == "OK"
     assert result["from_contract"] == 2
@@ -429,6 +446,9 @@ def test_migration_refuses_materialized_v2_without_profile_binding_before_backup
         conn.commit()
     finally:
         conn.close()
+    if os.name == "nt":
+        _assert_windows_maintenance_hold_no_mutation(db, backup)
+        return
     with pytest.raises(AdapterError) as exc_info:
         migrate_storage_v3(str(db), str(backup))
     assert exc_info.value.code == "PROFILE_MISMATCH"
@@ -446,6 +466,9 @@ def test_migration_refuses_incomplete_pinned_native_schema_before_backup(tmp_pat
         conn.commit()
     finally:
         conn.close()
+    if os.name == "nt":
+        _assert_windows_maintenance_hold_no_mutation(db, backup)
+        return
     with pytest.raises(AdapterError) as exc_info:
         migrate_storage_v3(str(db), str(backup))
     assert exc_info.value.code == "SCHEMA_MISMATCH"
@@ -463,6 +486,9 @@ def test_migration_refuses_unknown_v2_table_before_backup(tmp_path: Path) -> Non
         conn.commit()
     finally:
         conn.close()
+    if os.name == "nt":
+        _assert_windows_maintenance_hold_no_mutation(db, backup)
+        return
     with pytest.raises(AdapterError) as exc_info:
         migrate_storage_v3(str(db), str(backup))
     assert exc_info.value.code == "SCHEMA_MISMATCH"
@@ -480,6 +506,9 @@ def test_migration_schema_failure_rolls_back_transaction_and_keeps_verified_back
         original(conn)
         raise RuntimeError("injected-after-v3-schema")
 
+    if os.name == "nt":
+        _assert_windows_maintenance_hold_no_mutation(db, backup)
+        return
     monkeypatch.setattr(migration_module, "_create_v3_governance_schema", fail_after_schema)
     with pytest.raises(RuntimeError, match="injected-after-v3-schema"):
         migrate_storage_v3(str(db), str(backup))

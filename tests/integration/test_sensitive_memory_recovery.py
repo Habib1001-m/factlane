@@ -332,7 +332,7 @@ def test_pm1_success_scrubs_payload_and_preserves_unrelated_record(tmp_path: Pat
 
 
 def test_v3_recovery_preserves_events_invalidates_target_operations_and_appends_purge_event(tmp_path: Path) -> None:
-    async def prepare() -> tuple[dict[str, Any], tuple[Any, ...], tuple[Any, ...]]:
+    async def prepare() -> tuple[dict[str, Any], tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]]:
         engine, adapter = await _open_adapter(tmp_path)
         target = await _store(
             adapter,
@@ -392,6 +392,30 @@ def test_v3_recovery_preserves_events_invalidates_target_operations_and_appends_
         engine.conn.execute(
             "INSERT INTO lifecycle_operations("
             "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,grant_ref_digest,"
+            "scope_digest,target_memory_id,target_record_id,affected_members_json,event_ids_json,result_group_token,"
+            "replay_status,commit_timestamp"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "cross-namespace-unrelated-key",
+                "cross-namespace-unrelated-fingerprint",
+                "cross-namespace-unrelated-operation",
+                "cross-namespace-unrelated-request",
+                "REVOKE",
+                "OWNER",
+                "cross-namespace-unrelated-grant",
+                "unrelated-scope",
+                survivor_row["memory_id"],
+                target_row["memory_id"],  # record-id namespace collision only; not a target relation.
+                "[]",
+                "[]",
+                "cross-namespace-unrelated-group-token",
+                "COMMITTED",
+                "2026-09-29T00:00:05Z",
+            ),
+        )
+        engine.conn.execute(
+            "INSERT INTO lifecycle_operations("
+            "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,grant_ref_digest,"
             "scope_digest,affected_members_json,event_ids_json,result_group_token,replay_status,commit_timestamp"
             ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
@@ -442,11 +466,16 @@ def test_v3_recovery_preserves_events_invalidates_target_operations_and_appends_
                 "SELECT * FROM lifecycle_operations WHERE idempotency_key='unrelated-replay-key'"
             ).fetchone()
         )
+        cross_namespace_operation = tuple(
+            engine.conn.execute(
+                "SELECT * FROM lifecycle_operations WHERE idempotency_key='cross-namespace-unrelated-key'"
+            ).fetchone()
+        )
         engine.conn.commit()
         await adapter.close()
-        return target_row, prior_event, unrelated_operation
+        return target_row, prior_event, unrelated_operation, cross_namespace_operation
 
-    target_row, prior_event, unrelated_operation = asyncio.run(prepare())
+    target_row, prior_event, unrelated_operation, cross_namespace_operation = asyncio.run(prepare())
     _run(_plan(tmp_path / "memory.db", target_row, operation="v3-audit-recovery"), tmp_path)
 
     conn = sqlite3.connect(tmp_path / "memory.db")
@@ -477,6 +506,97 @@ def test_v3_recovery_preserves_events_invalidates_target_operations_and_appends_
                 "SELECT * FROM lifecycle_operations WHERE idempotency_key='unrelated-replay-key'"
             ).fetchone()
         ) == unrelated_operation
+        assert tuple(
+            conn.execute(
+                "SELECT * FROM lifecycle_operations WHERE idempotency_key='cross-namespace-unrelated-key'"
+            ).fetchone()
+        ) == cross_namespace_operation
+    finally:
+        conn.close()
+
+
+def test_v3_recovery_unrelated_lifecycle_snapshot_aborts_and_rolls_back_drift(tmp_path: Path) -> None:
+    class DriftUnrelatedLifecycleBeforeCommit(SensitiveMemoryRecoveryOperator):
+        @staticmethod
+        def _tombstone_lifecycle_operations(conn, linked_operations):
+            SensitiveMemoryRecoveryOperator._tombstone_lifecycle_operations(conn, linked_operations)
+            conn.execute(
+                "UPDATE lifecycle_operations SET result_group_token='tampered' "
+                "WHERE idempotency_key='unrelated-preservation-key'"
+            )
+
+    async def prepare() -> tuple[dict[str, Any], tuple[Any, ...]]:
+        engine, adapter = await _open_adapter(tmp_path)
+        target = await _store(
+            adapter,
+            key="v3-preservation-target",
+            fact="V3 preservation target lifecycle evidence.",
+            marker="9",
+        )
+        survivor = await _store(
+            adapter,
+            key="v3-preservation-survivor",
+            fact="V3 preservation unrelated lifecycle evidence.",
+            marker="a",
+        )
+        target_row = await _target_row(engine, target["memory_id"])
+        survivor_row = await _target_row(engine, survivor["memory_id"])
+        assert engine.conn is not None
+        engine.conn.execute(
+            "INSERT INTO lifecycle_operations("
+            "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,grant_ref_digest,"
+            "scope_digest,target_memory_id,target_record_id,affected_members_json,event_ids_json,result_group_token,"
+            "replay_status,commit_timestamp"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "unrelated-preservation-key",
+                "unrelated-preservation-fingerprint",
+                "unrelated-preservation-operation",
+                "unrelated-preservation-request",
+                "REVOKE",
+                "OWNER",
+                "unrelated-preservation-grant",
+                "unrelated-preservation-scope",
+                survivor_row["memory_id"],
+                survivor_row["record_id"],
+                "[]",
+                "[]",
+                "unrelated-preservation-group-token",
+                "COMMITTED",
+                "2026-09-29T00:00:06Z",
+            ),
+        )
+        before = tuple(
+            engine.conn.execute(
+                "SELECT * FROM lifecycle_operations WHERE idempotency_key='unrelated-preservation-key'"
+            ).fetchone()
+        )
+        engine.conn.commit()
+        await adapter.close()
+        return target_row, before
+
+    target_row, before = asyncio.run(prepare())
+    db = tmp_path / "memory.db"
+    operator = DriftUnrelatedLifecycleBeforeCommit(foreign_handle_provider=lambda _: [])
+    with pytest.raises(RecoveryHold) as caught:
+        _run(_plan(db, target_row, operation="v3-preservation-drift"), tmp_path, operator=operator)
+    assert caught.value.code == "HOLD_UNRELATED_LIFECYCLE_DRIFT_NO_MUTATION"
+
+    conn = sqlite3.connect(db)
+    try:
+        assert tuple(
+            conn.execute(
+                "SELECT * FROM lifecycle_operations WHERE idempotency_key='unrelated-preservation-key'"
+            ).fetchone()
+        ) == before
+        row = conn.execute(
+            "SELECT lifecycle_state,fact FROM adapter_records WHERE record_id=?",
+            (target_row["record_id"],),
+        ).fetchone()
+        assert row == (target_row["lifecycle_state"], target_row["fact"])
+        assert conn.execute(
+            "SELECT COUNT(*) FROM lifecycle_events WHERE operation_id='v3-preservation-drift' AND action='SENSITIVE_PURGE'"
+        ).fetchone()[0] == 0
     finally:
         conn.close()
 

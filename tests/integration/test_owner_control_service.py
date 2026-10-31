@@ -1062,3 +1062,254 @@ def test_replace_requires_inspected_group_token_and_delegates_to_governed_update
             await engine.close()
 
     asyncio.run(run())
+
+
+def test_reverify_replay_precedes_stale_group_cas_and_changed_payload_conflicts(tmp_path) -> None:
+    async def run() -> None:
+        engine, service = await _service(tmp_path)
+        try:
+            row = _record(
+                marker="6",
+                project_id="project-a",
+                lifecycle="VALIDATED_CURRENT",
+                contradiction_key="owner-reverify-replay-key",
+            )
+            await engine.write_record(row, [1.0] + [0.0] * 255)
+            scope = validate_scope("PROJECT", project_id="project-a")
+            token = (await engine.group_observation(scope, "owner-reverify-replay-key"))["public"]["observed_group_token"]
+            verification = {"source_timestamp": "2026-10-31T20:00:00Z", "verified_by": "OWNER"}
+
+            first = await service.reverify(
+                memory_id=row["memory_id"],
+                expected_record_id=row["record_id"],
+                expected_revision=1,
+                observed_group_token=token,
+                idempotency_key="owner-reverify-replay",
+                verification=verification,
+                scope="PROJECT",
+                project_id="project-a",
+            )
+            assert first["results"][0]["revision"] == 2
+            assert (await engine.group_observation(scope, "owner-reverify-replay-key"))["public"]["observed_group_token"] != token
+
+            replay = await service.reverify(
+                memory_id=row["memory_id"],
+                expected_record_id=row["record_id"],
+                expected_revision=1,
+                observed_group_token=token,
+                idempotency_key="owner-reverify-replay",
+                verification=verification,
+                scope="PROJECT",
+                project_id="project-a",
+            )
+            assert replay["idempotent_replay"] is True
+            assert replay["results"][0]["record_id"] == first["results"][0]["record_id"]
+
+            with pytest.raises(AdapterError) as conflict:
+                await service.reverify(
+                    memory_id=row["memory_id"],
+                    expected_record_id=row["record_id"],
+                    expected_revision=1,
+                    observed_group_token=token,
+                    idempotency_key="owner-reverify-replay",
+                    verification={**verification, "confidence": 0.9},
+                    scope="PROJECT",
+                    project_id="project-a",
+                )
+            assert conflict.value.code == "IDEMPOTENCY_CONFLICT"
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_replace_replay_precedes_stale_group_cas_and_changed_payload_conflicts(tmp_path) -> None:
+    async def run() -> None:
+        engine, service = await _service(tmp_path)
+        try:
+            row = _record(
+                marker="7",
+                project_id="project-a",
+                lifecycle="VALIDATED_CURRENT",
+                contradiction_key="owner-replace-replay-key",
+            )
+            await engine.write_record(row, [1.0] + [0.0] * 255)
+            scope = validate_scope("PROJECT", project_id="project-a")
+            token = (await engine.group_observation(scope, "owner-replace-replay-key"))["public"]["observed_group_token"]
+            replacement = {
+                "fact": "Replacement replay fact",
+                "source_provenance": {
+                    "source_class": "TEST",
+                    "source_ref": "owner-replace-replay-source",
+                    "source_hash": "8" * 64,
+                    "review_ref": "owner-replace-replay-review",
+                    "extraction_method": "owner-check",
+                },
+                "freshness_policy": {"kind": "manual"},
+                "source_timestamp": "2026-10-31T20:05:00Z",
+                "verified_by": "OWNER",
+                "subject": "replacement-replay-subject",
+            }
+
+            first = await service.replace(
+                memory_id=row["memory_id"],
+                expected_record_id=row["record_id"],
+                expected_revision=1,
+                observed_group_token=token,
+                idempotency_key="owner-replace-replay",
+                replacement=replacement,
+                scope="PROJECT",
+                project_id="project-a",
+            )
+            replay = await service.replace(
+                memory_id=row["memory_id"],
+                expected_record_id=row["record_id"],
+                expected_revision=1,
+                observed_group_token=token,
+                idempotency_key="owner-replace-replay",
+                replacement=replacement,
+                scope="PROJECT",
+                project_id="project-a",
+            )
+            assert replay["idempotent_replay"] is True
+            assert replay["results"][0]["record_id"] == first["results"][0]["record_id"]
+
+            with pytest.raises(AdapterError) as conflict:
+                await service.replace(
+                    memory_id=row["memory_id"],
+                    expected_record_id=row["record_id"],
+                    expected_revision=1,
+                    observed_group_token=token,
+                    idempotency_key="owner-replace-replay",
+                    replacement={**replacement, "confidence": 0.9},
+                    scope="PROJECT",
+                    project_id="project-a",
+                )
+            assert conflict.value.code == "IDEMPOTENCY_CONFLICT"
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_reverify_rechecks_freshness_group_change_inside_storage_transaction(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        engine, service = await _service(tmp_path)
+        try:
+            row = _record(
+                marker="8",
+                project_id="project-a",
+                lifecycle="VALIDATED_CURRENT",
+                contradiction_key="owner-reverify-freshness-race",
+            )
+            source_hash = row["source_provenance"]["source_hash"]  # type: ignore[index]
+            row["freshness_policy"] = {
+                "kind": "on_change",
+                "ttl_seconds": None,
+                "recheck_ref": "source:owner-race",
+                "source_fingerprint": source_hash,
+            }
+            await engine.write_record(row, [1.0] + [0.0] * 255)
+            scope = validate_scope("PROJECT", project_id="project-a")
+            token = (await engine.group_observation(scope, "owner-reverify-freshness-race"))["public"]["observed_group_token"]
+            original_write = engine.write_record
+            injected = False
+
+            async def racing_write(record, embedding, supersede_record_id=None, **kwargs):
+                nonlocal injected
+                if supersede_record_id is not None and not injected:
+                    injected = True
+                    outcome = await service.manual_recheck(
+                        memory_id=row["memory_id"],
+                        expected_record_id=row["record_id"],
+                        expected_revision=1,
+                        observed_group_token=token,
+                        idempotency_key="owner-race-adverse-recheck",
+                        evidence={
+                            "origin": "OWNER_SUPPLIED",
+                            "claim": "UNAVAILABLE",
+                            "recheck_ref": "source:owner-race",
+                            "observed_at": "2026-10-31T20:01:00Z",
+                            "method": "OWNER_REVIEWED_SOURCE",
+                        },
+                        scope="PROJECT",
+                        project_id="project-a",
+                    )
+                    assert outcome["freshness_gate_state"] == "RECHECK_UNAVAILABLE"
+                return await original_write(record, embedding, supersede_record_id, **kwargs)
+
+            monkeypatch.setattr(engine, "write_record", racing_write)
+            with pytest.raises(AdapterError) as changed:
+                await service.reverify(
+                    memory_id=row["memory_id"],
+                    expected_record_id=row["record_id"],
+                    expected_revision=1,
+                    observed_group_token=token,
+                    idempotency_key="owner-reverify-freshness-race",
+                    verification={"source_timestamp": "2026-10-31T20:00:00Z", "verified_by": "OWNER"},
+                    scope="PROJECT",
+                    project_id="project-a",
+                )
+            assert changed.value.code == "GROUP_VERSION_CONFLICT"
+            history = await engine.get_record(row["memory_id"], scope, history=True)
+            assert len(history) == 1
+            assert history[0]["record_id"] == row["record_id"]
+            assert history[0]["lifecycle_state"] == "VALIDATED_CURRENT"
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_candidate_reverify_rechecks_group_arrival_inside_storage_transaction(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        engine, service = await _service(tmp_path)
+        try:
+            row = _record(
+                marker="9",
+                project_id="project-a",
+                contradiction_key="owner-candidate-race",
+                fact="Candidate target",
+            )
+            row["contradiction_state"] = "NONE"
+            await engine.write_record(row, [1.0] + [0.0] * 255)
+            scope = validate_scope("PROJECT", project_id="project-a")
+            token = (await engine.group_observation(scope, "owner-candidate-race"))["public"]["observed_group_token"]
+            original_write = engine.write_record
+            original_promote = engine.promote_candidate
+            injected = False
+
+            async def racing_promote(record, embedding, promotion_scope, **kwargs):
+                nonlocal injected
+                if not injected:
+                    injected = True
+                    contender = _record(
+                        marker="a",
+                        project_id="project-a",
+                        contradiction_key="owner-candidate-race",
+                        fact="Incompatible contender",
+                    )
+                    await original_write(contender, [0.0, 1.0] + [0.0] * 254)
+                return await original_promote(record, embedding, promotion_scope, **kwargs)
+
+            monkeypatch.setattr(engine, "promote_candidate", racing_promote)
+            with pytest.raises(AdapterError) as changed:
+                await service.reverify(
+                    memory_id=row["memory_id"],
+                    expected_record_id=row["record_id"],
+                    expected_revision=1,
+                    observed_group_token=token,
+                    idempotency_key="owner-candidate-race-reverify",
+                    verification={"source_timestamp": "2026-10-31T20:02:00Z", "verified_by": "OWNER"},
+                    scope="PROJECT",
+                    project_id="project-a",
+                )
+            assert changed.value.code == "GROUP_VERSION_CONFLICT"
+            history = await engine.get_record(row["memory_id"], scope, history=True)
+            assert len(history) == 1
+            assert history[0]["record_id"] == row["record_id"]
+            assert history[0]["lifecycle_state"] == "CANDIDATE"
+        finally:
+            await engine.close()
+
+    asyncio.run(run())

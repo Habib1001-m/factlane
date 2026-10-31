@@ -378,6 +378,52 @@ def test_host_origin_referer_csrf_scope_and_group_token_are_enforced_without_ret
         assert len([call for call in service.calls if call[0] == "revoke"]) == before_conflict + 1
 
 
+def test_displayed_stale_group_token_is_forwarded_to_service_for_replay() -> None:
+    class ChangingDetailOwnerService(FakeOwnerService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.detail_token = GROUP_TOKEN
+
+        async def detail(self, **kwargs: Any) -> dict[str, Any]:
+            result = await super().detail(**kwargs)
+            result["group_cas"]["observed_group_token"] = self.detail_token
+            return result
+
+    service = ChangingDetailOwnerService()
+    with running_server(service) as server:
+        cookie, csrf = bootstrap(server)
+        origin = f"http://127.0.0.1:{server.server_address[1]}"
+        status, _, _ = request(
+            server,
+            "GET",
+            "/owner/api/v1/memories/11111111-1111-4111-8111-111111111111",
+            headers={"Cookie": cookie},
+        )
+        assert status == 200
+        detail_calls = len([call for call in service.calls if call[0] == "detail"])
+        service.detail_token = "b" * 64
+
+        status, _, body = request(
+            server,
+            "POST",
+            "/owner/api/v1/memories/11111111-1111-4111-8111-111111111111/reverify",
+            headers={"Cookie": cookie, "X-FactLane-CSRF": csrf, "Origin": origin},
+            json_body={
+                "expected_record_id": "22222222-2222-4222-8222-222222222222",
+                "expected_revision": 1,
+                "observed_group_token": GROUP_TOKEN,
+                "idempotency_key": "webui-reverify-replay",
+                "verification": {"verified_by": "OWNER"},
+            },
+        )
+        assert status == 200
+        assert json.loads(body)["action"] == "REVERIFY"
+        assert len([call for call in service.calls if call[0] == "detail"]) == detail_calls
+        reverify_calls = [call for call in service.calls if call[0] == "reverify"]
+        assert len(reverify_calls) == 1
+        assert reverify_calls[0][1]["observed_group_token"] == GROUP_TOKEN
+
+
 def test_read_api_pages_are_scope_bound_safe_and_include_all_owner_views() -> None:
     service = FakeOwnerService()
     with running_server(service) as server:

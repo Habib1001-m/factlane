@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 
+import factlane.storage as storage_module
 from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
 from factlane.contract import AdapterError, validate_scope
 from factlane.embeddings import EmbeddingProfile
@@ -132,6 +133,65 @@ def test_group_cas_schema_v2_rotates_on_freshness_generation(tmp_path) -> None:
             current_member = next(m for m in after["public"]["members"] if m["record_id"] == current["record_id"])
             assert current_member["freshness_gate_state"] == "SOURCE_CHANGE_REVIEW_REQUIRED"
             assert after["server"]["members"][0 if after["server"]["members"][0]["record_id"] == current["record_id"] else 1]["freshness_generation"] == 1
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_durable_terminal_audit_timestamp_advances_global_trust_clock_high_water(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "terminal-audit-clock.db"), _profile())
+        await engine.open()
+        try:
+            scope = validate_scope("PROJECT", project_id="group-project")
+            key = "terminal-audit-clock-key"
+            current = _record(
+                marker="z",
+                lifecycle="VALIDATED_CURRENT",
+                contradiction_key=key,
+                fact="Durable audit clock truth",
+            )
+            await engine.write_record(current, [1.0] + [0.0] * 255)
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_meta SET value=? WHERE key='trust_clock_high_water_at'",
+                ("2026-10-31T10:00:00Z",),
+            )
+            engine.conn.commit()
+            observed = await engine.group_observation(scope, key)
+
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T11:00:00Z")
+            await engine.terminal_disposition(
+                scope,
+                action="REVOKE",
+                memory_id=current["memory_id"],
+                expected_record_id=current["record_id"],
+                expected_revision=1,
+                observed_group_token=observed["public"]["observed_group_token"],
+                idempotency_key="terminal-audit-clock-op",
+                request_fingerprint="terminal-audit-clock-fingerprint",
+                request_id="terminal-audit-clock-request",
+                reason_code="OWNER_REQUEST",
+                actor_class="OWNER",
+                actor_ref_digest="actor-digest",
+                grant_ref_digest="grant-digest",
+                committed_at="2026-10-31T12:00:00Z",
+            )
+
+            high_water = engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0]
+            event_time = engine.conn.execute(
+                "SELECT occurred_at FROM lifecycle_events WHERE operation_id=("
+                "SELECT operation_id FROM lifecycle_operations WHERE idempotency_key='terminal-audit-clock-op')"
+            ).fetchone()[0]
+            operation_time = engine.conn.execute(
+                "SELECT commit_timestamp FROM lifecycle_operations WHERE idempotency_key='terminal-audit-clock-op'"
+            ).fetchone()[0]
+            assert high_water == "2026-10-31T12:00:00Z"
+            assert event_time == high_water
+            assert operation_time == high_water
         finally:
             await engine.close()
 

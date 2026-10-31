@@ -547,16 +547,6 @@ class OwnerControlService:
         target = next((row for row in history if row["record_id"] == expected_record_id), None)
         if target is None or int(target["revision"]) != expected_revision:
             raise AdapterError("VERSION_CONFLICT", "expected record/revision no longer matches the inspected target")
-        observation = await self._engine.group_observation(scope_context, target["contradiction_key"])
-        current_token = observation["public"]["observed_group_token"]
-        if current_token != observed_group_token:
-            raise AdapterError(
-                "GROUP_VERSION_CONFLICT",
-                "contradiction group changed; refetch and review before retrying",
-                refetch_required=True,
-                current_group_token=current_token,
-                current_group_count=observation["public"]["member_count"],
-            )
 
         update_kwargs: dict[str, Any] = {
             "memory_id": memory_id,

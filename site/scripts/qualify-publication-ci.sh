@@ -96,6 +96,11 @@ echo "PUBLICATION_CI_PROTECTED_BASE_COMMIT=$protected_base_commit"
 
 released_snapshot="$site_root/publication/released-contract-v0.1.4.json"
 released_snapshot_relative=${released_snapshot#"$repo_root/"}
+released_package_version=$(node -p "const x=require('$released_snapshot'); x.releaseAuthority?.packageVersion || ''")
+[[ "$released_package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo 'HOLD: could not derive released package version from publication authority' >&2
+  exit 1
+}
 control_introduction_commit=$(git -C "$repo_root" log --diff-filter=A --format=%H --reverse -- "$released_snapshot_relative" | head -n 1)
 [[ "$control_introduction_commit" =~ ^[0-9a-f]{40}$ ]] || {
   echo 'HOLD: could not derive the historical publication-control introduction commit' >&2
@@ -254,7 +259,7 @@ negative_llms_eligibility="$tmp_root/NEGATIVE_LLMS_PUBLICATION_ELIGIBILITY.json"
 }
 
 cp -a "$build_a" "$negative_footer_build"
-python - "$negative_footer_build/ar/index.html" "$candidate_version" <<'PY'
+python - "$negative_footer_build/ar/index.html" "$released_package_version" <<'PY'
 from pathlib import Path
 import re
 import sys
@@ -265,7 +270,7 @@ text = path.read_text()
 pattern = rf'(<footer\b[\s\S]*?)FactLane v{version}([\s\S]*?</footer>)'
 updated, count = re.subn(pattern, r'\1FactLane v9.9.9\2', text, count=1, flags=re.I)
 if count != 1:
-    raise SystemExit('negative control could not find Arabic global footer release claim')
+    raise SystemExit('negative control could not find Arabic global released-version footer claim')
 path.write_text(updated)
 PY
 negative_footer_eligibility="$tmp_root/NEGATIVE_FOOTER_PUBLICATION_ELIGIBILITY.json"

@@ -127,6 +127,31 @@ def test_mutation_input_uses_stdin_and_preserves_observed_group_token(monkeypatc
     assert kwargs["project_id"] == "project-a"
 
 
+def test_reverify_cli_is_a_direct_service_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    token = "f" * 64
+    payload = {
+        "memory_id": "11111111-1111-4111-8111-111111111111",
+        "expected_record_id": "22222222-2222-4222-8222-222222222222",
+        "expected_revision": 3,
+        "observed_group_token": token,
+        "idempotency_key": "owner-reverify-parity",
+        "verification": {"verified_by": "OWNER", "source_timestamp": "2026-10-31T20:00:00Z"},
+    }
+    monkeypatch.setattr(owner_cli.sys, "stdin", StringIO(json.dumps(payload)))
+    service = FakeOwnerService()
+    result = asyncio.run(owner_cli._invoke(service, _args("reverify", input="-")))
+    assert result["operation"] == "reverify"
+    assert [name for name, _ in service.calls] == ["reverify"]
+    assert service.calls[0][1] == {
+        **payload,
+        "scope": "PROJECT",
+        "project_id": "project-a",
+        "worktree_id": None,
+        "workflow_id": None,
+        "agent_id": None,
+    }
+
+
 def test_mutation_input_cannot_override_trusted_launcher_scope(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {
         "memory_id": "11111111-1111-4111-8111-111111111111",

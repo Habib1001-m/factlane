@@ -190,6 +190,55 @@ class SurvivorSnapshot:
     lifecycle_operation_digest: str
 
 
+@dataclass(frozen=True, slots=True)
+class LifecyclePreservationSnapshot:
+    """Digest-only pre-mutation proof for unrelated v3 lifecycle audit rows."""
+
+    event_count: int
+    event_digest: str
+    operation_count: int
+    operation_digest: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_count": self.event_count,
+            "event_digest": self.event_digest,
+            "operation_count": self.operation_count,
+            "operation_digest": self.operation_digest,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "LifecyclePreservationSnapshot":
+        if not isinstance(value, dict):
+            raise RecoveryHold(
+                "HOLD_RECOVERY_STATE_MISMATCH",
+                "persisted unrelated lifecycle preservation snapshot is missing or malformed",
+            )
+        counts = (value.get("event_count"), value.get("operation_count"))
+        digests = (value.get("event_digest"), value.get("operation_digest"))
+        if any(isinstance(count, bool) or not isinstance(count, int) or count < 0 for count in counts):
+            raise RecoveryHold(
+                "HOLD_RECOVERY_STATE_MISMATCH",
+                "persisted unrelated lifecycle preservation counts are invalid",
+            )
+        if any(
+            not isinstance(digest_value, str)
+            or len(digest_value) != 64
+            or any(ch not in "0123456789abcdef" for ch in digest_value)
+            for digest_value in digests
+        ):
+            raise RecoveryHold(
+                "HOLD_RECOVERY_STATE_MISMATCH",
+                "persisted unrelated lifecycle preservation digests are invalid",
+            )
+        return cls(
+            event_count=counts[0],
+            event_digest=digests[0],
+            operation_count=counts[1],
+            operation_digest=digests[1],
+        )
+
+
 def _safe_digest(*parts: str) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
@@ -465,6 +514,12 @@ class SensitiveMemoryRecoveryOperator:
                 self._preflight_database(conn, plan)
                 self._validate_recovery_interlock(conn, plan, persisted_phase)
                 inspections = self._inspect_targets(conn, plan)
+                lifecycle_preservation: LifecyclePreservationSnapshot | None = None
+                if _STATE_PHASE_RANK[persisted_phase] >= _STATE_PHASE_RANK[_LOGICAL_PURGE_IN_PROGRESS]:
+                    assert persisted is not None
+                    lifecycle_preservation = LifecyclePreservationSnapshot.from_dict(
+                        persisted.get("unrelated_lifecycle_snapshot")
+                    )
                 if all(item.already_purged for item in inspections):
                     if persisted_phase not in {
                         _LOGICAL_PURGE_IN_PROGRESS,
@@ -476,6 +531,8 @@ class SensitiveMemoryRecoveryOperator:
                             "purged targets are not backed by resumable persisted recovery state",
                         )
                     self._ensure_recovery_interlock(conn, plan)
+                    assert lifecycle_preservation is not None
+                    self._verify_unrelated_lifecycle(conn, plan, lifecycle_preservation)
                     logical_committed = True
                     if persisted_phase == _LOGICAL_PURGE_IN_PROGRESS:
                         self._write_state(state, plan, _SEALING_INCOMPLETE)
@@ -487,12 +544,36 @@ class SensitiveMemoryRecoveryOperator:
                             "HOLD_RECOVERY_STATE_MISMATCH",
                             "persisted recovery state claims commit but exact tombstones are absent",
                         )
-                    self._write_state(state, plan, _LOGICAL_PURGE_IN_PROGRESS)
-                    self._apply_logical_purge(conn, plan, inspections)
+                    if lifecycle_preservation is None:
+                        lifecycle_preservation = self._snapshot_unrelated_lifecycle(conn, plan)
+                    else:
+                        self._verify_unrelated_lifecycle(conn, plan, lifecycle_preservation)
+                    self._write_state(
+                        state,
+                        plan,
+                        _LOGICAL_PURGE_IN_PROGRESS,
+                        lifecycle_preservation=lifecycle_preservation,
+                    )
+                    self._apply_logical_purge(
+                        conn,
+                        plan,
+                        inspections,
+                        lifecycle_preservation=lifecycle_preservation,
+                    )
                     logical_committed = True
-                    self._write_state(state, plan, _SEALING_INCOMPLETE)
+                    self._write_state(
+                        state,
+                        plan,
+                        _SEALING_INCOMPLETE,
+                        lifecycle_preservation=lifecycle_preservation,
+                    )
                 survivor_snapshot = self._snapshot_survivors(conn, plan)
-                self._write_state(state, plan, _SEALING_INCOMPLETE)
+                self._write_state(
+                    state,
+                    plan,
+                    _SEALING_INCOMPLETE,
+                    lifecycle_preservation=lifecycle_preservation,
+                )
                 self._require_quiescent(db_path)
                 self._seal_and_promote(conn, plan, survivor_snapshot, maintenance_lease)
                 conn = None
@@ -503,16 +584,31 @@ class SensitiveMemoryRecoveryOperator:
                     maintenance_lease,
                 )
                 self._clear_recovery_interlock(db_path, plan)
-                self._write_state(state, plan, _LOCAL_PURGE_VERIFIED)
+                self._write_state(
+                    state,
+                    plan,
+                    _LOCAL_PURGE_VERIFIED,
+                    lifecycle_preservation=lifecycle_preservation,
+                )
                 _atomic_json(receipt, self._receipt(plan, inspections))
                 return RecoveryResult(plan.operation_id, _LOCAL_PURGE_VERIFIED, True, True, str(receipt), str(state), len(plan.targets))
             except RecoveryHold:
                 if logical_committed:
-                    self._write_state(state, plan, _SEALING_INCOMPLETE)
+                    self._write_state(
+                        state,
+                        plan,
+                        _SEALING_INCOMPLETE,
+                        lifecycle_preservation=lifecycle_preservation,
+                    )
                 raise
             except Exception as exc:
                 if logical_committed:
-                    self._write_state(state, plan, _SEALING_INCOMPLETE)
+                    self._write_state(
+                        state,
+                        plan,
+                        _SEALING_INCOMPLETE,
+                        lifecycle_preservation=lifecycle_preservation,
+                    )
                     raise RecoveryHold(_SEALING_INCOMPLETE, "logical purge committed but sealing or verification did not complete") from exc
                 raise
             finally:
@@ -541,18 +637,35 @@ class SensitiveMemoryRecoveryOperator:
         return payload
 
     @classmethod
-    def _write_state(cls, path: Path, plan: RecoveryPlan, phase: str) -> None:
+    def _write_state(
+        cls,
+        path: Path,
+        plan: RecoveryPlan,
+        phase: str,
+        *,
+        lifecycle_preservation: LifecyclePreservationSnapshot | None = None,
+    ) -> None:
         existing = cls._read_state(path, plan)
         if existing is not None and _STATE_PHASE_RANK[str(existing["phase"])] > _STATE_PHASE_RANK[phase]:
             return
-        _atomic_json(path, {
+        payload: dict[str, Any] = {
             "operation_id": plan.operation_id,
             "db_identity": _db_identity(plan.db_path),
             "phase": phase,
             "target_count": len(plan.targets),
             "plan_binding": _plan_binding(plan),
             "raw_content_logged": False,
-        })
+        }
+        snapshot_payload = (
+            lifecycle_preservation.to_dict()
+            if lifecycle_preservation is not None
+            else existing.get("unrelated_lifecycle_snapshot")
+            if existing is not None
+            else None
+        )
+        if snapshot_payload is not None:
+            payload["unrelated_lifecycle_snapshot"] = snapshot_payload
+        _atomic_json(path, payload)
 
     def _require_quiescent(self, db_path: str) -> None:
         try:
@@ -943,6 +1056,8 @@ class SensitiveMemoryRecoveryOperator:
         conn: sqlite3.Connection,
         plan: RecoveryPlan,
         inspections: list[TargetInspection],
+        *,
+        lifecycle_preservation: LifecyclePreservationSnapshot,
     ) -> None:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1055,6 +1170,7 @@ class SensitiveMemoryRecoveryOperator:
             self._append_sensitive_purge_events(conn, plan, recovery_events)
             self._verify_logical_absence(conn, current)
             self._verify_recovery_audit_state(conn, plan)
+            self._verify_unrelated_lifecycle(conn, plan, lifecycle_preservation)
             self._ensure_recovery_interlock(conn, plan)
             conn.commit()
         except Exception:
@@ -1117,12 +1233,15 @@ class SensitiveMemoryRecoveryOperator:
         plan: RecoveryPlan,
         event_ids_by_record: dict[str, str],
     ) -> str | None:
-        direct_ids = {
+        memory_ids = {
+            value
+            for field in ("target_memory_id", "winner_memory_id")
+            if (value := operation[field]) is not None
+        }
+        record_ids = {
             value
             for field in (
-                "target_memory_id",
                 "target_record_id",
-                "winner_memory_id",
                 "winner_record_id",
                 "winner_parent_record_id",
                 "result_record_id",
@@ -1146,7 +1265,7 @@ class SensitiveMemoryRecoveryOperator:
                 )
             affected = parsed
         for target in plan.targets:
-            if target.record_id in direct_ids or target.memory_id in direct_ids:
+            if target.memory_id in memory_ids or target.record_id in record_ids:
                 return event_ids_by_record[target.record_id]
             if any(
                 member.get("record_id") == target.record_id
@@ -1155,6 +1274,82 @@ class SensitiveMemoryRecoveryOperator:
             ):
                 return event_ids_by_record[target.record_id]
         return None
+
+    @staticmethod
+    def _event_is_target_linked(event: sqlite3.Row, plan: RecoveryPlan) -> bool:
+        memory_ids = {
+            value
+            for field in ("memory_id", "related_memory_id")
+            if (value := event[field]) is not None
+        }
+        record_ids = {
+            value
+            for field in ("record_id", "target_record_id", "related_record_id")
+            if (value := event[field]) is not None
+        }
+        return any(
+            target.memory_id in memory_ids or target.record_id in record_ids
+            for target in plan.targets
+        )
+
+    @staticmethod
+    def _digest_rows(rows: Iterable[sqlite3.Row]) -> tuple[int, str]:
+        digest_value = hashlib.sha256()
+        count = 0
+        for row in rows:
+            count += 1
+            for value in tuple(row):
+                if value is None:
+                    payload = b"N"
+                elif isinstance(value, bytes):
+                    payload = b"B" + value
+                else:
+                    payload = b"T" + str(value).encode("utf-8")
+                digest_value.update(len(payload).to_bytes(8, "big"))
+                digest_value.update(payload)
+        return count, digest_value.hexdigest()
+
+    @classmethod
+    def _snapshot_unrelated_lifecycle(
+        cls,
+        conn: sqlite3.Connection,
+        plan: RecoveryPlan,
+    ) -> LifecyclePreservationSnapshot:
+        event_rows = [
+            row
+            for row in conn.execute("SELECT * FROM lifecycle_events ORDER BY event_id").fetchall()
+            if not cls._event_is_target_linked(row, plan)
+        ]
+        event_count, event_digest = cls._digest_rows(event_rows)
+        placeholder_event_ids = {target.record_id: target.record_id for target in plan.targets}
+        operation_rows = [
+            row
+            for row in conn.execute(
+                "SELECT * FROM lifecycle_operations ORDER BY idempotency_key"
+            ).fetchall()
+            if cls._operation_target_event_id(row, plan, placeholder_event_ids) is None
+        ]
+        operation_count, operation_digest = cls._digest_rows(operation_rows)
+        return LifecyclePreservationSnapshot(
+            event_count=event_count,
+            event_digest=event_digest,
+            operation_count=operation_count,
+            operation_digest=operation_digest,
+        )
+
+    @classmethod
+    def _verify_unrelated_lifecycle(
+        cls,
+        conn: sqlite3.Connection,
+        plan: RecoveryPlan,
+        expected: LifecyclePreservationSnapshot,
+    ) -> None:
+        actual = cls._snapshot_unrelated_lifecycle(conn, plan)
+        if actual != expected:
+            raise RecoveryHold(
+                "HOLD_UNRELATED_LIFECYCLE_DRIFT_NO_MUTATION",
+                "unrelated lifecycle event or operation rows changed during sensitive Recovery",
+            )
 
     @classmethod
     def _target_linked_operations(

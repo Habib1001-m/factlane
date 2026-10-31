@@ -1510,6 +1510,23 @@ class SQLiteVecEngine:
     async def group_observation(self, scope: ScopeContext, contradiction_key: str) -> dict[str, Any]:
         return await self._run(self._group_observation_sync, scope, contradiction_key)
 
+    def _require_group_token_sync(
+        self,
+        scope: ScopeContext,
+        contradiction_key: str,
+        observed_group_token: str,
+    ) -> dict[str, Any]:
+        observed = self._group_observation_sync(scope, contradiction_key)
+        if observed["public"]["observed_group_token"] != observed_group_token:
+            raise AdapterError(
+                "GROUP_VERSION_CONFLICT",
+                "contradiction group changed after Owner observation",
+                refetch_required=True,
+                current_group_token=observed["public"]["observed_group_token"],
+                member_count=observed["public"]["member_count"],
+            )
+        return observed
+
     @staticmethod
     def _normalized_fact(value: str) -> str:
         return " ".join(value.casefold().split())
@@ -1808,6 +1825,7 @@ class SQLiteVecEngine:
             if adapter_collision is not None:
                 raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is already reserved by another write")
             self._sample_trust_clock_sync(iso_now())
+            self._sample_trust_clock_sync(committed_at)
             where, params = self._scope_where(scope)
             target_row = self.conn.execute(
                 self._select_sql(
@@ -2047,6 +2065,7 @@ class SQLiteVecEngine:
             if self.conn.execute("SELECT 1 FROM adapter_records WHERE idempotency_key=? LIMIT 1", (idempotency_key,)).fetchone():
                 raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is already reserved by another write")
             self._sample_trust_clock_sync(iso_now())
+            self._sample_trust_clock_sync(committed_at)
             observed = self._group_observation_sync(scope, contradiction_key)
             if observed["public"]["observed_group_token"] != observed_group_token:
                 raise AdapterError(
@@ -2658,6 +2677,7 @@ class SQLiteVecEngine:
                 raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is already reserved by another write")
 
             self._sample_trust_clock_sync(iso_now())
+            self._sample_trust_clock_sync(committed_at)
 
             where, params = self._scope_where(scope)
             target_row = self.conn.execute(
@@ -2925,6 +2945,8 @@ class SQLiteVecEngine:
         record: dict[str, Any],
         embedding: list[float],
         supersede_record_id: str | None = None,
+        *,
+        observed_group_token: str | None = None,
     ) -> None:
         self.require_embedding_compatibility()
         def transaction() -> None:
@@ -2933,6 +2955,7 @@ class SQLiteVecEngine:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 self._sample_trust_clock_sync(iso_now())
+                self._sample_trust_clock_sync(str(record["created_at"]))
                 _validate_current_authority_metadata(record)
                 if supersede_record_id is None and (
                     record.get("revision") != 1
@@ -2955,7 +2978,7 @@ class SQLiteVecEngine:
                 if supersede_record_id is not None:
                     old = self.conn.execute(
                         "SELECT native_content_hash, lifecycle_state,scope,project_id,worktree_id,workflow_id,agent_id,"
-                        "memory_id,revision,contradiction_state "
+                        "memory_id,revision,contradiction_state,contradiction_key "
                         "FROM adapter_records WHERE record_id = ?",
                         (supersede_record_id,),
                     ).fetchone()
@@ -2964,6 +2987,15 @@ class SQLiteVecEngine:
                             "VERSION_CONFLICT",
                             "expected revision is no longer the current lineage parent",
                         )
+                    if observed_group_token is not None:
+                        exact_scope = ScopeContext(
+                            str(old[2]),
+                            old[3],
+                            old[4],
+                            old[5],
+                            old[6],
+                        )
+                        self._require_group_token_sync(exact_scope, str(old[10]), observed_group_token)
                     if record.get("parent_record_id") != supersede_record_id:
                         raise AdapterError("VERSION_CONFLICT", "update lineage parent does not match expected revision")
                     if (
@@ -3144,6 +3176,7 @@ class SQLiteVecEngine:
         *,
         expected_record_id: str,
         expected_revision: int,
+        observed_group_token: str | None = None,
     ) -> dict[str, Any] | None:
         """Atomically promote one exact Candidate lineage parent to validated current."""
         self.require_embedding_compatibility()
@@ -3154,6 +3187,7 @@ class SQLiteVecEngine:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 self._sample_trust_clock_sync(iso_now())
+                self._sample_trust_clock_sync(str(record["created_at"]))
                 _validate_current_authority_metadata(record)
                 parent_row = self.conn.execute(
                     self._select_sql(
@@ -3165,6 +3199,8 @@ class SQLiteVecEngine:
                 if parent_row is None:
                     raise AdapterError("VERSION_CONFLICT", "candidate lineage parent no longer matches expected record and revision")
                 parent = self._row_to_dict(parent_row)
+                if observed_group_token is not None:
+                    self._require_group_token_sync(scope, parent["contradiction_key"], observed_group_token)
                 if parent["contradiction_state"] in {"UNRESOLVED", "QUARANTINED"}:
                     raise AdapterError("CONTRADICTION", "candidate has an unresolved contradiction and cannot be promoted")
                 if record.get("parent_record_id") != expected_record_id or record.get("revision") != expected_revision + 1:
@@ -3183,7 +3219,6 @@ class SQLiteVecEngine:
                         "INVALID_ENVELOPE",
                         "candidate REVERIFY successor cannot change logical or contradiction identity",
                     )
-
                 _validate_cross_project_storage_semantics(record)
                 _validate_current_contradiction_state(record)
 
