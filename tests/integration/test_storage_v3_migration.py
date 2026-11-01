@@ -6,6 +6,8 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -449,6 +451,506 @@ def test_explicit_v2_to_v3_migration_creates_verified_backup_and_restores(tmp_pa
         assert conn.execute("SELECT COUNT(*) FROM memories WHERE content_hash=?", ("a" * 64,)).fetchone()[0] == 1
     finally:
         conn.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_backup_stage_is_private_before_copy_even_with_permissive_umask(tmp_path: Path) -> None:
+    os.chmod(tmp_path, 0o700)
+    db = tmp_path / "private-stage.db"
+    backup = tmp_path / "private-stage.pre-v3.db"
+    _seed_full_v2(db)
+    source = sqlite3.connect(db)
+    parent_fd = migration_module._open_private_backup_parent(backup)
+    observed_during_copy: list[tuple[int, int]] = []
+    try:
+        source_snapshot = migration_module._logical_parity_snapshot(source)
+
+        class SourceProxy:
+            def backup(self, destination: sqlite3.Connection) -> None:
+                stages = list(tmp_path.glob(".factlane-*.stage"))
+                assert len(stages) == 1
+                stage_stat = os.stat(stages[0], follow_symlinks=False)
+                parent_stat = os.stat(tmp_path, follow_symlinks=False)
+                observed_during_copy.append(
+                    (stat.S_IMODE(stage_stat.st_mode), stat.S_IMODE(parent_stat.st_mode))
+                )
+                assert not backup.exists()
+                source.backup(destination)
+
+        prior_umask = os.umask(0)
+        try:
+            backup_sha = migration_module._backup_database(
+                SourceProxy(),  # type: ignore[arg-type]
+                backup,
+                parent_fd=parent_fd,
+                source_db=db,
+                source_snapshot=source_snapshot,
+            )
+        finally:
+            os.umask(prior_umask)
+    finally:
+        os.close(parent_fd)
+        source.close()
+
+    manifest = Path(str(backup) + ".factlane-v3-backup.json")
+    assert observed_during_copy == [(0o600, 0o700)]
+    assert backup_sha == _digest(backup)
+    assert stat.S_IMODE(os.stat(backup).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(manifest).st_mode) == 0o600
+    assert not list(tmp_path.glob(".factlane-*.stage*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_backup_verification_failure_removes_private_stage_without_publishing(tmp_path: Path, monkeypatch) -> None:
+    os.chmod(tmp_path, 0o700)
+    db = tmp_path / "backup-failure.db"
+    backup = tmp_path / "backup-failure.pre-v3.db"
+    _seed_full_v2(db)
+    source_before = _digest(db)
+    original_integrity = migration_module._integrity
+    calls = 0
+
+    def fail_backup_integrity(conn: sqlite3.Connection) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise migration_module.MigrationHold("MIGRATION_HOLD", "injected backup verification failure")
+        original_integrity(conn)
+
+    monkeypatch.setattr(migration_module, "_integrity", fail_backup_integrity)
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "MIGRATION_HOLD"
+    assert _digest(db) == source_before
+    assert inspect_storage_contract_version(str(db)) == 2
+    assert not backup.exists()
+    assert not Path(str(backup) + ".factlane-v3-backup.json").exists()
+    assert not list(tmp_path.glob(".factlane-*.stage*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+@pytest.mark.parametrize("destination_kind", ["regular", "symlink", "directory"])
+def test_backup_existing_destination_is_never_followed_or_overwritten(
+    tmp_path: Path,
+    destination_kind: str,
+) -> None:
+    os.chmod(tmp_path, 0o700)
+    db = tmp_path / f"existing-{destination_kind}.db"
+    backup = tmp_path / f"existing-{destination_kind}.pre-v3.db"
+    sentinel = tmp_path / f"sentinel-{destination_kind}.bin"
+    _seed_full_v2(db)
+    sentinel.write_bytes(b"sentinel-bytes")
+    if destination_kind == "regular":
+        backup.write_bytes(b"existing-backup")
+        expected = b"existing-backup"
+    elif destination_kind == "symlink":
+        backup.symlink_to(sentinel)
+        expected = b"sentinel-bytes"
+    else:
+        backup.mkdir()
+        expected = None
+
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "BACKUP_EXISTS"
+    assert inspect_storage_contract_version(str(db)) == 2
+    if destination_kind == "regular":
+        assert backup.read_bytes() == expected
+    elif destination_kind == "symlink":
+        assert backup.is_symlink()
+        assert sentinel.read_bytes() == expected
+    else:
+        assert backup.is_dir()
+    assert not Path(str(backup) + ".factlane-v3-backup.json").exists()
+    assert not list(tmp_path.glob(".factlane-*.stage*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_backup_parent_must_be_private_before_sensitive_copy(tmp_path: Path) -> None:
+    db = tmp_path / "shared-parent.db"
+    backup_parent = tmp_path / "shared-backups"
+    backup_parent.mkdir(mode=0o700)
+    os.chmod(backup_parent, 0o750)
+    backup = backup_parent / "shared-parent.pre-v3.db"
+    _seed_full_v2(db)
+    before = _digest(db)
+
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "MIGRATION_HOLD"
+    assert "operator-owned and private" in exc_info.value.safe_message
+    assert _digest(db) == before
+    assert not backup.exists()
+    assert not list(backup_parent.glob(".factlane-*.stage*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_backup_parent_must_be_owned_by_current_operator_before_sensitive_copy(tmp_path: Path, monkeypatch) -> None:
+    db = tmp_path / "wrong-owner.db"
+    backup_parent = tmp_path / "wrong-owner-backups"
+    backup_parent.mkdir(mode=0o700)
+    os.chmod(backup_parent, 0o700)
+    backup = backup_parent / "wrong-owner.pre-v3.db"
+    _seed_full_v2(db)
+    before = _digest(db)
+    real_euid = os.geteuid()
+    monkeypatch.setattr(migration_module.os, "geteuid", lambda: real_euid + 1)
+
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "MIGRATION_HOLD"
+    assert "operator-owned and private" in exc_info.value.safe_message
+    assert _digest(db) == before
+    assert not backup.exists()
+    assert not list(backup_parent.glob(".factlane-*.stage*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_backup_path_rejects_third_party_owned_ancestor_before_sensitive_copy(tmp_path: Path, monkeypatch) -> None:
+    ancestor = tmp_path / "foreign-ancestor"
+    backup_parent = ancestor / "private-backups"
+    backup_parent.mkdir(parents=True, mode=0o700)
+    os.chmod(ancestor, 0o755)
+    os.chmod(backup_parent, 0o700)
+    backup = backup_parent / "ancestor-owner.pre-v3.db"
+    real_stat = os.stat
+    real_euid = os.geteuid()
+
+    def stat_with_foreign_ancestor(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if kwargs.get("dir_fd") is None and Path(path) == ancestor:
+            values = list(result)
+            values[4] = real_euid + 1
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(migration_module.os, "stat", stat_with_foreign_ancestor)
+    monkeypatch.setattr(
+        migration_module.os,
+        "supports_dir_fd",
+        {*os.supports_dir_fd, stat_with_foreign_ancestor},
+    )
+    monkeypatch.setattr(
+        migration_module.os,
+        "supports_follow_symlinks",
+        {*os.supports_follow_symlinks, stat_with_foreign_ancestor},
+    )
+    with pytest.raises(AdapterError) as exc_info:
+        migration_module._open_private_backup_parent(backup)
+    assert exc_info.value.code == "MIGRATION_HOLD"
+    assert "untrusted OS identity" in exc_info.value.safe_message
+    assert not backup.exists()
+    assert not list(backup_parent.glob(".factlane-*.stage*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_backup_concurrent_final_creator_wins_without_overwrite(tmp_path: Path, monkeypatch) -> None:
+    os.chmod(tmp_path, 0o700)
+    db = tmp_path / "concurrent-backup.db"
+    backup = tmp_path / "concurrent-backup.pre-v3.db"
+    _seed_full_v2(db)
+    original_publish = migration_module._publish_private_stage_noreplace
+    injected = False
+
+    def racing_publish(parent_fd: int, stage_name: str, stage_identity: tuple[int, int], final_name: str, **kwargs) -> None:
+        nonlocal injected
+        if final_name == backup.name and not injected:
+            injected = True
+            fd = os.open(
+                final_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                os.write(fd, b"concurrent-winner")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        original_publish(parent_fd, stage_name, stage_identity, final_name, **kwargs)
+
+    monkeypatch.setattr(migration_module, "_publish_private_stage_noreplace", racing_publish)
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "BACKUP_EXISTS"
+    assert backup.read_bytes() == b"concurrent-winner"
+    assert inspect_storage_contract_version(str(db)) == 2
+    assert not Path(str(backup) + ".factlane-v3-backup.json").exists()
+    assert not list(tmp_path.glob(".factlane-*.stage*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_backup_stage_path_replacement_is_detected_before_source_copy(tmp_path: Path, monkeypatch) -> None:
+    os.chmod(tmp_path, 0o700)
+    db = tmp_path / "stage-replacement.db"
+    backup = tmp_path / "stage-replacement.pre-v3.db"
+    _seed_full_v2(db)
+    source = sqlite3.connect(db)
+    parent_fd = migration_module._open_private_backup_parent(backup)
+    source_snapshot = migration_module._logical_parity_snapshot(source)
+    original_connect = sqlite3.connect
+    replaced_paths: list[Path] = []
+
+    def replace_before_open(database, *args, **kwargs):
+        if kwargs.get("uri") and isinstance(database, str) and database.startswith("file:"):
+            encoded_path = database[5:].split("?", 1)[0]
+            stage = Path(urllib.parse.unquote(encoded_path))
+            stage.unlink()
+            stage.write_bytes(b"same-user-replacement")
+            os.chmod(stage, 0o600)
+            replaced_paths.append(stage)
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(migration_module.sqlite3, "connect", replace_before_open)
+    try:
+        with pytest.raises(AdapterError) as exc_info:
+            migration_module._backup_database(
+                source,
+                backup,
+                parent_fd=parent_fd,
+                source_db=db,
+                source_snapshot=source_snapshot,
+            )
+        assert exc_info.value.code == "MIGRATION_HOLD"
+    finally:
+        os.close(parent_fd)
+        source.close()
+
+    assert replaced_paths
+    assert not backup.exists()
+    assert all(path.read_bytes() == b"same-user-replacement" for path in replaced_paths)
+    assert b"The legacy fact remains unchanged." not in replaced_paths[0].read_bytes()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_backup_stage_removal_cannot_be_recreated_by_sqlite(tmp_path: Path, monkeypatch) -> None:
+    os.chmod(tmp_path, 0o700)
+    db = tmp_path / "stage-removal.db"
+    backup = tmp_path / "stage-removal.pre-v3.db"
+    _seed_full_v2(db)
+    source = sqlite3.connect(db)
+    parent_fd = migration_module._open_private_backup_parent(backup)
+    source_snapshot = migration_module._logical_parity_snapshot(source)
+    original_connect = sqlite3.connect
+    removed_paths: list[Path] = []
+
+    def remove_before_open(database, *args, **kwargs):
+        if kwargs.get("uri") and isinstance(database, str) and database.startswith("file:"):
+            encoded_path = database[5:].split("?", 1)[0]
+            stage = Path(urllib.parse.unquote(encoded_path))
+            stage.unlink()
+            removed_paths.append(stage)
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(migration_module.sqlite3, "connect", remove_before_open)
+    try:
+        with pytest.raises(AdapterError) as exc_info:
+            migration_module._backup_database(
+                source,
+                backup,
+                parent_fd=parent_fd,
+                source_db=db,
+                source_snapshot=source_snapshot,
+            )
+        assert exc_info.value.code == "MIGRATION_HOLD"
+        assert "existing-only" in exc_info.value.safe_message
+    finally:
+        os.close(parent_fd)
+        source.close()
+
+    assert removed_paths
+    assert not removed_paths[0].exists()
+    assert not backup.exists()
+    assert not Path(str(backup) + ".factlane-v3-backup.json").exists()
+    assert not list(tmp_path.glob(".factlane-*.stage*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+@pytest.mark.parametrize("manifest_kind", ["regular", "symlink", "directory"])
+def test_backup_manifest_collision_blocks_before_backup_copy(tmp_path: Path, manifest_kind: str) -> None:
+    os.chmod(tmp_path, 0o700)
+    db = tmp_path / "manifest-collision.db"
+    backup = tmp_path / "manifest-collision.pre-v3.db"
+    manifest = Path(str(backup) + ".factlane-v3-backup.json")
+    sentinel = tmp_path / "manifest-sentinel.bin"
+    _seed_full_v2(db)
+    sentinel.write_bytes(b"manifest-sentinel")
+    if manifest_kind == "regular":
+        manifest.write_bytes(b"existing-manifest")
+        os.chmod(manifest, 0o600)
+    elif manifest_kind == "symlink":
+        manifest.symlink_to(sentinel)
+    else:
+        manifest.mkdir()
+
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "BACKUP_EXISTS"
+    if manifest_kind == "regular":
+        assert manifest.read_bytes() == b"existing-manifest"
+    elif manifest_kind == "symlink":
+        assert manifest.is_symlink()
+        assert sentinel.read_bytes() == b"manifest-sentinel"
+    else:
+        assert manifest.is_dir()
+    assert not backup.exists()
+    assert inspect_storage_contract_version(str(db)) == 2
+    assert not list(tmp_path.glob(".factlane-*.stage*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_manifest_publish_collision_retains_verified_backup_and_keeps_source_v2(tmp_path: Path, monkeypatch) -> None:
+    os.chmod(tmp_path, 0o700)
+    db = tmp_path / "manifest-race.db"
+    backup = tmp_path / "manifest-race.pre-v3.db"
+    manifest = Path(str(backup) + ".factlane-v3-backup.json")
+    _seed_full_v2(db)
+    source_before = _digest(db)
+    original_publish = migration_module._publish_private_stage_noreplace
+    injected = False
+
+    def racing_publish(parent_fd: int, stage_name: str, stage_identity: tuple[int, int], final_name: str, **kwargs) -> None:
+        nonlocal injected
+        if final_name == manifest.name and not injected:
+            injected = True
+            fd = os.open(
+                final_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                os.write(fd, b"concurrent-manifest")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        original_publish(parent_fd, stage_name, stage_identity, final_name, **kwargs)
+
+    monkeypatch.setattr(migration_module, "_publish_private_stage_noreplace", racing_publish)
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "BACKUP_EXISTS"
+    assert injected is True
+    assert source_before == _digest(db)
+    assert inspect_storage_contract_version(str(db)) == 2
+    assert backup.is_file()
+    assert stat.S_IMODE(os.stat(backup).st_mode) == 0o600
+    assert manifest.read_bytes() == b"concurrent-manifest"
+    assert not list(tmp_path.glob(".factlane-*.stage*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_manifest_failure_after_backup_publication_retains_verified_backup(tmp_path: Path, monkeypatch) -> None:
+    os.chmod(tmp_path, 0o700)
+    db = tmp_path / "manifest-interruption.db"
+    backup = tmp_path / "manifest-interruption.pre-v3.db"
+    manifest = Path(str(backup) + ".factlane-v3-backup.json")
+    _seed_full_v2(db)
+    source_before = _digest(db)
+    observed_backup_sha: list[str] = []
+
+    def fail_manifest(backup_path: Path, **kwargs) -> None:
+        assert backup_path == backup
+        assert backup.is_file()
+        assert stat.S_IMODE(os.stat(backup).st_mode) == 0o600
+        observed_backup_sha.append(_digest(backup) or "")
+        raise migration_module.MigrationHold("MIGRATION_HOLD", "injected interruption before manifest publication")
+
+    monkeypatch.setattr(migration_module, "_write_backup_manifest", fail_manifest)
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "MIGRATION_HOLD"
+    assert observed_backup_sha and observed_backup_sha[0] == _digest(backup)
+    assert source_before == _digest(db)
+    assert inspect_storage_contract_version(str(db)) == 2
+    assert backup.is_file()
+    assert not manifest.exists()
+    assert not list(tmp_path.glob(".factlane-*.stage*"))
+
+    retained_sha = _digest(backup)
+    with pytest.raises(AdapterError) as retry:
+        migrate_storage_v3(str(db), str(backup))
+    assert retry.value.code == "BACKUP_EXISTS"
+    assert _digest(backup) == retained_sha
+    assert not manifest.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_private_stage_cleanup_removes_regular_sqlite_sidecars(tmp_path: Path) -> None:
+    os.chmod(tmp_path, 0o700)
+    backup = tmp_path / "sidecar-cleanup.pre-v3.db"
+    parent_fd = migration_module._open_private_backup_parent(backup)
+    try:
+        stage_name, stage_fd, stage_identity = migration_module._create_private_stage(parent_fd)
+        os.close(stage_fd)
+        for suffix in ("-journal", "-wal", "-shm"):
+            fd = os.open(
+                stage_name + suffix,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            os.close(fd)
+        migration_module._cleanup_private_stage(
+            parent_fd,
+            stage_name,
+            stage_identity,
+            include_sqlite_sidecars=True,
+        )
+        assert not list(tmp_path.glob(".factlane-*.stage*"))
+    finally:
+        os.close(parent_fd)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_private_stage_cleanup_refuses_symlink_sidecar_without_following(tmp_path: Path) -> None:
+    os.chmod(tmp_path, 0o700)
+    backup = tmp_path / "sidecar-symlink.pre-v3.db"
+    sentinel = tmp_path / "sidecar-sentinel.bin"
+    sentinel.write_bytes(b"sidecar-sentinel")
+    parent_fd = migration_module._open_private_backup_parent(backup)
+    stage_name, stage_fd, stage_identity = migration_module._create_private_stage(parent_fd)
+    os.close(stage_fd)
+    sidecar = tmp_path / (stage_name + "-wal")
+    sidecar.symlink_to(sentinel)
+    try:
+        with pytest.raises(AdapterError) as exc_info:
+            migration_module._cleanup_private_stage(
+                parent_fd,
+                stage_name,
+                stage_identity,
+                include_sqlite_sidecars=True,
+            )
+        assert exc_info.value.code == "MIGRATION_HOLD"
+        assert sentinel.read_bytes() == b"sidecar-sentinel"
+        assert sidecar.is_symlink()
+        assert (tmp_path / stage_name).is_file()
+    finally:
+        sidecar.unlink(missing_ok=True)
+        (tmp_path / stage_name).unlink(missing_ok=True)
+        os.close(parent_fd)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
+def test_missing_secure_backup_primitive_fails_closed_before_sensitive_copy(tmp_path: Path, monkeypatch) -> None:
+    os.chmod(tmp_path, 0o700)
+    db = tmp_path / "missing-primitive.db"
+    backup = tmp_path / "missing-primitive.pre-v3.db"
+    _seed_full_v2(db)
+    source_before = _digest(db)
+    reduced_dir_fd = set(os.supports_dir_fd)
+    reduced_dir_fd.discard(os.link)
+    monkeypatch.setattr(migration_module.os, "supports_dir_fd", reduced_dir_fd)
+
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "MIGRATION_HOLD"
+    assert "primitives are unavailable" in exc_info.value.safe_message
+    assert source_before == _digest(db)
+    assert inspect_storage_contract_version(str(db)) == 2
+    assert not backup.exists()
+    assert not Path(str(backup) + ".factlane-v3-backup.json").exists()
+    assert not list(tmp_path.glob(".factlane-*.stage*"))
 
 
 def test_restore_refuses_valid_v2_image_without_operator_backup_manifest(tmp_path: Path) -> None:

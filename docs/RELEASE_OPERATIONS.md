@@ -151,7 +151,9 @@ closed for review.
 
 An existing v0.1.4 storage-v2 database is not silently upgraded by normal v0.1.5 startup. The RC
 fails closed with `MIGRATION_REQUIRED` until the trusted migration operator completes the transition.
-Stop/quiesce FactLane and choose a new operator-owned backup path before running:
+Stop/quiesce FactLane and choose a new backup path inside an **existing private directory owned by
+the migration operator** before running. The backup parent must grant no group/other permissions
+(`mode & 077 == 0`); the migration does not create or relax that directory for you:
 
 ```bash
 uv run factlane-migrate-storage-v3 migrate \
@@ -159,10 +161,15 @@ uv run factlane-migrate-storage-v3 migrate \
   --backup /absolute/path/to/backups/factlane-pre-v3.sqlite3
 ```
 
-The operator requires exact storage v2, verifies database integrity and lineage, creates the backup
-with SQLite's backup path, reopens that backup to verify integrity and contract v2, records its
-SHA-256, applies the v3 governance schema transactionally, advances the storage contract version
-last, then verifies the resulting database as v3. A pre-existing backup destination is rejected.
+The operator requires exact storage v2, verifies database integrity and lineage, creates the SQLite
+backup in a confidential `0600` same-directory staging inode, reopens that existing inode without
+allowing recreation, verifies integrity and contract v2, then atomically publishes the backup with
+no replacement. Its verification manifest is published with equivalent private/no-replace semantics.
+A pre-existing backup or manifest destination is rejected. If the backup has already been published
+but manifest publication fails or is interrupted, the verified backup is retained and the migration
+holds before changing the source database; the operator must investigate rather than overwrite it.
+After the verified backup and manifest exist, the operator applies the v3 governance schema
+transactionally, advances the storage contract version last, then verifies the resulting database as v3.
 
 After migration, preserve the reported backup path and SHA-256 as rollback evidence and re-run the
 normal runtime checks before enabling writes.

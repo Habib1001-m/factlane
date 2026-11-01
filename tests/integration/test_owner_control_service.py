@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+import threading
 import uuid
 from typing import Any
 
 import pytest
 
 import factlane.owner_control as owner_control_module
+import factlane.storage as storage_module
 from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
 from factlane.contract import AdapterError, canonical_json, validate_scope
 from factlane.embeddings import EmbeddingProfile
@@ -46,6 +49,20 @@ class _Provider:
 
     def provider_status(self) -> dict[str, object]:
         return {"local_only": True}
+
+
+class _BeginImmediateProbe:
+    def __init__(self, connection: sqlite3.Connection, attempted: threading.Event) -> None:
+        self._connection = connection
+        self._attempted = attempted
+
+    def execute(self, sql: str, *args, **kwargs):
+        if sql.strip().upper() == "BEGIN IMMEDIATE":
+            self._attempted.set()
+        return self._connection.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
 
 
 def _record(
@@ -476,6 +493,217 @@ def test_resolve_candidate_rejects_stale_ttl_verification_before_current_admissi
     asyncio.run(run())
 
 
+def test_resolve_candidate_rechecks_ttl_after_write_lock_wait_without_partial_adjudication(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        engine, service = await _service(tmp_path)
+        blocker: sqlite3.Connection | None = None
+        begin_attempted = threading.Event()
+        try:
+            key = "resolve-lock-wait-expiry"
+            current = _record(
+                marker="a1",
+                project_id="project-a",
+                lifecycle="VALIDATED_CURRENT",
+                contradiction_key=key,
+                fact="Current before lock wait",
+            )
+            winner = _record(
+                marker="b1",
+                project_id="project-a",
+                contradiction_key=key,
+                fact="Candidate whose proof expires",
+            )
+            loser = _record(
+                marker="c1",
+                project_id="project-a",
+                contradiction_key=key,
+                fact="Losing candidate",
+            )
+            for row in (current, winner, loser):
+                await engine.write_record(row, [1.0] + [0.0] * 255)
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_meta SET value=? WHERE key='trust_clock_high_water_at'",
+                ("2026-10-31T20:00:00Z",),
+            )
+            engine.conn.commit()
+            scope = validate_scope("PROJECT", project_id="project-a")
+            observed = await engine.group_observation(scope, key)
+            token_before = observed["public"]["observed_group_token"]
+            counts_before = {
+                table: int(engine.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in (
+                    "adapter_records",
+                    "memories",
+                    "memory_embeddings",
+                    "lifecycle_events",
+                    "lifecycle_operations",
+                )
+            }
+            verification = {
+                "source_provenance": {
+                    "source_class": "TEST",
+                    "source_ref": "lock-wait-resolve-source",
+                    "source_hash": "7" * 64,
+                    "review_ref": "lock-wait-resolve-review",
+                    "extraction_method": "owner-check",
+                },
+                "freshness_policy": {"kind": "ttl", "ttl_seconds": 60},
+                "source_timestamp": "2026-10-31T20:00:00Z",
+                "last_verified_at": "2026-10-31T20:00:00Z",
+                "verified_by": "OWNER",
+                "tags": winner["tags"],
+            }
+            monkeypatch.setattr(owner_control_module, "iso_now", lambda: "2026-10-31T20:00:30Z")
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T20:01:01Z")
+            blocker = sqlite3.connect(engine.db_path, timeout=5.0, check_same_thread=False)
+            blocker.execute("BEGIN IMMEDIATE")
+            engine.conn = _BeginImmediateProbe(engine.conn, begin_attempted)  # type: ignore[assignment]
+            contender = asyncio.create_task(
+                service.resolve(
+                    contradiction_key=key,
+                    observed_group_token=token_before,
+                    winner_memory_id=winner["memory_id"],
+                    winner_record_id=winner["record_id"],
+                    winner_expected_revision=1,
+                    idempotency_key="resolve-lock-wait-expired",
+                    reason_code="STRONGER_EVIDENCE",
+                    verification=verification,
+                    scope="PROJECT",
+                    project_id="project-a",
+                )
+            )
+            assert await asyncio.to_thread(begin_attempted.wait, 2)
+            await asyncio.sleep(0)
+            assert not contender.done()
+            blocker.commit()
+            with pytest.raises(AdapterError) as expired:
+                await contender
+            assert expired.value.code == "WINNER_PROOF_INVALID"
+            assert begin_attempted.is_set()
+            assert engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0] == "2026-10-31T20:01:01Z"
+            assert {
+                table: int(engine.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in counts_before
+            } == counts_before
+            assert (await engine.group_observation(scope, key))["public"]["observed_group_token"] == token_before
+            assert (await engine.get_record(current["memory_id"], scope, history=True))[0]["lifecycle_state"] == "VALIDATED_CURRENT"
+            assert (await engine.get_record(winner["memory_id"], scope, history=True))[0]["lifecycle_state"] == "CANDIDATE"
+            assert (await engine.get_record(loser["memory_id"], scope, history=True))[0]["lifecycle_state"] == "CANDIDATE"
+        finally:
+            if blocker is not None:
+                blocker.close()
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_resolve_group_drift_after_lock_wait_precedes_transactional_expiry(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        engine, service = await _service(tmp_path)
+        blocker: sqlite3.Connection | None = None
+        begin_attempted = threading.Event()
+        try:
+            key = "resolve-lock-wait-group-drift"
+            current = _record(
+                marker="a2",
+                project_id="project-a",
+                lifecycle="VALIDATED_CURRENT",
+                contradiction_key=key,
+                fact="Current before group drift",
+            )
+            winner = _record(
+                marker="b2",
+                project_id="project-a",
+                contradiction_key=key,
+                fact="Candidate whose proof also expires",
+            )
+            loser = _record(
+                marker="c2",
+                project_id="project-a",
+                contradiction_key=key,
+                fact="Candidate changed by concurrent writer",
+            )
+            for row in (current, winner, loser):
+                await engine.write_record(row, [1.0] + [0.0] * 255)
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_meta SET value=? WHERE key='trust_clock_high_water_at'",
+                ("2026-10-31T20:00:00Z",),
+            )
+            engine.conn.commit()
+            scope = validate_scope("PROJECT", project_id="project-a")
+            token_before = (await engine.group_observation(scope, key))["public"]["observed_group_token"]
+            event_count_before = int(engine.conn.execute("SELECT COUNT(*) FROM lifecycle_events").fetchone()[0])
+            operation_count_before = int(engine.conn.execute("SELECT COUNT(*) FROM lifecycle_operations").fetchone()[0])
+            verification = {
+                "source_provenance": {
+                    "source_class": "TEST",
+                    "source_ref": "lock-wait-group-drift-source",
+                    "source_hash": "9" * 64,
+                    "review_ref": "lock-wait-group-drift-review",
+                    "extraction_method": "owner-check",
+                },
+                "freshness_policy": {"kind": "ttl", "ttl_seconds": 60},
+                "source_timestamp": "2026-10-31T20:00:00Z",
+                "last_verified_at": "2026-10-31T20:00:00Z",
+                "verified_by": "OWNER",
+                "tags": winner["tags"],
+            }
+            monkeypatch.setattr(owner_control_module, "iso_now", lambda: "2026-10-31T20:00:30Z")
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T20:01:01Z")
+            blocker = sqlite3.connect(engine.db_path, timeout=5.0, check_same_thread=False)
+            blocker.create_function("factlane_contract_v3_writer", 0, lambda: 1)
+            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute(
+                "UPDATE adapter_records SET contradiction_state='NONE' WHERE record_id=?",
+                (loser["record_id"],),
+            )
+            engine.conn = _BeginImmediateProbe(engine.conn, begin_attempted)  # type: ignore[assignment]
+            contender = asyncio.create_task(
+                service.resolve(
+                    contradiction_key=key,
+                    observed_group_token=token_before,
+                    winner_memory_id=winner["memory_id"],
+                    winner_record_id=winner["record_id"],
+                    winner_expected_revision=1,
+                    idempotency_key="resolve-lock-wait-group-drift",
+                    reason_code="STRONGER_EVIDENCE",
+                    verification=verification,
+                    scope="PROJECT",
+                    project_id="project-a",
+                )
+            )
+            assert await asyncio.to_thread(begin_attempted.wait, 2)
+            await asyncio.sleep(0)
+            assert not contender.done()
+            blocker.commit()
+            with pytest.raises(AdapterError) as drift:
+                await contender
+            assert drift.value.code == "GROUP_VERSION_CONFLICT"
+            assert begin_attempted.is_set()
+            assert engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0] == "2026-10-31T20:00:00Z"
+            assert int(engine.conn.execute("SELECT COUNT(*) FROM lifecycle_events").fetchone()[0]) == event_count_before
+            assert int(engine.conn.execute("SELECT COUNT(*) FROM lifecycle_operations").fetchone()[0]) == operation_count_before
+            assert (await engine.get_record(current["memory_id"], scope, history=True))[0]["lifecycle_state"] == "VALIDATED_CURRENT"
+            assert (await engine.get_record(winner["memory_id"], scope, history=True))[0]["lifecycle_state"] == "CANDIDATE"
+            assert (await engine.get_record(loser["memory_id"], scope, history=True))[0]["lifecycle_state"] == "CANDIDATE"
+            assert (await engine.group_observation(scope, key))["public"]["observed_group_token"] != token_before
+        finally:
+            if blocker is not None:
+                blocker.close()
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_readmit_builds_same_memory_successor_replays_and_does_not_persist_proof_in_operation(tmp_path) -> None:
     async def run() -> None:
         engine, service = await _service(tmp_path)
@@ -563,6 +791,233 @@ def test_readmit_builds_same_memory_successor_replays_and_does_not_persist_proof
             assert replay["operation_id"] == result["operation_id"]
             assert replay["request_id"] == "owner-readmit-request"
         finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_readmit_rechecks_ttl_after_write_lock_wait_without_partial_successor(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        engine, service = await _service(tmp_path)
+        blocker: sqlite3.Connection | None = None
+        begin_attempted = threading.Event()
+        try:
+            target = _record(
+                marker="d1",
+                project_id="project-a",
+                lifecycle="VALIDATED_CURRENT",
+                contradiction_key="readmit-lock-wait-expiry",
+                fact="Revoked truth with expiring proof",
+            )
+            await engine.write_record(target, [1.0] + [0.0] * 255)
+            scope = validate_scope("PROJECT", project_id="project-a")
+            token = (await engine.group_observation(scope, "readmit-lock-wait-expiry"))["public"][
+                "observed_group_token"
+            ]
+            await service.revoke(
+                memory_id=target["memory_id"],
+                expected_record_id=target["record_id"],
+                expected_revision=1,
+                observed_group_token=token,
+                idempotency_key="readmit-lock-wait-revoke",
+                reason_code="OUTDATED",
+                scope="PROJECT",
+                project_id="project-a",
+            )
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_meta SET value=? WHERE key='trust_clock_high_water_at'",
+                ("2026-10-31T20:00:00Z",),
+            )
+            engine.conn.commit()
+            observed = await engine.group_observation(scope, "readmit-lock-wait-expiry")
+            token_before = observed["public"]["observed_group_token"]
+            counts_before = {
+                table: int(engine.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in (
+                    "adapter_records",
+                    "memories",
+                    "memory_embeddings",
+                    "lifecycle_events",
+                    "lifecycle_operations",
+                )
+            }
+            verification = {
+                "source_provenance": {
+                    "source_class": "TEST",
+                    "source_ref": "lock-wait-readmit-source",
+                    "source_hash": "8" * 64,
+                    "review_ref": "lock-wait-readmit-review",
+                    "extraction_method": "owner-check",
+                },
+                "freshness_policy": {"kind": "ttl", "ttl_seconds": 60},
+                "source_timestamp": "2026-10-31T20:00:00Z",
+                "last_verified_at": "2026-10-31T20:00:00Z",
+                "verified_by": "OWNER",
+                "tags": target["tags"],
+            }
+            monkeypatch.setattr(owner_control_module, "iso_now", lambda: "2026-10-31T20:00:30Z")
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T20:01:01Z")
+            blocker = sqlite3.connect(engine.db_path, timeout=5.0, check_same_thread=False)
+            blocker.execute("BEGIN IMMEDIATE")
+            engine.conn = _BeginImmediateProbe(engine.conn, begin_attempted)  # type: ignore[assignment]
+            contender = asyncio.create_task(
+                service.readmit(
+                    memory_id=target["memory_id"],
+                    revoked_record_id=target["record_id"],
+                    expected_revoked_revision=1,
+                    observed_group_token=token_before,
+                    idempotency_key="readmit-lock-wait-expired",
+                    verification=verification,
+                    scope="PROJECT",
+                    project_id="project-a",
+                )
+            )
+            assert await asyncio.to_thread(begin_attempted.wait, 2)
+            await asyncio.sleep(0)
+            assert not contender.done()
+            blocker.commit()
+            with pytest.raises(AdapterError) as expired:
+                await contender
+            assert expired.value.code == "VERIFICATION_REQUIRED"
+            assert begin_attempted.is_set()
+            assert engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0] == "2026-10-31T20:01:01Z"
+            assert {
+                table: int(engine.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in counts_before
+            } == counts_before
+            assert (await engine.group_observation(scope, "readmit-lock-wait-expiry"))["public"][
+                "observed_group_token"
+            ] == token_before
+            history = await engine.get_record(target["memory_id"], scope, history=True)
+            assert len(history) == 1
+            assert history[0]["lifecycle_state"] == "REVOKED"
+        finally:
+            if blocker is not None:
+                blocker.close()
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_readmit_lineage_drift_after_lock_wait_precedes_transactional_expiry(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        engine, service = await _service(tmp_path)
+        blocker: sqlite3.Connection | None = None
+        begin_attempted = threading.Event()
+        try:
+            target = _record(
+                marker="d2",
+                project_id="project-a",
+                lifecycle="VALIDATED_CURRENT",
+                contradiction_key="readmit-lock-wait-lineage-drift",
+                fact="Revoked truth with concurrent descendant",
+            )
+            await engine.write_record(target, [1.0] + [0.0] * 255)
+            scope = validate_scope("PROJECT", project_id="project-a")
+            token = (await engine.group_observation(scope, "readmit-lock-wait-lineage-drift"))["public"][
+                "observed_group_token"
+            ]
+            await service.revoke(
+                memory_id=target["memory_id"],
+                expected_record_id=target["record_id"],
+                expected_revision=1,
+                observed_group_token=token,
+                idempotency_key="readmit-lineage-drift-revoke",
+                reason_code="OUTDATED",
+                scope="PROJECT",
+                project_id="project-a",
+            )
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_meta SET value=? WHERE key='trust_clock_high_water_at'",
+                ("2026-10-31T20:00:00Z",),
+            )
+            engine.conn.commit()
+            token_before = (await engine.group_observation(scope, "readmit-lock-wait-lineage-drift"))["public"][
+                "observed_group_token"
+            ]
+            event_count_before = int(engine.conn.execute("SELECT COUNT(*) FROM lifecycle_events").fetchone()[0])
+            operation_count_before = int(engine.conn.execute("SELECT COUNT(*) FROM lifecycle_operations").fetchone()[0])
+            target_cursor = engine.conn.execute("SELECT * FROM adapter_records WHERE record_id=?", (target["record_id"],))
+            target_row = target_cursor.fetchone()
+            assert target_row is not None
+            columns = [description[0] for description in target_cursor.description]
+            child = dict(zip(columns, tuple(target_row), strict=True))
+            child.update(
+                {
+                    "record_id": str(uuid.uuid4()),
+                    "revision": 2,
+                    "parent_record_id": target["record_id"],
+                    "source_timestamp": None,
+                    "last_verified_at": None,
+                    "verified_by": "UNVERIFIED",
+                    "authority_role": "UNRESOLVED",
+                    "contradiction_state": "UNRESOLVED",
+                    "confidence": 0.5,
+                    "lifecycle_state": "CANDIDATE",
+                    "native_content_hash": "e" * 64,
+                    "payload_fingerprint": "f" * 64,
+                    "idempotency_key": "readmit-lineage-drift-child",
+                }
+            )
+            verification = {
+                "source_provenance": {
+                    "source_class": "TEST",
+                    "source_ref": "lock-wait-lineage-drift-source",
+                    "source_hash": "a" * 64,
+                    "review_ref": "lock-wait-lineage-drift-review",
+                    "extraction_method": "owner-check",
+                },
+                "freshness_policy": {"kind": "ttl", "ttl_seconds": 60},
+                "source_timestamp": "2026-10-31T20:00:00Z",
+                "last_verified_at": "2026-10-31T20:00:00Z",
+                "verified_by": "OWNER",
+                "tags": target["tags"],
+            }
+            monkeypatch.setattr(owner_control_module, "iso_now", lambda: "2026-10-31T20:00:30Z")
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T20:01:01Z")
+            blocker = sqlite3.connect(engine.db_path, timeout=5.0, check_same_thread=False)
+            blocker.create_function("factlane_contract_v3_writer", 0, lambda: 1)
+            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute(
+                f"INSERT INTO adapter_records ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                [child[column] for column in columns],
+            )
+            engine.conn = _BeginImmediateProbe(engine.conn, begin_attempted)  # type: ignore[assignment]
+            contender = asyncio.create_task(
+                service.readmit(
+                    memory_id=target["memory_id"],
+                    revoked_record_id=target["record_id"],
+                    expected_revoked_revision=1,
+                    observed_group_token=token_before,
+                    idempotency_key="readmit-lock-wait-lineage-drift",
+                    verification=verification,
+                    scope="PROJECT",
+                    project_id="project-a",
+                )
+            )
+            assert await asyncio.to_thread(begin_attempted.wait, 2)
+            await asyncio.sleep(0)
+            assert not contender.done()
+            blocker.commit()
+            with pytest.raises(AdapterError) as drift:
+                await contender
+            assert drift.value.code == "LINEAGE_CHANGED"
+            assert begin_attempted.is_set()
+            assert engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0] == "2026-10-31T20:00:00Z"
+            assert int(engine.conn.execute("SELECT COUNT(*) FROM lifecycle_events").fetchone()[0]) == event_count_before
+            assert int(engine.conn.execute("SELECT COUNT(*) FROM lifecycle_operations").fetchone()[0]) == operation_count_before
+            history = await engine.get_record(target["memory_id"], scope, history=True)
+            assert [row["lifecycle_state"] for row in history[:2]] == ["CANDIDATE", "REVOKED"]
+            assert history[0]["record_id"] == child["record_id"]
+        finally:
+            if blocker is not None:
+                blocker.close()
             await engine.close()
 
     asyncio.run(run())

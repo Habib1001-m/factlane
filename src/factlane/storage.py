@@ -23,6 +23,7 @@ from .contract import (
     AdapterError,
     ScopeContext,
     canonical_json,
+    is_fresh,
     iso_now,
     native_hash,
     parse_iso,
@@ -2192,6 +2193,13 @@ class SQLiteVecEngine:
             current_rows = [row for row in active_rows if row["lifecycle_state"] == "VALIDATED_CURRENT"]
             if len(current_rows) > 1:
                 raise AdapterError("LIFECYCLE_INVARIANT_VIOLATION", "RESOLVE cannot proceed with multiple Current rows")
+            if winner["lifecycle_state"] == "CANDIDATE":
+                assert candidate_successor is not None
+                self._require_transactional_freshness_sync(
+                    candidate_successor,
+                    error_code="WINNER_PROOF_INVALID",
+                    safe_message="Candidate winner verification expired before Current admission",
+                )
 
             result_record_id = winner["record_id"]
             result_revision = int(winner["revision"])
@@ -2380,6 +2388,29 @@ class SQLiteVecEngine:
 
     async def resolve_group(self, scope: ScopeContext, **values: Any) -> dict[str, Any]:
         return await self._run(lambda: self._resolve_group_sync(scope, **values))
+
+    def _require_transactional_freshness_sync(
+        self,
+        record: dict[str, Any],
+        *,
+        error_code: str,
+        safe_message: str,
+    ) -> None:
+        """Recheck Current-admission freshness at the serialized write boundary."""
+        assert self.conn is not None
+        _, effective_now = self._sample_trust_clock_sync(iso_now())
+        if is_fresh(
+            record["freshness_policy"],
+            record.get("last_verified_at"),
+            record["source_provenance"],
+            now=parse_iso(effective_now, required=True),
+        ):
+            return
+        # No lifecycle/native/vector/adjudication write is allowed before this
+        # point. Preserve only the monotonic trust-clock safety observation so a
+        # later wall-clock rollback cannot resurrect proof already seen expired.
+        self.conn.commit()
+        raise AdapterError(error_code, safe_message)
 
     def _sample_trust_clock_sync(self, sampled_at: str) -> tuple[bool, str]:
         """Return clock health and monotonically maintain the durable audit high-water mark."""
@@ -2832,6 +2863,11 @@ class SQLiteVecEngine:
             ).fetchone()
             if native is None:
                 raise AdapterError("READMIT_RECOVERY_PURGED_DENIED", "readmit target payload was physically purged")
+            self._require_transactional_freshness_sync(
+                verified_successor,
+                error_code="VERIFICATION_REQUIRED",
+                safe_message="readmit verification expired before Current admission",
+            )
 
             active_rows = [
                 self._row_to_dict(row)

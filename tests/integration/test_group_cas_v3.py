@@ -600,6 +600,215 @@ def test_resolve_candidate_creates_verified_successor_and_supersedes_current(tmp
     asyncio.run(run())
 
 
+def test_candidate_resolve_accepts_exact_ttl_boundary_and_replays_after_expiry(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "resolve-ttl-boundary.db"), _profile())
+        await engine.open()
+        try:
+            scope = validate_scope("PROJECT", project_id="group-project")
+            key = "resolve-ttl-boundary-key"
+            current = _record(marker="a", lifecycle="VALIDATED_CURRENT", contradiction_key=key, fact="Old current")
+            winner = _record(marker="b", lifecycle="CANDIDATE", contradiction_key=key, fact="TTL winner")
+            loser = _record(marker="c", lifecycle="CANDIDATE", contradiction_key=key, fact="TTL loser")
+            for row, vector in (
+                (current, [1.0] + [0.0] * 255),
+                (winner, [0.0, 1.0] + [0.0] * 254),
+                (loser, [0.0, 0.0, 1.0] + [0.0] * 253),
+            ):
+                await engine.write_record(row, vector)
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_meta SET value=? WHERE key='trust_clock_high_water_at'",
+                ("2026-10-31T20:10:00Z",),
+            )
+            engine.conn.commit()
+            successor = _candidate_successor(winner, native_marker="d", operation_marker="resolve-ttl-boundary")
+            successor["source_timestamp"] = "2026-10-31T20:10:00Z"
+            successor["last_verified_at"] = "2026-10-31T20:10:00Z"
+            successor["freshness_policy"] = {
+                "kind": "ttl",
+                "ttl_seconds": 60,
+                "recheck_ref": None,
+                "source_fingerprint": None,
+            }
+            observed = await engine.group_observation(scope, key)
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T20:11:00Z")
+            result = await engine.resolve_group(
+                scope,
+                contradiction_key=key,
+                observed_group_token=observed["public"]["observed_group_token"],
+                winner_memory_id=winner["memory_id"],
+                winner_record_id=winner["record_id"],
+                winner_expected_revision=1,
+                idempotency_key="resolve-ttl-boundary-op",
+                request_fingerprint="resolve-ttl-boundary-fingerprint",
+                request_id="resolve-ttl-boundary-request",
+                reason_code="STRONGER_EVIDENCE",
+                actor_class="OWNER",
+                actor_ref_digest="actor-digest",
+                grant_ref_digest="grant-digest",
+                committed_at="2026-10-31T20:10:30Z",
+                candidate_successor=successor,
+            )
+            assert result["winner"]["result_record_id"] == successor["record_id"]
+            assert engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0] == "2026-10-31T20:11:00Z"
+
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T20:30:00Z")
+            replay = await engine.resolve_group(
+                scope,
+                contradiction_key=key,
+                observed_group_token=observed["public"]["observed_group_token"],
+                winner_memory_id=winner["memory_id"],
+                winner_record_id=winner["record_id"],
+                winner_expected_revision=1,
+                idempotency_key="resolve-ttl-boundary-op",
+                request_fingerprint="resolve-ttl-boundary-fingerprint",
+                request_id="ignored-on-replay",
+                reason_code="STRONGER_EVIDENCE",
+                actor_class="OWNER",
+                actor_ref_digest="actor-digest",
+                grant_ref_digest="grant-digest",
+                committed_at="2026-10-31T20:30:00Z",
+                candidate_successor=successor,
+            )
+            assert replay["operation_id"] == result["operation_id"]
+            assert replay["idempotent_replay"] is True
+            assert engine.conn.execute(
+                "SELECT COUNT(*) FROM lifecycle_operations WHERE idempotency_key='resolve-ttl-boundary-op'"
+            ).fetchone()[0] == 1
+            assert engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0] == "2026-10-31T20:11:00Z"
+
+            with pytest.raises(AdapterError) as changed_replay:
+                await engine.resolve_group(
+                    scope,
+                    contradiction_key=key,
+                    observed_group_token=observed["public"]["observed_group_token"],
+                    winner_memory_id=winner["memory_id"],
+                    winner_record_id=winner["record_id"],
+                    winner_expected_revision=1,
+                    idempotency_key="resolve-ttl-boundary-op",
+                    request_fingerprint="resolve-ttl-boundary-different-fingerprint",
+                    request_id="changed-replay-request",
+                    reason_code="STRONGER_EVIDENCE",
+                    actor_class="OWNER",
+                    actor_ref_digest="actor-digest",
+                    grant_ref_digest="grant-digest",
+                    committed_at="2026-10-31T20:30:00Z",
+                    candidate_successor=successor,
+                )
+            assert changed_replay.value.code == "IDEMPOTENCY_CONFLICT"
+            assert engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0] == "2026-10-31T20:11:00Z"
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_candidate_resolve_expiry_persists_highwater_without_partial_adjudication_and_blocks_clock_rollback(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "resolve-ttl-expired.db"), _profile())
+        await engine.open()
+        try:
+            scope = validate_scope("PROJECT", project_id="group-project")
+            key = "resolve-ttl-expired-key"
+            current = _record(marker="e", lifecycle="VALIDATED_CURRENT", contradiction_key=key, fact="Old current")
+            winner = _record(marker="f", lifecycle="CANDIDATE", contradiction_key=key, fact="Expiring winner")
+            loser = _record(marker="g", lifecycle="CANDIDATE", contradiction_key=key, fact="Unchanged loser")
+            for row, vector in (
+                (current, [1.0] + [0.0] * 255),
+                (winner, [0.0, 1.0] + [0.0] * 254),
+                (loser, [0.0, 0.0, 1.0] + [0.0] * 253),
+            ):
+                await engine.write_record(row, vector)
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_meta SET value=? WHERE key='trust_clock_high_water_at'",
+                ("2026-10-31T20:10:00Z",),
+            )
+            engine.conn.commit()
+            successor = _candidate_successor(winner, native_marker="h", operation_marker="resolve-ttl-expired")
+            successor["source_timestamp"] = "2026-10-31T20:10:00Z"
+            successor["last_verified_at"] = "2026-10-31T20:10:00Z"
+            successor["freshness_policy"] = {
+                "kind": "ttl",
+                "ttl_seconds": 60,
+                "recheck_ref": None,
+                "source_fingerprint": None,
+            }
+            observed = await engine.group_observation(scope, key)
+            token_before = observed["public"]["observed_group_token"]
+            counts_before = {
+                table: int(engine.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in (
+                    "adapter_records",
+                    "memories",
+                    "memory_embeddings",
+                    "lifecycle_events",
+                    "lifecycle_operations",
+                )
+            }
+
+            async def attempt(key_suffix: str) -> AdapterError:
+                with pytest.raises(AdapterError) as exc_info:
+                    await engine.resolve_group(
+                        scope,
+                        contradiction_key=key,
+                        observed_group_token=token_before,
+                        winner_memory_id=winner["memory_id"],
+                        winner_record_id=winner["record_id"],
+                        winner_expected_revision=1,
+                        idempotency_key=f"resolve-ttl-expired-{key_suffix}",
+                        request_fingerprint=f"resolve-ttl-expired-{key_suffix}-fingerprint",
+                        request_id=f"resolve-ttl-expired-{key_suffix}-request",
+                        reason_code="STRONGER_EVIDENCE",
+                        actor_class="OWNER",
+                        actor_ref_digest="actor-digest",
+                        grant_ref_digest="grant-digest",
+                        committed_at="2026-10-31T20:10:30Z",
+                        candidate_successor=successor,
+                    )
+                return exc_info.value
+
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T20:11:01Z")
+            expired = await attempt("first")
+            assert expired.code == "WINNER_PROOF_INVALID"
+            assert engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0] == "2026-10-31T20:11:01Z"
+            assert {
+                table: int(engine.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in counts_before
+            } == counts_before
+            assert (await engine.group_observation(scope, key))["public"]["observed_group_token"] == token_before
+            assert (await engine.get_record(current["memory_id"], scope, history=True))[0]["lifecycle_state"] == "VALIDATED_CURRENT"
+            assert (await engine.get_record(winner["memory_id"], scope, history=True))[0]["lifecycle_state"] == "CANDIDATE"
+            assert (await engine.get_record(loser["memory_id"], scope, history=True))[0]["lifecycle_state"] == "CANDIDATE"
+
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T19:00:00Z")
+            rollback_retry = await attempt("rollback")
+            assert rollback_retry.code == "WINNER_PROOF_INVALID"
+            assert engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0] == "2026-10-31T20:11:01Z"
+            assert {
+                table: int(engine.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in counts_before
+            } == counts_before
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_candidate_promotion_rereads_complete_group_and_rejects_incompatible_peer(tmp_path) -> None:
     async def run() -> None:
         engine = SQLiteVecEngine(str(tmp_path / "promotion-group.db"), _profile())

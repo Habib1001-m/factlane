@@ -6,7 +6,9 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import tempfile
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any
@@ -214,11 +216,239 @@ def _logical_parity_snapshot(conn: sqlite3.Connection) -> dict[str, dict[str, An
     return snapshot
 
 
-def _require_migration_capacity_and_permissions(db: Path, backup: Path) -> None:
+def _canonical_backup_target(backup_path: str) -> Path:
+    requested = Path(os.path.abspath(backup_path))
+    if not requested.name or requested.name in {".", ".."}:
+        raise MigrationHold("MIGRATION_HOLD", "backup destination must name one file")
+    try:
+        parent = requested.parent.resolve(strict=True)
+    except OSError as exc:
+        raise MigrationHold(
+            "MIGRATION_HOLD",
+            "backup parent directory must already exist",
+        ) from exc
+    return parent / requested.name
+
+
+def _require_secure_backup_primitives() -> None:
+    required_flags = ("O_NOFOLLOW", "O_DIRECTORY")
+    if os.name != "posix" or not hasattr(os, "geteuid") or any(
+        not hasattr(os, flag) for flag in required_flags
+    ):
+        raise MigrationHold(
+            "MIGRATION_HOLD",
+            "secure pre-v3 backup publication requires POSIX no-follow directory primitives",
+        )
+    if (
+        os.open not in os.supports_dir_fd
+        or os.stat not in os.supports_dir_fd
+        or os.unlink not in os.supports_dir_fd
+        or os.link not in os.supports_dir_fd
+        or os.stat not in os.supports_follow_symlinks
+        or os.link not in os.supports_follow_symlinks
+    ):
+        raise MigrationHold(
+            "MIGRATION_HOLD",
+            "secure pre-v3 backup publication primitives are unavailable",
+        )
+
+
+def _open_private_backup_parent(backup: Path) -> int:
+    _require_secure_backup_primitives()
+    euid = os.geteuid()
+    parent = backup.parent
+    current = parent
+    child_stat: os.stat_result | None = None
+    while True:
+        try:
+            current_stat = os.stat(current, follow_symlinks=False)
+        except OSError as exc:
+            raise MigrationHold(
+                "MIGRATION_HOLD",
+                "backup path custody could not be verified",
+            ) from exc
+        if not stat.S_ISDIR(current_stat.st_mode):
+            raise MigrationHold("MIGRATION_HOLD", "backup path contains a non-directory ancestor")
+        if current == parent:
+            if current_stat.st_uid != euid or stat.S_IMODE(current_stat.st_mode) & 0o077:
+                raise MigrationHold(
+                    "MIGRATION_HOLD",
+                    "backup parent must be operator-owned and private",
+                )
+        else:
+            if current_stat.st_uid not in {0, euid}:
+                raise MigrationHold(
+                    "MIGRATION_HOLD",
+                    "backup path ancestor is owned by an untrusted OS identity",
+                )
+            if stat.S_IMODE(current_stat.st_mode) & 0o022:
+                sticky_protects_child = bool(current_stat.st_mode & stat.S_ISVTX) and child_stat is not None and (
+                    child_stat.st_uid in {0, euid}
+                )
+                if not sticky_protects_child:
+                    raise MigrationHold(
+                        "MIGRATION_HOLD",
+                        "backup path ancestor permits replacement by another OS identity",
+                    )
+        if current.parent == current:
+            break
+        child_stat = current_stat
+        current = current.parent
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        parent_fd = os.open(parent, flags)
+    except OSError as exc:
+        raise MigrationHold("MIGRATION_HOLD", "backup parent could not be opened securely") from exc
+    try:
+        path_stat = os.stat(parent, follow_symlinks=False)
+        handle_stat = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(handle_stat.st_mode)
+            or (path_stat.st_dev, path_stat.st_ino) != (handle_stat.st_dev, handle_stat.st_ino)
+            or handle_stat.st_uid != euid
+            or stat.S_IMODE(handle_stat.st_mode) & 0o077
+        ):
+            raise MigrationHold("MIGRATION_HOLD", "backup parent identity or custody changed")
+        return parent_fd
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _entry_stat(parent_fd: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _require_entry_absent(parent_fd: int, name: str, *, label: str) -> None:
+    if _entry_stat(parent_fd, name) is not None:
+        raise MigrationHold("BACKUP_EXISTS", f"{label} already exists")
+
+
+def _create_private_stage(parent_fd: int) -> tuple[str, int, tuple[int, int]]:
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    for _ in range(8):
+        name = f".factlane-{uuid.uuid4().hex}.stage"
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise MigrationHold("MIGRATION_HOLD", "private backup stage could not be created") from exc
+        try:
+            os.fchmod(fd, 0o600)
+            handle_stat = os.fstat(fd)
+            if (
+                not stat.S_ISREG(handle_stat.st_mode)
+                or handle_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(handle_stat.st_mode) != 0o600
+            ):
+                raise MigrationHold("MIGRATION_HOLD", "private backup stage custody is invalid")
+            return name, fd, (int(handle_stat.st_dev), int(handle_stat.st_ino))
+        except BaseException:
+            os.close(fd)
+            try:
+                os.unlink(name, dir_fd=parent_fd)
+            except OSError:
+                pass
+            raise
+    raise MigrationHold("MIGRATION_HOLD", "private backup stage name could not be reserved")
+
+
+def _require_stage_identity(parent_fd: int, name: str, identity: tuple[int, int]) -> None:
+    entry = _entry_stat(parent_fd, name)
+    if (
+        entry is None
+        or not stat.S_ISREG(entry.st_mode)
+        or (int(entry.st_dev), int(entry.st_ino)) != identity
+        or entry.st_uid != os.geteuid()
+        or stat.S_IMODE(entry.st_mode) != 0o600
+    ):
+        raise MigrationHold("MIGRATION_HOLD", "private backup stage identity changed")
+
+
+def _cleanup_private_stage(
+    parent_fd: int,
+    name: str,
+    identity: tuple[int, int],
+    *,
+    include_sqlite_sidecars: bool,
+) -> None:
+    for suffix in (("-journal", "-wal", "-shm") if include_sqlite_sidecars else ()):
+        sidecar_name = name + suffix
+        entry = _entry_stat(parent_fd, sidecar_name)
+        if entry is None:
+            continue
+        if not stat.S_ISREG(entry.st_mode):
+            raise MigrationHold("MIGRATION_HOLD", "private SQLite backup sidecar has unexpected type")
+        os.unlink(sidecar_name, dir_fd=parent_fd)
+    entry = _entry_stat(parent_fd, name)
+    if entry is None:
+        return
+    if (int(entry.st_dev), int(entry.st_ino)) != identity:
+        raise MigrationHold("MIGRATION_HOLD", "private backup stage no longer names the reserved inode")
+    os.unlink(name, dir_fd=parent_fd)
+
+
+def _publish_private_stage_noreplace(
+    parent_fd: int,
+    stage_name: str,
+    stage_identity: tuple[int, int],
+    final_name: str,
+    *,
+    label: str,
+    include_sqlite_sidecars: bool,
+) -> None:
+    _require_stage_identity(parent_fd, stage_name, stage_identity)
+    try:
+        os.link(
+            stage_name,
+            final_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileExistsError as exc:
+        raise MigrationHold("BACKUP_EXISTS", f"{label} already exists") from exc
+    except (NotImplementedError, OSError) as exc:
+        raise MigrationHold(
+            "MIGRATION_HOLD",
+            f"{label} could not be published with atomic no-replace semantics",
+        ) from exc
+
+    final_stat = _entry_stat(parent_fd, final_name)
+    if (
+        final_stat is None
+        or not stat.S_ISREG(final_stat.st_mode)
+        or (int(final_stat.st_dev), int(final_stat.st_ino)) != stage_identity
+        or final_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(final_stat.st_mode) != 0o600
+    ):
+        raise MigrationHold("MIGRATION_HOLD", f"{label} publication identity is invalid")
+    os.fsync(parent_fd)
+    _cleanup_private_stage(
+        parent_fd,
+        stage_name,
+        stage_identity,
+        include_sqlite_sidecars=include_sqlite_sidecars,
+    )
+    os.fsync(parent_fd)
+
+
+def _require_migration_capacity_and_permissions(db: Path, backup: Path, parent_fd: int) -> None:
     if not db.is_file() or not os.access(db, os.R_OK | os.W_OK):
         raise MigrationHold("MIGRATION_HOLD", "storage v2 database is not readable and writable by the migration operator")
-    backup.parent.mkdir(parents=True, exist_ok=True)
-    if not os.access(db.parent, os.W_OK) or not os.access(backup.parent, os.W_OK):
+    parent_stat = os.fstat(parent_fd)
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_stat.st_mode) & 0o077
+    ):
+        raise MigrationHold("MIGRATION_HOLD", "backup parent custody is not private")
+    if not os.access(db.parent, os.W_OK) or not os.access(backup.parent, os.R_OK | os.W_OK | os.X_OK):
         raise MigrationHold("MIGRATION_HOLD", "migration and backup directories must be writable by the operator")
     source_bytes = db.stat().st_size + sum(
         sidecar.stat().st_size for sidecar in (Path(str(db) + "-wal"), Path(str(db) + "-shm")) if sidecar.exists()
@@ -232,10 +462,16 @@ def _backup_manifest_path(backup_path: Path) -> Path:
     return Path(str(backup_path) + ".factlane-v3-backup.json")
 
 
-def _write_backup_manifest(backup_path: Path, *, source_db: Path, backup_sha256: str, snapshot: dict[str, Any]) -> None:
+def _write_backup_manifest(
+    backup_path: Path,
+    *,
+    parent_fd: int,
+    source_db: Path,
+    backup_sha256: str,
+    snapshot: dict[str, Any],
+) -> None:
     manifest_path = _backup_manifest_path(backup_path)
-    if manifest_path.exists():
-        raise MigrationHold("BACKUP_EXISTS", "backup verification manifest already exists")
+    _require_entry_absent(parent_fd, manifest_path.name, label="backup verification manifest")
     payload = {
         "schema_version": 1,
         "kind": "FACTLANE_PRE_V3_BACKUP",
@@ -244,10 +480,36 @@ def _write_backup_manifest(backup_path: Path, *, source_db: Path, backup_sha256:
         "logical_snapshot_sha256": hashlib.sha256(canonical_json(snapshot).encode("utf-8")).hexdigest(),
         "created_at": iso_now(),
     }
-    tmp = manifest_path.with_name(manifest_path.name + f".{uuid.uuid4()}.tmp")
-    tmp.write_text(canonical_json(payload) + "\n", encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, manifest_path)
+    data = (canonical_json(payload) + "\n").encode("utf-8")
+    stage_name, stage_fd, stage_identity = _create_private_stage(parent_fd)
+    published = False
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(stage_fd, view)
+            if written <= 0:
+                raise MigrationHold("MIGRATION_HOLD", "backup verification manifest write failed")
+            view = view[written:]
+        os.fsync(stage_fd)
+        _require_stage_identity(parent_fd, stage_name, stage_identity)
+        _publish_private_stage_noreplace(
+            parent_fd,
+            stage_name,
+            stage_identity,
+            manifest_path.name,
+            label="backup verification manifest",
+            include_sqlite_sidecars=False,
+        )
+        published = True
+    finally:
+        os.close(stage_fd)
+        if not published:
+            _cleanup_private_stage(
+                parent_fd,
+                stage_name,
+                stage_identity,
+                include_sqlite_sidecars=False,
+            )
 
 
 def _verify_backup_manifest(backup_path: Path, *, source_db: Path, snapshot: dict[str, Any]) -> str:
@@ -450,26 +712,72 @@ def _create_v3_governance_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def _backup_database(conn: sqlite3.Connection, backup_path: Path, *, source_db: Path, source_snapshot: dict[str, Any]) -> str:
-    if backup_path.exists():
-        raise MigrationHold("BACKUP_EXISTS", "backup destination already exists")
-    backup_path.parent.mkdir(parents=True, exist_ok=True)
-    backup = sqlite3.connect(backup_path)
+def _backup_database(
+    conn: sqlite3.Connection,
+    backup_path: Path,
+    *,
+    parent_fd: int,
+    source_db: Path,
+    source_snapshot: dict[str, Any],
+) -> str:
+    _require_entry_absent(parent_fd, backup_path.name, label="backup destination")
+    _require_entry_absent(
+        parent_fd,
+        _backup_manifest_path(backup_path).name,
+        label="backup verification manifest",
+    )
+    stage_name, stage_fd, stage_identity = _create_private_stage(parent_fd)
+    stage_path = backup_path.parent / stage_name
+    backup: sqlite3.Connection | None = None
+    published = False
     try:
-        conn.backup(backup)
-        backup.commit()
-        _integrity(backup)
-        _require_v2_schema(backup)
-        _require_lineage_compatibility(backup)
-        _require_v2_native_profile_parity(backup)
-        if _logical_parity_snapshot(backup) != source_snapshot:
-            raise MigrationHold("BACKUP_INVALID", "pre-v3 backup does not preserve the source logical state")
+        try:
+            _require_stage_identity(parent_fd, stage_name, stage_identity)
+            stage_uri = "file:" + urllib.parse.quote(str(stage_path), safe="/") + "?mode=rw"
+            try:
+                backup = sqlite3.connect(stage_uri, uri=True, timeout=5.0)
+            except sqlite3.Error as exc:
+                raise MigrationHold(
+                    "MIGRATION_HOLD",
+                    "private backup stage could not be reopened existing-only",
+                ) from exc
+            _require_stage_identity(parent_fd, stage_name, stage_identity)
+            conn.backup(backup)
+            backup.commit()
+            _integrity(backup)
+            _require_v2_schema(backup)
+            _require_lineage_compatibility(backup)
+            _require_v2_native_profile_parity(backup)
+            if _logical_parity_snapshot(backup) != source_snapshot:
+                raise MigrationHold("BACKUP_INVALID", "pre-v3 backup does not preserve the source logical state")
+        finally:
+            if backup is not None:
+                backup.close()
+        os.fchmod(stage_fd, 0o600)
+        os.fsync(stage_fd)
+        _require_stage_identity(parent_fd, stage_name, stage_identity)
+        _publish_private_stage_noreplace(
+            parent_fd,
+            stage_name,
+            stage_identity,
+            backup_path.name,
+            label="backup destination",
+            include_sqlite_sidecars=True,
+        )
+        published = True
     finally:
-        backup.close()
-    os.chmod(backup_path, 0o600)
+        os.close(stage_fd)
+        if not published:
+            _cleanup_private_stage(
+                parent_fd,
+                stage_name,
+                stage_identity,
+                include_sqlite_sidecars=True,
+            )
     backup_sha256 = _sha256(backup_path)
     _write_backup_manifest(
         backup_path,
+        parent_fd=parent_fd,
         source_db=source_db,
         backup_sha256=backup_sha256,
         snapshot=source_snapshot,
@@ -479,51 +787,56 @@ def _backup_database(conn: sqlite3.Connection, backup_path: Path, *, source_db: 
 
 def migrate_storage_v3(db_path: str, backup_path: str) -> dict[str, Any]:
     db = Path(db_path).resolve()
-    backup = Path(backup_path).resolve()
-    _require_migration_capacity_and_permissions(db, backup)
+    backup = _canonical_backup_target(backup_path)
     if inspect_storage_contract_version(str(db)) != 2:
         raise MigrationHold("SCHEMA_MISMATCH", "migrate-storage-v3 requires an exact storage-v2 database")
     operation_id = str(uuid.uuid4())
     try:
         lease_context = MaintenanceLease(str(db), f"migration:{operation_id}")
         with lease_context:
-            conn = _connect(db)
+            parent_fd = _open_private_backup_parent(backup)
             try:
-                register_storage_legacy_maintenance_writer(conn)
-                _integrity(conn)
-                _require_v2_schema(conn)
-                _require_lineage_compatibility(conn)
-                _require_v2_native_profile_parity(conn)
-                source_snapshot = _logical_parity_snapshot(conn)
-                backup_sha256 = _backup_database(
-                    conn,
-                    backup,
-                    source_db=db,
-                    source_snapshot=source_snapshot,
-                )
-                conn.execute("BEGIN IMMEDIATE")
+                _require_migration_capacity_and_permissions(db, backup, parent_fd)
+                conn = _connect(db)
                 try:
-                    _create_v3_governance_schema(conn)
-                    if _logical_parity_snapshot(conn) != source_snapshot:
-                        raise MigrationHold("MIGRATION_HOLD", "migration changed historical native/vector/adapter rows")
-                    # Contract version moves last, after every schema/index/fence succeeds.
-                    conn.execute(
-                        "UPDATE adapter_meta SET value=? WHERE key='contract_version'",
-                        (str(STORAGE_CONTRACT_VERSION),),
+                    register_storage_legacy_maintenance_writer(conn)
+                    _integrity(conn)
+                    _require_v2_schema(conn)
+                    _require_lineage_compatibility(conn)
+                    _require_v2_native_profile_parity(conn)
+                    source_snapshot = _logical_parity_snapshot(conn)
+                    backup_sha256 = _backup_database(
+                        conn,
+                        backup,
+                        parent_fd=parent_fd,
+                        source_db=db,
+                        source_snapshot=source_snapshot,
                     )
-                    conn.commit()
-                except BaseException:
-                    conn.rollback()
-                    raise
-                _integrity(conn)
-                if _logical_parity_snapshot(conn) != source_snapshot:
-                    raise MigrationHold("MIGRATION_HOLD", "post-migration native/vector/adapter parity check failed")
-                try:
-                    SensitiveMemoryRecoveryOperator._require_known_recovery_schema(conn)
-                except RecoveryHold as exc:
-                    raise MigrationHold("MIGRATION_HOLD", "post-migration Recovery schema preflight failed") from exc
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        _create_v3_governance_schema(conn)
+                        if _logical_parity_snapshot(conn) != source_snapshot:
+                            raise MigrationHold("MIGRATION_HOLD", "migration changed historical native/vector/adapter rows")
+                        # Contract version moves last, after every schema/index/fence succeeds.
+                        conn.execute(
+                            "UPDATE adapter_meta SET value=? WHERE key='contract_version'",
+                            (str(STORAGE_CONTRACT_VERSION),),
+                        )
+                        conn.commit()
+                    except BaseException:
+                        conn.rollback()
+                        raise
+                    _integrity(conn)
+                    if _logical_parity_snapshot(conn) != source_snapshot:
+                        raise MigrationHold("MIGRATION_HOLD", "post-migration native/vector/adapter parity check failed")
+                    try:
+                        SensitiveMemoryRecoveryOperator._require_known_recovery_schema(conn)
+                    except RecoveryHold as exc:
+                        raise MigrationHold("MIGRATION_HOLD", "post-migration Recovery schema preflight failed") from exc
+                finally:
+                    conn.close()
             finally:
-                conn.close()
+                os.close(parent_fd)
     except RecoveryHold as exc:
         raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
     if inspect_storage_contract_version(str(db)) != STORAGE_CONTRACT_VERSION:

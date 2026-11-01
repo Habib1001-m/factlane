@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 
+import factlane.storage as storage_module
 from factlane.contract import AdapterError, validate_scope
 from factlane.embeddings import EmbeddingProfile
 from factlane.storage import SQLiteVecEngine
@@ -189,6 +190,138 @@ def test_readmit_unique_revoked_tip_creates_current_successor_and_replays(tmp_pa
                 "SELECT COUNT(*) FROM adapter_records WHERE memory_id=? AND parent_record_id=?",
                 (target["memory_id"], target["record_id"]),
             ).fetchone()[0] == 1
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_readmit_accepts_exact_ttl_boundary_and_replays_after_expiry(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "readmit-ttl-boundary.db"), _profile())
+        await engine.open()
+        try:
+            target = _record(fact="TTL boundary truth", key="readmit-ttl-boundary", marker="a")
+            await engine.write_record(target, [1.0] + [0.0] * 255)
+            await _revoke(engine, target)
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_meta SET value=? WHERE key='trust_clock_high_water_at'",
+                ("2026-10-31T19:59:00Z",),
+            )
+            engine.conn.commit()
+            successor = _successor(target, marker="b")
+            successor["source_timestamp"] = "2026-10-31T19:59:00Z"
+            successor["last_verified_at"] = "2026-10-31T19:59:00Z"
+            successor["freshness_policy"] = {
+                "kind": "ttl",
+                "ttl_seconds": 60,
+                "recheck_ref": None,
+                "source_fingerprint": None,
+            }
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T20:00:00Z")
+            result = await _readmit(engine, target, successor, key="readmit-ttl-boundary-op")
+            assert result["status"] == "OK"
+            assert result["result_record_id"] == successor["record_id"]
+
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T20:30:00Z")
+            replay = await _readmit(engine, target, successor, key="readmit-ttl-boundary-op")
+            assert replay["operation_id"] == result["operation_id"]
+            assert replay["idempotent_replay"] is True
+            assert engine.conn.execute(
+                "SELECT COUNT(*) FROM lifecycle_operations WHERE idempotency_key='readmit-ttl-boundary-op'"
+            ).fetchone()[0] == 1
+
+            scope = validate_scope("PROJECT", project_id="readmit-project")
+            with pytest.raises(AdapterError) as changed_replay:
+                await engine.readmit(
+                    scope,
+                    memory_id=str(target["memory_id"]),
+                    revoked_record_id=str(target["record_id"]),
+                    expected_revoked_revision=int(target["revision"]),
+                    observed_group_token="stale-token-is-ignored-on-replay",
+                    idempotency_key="readmit-ttl-boundary-op",
+                    request_fingerprint="different-readmit-fingerprint",
+                    request_id="changed-replay-request",
+                    verified_successor=successor,
+                    actor_class="OWNER",
+                    actor_ref_digest="actor-digest",
+                    grant_ref_digest="grant-digest",
+                    committed_at="2026-10-31T20:30:00Z",
+                )
+            assert changed_replay.value.code == "IDEMPOTENCY_CONFLICT"
+            assert engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0] == "2026-10-31T20:00:00Z"
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_readmit_expiry_persists_highwater_without_partial_adjudication(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "readmit-ttl-expired.db"), _profile())
+        await engine.open()
+        try:
+            target = _record(fact="TTL expiring truth", key="readmit-ttl-expired", marker="c")
+            await engine.write_record(target, [1.0] + [0.0] * 255)
+            await _revoke(engine, target)
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_meta SET value=? WHERE key='trust_clock_high_water_at'",
+                ("2026-10-31T20:00:00Z",),
+            )
+            engine.conn.commit()
+            successor = _successor(target, marker="d")
+            successor["source_timestamp"] = "2026-10-31T20:00:00Z"
+            successor["last_verified_at"] = "2026-10-31T20:00:00Z"
+            successor["freshness_policy"] = {
+                "kind": "ttl",
+                "ttl_seconds": 60,
+                "recheck_ref": None,
+                "source_fingerprint": None,
+            }
+            scope = validate_scope("PROJECT", project_id="readmit-project")
+            token_before = (await engine.group_observation(scope, str(target["contradiction_key"])))[
+                "public"
+            ]["observed_group_token"]
+            counts_before = {
+                table: int(engine.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in (
+                    "adapter_records",
+                    "memories",
+                    "memory_embeddings",
+                    "lifecycle_events",
+                    "lifecycle_operations",
+                )
+            }
+
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T20:01:01Z")
+            with pytest.raises(AdapterError) as expired:
+                await _readmit(engine, target, successor, key="readmit-ttl-expired-op")
+            assert expired.value.code == "VERIFICATION_REQUIRED"
+            assert engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0] == "2026-10-31T20:01:01Z"
+            assert {
+                table: int(engine.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in counts_before
+            } == counts_before
+            assert (await engine.group_observation(scope, str(target["contradiction_key"])))[
+                "public"
+            ]["observed_group_token"] == token_before
+            history = await engine.get_record(str(target["memory_id"]), scope, history=True)
+            assert len(history) == 1
+            assert history[0]["lifecycle_state"] == "REVOKED"
+
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T19:00:00Z")
+            with pytest.raises(AdapterError) as rollback_retry:
+                await _readmit(engine, target, successor, key="readmit-ttl-expired-retry")
+            assert rollback_retry.value.code == "VERIFICATION_REQUIRED"
+            assert engine.conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+            ).fetchone()[0] == "2026-10-31T20:01:01Z"
         finally:
             await engine.close()
 
