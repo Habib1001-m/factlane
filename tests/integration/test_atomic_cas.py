@@ -378,20 +378,20 @@ def test_store_reconciles_same_key_commit_between_initial_replay_and_duplicate_c
         engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "same-key-store-preflight-race.db")
         first_lookup_done = asyncio.Event()
         release_b = asyncio.Event()
-        original_find = engine_b.find_idempotency
+        original_owner = engine_b.idempotency_owner
         calls = 0
 
-        async def gated_find(key: str):
+        async def gated_owner(key: str):
             nonlocal calls
             calls += 1
-            result = await original_find(key)
+            result = await original_owner(key)
             if calls == 1:
                 assert result is None
                 first_lookup_done.set()
                 await asyncio.wait_for(release_b.wait(), timeout=5)
             return result
 
-        engine_b.find_idempotency = gated_find  # type: ignore[method-assign]
+        engine_b.idempotency_owner = gated_owner  # type: ignore[method-assign]
         request = {
             "fact": "Same-key store replay wins over duplicate classification.",
             "scope": "PROJECT",
@@ -441,20 +441,20 @@ def test_update_reconciles_same_key_commit_between_initial_replay_and_stale_pref
             parent = seed["results"][0]
             first_lookup_done = asyncio.Event()
             release_b = asyncio.Event()
-            original_find = engine_b.find_idempotency
+            original_owner = engine_b.idempotency_owner
             calls = 0
 
-            async def gated_find(key: str):
+            async def gated_owner(key: str):
                 nonlocal calls
                 calls += 1
-                result = await original_find(key)
+                result = await original_owner(key)
                 if calls == 1:
                     assert result is None
                     first_lookup_done.set()
                     await asyncio.wait_for(release_b.wait(), timeout=5)
                 return result
 
-            engine_b.find_idempotency = gated_find  # type: ignore[method-assign]
+            engine_b.idempotency_owner = gated_owner  # type: ignore[method-assign]
             request = {
                 "memory_id": parent["memory_id"],
                 "expected_record_id": parent["record_id"],
@@ -496,21 +496,21 @@ def test_store_lifecycle_claim_between_initial_lookup_and_duplicate_check_is_con
         engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "store-lifecycle-preflight-race.db")
         first_lookup_done = asyncio.Event()
         release_b = asyncio.Event()
-        original_operation_lookup = engine_b.operation_by_idempotency
+        original_owner_lookup = engine_b.idempotency_owner
         calls = 0
         shared_key = "store-lifecycle-preflight-race"
 
-        async def gated_operation_lookup(key: str):
+        async def gated_owner_lookup(key: str):
             nonlocal calls
             calls += 1
-            result = await original_operation_lookup(key)
+            result = await original_owner_lookup(key)
             if key == shared_key and calls == 1:
                 assert result is None
                 first_lookup_done.set()
                 await asyncio.wait_for(release_b.wait(), timeout=5)
             return result
 
-        engine_b.operation_by_idempotency = gated_operation_lookup  # type: ignore[method-assign]
+        engine_b.idempotency_owner = gated_owner_lookup  # type: ignore[method-assign]
         exact_fact = "Lifecycle claim must win over store duplicate classification."
         await _seed_current(adapter_a, key="store-lifecycle-exact-seed", fact=exact_fact)
         request = {
@@ -554,7 +554,7 @@ def test_update_lifecycle_claim_between_initial_lookup_and_stale_preflight_is_co
         engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "update-lifecycle-preflight-race.db")
         first_lookup_done = asyncio.Event()
         release_b = asyncio.Event()
-        original_operation_lookup = engine_b.operation_by_idempotency
+        original_owner_lookup = engine_b.idempotency_owner
         calls = 0
         shared_key = "update-lifecycle-preflight-race"
         try:
@@ -565,17 +565,17 @@ def test_update_lifecycle_claim_between_initial_lookup_and_stale_preflight_is_co
             )
             parent = seed["results"][0]
 
-            async def gated_operation_lookup(key: str):
+            async def gated_owner_lookup(key: str):
                 nonlocal calls
                 calls += 1
-                result = await original_operation_lookup(key)
+                result = await original_owner_lookup(key)
                 if key == shared_key and calls == 1:
                     assert result is None
                     first_lookup_done.set()
                     await asyncio.wait_for(release_b.wait(), timeout=5)
                 return result
 
-            engine_b.operation_by_idempotency = gated_operation_lookup  # type: ignore[method-assign]
+            engine_b.idempotency_owner = gated_owner_lookup  # type: ignore[method-assign]
             request = {
                 "memory_id": parent["memory_id"],
                 "expected_record_id": parent["record_id"],
@@ -606,6 +606,63 @@ def test_update_lifecycle_claim_between_initial_lookup_and_stale_preflight_is_co
             assert conflict.value.code == "IDEMPOTENCY_CONFLICT"
         finally:
             release_b.set()
+            await adapter_a.close()
+            await adapter_b.close()
+
+    asyncio.run(run())
+
+
+def test_update_write_transaction_checks_global_idempotency_before_stale_parent(tmp_path) -> None:
+    async def run() -> None:
+        engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "update-write-transaction-global-idempotency.db")
+        shared_key = "update-write-transaction-global-idempotency"
+        entered_write = asyncio.Event()
+        release_write = asyncio.Event()
+        original_write = engine_b.write_record
+        try:
+            seed = await _seed_current(
+                adapter_a,
+                key="update-write-transaction-seed",
+                fact="Transactional global idempotency must precede stale predecessor checks.",
+            )
+            parent = seed["results"][0]
+
+            async def gated_write(*args: Any, **kwargs: Any) -> None:
+                entered_write.set()
+                await asyncio.wait_for(release_write.wait(), timeout=5)
+                await original_write(*args, **kwargs)
+
+            engine_b.write_record = gated_write  # type: ignore[method-assign]
+            request = {
+                "memory_id": parent["memory_id"],
+                "expected_record_id": parent["record_id"],
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": 1,
+                "mode": "REVERIFY",
+                "idempotency_key": shared_key,
+                "verification": {
+                    "source_provenance": {
+                        "source_class": "CURRENT_REPO",
+                        "source_ref": "update-write-transaction-global-idempotency",
+                        "source_hash": "c" * 64,
+                        "review_ref": "atomic-cas",
+                        "extraction_method": "AUTOMATED_CHECK",
+                    },
+                    "source_timestamp": "2026-08-30T00:00:00Z",
+                    "verified_by": "AUTOMATED_CHECK",
+                },
+            }
+            b_task = asyncio.create_task(adapter_b.update(**request))
+            await asyncio.wait_for(entered_write.wait(), timeout=5)
+            await _claim_lifecycle_key(engine_a, adapter_a, key=shared_key, marker="write-transaction")
+            await adapter_a.update(**{**request, "idempotency_key": "update-write-transaction-other-writer"})
+            release_write.set()
+            with pytest.raises(AdapterError) as conflict:
+                await b_task
+            assert conflict.value.code == "IDEMPOTENCY_CONFLICT"
+        finally:
+            release_write.set()
             await adapter_a.close()
             await adapter_b.close()
 

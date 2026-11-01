@@ -1552,6 +1552,23 @@ class SQLiteVecEngine:
     async def operation_by_idempotency(self, idempotency_key: str) -> dict[str, Any] | None:
         return await self._run(self._operation_row_sync, idempotency_key)
 
+    def _idempotency_owner_sync(self, idempotency_key: str) -> str | None:
+        assert self.conn is not None
+        rows = self.conn.execute(
+            "SELECT owner FROM ("
+            "SELECT 'operation' AS owner FROM lifecycle_operations WHERE idempotency_key=? "
+            "UNION ALL "
+            "SELECT 'adapter' AS owner FROM adapter_records WHERE idempotency_key=?"
+            ") LIMIT 2",
+            (idempotency_key, idempotency_key),
+        ).fetchall()
+        if len(rows) > 1:
+            raise AdapterError("STORAGE_INTEGRITY", "idempotency key is reserved in multiple global namespaces")
+        return str(rows[0][0]) if rows else None
+
+    async def idempotency_owner(self, idempotency_key: str) -> str | None:
+        return await self._run(self._idempotency_owner_sync, idempotency_key)
+
     def _operation_replay_sync(
         self,
         idempotency_key: str,
@@ -3009,6 +3026,11 @@ class SQLiteVecEngine:
             now = time.time()
             self.conn.execute("BEGIN IMMEDIATE")
             try:
+                owner = self._idempotency_owner_sync(str(record["idempotency_key"]))
+                if owner == "operation":
+                    raise RecordUniquenessConflict("global_idempotency")
+                if owner == "adapter":
+                    raise RecordUniquenessConflict("idempotency_key")
                 self._sample_trust_clock_sync(iso_now())
                 self._sample_trust_clock_sync(str(record["created_at"]))
                 _validate_current_authority_metadata(record)

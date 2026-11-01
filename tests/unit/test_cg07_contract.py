@@ -306,10 +306,7 @@ def test_policy_decision_is_bound_to_validated_operation_and_payload() -> None:
                 self.adapter: MemoryAdapter | None = None
                 self.idempotency_calls = 0
 
-            async def operation_by_idempotency(self, key: str):
-                return None
-
-            async def find_idempotency(self, key: str):
+            async def idempotency_owner(self, key: str):
                 self.idempotency_calls += 1
                 if self.idempotency_calls == 1:
                     assert self.adapter is not None
@@ -329,6 +326,9 @@ def test_policy_decision_is_bound_to_validated_operation_and_payload() -> None:
                         idempotency_key="policy-payload-nested",
                     )
                 raise AdapterError("BYPASS_REACHED", "payload-bound policy check was bypassed")
+
+            async def find_idempotency(self, key: str):
+                raise AssertionError("atomic idempotency owner check should fail before adapter replay lookup")
 
         engine = PayloadEngine()
         adapter = MemoryAdapter(

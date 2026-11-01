@@ -385,6 +385,9 @@ def test_public_scope_authority_claim_is_denied_before_role_derivation() -> None
 
 def test_replace_error_explains_conditional_replacement_requirements() -> None:
     class ExistingRecordEngine:
+        async def idempotency_owner(self, key: str) -> None:
+            return None
+
         async def operation_by_idempotency(self, key: str) -> None:
             return None
 
