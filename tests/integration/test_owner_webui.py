@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 import threading
 from contextlib import contextmanager
 from typing import Any, Iterator
@@ -236,6 +237,24 @@ def test_loopback_bootstrap_is_one_use_and_every_get_requires_authentication() -
         assert status == 401
         status, _, _ = request(server, "GET", "/does-not-exist", headers={"Cookie": cookie})
         assert status == 404
+
+
+def test_idle_browser_preconnect_does_not_starve_other_requests() -> None:
+    service = FakeOwnerService()
+    with running_server(service) as server:
+        port = server.server_address[1]
+        idle = socket.create_connection(("127.0.0.1", port), timeout=2)
+        try:
+            # Browsers may speculatively open a TCP connection before sending an
+            # HTTP request. The Owner WebUI must still serve other loopback
+            # requests instead of letting that idle connection monopolize the
+            # server accept loop.
+            status, headers, body = request(server, "GET", "/owner/api/v1/health")
+            assert status == 401
+            assert json.loads(body)["error_code"] == "UNAUTHENTICATED"
+            assert_security_headers(headers)
+        finally:
+            idle.close()
 
 
 def test_session_cookie_is_host_only_strict_http_only_and_restart_invalidates_bootstrap() -> None:

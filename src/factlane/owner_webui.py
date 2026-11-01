@@ -12,7 +12,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from http.cookies import SimpleCookie
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Protocol
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -137,6 +137,7 @@ class _OwnerWebUIState:
         self.bootstrap_expires_at = time.monotonic() + bootstrap_ttl_seconds
         self.sessions: dict[str, _Session] = {}
         self.lock = threading.RLock()
+        self.service_call_lock = threading.RLock()
         self.origin = ""
 
     def set_origin(self, port: int) -> None:
@@ -196,7 +197,7 @@ class _OwnerWebUIState:
                 session.observe_group_token(token)
 
 
-class OwnerWebUIServer(HTTPServer):
+class OwnerWebUIServer(ThreadingHTTPServer):
     """Single-process loopback HTTP server for one trusted Owner control session."""
 
     def __init__(self, address: tuple[str, int], state: _OwnerWebUIState) -> None:
@@ -385,7 +386,11 @@ class OwnerWebUIRequestHandler(BaseHTTPRequestHandler):
                 "OWNER_CONTROL_UNAVAILABLE",
                 f"OwnerControlService does not expose the governed {method_name} operation",
             )
-        result = asyncio.run(method(**kwargs))
+        # Threaded request acceptance prevents an idle browser preconnect from
+        # monopolizing the HTTP accept loop, while governed Owner operations
+        # remain serialized exactly as they were under the prior HTTPServer.
+        with self.state.service_call_lock:
+            result = asyncio.run(method(**kwargs))
         if not isinstance(result, dict):
             raise AdapterError("OWNER_CONTROL_UNAVAILABLE", "OwnerControlService returned an invalid structural result")
         return result
