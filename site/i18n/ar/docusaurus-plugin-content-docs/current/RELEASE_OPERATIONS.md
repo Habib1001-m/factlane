@@ -144,6 +144,9 @@ unavailable أو indeterminate أو stale أو mismatched يفشل مغلقًا 
 مجلد الـbackup أي صلاحيات للمجموعة أو للآخرين (`mode & 077 == 0`)؛ ولا تنشئ عملية الترحيل هذا
 المجلد أو توسّع صلاحياته نيابة عن المشغّل:
 
+كلٌّ من عملية الترحيل هذه ومسار restore المقابل لنسخة pre-v3 هو **عملية صيانة POSIX-only**.
+ولا يشمل دعم Windows القياسي لوقت التشغيل ترحيل v2 → v3 أو restore.
+
 ```bash
 uv run factlane-migrate-storage-v3 migrate \
   --db /absolute/path/to/factlane.sqlite3 \

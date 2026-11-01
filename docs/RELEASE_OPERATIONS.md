@@ -155,6 +155,9 @@ Stop/quiesce FactLane and choose a new backup path inside an **existing private 
 the migration operator** before running. The backup parent must grant no group/other permissions
 (`mode & 077 == 0`); the migration does not create or relax that directory for you:
 
+Both this migration and the matching pre-v3 restore path are **POSIX-only maintenance operations**.
+Native Windows standard-runtime support does not include v2 → v3 migration or restore.
+
 ```bash
 uv run factlane-migrate-storage-v3 migrate \
   --db /absolute/path/to/factlane.sqlite3 \
