@@ -327,6 +327,124 @@ def test_two_independent_clients_converge_same_update_idempotency_key(tmp_path) 
     asyncio.run(run())
 
 
+def test_store_reconciles_same_key_commit_between_initial_replay_and_duplicate_check(tmp_path) -> None:
+    async def run() -> None:
+        engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "same-key-store-preflight-race.db")
+        first_lookup_done = asyncio.Event()
+        release_b = asyncio.Event()
+        original_find = engine_b.find_idempotency
+        calls = 0
+
+        async def gated_find(key: str):
+            nonlocal calls
+            calls += 1
+            result = await original_find(key)
+            if calls == 1:
+                assert result is None
+                first_lookup_done.set()
+                await asyncio.wait_for(release_b.wait(), timeout=5)
+            return result
+
+        engine_b.find_idempotency = gated_find  # type: ignore[method-assign]
+        request = {
+            "fact": "Same-key store replay wins over duplicate classification.",
+            "scope": "PROJECT",
+            "project_id": "factlane",
+            "memory_type": "PROJECT_LEARNED_FACT",
+            "source_provenance": {
+                "source_class": "CURRENT_REPO",
+                "source_ref": "same-key-store-preflight-race",
+                "source_hash": "7" * 64,
+                "review_ref": "atomic-cas",
+                "extraction_method": "AUTOMATED_CHECK",
+            },
+            "freshness_policy": {"kind": "manual"},
+            "idempotency_key": "same-key-store-preflight-race",
+            "source_timestamp": "2026-08-30T00:00:00Z",
+            "last_verified_at": "2026-08-30T00:00:00Z",
+            "verified_by": "AUTOMATED_CHECK",
+            "requested_lifecycle_state": "VALIDATED_CURRENT",
+            "tags": ["subject:same-key-store-preflight-race"],
+        }
+        try:
+            b_task = asyncio.create_task(adapter_b.store(**request))
+            await asyncio.wait_for(first_lookup_done.wait(), timeout=5)
+            a_result = await adapter_a.store(**request)
+            release_b.set()
+            b_result = await b_task
+            assert a_result["status"] == "OK"
+            assert b_result["idempotent_replay"] is True
+            assert b_result["results"][0]["record_id"] == a_result["results"][0]["record_id"]
+        finally:
+            release_b.set()
+            await adapter_a.close()
+            await adapter_b.close()
+
+    asyncio.run(run())
+
+
+def test_update_reconciles_same_key_commit_between_initial_replay_and_stale_preflight(tmp_path) -> None:
+    async def run() -> None:
+        engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "same-key-update-preflight-race.db")
+        try:
+            seed = await _seed_current(
+                adapter_a,
+                key="same-key-update-preflight-seed",
+                fact="Same-key update replay wins over stale preflight state.",
+            )
+            parent = seed["results"][0]
+            first_lookup_done = asyncio.Event()
+            release_b = asyncio.Event()
+            original_find = engine_b.find_idempotency
+            calls = 0
+
+            async def gated_find(key: str):
+                nonlocal calls
+                calls += 1
+                result = await original_find(key)
+                if calls == 1:
+                    assert result is None
+                    first_lookup_done.set()
+                    await asyncio.wait_for(release_b.wait(), timeout=5)
+                return result
+
+            engine_b.find_idempotency = gated_find  # type: ignore[method-assign]
+            request = {
+                "memory_id": parent["memory_id"],
+                "expected_record_id": parent["record_id"],
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": 1,
+                "mode": "REVERIFY",
+                "idempotency_key": "same-key-update-preflight-race",
+                "verification": {
+                    "source_provenance": {
+                        "source_class": "CURRENT_REPO",
+                        "source_ref": "same-key-update-preflight-race",
+                        "source_hash": "8" * 64,
+                        "review_ref": "atomic-cas",
+                        "extraction_method": "AUTOMATED_CHECK",
+                    },
+                    "source_timestamp": "2026-08-30T00:00:00Z",
+                    "verified_by": "AUTOMATED_CHECK",
+                },
+            }
+            b_task = asyncio.create_task(adapter_b.update(**request))
+            await asyncio.wait_for(first_lookup_done.wait(), timeout=5)
+            a_result = await adapter_a.update(**request)
+            release_b.set()
+            b_result = await b_task
+            assert b_result["idempotent_replay"] is True
+            assert b_result["results"][0]["record_id"] == a_result["results"][0]["record_id"]
+        finally:
+            if "release_b" in locals():
+                release_b.set()
+            await adapter_a.close()
+            await adapter_b.close()
+
+    asyncio.run(run())
+
+
 def test_two_independent_clients_same_update_key_different_payload_conflicts(tmp_path) -> None:
     async def run() -> None:
         engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "same-key-update-conflict.db")

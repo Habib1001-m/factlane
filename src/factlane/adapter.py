@@ -1316,6 +1316,15 @@ class MemoryAdapter:
             stable_hash = native_hash(scope_context, fact)
             exact = await self.engine.find_exact(stable_hash)
             if exact:
+                concurrent_idempotent = await self.engine.find_idempotency(idempotency_key)
+                if concurrent_idempotent:
+                    if concurrent_idempotent["payload_fingerprint"] != payload_fingerprint:
+                        raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different payload")
+                    envelope = self._base_envelope(request_id, "memory_store", scope_context)
+                    envelope["results"] = [self._public(concurrent_idempotent)]
+                    envelope["idempotent_replay"] = True
+                    envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
+                    return envelope
                 envelope = self._base_envelope(request_id, "memory_store", scope_context)
                 envelope["status"] = "DUPLICATE"
                 envelope["results"] = [self._public(exact)]
@@ -1805,11 +1814,26 @@ class MemoryAdapter:
             envelope["results"] = [self._public(replay)]
             envelope["idempotent_replay"] = True
             return envelope
+
+        async def reconcile_preflight_idempotent_update() -> dict[str, Any] | None:
+            concurrent = await self.engine.find_idempotency(idempotency_key)
+            if concurrent is None:
+                return None
+            if concurrent["payload_fingerprint"] != update_request_fingerprint:
+                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different update")
+            envelope = self._base_envelope(request_id, "memory_update", scope_context)
+            envelope["results"] = [self._public(concurrent)]
+            envelope["idempotent_replay"] = True
+            return envelope
+
         current_rows = await self.engine.get_record(memory_id, scope_context, history=False)
         candidate_promotion = False
         if current_rows:
             old = current_rows[0]
             if expected_record_id is not None and expected_record_id != old["record_id"]:
+                concurrent_replay = await reconcile_preflight_idempotent_update()
+                if concurrent_replay is not None:
+                    return concurrent_replay
                 raise AdapterError("VERSION_CONFLICT", "expected_record_id does not match the current lineage parent")
         else:
             history_rows = await self.engine.get_record(memory_id, scope_context, history=True)
@@ -1821,14 +1845,23 @@ class MemoryAdapter:
                     raise AdapterError("INVALID_ENVELOPE", "Candidate REVERIFY requires expected_record_id")
                 matching = [row for row in candidates if row["record_id"] == expected_record_id]
                 if not matching:
+                    concurrent_replay = await reconcile_preflight_idempotent_update()
+                    if concurrent_replay is not None:
+                        return concurrent_replay
                     raise AdapterError("VERSION_CONFLICT", "expected_record_id does not match the Candidate lineage parent")
                 old = matching[0]
                 candidate_promotion = True
             else:
                 if await self.engine.memory_exists_outside_scope(memory_id, scope_context):
                     raise AdapterError("CROSS_SCOPE_DENIED", "memory_id exists outside the requested scope")
+                concurrent_replay = await reconcile_preflight_idempotent_update()
+                if concurrent_replay is not None:
+                    return concurrent_replay
                 raise AdapterError("NOT_FOUND", "current memory_id was not found")
         if old["revision"] != expected_revision:
+            concurrent_replay = await reconcile_preflight_idempotent_update()
+            if concurrent_replay is not None:
+                return concurrent_replay
             raise AdapterError(
                 "VERSION_CONFLICT",
                 "expected_revision does not match current revision; read memory_get and retry with that revision",
