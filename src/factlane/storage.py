@@ -3241,6 +3241,13 @@ class SQLiteVecEngine:
             assert self.conn is not None
             self.conn.execute("BEGIN IMMEDIATE")
             try:
+                if self._operation_row_sync(str(record["idempotency_key"])) is not None:
+                    raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by another governed write")
+                if self.conn.execute(
+                    "SELECT 1 FROM adapter_records WHERE idempotency_key=? LIMIT 1",
+                    (record["idempotency_key"],),
+                ).fetchone():
+                    raise RecordUniquenessConflict("idempotency_key")
                 self._sample_trust_clock_sync(iso_now())
                 self._sample_trust_clock_sync(str(record["created_at"]))
                 _validate_current_authority_metadata(record)

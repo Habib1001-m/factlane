@@ -1300,31 +1300,31 @@ class MemoryAdapter:
             "contribution_origin": self._contribution_origin(),
         }
         payload_fingerprint = self._payload_fingerprint(fingerprint_input)
-        async with self._get_write_lock():
-            reserved_operation = await self.engine.operation_by_idempotency(idempotency_key)
-            if reserved_operation is not None:
+
+        async def reconcile_store_idempotency() -> dict[str, Any] | None:
+            if await self.engine.operation_by_idempotency(idempotency_key) is not None:
                 raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by another governed write")
             existing = await self.engine.find_idempotency(idempotency_key)
-            if existing:
-                if existing["payload_fingerprint"] != payload_fingerprint:
-                    raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different payload")
-                envelope = self._base_envelope(request_id, "memory_store", scope_context)
-                envelope["results"] = [self._public(existing)]
-                envelope["idempotent_replay"] = True
-                envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
-                return envelope
+            if existing is None:
+                return None
+            if existing["payload_fingerprint"] != payload_fingerprint:
+                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different payload")
+            envelope = self._base_envelope(request_id, "memory_store", scope_context)
+            envelope["results"] = [self._public(existing)]
+            envelope["idempotent_replay"] = True
+            envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
+            return envelope
+
+        async with self._get_write_lock():
+            replay = await reconcile_store_idempotency()
+            if replay is not None:
+                return replay
             stable_hash = native_hash(scope_context, fact)
             exact = await self.engine.find_exact(stable_hash)
             if exact:
-                concurrent_idempotent = await self.engine.find_idempotency(idempotency_key)
-                if concurrent_idempotent:
-                    if concurrent_idempotent["payload_fingerprint"] != payload_fingerprint:
-                        raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different payload")
-                    envelope = self._base_envelope(request_id, "memory_store", scope_context)
-                    envelope["results"] = [self._public(concurrent_idempotent)]
-                    envelope["idempotent_replay"] = True
-                    envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
-                    return envelope
+                replay = await reconcile_store_idempotency()
+                if replay is not None:
+                    return replay
                 envelope = self._base_envelope(request_id, "memory_store", scope_context)
                 envelope["status"] = "DUPLICATE"
                 envelope["results"] = [self._public(exact)]
@@ -1383,17 +1383,9 @@ class MemoryAdapter:
             try:
                 await self.engine.write_record(record, embedding)
             except RecordUniquenessConflict:
-                if await self.engine.operation_by_idempotency(idempotency_key) is not None:
-                    raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by another governed write")
-                concurrent_idempotent = await self.engine.find_idempotency(idempotency_key)
-                if concurrent_idempotent:
-                    if concurrent_idempotent["payload_fingerprint"] != payload_fingerprint:
-                        raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different payload")
-                    envelope = self._base_envelope(request_id, "memory_store", scope_context)
-                    envelope["results"] = [self._public(concurrent_idempotent)]
-                    envelope["idempotent_replay"] = True
-                    envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
-                    return envelope
+                replay = await reconcile_store_idempotency()
+                if replay is not None:
+                    return replay
                 concurrent_exact = await self.engine.find_exact(stable_hash)
                 if concurrent_exact:
                     envelope = self._base_envelope(request_id, "memory_store", scope_context)
@@ -1803,19 +1795,9 @@ class MemoryAdapter:
             ):
                 raise AdapterError("INVALID_ENVELOPE", f"{mode} observed_group_token must be an exact 64-hex token")
             update_group_token = observed_group_token.lower()
-        reserved_operation = await self.engine.operation_by_idempotency(idempotency_key)
-        if reserved_operation is not None:
-            raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by another governed write")
-        replay = await self.engine.find_idempotency(idempotency_key)
-        if replay:
-            if replay["payload_fingerprint"] != update_request_fingerprint:
-                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different update")
-            envelope = self._base_envelope(request_id, "memory_update", scope_context)
-            envelope["results"] = [self._public(replay)]
-            envelope["idempotent_replay"] = True
-            return envelope
-
         async def reconcile_preflight_idempotent_update() -> dict[str, Any] | None:
+            if await self.engine.operation_by_idempotency(idempotency_key) is not None:
+                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by another governed write")
             concurrent = await self.engine.find_idempotency(idempotency_key)
             if concurrent is None:
                 return None
@@ -1825,6 +1807,10 @@ class MemoryAdapter:
             envelope["results"] = [self._public(concurrent)]
             envelope["idempotent_replay"] = True
             return envelope
+
+        replay = await reconcile_preflight_idempotent_update()
+        if replay is not None:
+            return replay
 
         current_rows = await self.engine.get_record(memory_id, scope_context, history=False)
         candidate_promotion = False
@@ -1840,6 +1826,9 @@ class MemoryAdapter:
             candidates = [row for row in history_rows if row["lifecycle_state"] == "CANDIDATE"]
             if candidates:
                 if mode == "REPLACE":
+                    concurrent_replay = await reconcile_preflight_idempotent_update()
+                    if concurrent_replay is not None:
+                        return concurrent_replay
                     raise AdapterError("CANDIDATE_REPLACE_DENIED", "Candidate records cannot be replaced before promotion")
                 if expected_record_id is None:
                     raise AdapterError("INVALID_ENVELOPE", "Candidate REVERIFY requires expected_record_id")
@@ -1873,6 +1862,9 @@ class MemoryAdapter:
                 "RECHECK_UNAVAILABLE",
                 "RECHECK_INDETERMINATE",
             }:
+                concurrent_replay = await reconcile_preflight_idempotent_update()
+                if concurrent_replay is not None:
+                    return concurrent_replay
                 raise AdapterError(
                     "RECHECK_EVIDENCE_REQUIRED",
                     "ordinary REVERIFY cannot clear an active on_change manual-recheck hold",
@@ -2017,14 +2009,9 @@ class MemoryAdapter:
             return envelope
 
         async with self._get_write_lock():
-            existing = await self.engine.find_idempotency(idempotency_key)
-            if existing:
-                if existing["payload_fingerprint"] != fingerprint:
-                    raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different update")
-                envelope = self._base_envelope(request_id, "memory_update", scope_context)
-                envelope["results"] = [self._public(existing)]
-                envelope["idempotent_replay"] = True
-                return envelope
+            replay = await reconcile_preflight_idempotent_update()
+            if replay is not None:
+                return replay
             record_id = str(uuid.uuid4())
             if mode == "REVERIFY":
                 origin = old.get("contribution_origin")

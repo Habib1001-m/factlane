@@ -127,6 +127,52 @@ async def _seed_current(adapter: MemoryAdapter, *, key: str, fact: str) -> dict[
     )
 
 
+async def _claim_lifecycle_key(
+    engine: SQLiteVecEngine,
+    adapter: MemoryAdapter,
+    *,
+    key: str,
+    marker: str,
+) -> None:
+    seeded = await adapter.store(
+        fact=f"Lifecycle idempotency claim fixture {marker}.",
+        scope="PROJECT",
+        project_id="factlane",
+        memory_type="PROJECT_LEARNED_FACT",
+        source_provenance={
+            "source_class": "CURRENT_REPO",
+            "source_ref": f"lifecycle-claim-{marker}",
+            "source_hash": "9" * 64,
+            "review_ref": "atomic-cas",
+            "extraction_method": "AUTOMATED_CHECK",
+        },
+        freshness_policy={"kind": "manual"},
+        idempotency_key=f"{key}-seed-{marker}",
+        requested_lifecycle_state="CANDIDATE",
+        tags=[f"subject:lifecycle-claim-{marker}"],
+    )
+    public = seeded["results"][0]
+    scope = adapter._safe_scope("PROJECT", "factlane", None, None, None)
+    full = (await engine.get_record(public["memory_id"], scope, history=True))[0]
+    observed = await engine.group_observation(scope, full["contradiction_key"])
+    await engine.terminal_disposition(
+        scope,
+        action="REJECT",
+        memory_id=full["memory_id"],
+        expected_record_id=full["record_id"],
+        expected_revision=int(full["revision"]),
+        observed_group_token=observed["public"]["observed_group_token"],
+        idempotency_key=key,
+        request_fingerprint=f"lifecycle-claim-{marker}",
+        request_id=f"request-lifecycle-claim-{marker}",
+        reason_code="INSUFFICIENT_EVIDENCE",
+        actor_class="OWNER",
+        actor_ref_digest="atomic-cas-owner",
+        grant_ref_digest="atomic-cas-grant",
+        committed_at="2026-09-30T00:00:01Z",
+    )
+
+
 async def _race_two_reverify_updates(tmp_path) -> None:
     engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "reverify.db")
     scope = adapter_a._safe_scope("PROJECT", "factlane", None, None, None)
@@ -439,6 +485,127 @@ def test_update_reconciles_same_key_commit_between_initial_replay_and_stale_pref
         finally:
             if "release_b" in locals():
                 release_b.set()
+            await adapter_a.close()
+            await adapter_b.close()
+
+    asyncio.run(run())
+
+
+def test_store_lifecycle_claim_between_initial_lookup_and_duplicate_check_is_conflict(tmp_path) -> None:
+    async def run() -> None:
+        engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "store-lifecycle-preflight-race.db")
+        first_lookup_done = asyncio.Event()
+        release_b = asyncio.Event()
+        original_operation_lookup = engine_b.operation_by_idempotency
+        calls = 0
+        shared_key = "store-lifecycle-preflight-race"
+
+        async def gated_operation_lookup(key: str):
+            nonlocal calls
+            calls += 1
+            result = await original_operation_lookup(key)
+            if key == shared_key and calls == 1:
+                assert result is None
+                first_lookup_done.set()
+                await asyncio.wait_for(release_b.wait(), timeout=5)
+            return result
+
+        engine_b.operation_by_idempotency = gated_operation_lookup  # type: ignore[method-assign]
+        exact_fact = "Lifecycle claim must win over store duplicate classification."
+        await _seed_current(adapter_a, key="store-lifecycle-exact-seed", fact=exact_fact)
+        request = {
+            "fact": exact_fact,
+            "scope": "PROJECT",
+            "project_id": "factlane",
+            "memory_type": "PROJECT_LEARNED_FACT",
+            "source_provenance": {
+                "source_class": "CURRENT_REPO",
+                "source_ref": "store-lifecycle-preflight-race",
+                "source_hash": "a" * 64,
+                "review_ref": "atomic-cas",
+                "extraction_method": "AUTOMATED_CHECK",
+            },
+            "freshness_policy": {"kind": "manual"},
+            "idempotency_key": shared_key,
+            "source_timestamp": "2026-08-30T00:00:00Z",
+            "last_verified_at": "2026-08-30T00:00:00Z",
+            "verified_by": "AUTOMATED_CHECK",
+            "requested_lifecycle_state": "VALIDATED_CURRENT",
+            "tags": ["subject:store-lifecycle-preflight-race"],
+        }
+        try:
+            b_task = asyncio.create_task(adapter_b.store(**request))
+            await asyncio.wait_for(first_lookup_done.wait(), timeout=5)
+            await _claim_lifecycle_key(engine_a, adapter_a, key=shared_key, marker="store")
+            release_b.set()
+            with pytest.raises(AdapterError) as conflict:
+                await b_task
+            assert conflict.value.code == "IDEMPOTENCY_CONFLICT"
+        finally:
+            release_b.set()
+            await adapter_a.close()
+            await adapter_b.close()
+
+    asyncio.run(run())
+
+
+def test_update_lifecycle_claim_between_initial_lookup_and_stale_preflight_is_conflict(tmp_path) -> None:
+    async def run() -> None:
+        engine_a, engine_b, adapter_a, adapter_b = await _open_clients(tmp_path, "update-lifecycle-preflight-race.db")
+        first_lookup_done = asyncio.Event()
+        release_b = asyncio.Event()
+        original_operation_lookup = engine_b.operation_by_idempotency
+        calls = 0
+        shared_key = "update-lifecycle-preflight-race"
+        try:
+            seed = await _seed_current(
+                adapter_a,
+                key="update-lifecycle-preflight-seed",
+                fact="Lifecycle claim must win over update stale preflight.",
+            )
+            parent = seed["results"][0]
+
+            async def gated_operation_lookup(key: str):
+                nonlocal calls
+                calls += 1
+                result = await original_operation_lookup(key)
+                if key == shared_key and calls == 1:
+                    assert result is None
+                    first_lookup_done.set()
+                    await asyncio.wait_for(release_b.wait(), timeout=5)
+                return result
+
+            engine_b.operation_by_idempotency = gated_operation_lookup  # type: ignore[method-assign]
+            request = {
+                "memory_id": parent["memory_id"],
+                "expected_record_id": parent["record_id"],
+                "scope": "PROJECT",
+                "project_id": "factlane",
+                "expected_revision": 1,
+                "mode": "REVERIFY",
+                "idempotency_key": shared_key,
+                "verification": {
+                    "source_provenance": {
+                        "source_class": "CURRENT_REPO",
+                        "source_ref": "update-lifecycle-preflight-race",
+                        "source_hash": "b" * 64,
+                        "review_ref": "atomic-cas",
+                        "extraction_method": "AUTOMATED_CHECK",
+                    },
+                    "source_timestamp": "2026-08-30T00:00:00Z",
+                    "verified_by": "AUTOMATED_CHECK",
+                },
+            }
+            b_task = asyncio.create_task(adapter_b.update(**request))
+            await asyncio.wait_for(first_lookup_done.wait(), timeout=5)
+            await _claim_lifecycle_key(engine_a, adapter_a, key=shared_key, marker="update")
+            await adapter_a.update(**{**request, "idempotency_key": "update-lifecycle-other-writer"})
+            release_b.set()
+            with pytest.raises(AdapterError) as conflict:
+                await b_task
+            assert conflict.value.code == "IDEMPOTENCY_CONFLICT"
+        finally:
+            release_b.set()
             await adapter_a.close()
             await adapter_b.close()
 
