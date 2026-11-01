@@ -384,6 +384,15 @@ def _validate_existing_v3_schema(conn: sqlite3.Connection) -> None:
     for name, expected_sql in expected_triggers.items():
         if _normalize_schema_sql(actual_triggers[name]) != _normalize_schema_sql(expected_sql):
             raise AdapterError("SCHEMA_MISMATCH", f"storage v3 trigger {name} is not exact")
+    clock_rows = conn.execute(
+        "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+    ).fetchall()
+    if len(clock_rows) != 1:
+        raise AdapterError("SCHEMA_MISMATCH", "storage v3 trust-clock high-water is missing")
+    try:
+        parse_iso(clock_rows[0][0], required=True)
+    except (ValueError, TypeError, AdapterError) as exc:
+        raise AdapterError("SCHEMA_MISMATCH", "storage v3 trust-clock high-water is malformed") from exc
 
 
 def inspect_storage_contract_version(db_path: str) -> int | None:
@@ -1543,6 +1552,38 @@ class SQLiteVecEngine:
     async def operation_by_idempotency(self, idempotency_key: str) -> dict[str, Any] | None:
         return await self._run(self._operation_row_sync, idempotency_key)
 
+    def _operation_replay_sync(
+        self,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> dict[str, Any] | None:
+        assert self.conn is not None
+        if self.conn.execute(
+            "SELECT 1 FROM adapter_records WHERE idempotency_key=? LIMIT 1", (idempotency_key,)
+        ).fetchone():
+            raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by a legacy write")
+        replay = self._operation_row_sync(idempotency_key)
+        if replay is None:
+            return None
+        if replay["replay_status"] == "RECOVERY_INVALIDATED":
+            raise AdapterError(
+                "RECOVERY_INVALIDATED_REPLAY",
+                "operation replay was invalidated by sensitive Recovery",
+            )
+        if replay["request_fingerprint"] != request_fingerprint:
+            raise AdapterError(
+                "IDEMPOTENCY_CONFLICT",
+                "idempotency key is bound to another governed operation",
+            )
+        return self._operation_result(replay, replay=True)
+
+    async def operation_replay(
+        self,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> dict[str, Any] | None:
+        return await self._run(self._operation_replay_sync, idempotency_key, request_fingerprint)
+
     @staticmethod
     def _operation_result(operation: dict[str, Any], *, replay: bool) -> dict[str, Any]:
         if operation["operation_kind"] == "MANUAL_RECHECK" and operation["replay_status"] == "BLOCKED":
@@ -2526,6 +2567,8 @@ class SQLiteVecEngine:
                 return self._operation_result(op, replay=False)
 
             if outcome == "UNCHANGED":
+                if clock_healthy and delta_seconds < -MAX_FUTURE_EVIDENCE_SKEW_SECONDS:
+                    raise AdapterError("EVIDENCE_INVALID", "observed_at exceeds the healthy-clock future-skew bound")
                 if not clock_healthy:
                     return durable_reject("TRUST_CLOCK_UNRELIABLE")
                 if delta_seconds < 0:
@@ -2708,7 +2751,15 @@ class SQLiteVecEngine:
                 ).fetchall()
             ]
             higher = [row for row in lineage_rows if int(row["revision"]) > expected_revoked_revision]
-            direct_children = [row for row in lineage_rows if row["parent_record_id"] == revoked_record_id]
+            # Parent linkage is global: REPLACE may create a successor with a
+            # different memory_id. Same-memory lineage alone is insufficient.
+            direct_children = [
+                self._row_to_dict(row)
+                for row in self.conn.execute(
+                    self._select_sql("WHERE a.parent_record_id=? ORDER BY a.record_id"),
+                    (revoked_record_id,),
+                ).fetchall()
+            ]
             if higher or direct_children:
                 if any(row["lifecycle_state"] == "QUARANTINED" for row in [*higher, *direct_children]):
                     raise AdapterError(
@@ -2728,7 +2779,11 @@ class SQLiteVecEngine:
                     refetch_required=True,
                     current_group_token=observed["public"]["observed_group_token"],
                 )
-            if any(member["lifecycle_state"] in {"STALE", "QUARANTINED"} for member in observed["server"]["members"]):
+            if any(
+                member["lifecycle_state"] in {"STALE", "QUARANTINED"}
+                or (member["lifecycle_state"] == "VALIDATED_CURRENT" and member["freshness_gate_state"] != "NONE")
+                for member in observed["server"]["members"]
+            ):
                 raise AdapterError("GROUP_MEMBER_NOT_ADMISSIBLE", "blocking group member prevents readmission")
 
             if (

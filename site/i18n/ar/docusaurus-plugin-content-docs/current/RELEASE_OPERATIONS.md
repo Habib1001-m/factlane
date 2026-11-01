@@ -179,11 +179,11 @@ uv run factlane-migrate-storage-v3 restore \
 فرع `main` المتحرك:
 
 ```bash
-git clone --branch v0.1.3 --depth 1 https://github.com/Habib1001-m/factlane.git
+git clone --branch v0.1.4 --depth 1 https://github.com/Habib1001-m/factlane.git
 cd factlane
 
-test "$(git rev-parse HEAD)" = "59173b7d9fa3af924c373176411882caa04a6c1d"
-test "$(git rev-parse 'HEAD^{tree}')" = "93db940802432b6f9ca2f5513916fd2b84c6393a"
+test "$(git rev-parse HEAD)" = "4b2cf5b27d454799dd253c0306d83bd076c9369f"
+test "$(git rev-parse 'HEAD^{tree}')" = "d9a69de5e63419bfb6aade745e25137e07857cbb"
 
 uv sync --frozen
 uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
@@ -196,13 +196,13 @@ uv run factlane --help-tools
 نزّل wheel الخاصة بالإصدار، وتحقق منها، ثم ثبّتها في بيئة جديدة:
 
 ```bash
-curl -fLO https://github.com/Habib1001-m/factlane/releases/download/v0.1.3/factlane-0.1.3-py3-none-any.whl
+curl -fLO https://github.com/Habib1001-m/factlane/releases/download/v0.1.4/factlane-0.1.4-py3-none-any.whl
 printf '%s  %s\n' \
-  'daf145cd7754b7c46a0f18ad49cc8872291094c8ac84621fce3cec091f90072a' \
-  'factlane-0.1.3-py3-none-any.whl' | sha256sum -c -
+  'b1a256d124d74ffd6b9dba4338c171e35b95fa901e232bb1ed59ebd4f0316307' \
+  'factlane-0.1.4-py3-none-any.whl' | sha256sum -c -
 
 python3.11 -m venv .venv
-.venv/bin/python -m pip install ./factlane-0.1.3-py3-none-any.whl
+.venv/bin/python -m pip install ./factlane-0.1.4-py3-none-any.whl
 .venv/bin/python -m pip check
 .venv/bin/factlane --help
 .venv/bin/factlane --help-tools
@@ -218,13 +218,13 @@ source checkout الموسوم مع `uv sync --frozen` وملف `uv.lock` الم
 يُعد source distribution أيضًا سطح clean-install مدعومًا بعد التحقق من SHA-256 الخاص به:
 
 ```bash
-curl -fLO https://github.com/Habib1001-m/factlane/releases/download/v0.1.3/factlane-0.1.3.tar.gz
+curl -fLO https://github.com/Habib1001-m/factlane/releases/download/v0.1.4/factlane-0.1.4.tar.gz
 printf '%s  %s\n' \
-  '81de371ec23d17109f9267750fed80cd6492cee245681d72630da6868f3cd16b' \
-  'factlane-0.1.3.tar.gz' | sha256sum -c -
+  '80c01dbf20dd5139350a9434c787c27a468f458397740fd0d85064394be1f5a3' \
+  'factlane-0.1.4.tar.gz' | sha256sum -c -
 
 python3.11 -m venv .venv
-.venv/bin/python -m pip install ./factlane-0.1.3.tar.gz
+.venv/bin/python -m pip install ./factlane-0.1.4.tar.gz
 ```
 
 تُشحن Skill المحمولة `using-factlane` مع الحزمة، لكن تثبيت الحزمة لا يسجل Skill

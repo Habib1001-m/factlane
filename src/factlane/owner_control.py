@@ -802,21 +802,6 @@ class OwnerControlService:
         validate_owner_reason("RESOLVE", reason_code)
         request_id_value = self._request_id(request_id)
         scope_context = self._scope(scope, project_id, worktree_id, workflow_id, agent_id)
-        winner = await self._winner_record(
-            scope_context,
-            contradiction_key=contradiction_key_value,
-            winner_memory_id=winner_memory_id,
-            winner_record_id=winner_record_id,
-        )
-        if int(winner["revision"]) != winner_expected_revision:
-            raise AdapterError("VERSION_CONFLICT", "winner expected_revision no longer matches")
-        if winner["lifecycle_state"] == "CANDIDATE" and verification is None:
-            raise AdapterError("WINNER_PROOF_REQUIRED", "Candidate RESOLVE winner requires complete fresh verification")
-        if winner["lifecycle_state"] == "VALIDATED_CURRENT" and verification is not None:
-            raise AdapterError("WINNER_PROOF_INVALID", "existing Current winner does not accept verification payload")
-        if winner["lifecycle_state"] not in {"VALIDATED_CURRENT", "CANDIDATE"}:
-            raise AdapterError("INVALID_WINNER", "winner lifecycle is not admissible")
-
         actor_ref = self._owner_context.contributor_ref
         verification_digest = digest(verification) if verification is not None else None
         request_fingerprint = digest(
@@ -835,17 +820,66 @@ class OwnerControlService:
                 "verification_digest": verification_digest,
             }
         )
+        replay = await self._engine.operation_replay(idempotency_key_value, request_fingerprint)
+        if replay is not None:
+            return replay
+        try:
+            winner = await self._winner_record(
+                scope_context,
+                contradiction_key=contradiction_key_value,
+                winner_memory_id=winner_memory_id,
+                winner_record_id=winner_record_id,
+            )
+        except AdapterError:
+            replay = await self._engine.operation_replay(idempotency_key_value, request_fingerprint)
+            if replay is not None:
+                return replay
+            raise
+        if int(winner["revision"]) != winner_expected_revision:
+            raise AdapterError("VERSION_CONFLICT", "winner expected_revision no longer matches")
+        if winner["lifecycle_state"] == "CANDIDATE" and verification is None:
+            raise AdapterError("WINNER_PROOF_REQUIRED", "Candidate RESOLVE winner requires complete fresh verification")
+        if winner["lifecycle_state"] == "VALIDATED_CURRENT" and verification is not None:
+            raise AdapterError("WINNER_PROOF_INVALID", "existing Current winner does not accept verification payload")
+        if winner["lifecycle_state"] not in {"VALIDATED_CURRENT", "CANDIDATE"}:
+            # The winner can become SUPERSEDED between service replay preflight
+            # and this read. Let the transactional kernel replay first, then
+            # reject an inadmissible winner if no matching operation committed.
+            return await self._engine.resolve_group(
+                scope_context,
+                contradiction_key=contradiction_key_value,
+                observed_group_token=observed_group_token,
+                winner_memory_id=winner_memory_id,
+                winner_record_id=winner_record_id,
+                winner_expected_revision=winner_expected_revision,
+                idempotency_key=idempotency_key_value,
+                request_fingerprint=request_fingerprint,
+                request_id=request_id_value,
+                reason_code=reason_code,
+                actor_class=self._owner_context.contributor_class,
+                actor_ref_digest=digest(actor_ref) if actor_ref is not None else None,
+                grant_ref_digest=digest(self._owner_context.grant_ref),
+                committed_at=iso_now(),
+                candidate_successor=None,
+            )
+
         committed_at = iso_now()
         candidate_successor = None
         if winner["lifecycle_state"] == "CANDIDATE":
             assert verification is not None
-            candidate_successor = self._candidate_successor(
-                scope_context,
-                winner,
-                verification,
-                request_fingerprint=request_fingerprint,
-                committed_at=committed_at,
-            )
+            try:
+                candidate_successor = self._candidate_successor(
+                    scope_context,
+                    winner,
+                    verification,
+                    request_fingerprint=request_fingerprint,
+                    committed_at=committed_at,
+                )
+            except AdapterError:
+                replay = await self._engine.operation_replay(idempotency_key_value, request_fingerprint)
+                if replay is not None:
+                    return replay
+                raise
         return await self._engine.resolve_group(
             scope_context,
             contradiction_key=contradiction_key_value,
@@ -1220,37 +1254,29 @@ class OwnerControlService:
                 "verification": normalized_verification,
             }
         )
-        existing_operation = await self._engine.operation_by_idempotency(idempotency_key_value)
-        if existing_operation is not None:
-            return await self._engine.readmit(
+        replay = await self._engine.operation_replay(idempotency_key_value, request_fingerprint)
+        if replay is not None:
+            return replay
+        try:
+            target = await self._exact_readmit_target(
                 scope_context,
                 memory_id=memory_id,
                 revoked_record_id=revoked_record_id,
                 expected_revoked_revision=expected_revoked_revision,
-                observed_group_token=observed_group_token,
-                idempotency_key=idempotency_key_value,
-                request_fingerprint=request_fingerprint,
-                request_id=request_id_value,
-                verified_successor={},
-                actor_class=self._owner_context.contributor_class,
-                actor_ref_digest=digest(actor_ref) if actor_ref is not None else None,
-                grant_ref_digest=digest(self._owner_context.grant_ref),
-                committed_at=iso_now(),
             )
-        target = await self._exact_readmit_target(
-            scope_context,
-            memory_id=memory_id,
-            revoked_record_id=revoked_record_id,
-            expected_revoked_revision=expected_revoked_revision,
-        )
-        committed_at = iso_now()
-        successor = self._readmit_successor(
-            scope_context,
-            target,
-            normalized_verification,
-            request_fingerprint=request_fingerprint,
-            committed_at=committed_at,
-        )
+            committed_at = iso_now()
+            successor = self._readmit_successor(
+                scope_context,
+                target,
+                normalized_verification,
+                request_fingerprint=request_fingerprint,
+                committed_at=committed_at,
+            )
+        except AdapterError:
+            replay = await self._engine.operation_replay(idempotency_key_value, request_fingerprint)
+            if replay is not None:
+                return replay
+            raise
         return await self._engine.readmit(
             scope_context,
             memory_id=memory_id,

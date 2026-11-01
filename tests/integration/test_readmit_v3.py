@@ -320,3 +320,59 @@ def test_recovery_quarantined_descendant_and_blocking_peer_fail_closed(tmp_path)
             await second.close()
 
     asyncio.run(run())
+
+
+def test_readmit_rejects_freshness_held_current_peer(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "readmit-held-current.db"), _profile())
+        await engine.open()
+        try:
+            target = _record(fact="Revoked truth", key="held-current-group", marker="a")
+            await engine.write_record(target, [1.0] + [0.0] * 255)
+            await _revoke(engine, target)
+            peer = _record(fact="Revoked truth", key="held-current-group", marker="b")
+            await engine.write_record(peer, [0.0, 1.0] + [0.0] * 254)
+            assert engine.conn is not None
+            engine.conn.execute(
+                "INSERT INTO lifecycle_events(event_id,memory_id,record_id,target_record_id,target_revision,"
+                "action,actor_class,grant_ref_digest,occurred_at,freshness_outcome,freshness_generation) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), peer["memory_id"], peer["record_id"], peer["record_id"], 1,
+                 "MANUAL_RECHECK", "OWNER", "test-grant", "2026-10-31T19:00:00Z", "CHANGED", 1),
+            )
+            engine.conn.commit()
+            with pytest.raises(AdapterError) as blocked:
+                await _readmit(engine, target, _successor(target), key="held-current-readmit")
+            assert blocked.value.code == "GROUP_MEMBER_NOT_ADMISSIBLE"
+            assert engine.conn.execute(
+                "SELECT COUNT(*) FROM lifecycle_operations WHERE idempotency_key='held-current-readmit'"
+            ).fetchone()[0] == 0
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_readmit_rejects_cross_memory_child_of_revoked_record(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "readmit-cross-memory-child.db"), _profile())
+        await engine.open()
+        try:
+            target = _record(fact="Original truth", key="cross-memory-child", marker="a")
+            await engine.write_record(target, [1.0] + [0.0] * 255)
+            await _revoke(engine, target)
+            child = _record(fact="Replacement truth", key="cross-memory-child", lifecycle="CANDIDATE", marker="b")
+            await engine.write_record(child, [0.0, 1.0] + [0.0] * 254)
+            assert engine.conn is not None
+            engine.conn.execute(
+                "UPDATE adapter_records SET parent_record_id=? WHERE record_id=?",
+                (target["record_id"], child["record_id"]),
+            )
+            engine.conn.commit()
+            with pytest.raises(AdapterError) as blocked:
+                await _readmit(engine, target, _successor(target), key="cross-memory-child-readmit")
+            assert blocked.value.code == "LINEAGE_CHANGED"
+        finally:
+            await engine.close()
+
+    asyncio.run(run())

@@ -486,6 +486,9 @@ def test_v3_recovery_preserves_events_invalidates_target_operations_and_appends_
             "SELECT * FROM lifecycle_events WHERE operation_id='v3-audit-recovery' AND action='SENSITIVE_PURGE'"
         ).fetchone()
         assert purge is not None
+        assert conn.execute(
+            "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+        ).fetchone()[0] >= purge["occurred_at"]
         assert purge["memory_id"] == target_row["memory_id"]
         assert purge["record_id"] == target_row["record_id"]
         assert purge["prior_lifecycle_state"] == target_row["lifecycle_state"]

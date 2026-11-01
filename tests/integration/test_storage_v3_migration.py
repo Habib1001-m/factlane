@@ -272,6 +272,33 @@ def test_v3_preflight_rejects_partial_schema(tmp_path: Path) -> None:
     assert exc_info.value.code == "SCHEMA_MISMATCH"
 
 
+@pytest.mark.parametrize("invalid_value", [None, "not-a-timestamp"])
+def test_v3_preflight_rejects_missing_or_invalid_trust_clock_before_runtime(tmp_path: Path, invalid_value) -> None:
+    db = tmp_path / "bad-v3-trust-clock.db"
+
+    async def seed() -> None:
+        engine = SQLiteVecEngine(str(db), _profile())
+        await engine.open()
+        await engine.close()
+
+    asyncio.run(seed())
+    conn = sqlite3.connect(db)
+    try:
+        if invalid_value is None:
+            conn.execute("DELETE FROM adapter_meta WHERE key='trust_clock_high_water_at'")
+        else:
+            conn.execute("UPDATE adapter_meta SET value=? WHERE key='trust_clock_high_water_at'", (invalid_value,))
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(AdapterError) as exc_info:
+        inspect_storage_contract_version(str(db))
+    assert exc_info.value.code == "SCHEMA_MISMATCH"
+    with pytest.raises(AdapterError) as runtime_error:
+        asyncio.run(SQLiteVecEngine(str(db), _profile()).open())
+    assert runtime_error.value.code == "SCHEMA_MISMATCH"
+
+
 def test_v3_preflight_rejects_same_name_nonunique_lineage_guard_before_backend(tmp_path: Path, monkeypatch) -> None:
     async def seed() -> None:
         engine = SQLiteVecEngine(str(tmp_path / "drifted-index-v3.db"), _profile())

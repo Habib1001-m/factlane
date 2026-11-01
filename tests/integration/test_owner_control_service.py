@@ -363,6 +363,38 @@ def test_resolve_candidate_requires_owner_proof_and_builds_verified_successor(tm
             assert resolved["action"] == "RESOLVE"
             assert resolved["winner"]["parent_record_id"] == winner["record_id"]
             assert resolved["winner"]["resulting_revision"] == 2
+            replayed = await service.resolve(
+                contradiction_key=key,
+                observed_group_token=observed["public"]["observed_group_token"],
+                winner_memory_id=winner["memory_id"],
+                winner_record_id=winner["record_id"],
+                winner_expected_revision=1,
+                idempotency_key="resolve-with-proof",
+                reason_code="STRONGER_EVIDENCE",
+                verification=verification,
+                scope="PROJECT",
+                project_id="project-a",
+            )
+            assert replayed["idempotent_replay"] is True
+            assert replayed["operation_id"] == resolved["operation_id"]
+            assert replayed["winner"] == resolved["winner"]
+
+            changed_verification = dict(verification)
+            changed_verification["source_timestamp"] = "2026-10-31T20:12:00Z"
+            with pytest.raises(AdapterError) as changed:
+                await service.resolve(
+                    contradiction_key=key,
+                    observed_group_token=observed["public"]["observed_group_token"],
+                    winner_memory_id=winner["memory_id"],
+                    winner_record_id=winner["record_id"],
+                    winner_expected_revision=1,
+                    idempotency_key="resolve-with-proof",
+                    reason_code="STRONGER_EVIDENCE",
+                    verification=changed_verification,
+                    scope="PROJECT",
+                    project_id="project-a",
+                )
+            assert changed.value.code == "IDEMPOTENCY_CONFLICT"
             history = await engine.get_record(
                 winner["memory_id"], validate_scope("PROJECT", project_id="project-a"), history=True
             )

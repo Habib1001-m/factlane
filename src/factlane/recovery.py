@@ -16,7 +16,7 @@ try:
 except ImportError:  # Windows: sensitive-memory recovery maintenance is POSIX-only.
     _fcntl = None
 
-from .contract import PUBLIC_TOOL_NAMES, AdapterError, canonical_json, iso_now
+from .contract import PUBLIC_TOOL_NAMES, AdapterError, canonical_json, iso_now, parse_iso
 from .embedding_compatibility import parse_embedding_profile_metadata
 from .embeddings import EmbeddingProfile
 from .storage import (
@@ -1402,6 +1402,16 @@ class SensitiveMemoryRecoveryOperator:
         prepared: list[tuple[RecoveryTarget, str, str, str]],
     ) -> None:
         occurred_at = iso_now()
+        previous = conn.execute(
+            "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+        ).fetchone()
+        if previous is None:
+            raise RecoveryHold("HOLD_UNEXPECTED_DERIVED_STATE_NO_MUTATION", "trust-clock high-water is missing")
+        if parse_iso(occurred_at, required=True) > parse_iso(str(previous[0]), required=True):
+            conn.execute(
+                "UPDATE adapter_meta SET value=? WHERE key='trust_clock_high_water_at'",
+                (occurred_at,),
+            )
         actor_digest = _safe_digest("sensitive-recovery-actor", plan.operation_id)
         grant_digest = _safe_digest("sensitive-recovery-grant", plan.operation_id)
         for target, event_id, prior_lifecycle, prior_contradiction in prepared:

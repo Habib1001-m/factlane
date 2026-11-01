@@ -336,6 +336,29 @@ def test_future_matching_within_skew_does_not_renew_trust(tmp_path, monkeypatch)
     asyncio.run(run())
 
 
+def test_future_matching_beyond_skew_is_not_durable_or_idempotency_reserved(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "future-invalid.db"), _profile())
+        await engine.open()
+        try:
+            record = _current(last_verified_at="2026-10-31T18:00:00Z")
+            await _seed(engine, record)
+            monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-10-31T20:00:00Z")
+            with pytest.raises(AdapterError) as exc:
+                await _recheck(engine, record, key="future-invalid", observed_at="2026-10-31T20:05:01Z")
+            assert exc.value.code == "EVIDENCE_INVALID"
+            assert engine.conn is not None
+            assert engine.conn.execute("SELECT COUNT(*) FROM lifecycle_operations").fetchone()[0] == 0
+            assert engine.conn.execute("SELECT COUNT(*) FROM lifecycle_events").fetchone()[0] == 0
+            corrected = await _recheck(engine, record, key="future-invalid", observed_at="2026-10-31T20:02:00Z")
+            assert corrected["status"] == "BLOCKED"
+            assert corrected["error"] == "EVIDENCE_NOT_YET_OBSERVED"
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_clock_rollback_blocks_unchanged_but_commits_causally_newer_adverse_with_generation(tmp_path, monkeypatch) -> None:
     async def run() -> None:
         engine = SQLiteVecEngine(str(tmp_path / "rollback.db"), _profile())
