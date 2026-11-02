@@ -1,20 +1,150 @@
 from __future__ import annotations
 
+import asyncio
 import http.client
 import json
 import socket
 import threading
+import uuid
 from contextlib import contextmanager
 from typing import Any, Iterator
 from urllib.parse import urlencode
 
 import pytest
 
-from factlane.contract import AdapterError
+import factlane.storage as storage_module
+from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
+from factlane.contract import AdapterError, validate_scope
+from factlane.embeddings import EmbeddingProfile
+from factlane.owner_control import OwnerControlService
 from factlane.owner_webui import _build_launcher_parser, create_owner_server
+from factlane.storage import SQLiteVecEngine
 
 
 GROUP_TOKEN = "a" * 64
+
+
+def _real_profile() -> EmbeddingProfile:
+    return EmbeddingProfile(
+        profile_id="owner-webui-test-256",
+        provider_kind="OLLAMA_LOCAL",
+        base_model_identity="nomic-embed-text:latest",
+        model_digest="0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+        source_dimension=768,
+        output_dimension=256,
+        normalization_policy="OLLAMA_API_NORMALIZED_AFTER_DIMENSION_PROJECTION",
+        distance_metric="cosine",
+        projection_version="ollama-dimensions-v1",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+    )
+
+
+class _RealProvider:
+    def __init__(self) -> None:
+        self.profile = _real_profile()
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0] + [0.0] * 255 for _ in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return [1.0] + [0.0] * 255
+
+    def provider_status(self) -> dict[str, object]:
+        return {"local_only": True}
+
+
+def _candidate_record(marker: str, contradiction_key: str, fact: str) -> dict[str, Any]:
+    record_id = str(uuid.uuid4())
+    memory_id = str(uuid.uuid4())
+    return {
+        "record_id": record_id,
+        "memory_id": memory_id,
+        "revision": 1,
+        "parent_record_id": None,
+        "scope": "PROJECT",
+        "project_id": "project-a",
+        "worktree_id": None,
+        "workflow_id": None,
+        "agent_id": None,
+        "memory_type": "PROJECT_LEARNED_FACT",
+        "fact": fact,
+        "source_provenance": {
+            "source_class": "TEST",
+            "source_ref": f"source:{marker}",
+            "source_hash": marker * 64,
+            "review_ref": f"review:{marker}",
+            "extraction_method": "test",
+        },
+        "source_timestamp": None,
+        "created_at": "2026-11-01T20:00:00Z",
+        "last_verified_at": None,
+        "verified_by": "UNVERIFIED",
+        "authority_role": "UNRESOLVED",
+        "contribution_origin": {"contributor_class": "OWNER", "contributor_ref": "owner-webui-test"},
+        "freshness_policy": {"kind": "manual"},
+        "supersedes": [],
+        "contradiction_key": contradiction_key,
+        "contradiction_state": "UNRESOLVED",
+        "confidence": 0.5,
+        "tags": [f"subject:{contradiction_key}"],
+        "lifecycle_state": "CANDIDATE",
+        "native_content_hash": marker.upper() * 64,
+        "payload_fingerprint": (marker + "f") * 32,
+        "idempotency_key": f"candidate-{marker}",
+        "embedding_profile_id": _real_profile().profile_id,
+        "embedding_model_digest": _real_profile().model_digest,
+        "embedding_output_dimension": 256,
+    }
+
+
+def _on_change_current_record() -> dict[str, Any]:
+    record_id = str(uuid.uuid4())
+    source_hash = "d" * 64
+    return {
+        "record_id": record_id,
+        "memory_id": str(uuid.uuid4()),
+        "revision": 1,
+        "parent_record_id": None,
+        "scope": "PROJECT",
+        "project_id": "project-a",
+        "worktree_id": None,
+        "workflow_id": None,
+        "agent_id": None,
+        "memory_type": "PROJECT_LEARNED_FACT",
+        "fact": "The observed source is unchanged.",
+        "source_provenance": {
+            "source_class": "CURRENT_REPO",
+            "source_ref": "repo:owner-webui.md",
+            "source_hash": source_hash,
+            "review_ref": "initial-review",
+            "extraction_method": "manual",
+        },
+        "source_timestamp": "2026-11-02T00:00:00Z",
+        "created_at": "2026-11-02T00:00:00Z",
+        "last_verified_at": "2026-11-02T00:00:00Z",
+        "verified_by": "OWNER",
+        "authority_role": "PROJECT_CURRENT",
+        "contribution_origin": {"contributor_class": "OWNER", "contributor_ref": "owner-webui-test"},
+        "freshness_policy": {
+            "kind": "on_change",
+            "ttl_seconds": None,
+            "recheck_ref": "source:repo:owner-webui.md",
+            "source_fingerprint": source_hash,
+        },
+        "supersedes": [],
+        "contradiction_key": "ui-manual-recheck-key",
+        "contradiction_state": "NONE",
+        "confidence": 1.0,
+        "tags": [],
+        "lifecycle_state": "VALIDATED_CURRENT",
+        "native_content_hash": "e" * 64,
+        "payload_fingerprint": "f" * 64,
+        "idempotency_key": f"on-change-{record_id}",
+        "embedding_profile_id": _real_profile().profile_id,
+        "embedding_model_digest": _real_profile().model_digest,
+        "embedding_output_dimension": 256,
+    }
 
 
 class FakeOwnerService:
@@ -22,6 +152,7 @@ class FakeOwnerService:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.failures: dict[str, AdapterError] = {}
         self.detail_lifecycle = "VALIDATED_CURRENT"
+        self.detail_freshness: dict[str, Any] = {"kind": "manual"}
 
     def _record(self, name: str, kwargs: dict[str, Any]) -> None:
         self.calls.append((name, dict(kwargs)))
@@ -53,34 +184,34 @@ class FakeOwnerService:
     async def detail(self, **kwargs: Any) -> dict[str, Any]:
         self._record("detail", kwargs)
         memory_id = kwargs["memory_id"]
+        record = {
+            "memory_id": memory_id,
+            "record_id": "22222222-2222-4222-8222-222222222222",
+            "revision": 1,
+            "parent_record_id": None,
+            "scope": {"scope": "PROJECT", "project_id": "project-a"},
+            "memory_type": "FACT",
+            "fact": "<script>alert(1)</script>",
+            "source_provenance": {"source_class": "OWNER_SUPPLIED", "source_ref": "owner:test"},
+            "source_timestamp": "2026-11-01T00:00:00Z",
+            "created_at": "2026-11-01T00:00:00Z",
+            "last_verified_at": "2026-11-01T00:00:00Z",
+            "verified_by": "OWNER",
+            "authority_role": "OWNER",
+            "contribution_origin": {"contributor_class": "OWNER", "contributor_ref": "owner:test"},
+            "freshness_policy": self.detail_freshness,
+            "supersedes": [],
+            "contradiction_state": "NONE",
+            "confidence": 1.0,
+            "tags": ["subject:test"],
+            "lifecycle_state": self.detail_lifecycle,
+            "freshness_gate_state": "NONE",
+        }
         return {
             "status": "OK",
             "memory_id": memory_id,
-            "records": [
-                {
-                    "memory_id": memory_id,
-                    "record_id": "22222222-2222-4222-8222-222222222222",
-                    "revision": 1,
-                    "parent_record_id": None,
-                    "scope": {"scope": "PROJECT", "project_id": "project-a"},
-                    "memory_type": "FACT",
-                    "fact": "<script>alert(1)</script>",
-                    "source_provenance": {"source_class": "OWNER_SUPPLIED", "source_ref": "owner:test"},
-                    "source_timestamp": "2026-11-01T00:00:00Z",
-                    "created_at": "2026-11-01T00:00:00Z",
-                    "last_verified_at": "2026-11-01T00:00:00Z",
-                    "verified_by": "OWNER",
-                    "authority_role": "OWNER",
-                    "contribution_origin": {"contributor_class": "OWNER", "contributor_ref": "owner:test"},
-                    "freshness_policy": {"mode": "manual"},
-                    "supersedes": [],
-                    "contradiction_state": "NONE",
-                    "confidence": 1.0,
-                    "tags": ["subject:test"],
-                    "lifecycle_state": self.detail_lifecycle,
-                    "freshness_gate_state": "NONE",
-                }
-            ],
+            "latest": record,
+            "records": [record],
             "events": [
                 {
                     "event_id": "event-1",
@@ -106,6 +237,7 @@ class FakeOwnerService:
                 ],
             },
             "next_cursor": None,
+            "events_next_cursor": None,
         }
 
     async def conflicts(self, **kwargs: Any) -> dict[str, Any]:
@@ -525,6 +657,62 @@ def test_displayed_stale_group_token_is_forwarded_to_service_for_replay() -> Non
         assert reverify_calls[0][1]["observed_group_token"] == GROUP_TOKEN
 
 
+@pytest.mark.parametrize(
+    "path",
+    ["/owner/", "/owner/current", "/owner/candidates", "/owner/history"],
+)
+def test_pages_that_do_not_render_group_observations_do_not_credit_hidden_tokens(path: str) -> None:
+    service = FakeOwnerService()
+    with running_server(service) as server:
+        cookie, csrf = bootstrap(server)
+        origin = f"http://127.0.0.1:{server.server_address[1]}"
+        status, _, body = request(server, "GET", path, headers={"Cookie": cookie})
+        assert status == 200, body
+
+        status, _, body = request(
+            server,
+            "POST",
+            "/owner/api/v1/memories/11111111-1111-4111-8111-111111111111/revoke",
+            headers={"Cookie": cookie, "X-FactLane-CSRF": csrf, "Origin": origin},
+            json_body={
+                "expected_record_id": "22222222-2222-4222-8222-222222222222",
+                "expected_revision": 1,
+                "observed_group_token": GROUP_TOKEN,
+                "idempotency_key": f"hidden-token-{path}",
+                "reason_code": "OUTDATED",
+            },
+        )
+        assert status == 400
+        assert json.loads(body)["error_code"] == "INVALID_ENVELOPE"
+        assert not [call for call in service.calls if call[0] == "revoke"]
+
+
+def test_needs_review_credits_only_the_conflict_group_it_actually_renders() -> None:
+    service = FakeOwnerService()
+    with running_server(service) as server:
+        cookie, csrf = bootstrap(server)
+        origin = f"http://127.0.0.1:{server.server_address[1]}"
+        status, _, body = request(server, "GET", "/owner/needs-review", headers={"Cookie": cookie})
+        assert status == 200
+        assert GROUP_TOKEN in body.decode("utf-8")
+
+        status, _, body = request(
+            server,
+            "POST",
+            "/owner/api/v1/memories/11111111-1111-4111-8111-111111111111/revoke",
+            headers={"Cookie": cookie, "X-FactLane-CSRF": csrf, "Origin": origin},
+            json_body={
+                "expected_record_id": "22222222-2222-4222-8222-222222222222",
+                "expected_revision": 1,
+                "observed_group_token": GROUP_TOKEN,
+                "idempotency_key": "needs-review-visible-token",
+                "reason_code": "OUTDATED",
+            },
+        )
+        assert status == 200, body
+        assert json.loads(body)["action"] == "REVOKE"
+
+
 def test_read_api_pages_are_scope_bound_safe_and_include_all_owner_views() -> None:
     service = FakeOwnerService()
     with running_server(service) as server:
@@ -638,6 +826,154 @@ def test_owner_pages_render_visible_operator_workflows_and_record_detail() -> No
             if call[0] == "inventory" and call[1].get("lifecycle_state") in {"HISTORICAL", "SUPERSEDED", "REVOKED", "REJECTED"}
         }
         assert history_states == {"HISTORICAL", "SUPERSEDED", "REVOKED", "REJECTED"}
+
+
+def test_on_change_detail_exposes_manual_recheck_control_from_contract_kind() -> None:
+    service = FakeOwnerService()
+    service.detail_freshness = {
+        "kind": "on_change",
+        "recheck_ref": "source:test",
+        "source_fingerprint": "d" * 64,
+    }
+    memory_id = "11111111-1111-4111-8111-111111111111"
+    with running_server(service) as server:
+        cookie, _ = bootstrap(server)
+        status, _, body = request(server, "GET", f"/owner/memories/{memory_id}", headers={"Cookie": cookie})
+        text = body.decode("utf-8")
+        assert status == 200
+        assert 'data-action="MANUAL_RECHECK"' in text
+        assert 'action="/owner/ui/memories/11111111-1111-4111-8111-111111111111/recheck"' in text
+        assert '"claim": "OBSERVED_HASH"' in text
+        assert '"method": "OWNER_REVIEWED_SOURCE"' in text
+
+
+def test_detail_actions_bind_to_exact_latest_even_when_revision_page_is_older() -> None:
+    class PagedDetailService(FakeOwnerService):
+        async def detail(self, **kwargs: Any) -> dict[str, Any]:
+            result = await super().detail(**kwargs)
+            old = dict(result["records"][0])
+            old["fact"] = "Old paged revision"
+            old["revision"] = 1
+            old["record_id"] = "22222222-2222-4222-8222-222222222222"
+            latest = dict(old)
+            latest["fact"] = "Exact latest revision"
+            latest["revision"] = 101
+            latest["record_id"] = "99999999-9999-4999-8999-999999999999"
+            latest["parent_record_id"] = old["record_id"]
+            result["records"] = [old]
+            result["latest"] = latest
+            result["next_cursor"] = "next-revision-cursor"
+            result["events_next_cursor"] = "next-event-cursor"
+            return result
+
+    service = PagedDetailService()
+    memory_id = "11111111-1111-4111-8111-111111111111"
+    with running_server(service) as server:
+        cookie, _ = bootstrap(server)
+        status, _, body = request(server, "GET", f"/owner/memories/{memory_id}", headers={"Cookie": cookie})
+        text = body.decode("utf-8")
+        assert status == 200
+        assert "Exact latest revision" in text
+        assert 'name="expected_revision" value="101"' in text
+        assert 'name="expected_record_id" value="99999999-9999-4999-8999-999999999999"' in text
+        assert "?cursor=next-revision-cursor" in text
+        assert "?event_cursor=next-event-cursor" in text
+
+        status, _, _ = request(
+            server,
+            "GET",
+            f"/owner/memories/{memory_id}?event_cursor=next-event-cursor",
+            headers={"Cookie": cookie},
+        )
+        assert status == 200
+        detail_call = [call for call in service.calls if call[0] == "detail"][-1][1]
+        assert detail_call["event_cursor"] == "next-event-cursor"
+
+
+def test_history_and_needs_review_expose_independent_section_cursors() -> None:
+    class PagedInventoryService(FakeOwnerService):
+        async def inventory(self, **kwargs: Any) -> dict[str, Any]:
+            result = await super().inventory(**kwargs)
+            state = kwargs.get("lifecycle_state") or kwargs.get("contradiction_state") or "all"
+            result["next_cursor"] = f"cursor-{state}"
+            return result
+
+        async def conflicts(self, **kwargs: Any) -> dict[str, Any]:
+            result = await super().conflicts(**kwargs)
+            result["next_cursor"] = "cursor-conflicts"
+            return result
+
+    service = PagedInventoryService()
+    with running_server(service) as server:
+        cookie, _ = bootstrap(server)
+        status, _, body = request(server, "GET", "/owner/history", headers={"Cookie": cookie})
+        text = body.decode("utf-8")
+        assert status == 200
+        for name, state in (
+            ("historical_cursor", "HISTORICAL"),
+            ("superseded_cursor", "SUPERSEDED"),
+            ("revoked_cursor", "REVOKED"),
+            ("rejected_cursor", "REJECTED"),
+        ):
+            assert f"?{name}=cursor-{state}" in text
+
+        status, _, _ = request(
+            server,
+            "GET",
+            "/owner/history?revoked_cursor=cursor-REVOKED",
+            headers={"Cookie": cookie},
+        )
+        assert status == 200
+        revoked_call = [
+            call for call in service.calls
+            if call[0] == "inventory" and call[1].get("lifecycle_state") == "REVOKED"
+        ][-1][1]
+        assert revoked_call["cursor"] == "cursor-REVOKED"
+
+        status, _, body = request(server, "GET", "/owner/needs-review", headers={"Cookie": cookie})
+        text = body.decode("utf-8")
+        assert status == 200
+        assert "?unresolved_cursor=cursor-UNRESOLVED" in text
+        assert "?stale_cursor=cursor-STALE" in text
+        assert "?conflicts_cursor=cursor-conflicts" in text
+
+
+def test_group_overflow_renders_safe_blocked_ui_without_mutation_controls() -> None:
+    service = FakeOwnerService()
+    service.failures["conflicts"] = AdapterError(
+        "GROUP_LIMIT_EXCEEDED",
+        "contradiction group exceeds the mutation-safe member bound",
+        member_count=33,
+        limit=32,
+    )
+    with running_server(service) as server:
+        cookie, _ = bootstrap(server)
+        status, headers, body = request(server, "GET", "/owner/conflicts", headers={"Cookie": cookie})
+        text = body.decode("utf-8")
+        assert status == 409
+        assert headers["content-type"].startswith("text/html")
+        assert "GROUP_LIMIT_EXCEEDED" in text
+        assert "mutation controls remain unavailable" in text
+        assert "33" in text and "32" in text
+        assert 'data-action="RESOLVE"' not in text
+        assert 'data-action="REVOKE"' not in text
+
+
+def test_conflict_with_stale_member_disables_resolve_controls() -> None:
+    class BlockingConflictService(FakeOwnerService):
+        async def conflicts(self, **kwargs: Any) -> dict[str, Any]:
+            result = await super().conflicts(**kwargs)
+            result["items"][0]["group_cas"]["members"][1]["lifecycle_state"] = "STALE"
+            return result
+
+    service = BlockingConflictService()
+    with running_server(service) as server:
+        cookie, _ = bootstrap(server)
+        status, _, body = request(server, "GET", "/owner/conflicts", headers={"Cookie": cookie})
+        text = body.decode("utf-8")
+        assert status == 200
+        assert "STALE or QUARANTINED blocking members" in text
+        assert 'data-action="RESOLVE"' not in text
 
 
 def test_conflicts_page_renders_all_observed_members_and_resolve_controls() -> None:
@@ -823,6 +1159,241 @@ def test_visible_forms_route_all_governed_actions_through_owner_service(
         )
         assert status == 200, body
         assert len([call for call in service.calls if call[0] == method_name]) == before + 1
+
+
+def test_candidate_only_resolve_form_succeeds_end_to_end_with_real_owner_service(tmp_path) -> None:
+    async def setup() -> tuple[SQLiteVecEngine, OwnerControlService, dict[str, Any], dict[str, Any], str]:
+        engine = SQLiteVecEngine(str(tmp_path / "owner-webui-resolve.db"), _real_profile())
+        await engine.open()
+        adapter = MemoryAdapter(
+            engine,
+            _RealProvider(),
+            trusted_write_context=trusted_write_context_for_profile(
+                "owner-current", contributor_ref="owner-webui-test"
+            ),
+        )
+        service = OwnerControlService(adapter)
+        key = "ui-candidate-resolve-key"
+        winner = _candidate_record("a", key, "Candidate winner")
+        loser = _candidate_record("b", key, "Candidate loser")
+        await engine.write_record(winner, [1.0] + [0.0] * 255)
+        await engine.write_record(loser, [1.0] + [0.0] * 255)
+        token = (await engine.group_observation(validate_scope("PROJECT", project_id="project-a"), key))[
+            "public"
+        ]["observed_group_token"]
+        return engine, service, winner, loser, token
+
+    engine, service, winner, loser, token = asyncio.run(setup())
+    try:
+        with running_server(service) as server:
+            cookie, csrf = bootstrap(server)
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            status, _, body = request(server, "GET", "/owner/conflicts", headers={"Cookie": cookie})
+            conflict_page = body.decode("utf-8")
+            assert status == 200
+            assert winner["memory_id"] in conflict_page
+            assert loser["memory_id"] in conflict_page
+            assert token in conflict_page
+            assert "Candidate fresh verification payload" in conflict_page
+            assert "source:a" in conflict_page
+            assert '"freshness_policy": {' in conflict_page
+            assert '"kind": "manual"' in conflict_page
+            assert "<textarea name=\"verification_json\" required>{}</textarea>" not in conflict_page
+
+            verification = {
+                "source_provenance": {
+                    "source_class": "TEST",
+                    "source_ref": "ui-resolve-source",
+                    "source_hash": "c" * 64,
+                    "review_ref": "ui-resolve-review",
+                    "extraction_method": "owner-check",
+                },
+                "freshness_policy": {"kind": "manual"},
+                "source_timestamp": "2026-11-02T00:00:00Z",
+                "verified_by": "OWNER",
+                "tags": winner["tags"],
+            }
+            status, _, body = request(
+                server,
+                "POST",
+                "/owner/ui/conflicts/ui-candidate-resolve-key/resolve",
+                headers={"Cookie": cookie, "Origin": origin},
+                form_body={
+                    "_csrf": csrf,
+                    "observed_group_token": token,
+                    "winner_memory_id": str(winner["memory_id"]),
+                    "winner_record_id": str(winner["record_id"]),
+                    "winner_expected_revision": "1",
+                    "idempotency_key": "ui-real-candidate-resolve",
+                    "reason_code": "STRONGER_EVIDENCE",
+                    "verification_json": json.dumps(verification, separators=(",", ":")),
+                },
+            )
+            result_page = body.decode("utf-8")
+            assert status == 200
+            assert "RESOLVE completed" in result_page
+
+        scope = validate_scope("PROJECT", project_id="project-a")
+        winner_history = asyncio.run(engine.get_record(str(winner["memory_id"]), scope, history=True))
+        loser_history = asyncio.run(engine.get_record(str(loser["memory_id"]), scope, history=True))
+        assert winner_history[0]["lifecycle_state"] == "VALIDATED_CURRENT"
+        assert winner_history[0]["revision"] == 2
+        assert winner_history[0]["parent_record_id"] == winner["record_id"]
+        assert loser_history[0]["lifecycle_state"] == "REJECTED"
+    finally:
+        asyncio.run(engine.close())
+
+
+def test_on_change_manual_recheck_succeeds_end_to_end_with_real_owner_service(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-11-02T01:00:00Z")
+
+    async def setup() -> tuple[SQLiteVecEngine, OwnerControlService, dict[str, Any], str]:
+        engine = SQLiteVecEngine(str(tmp_path / "owner-webui-recheck.db"), _real_profile())
+        await engine.open()
+        adapter = MemoryAdapter(
+            engine,
+            _RealProvider(),
+            trusted_write_context=trusted_write_context_for_profile(
+                "owner-current", contributor_ref="owner-webui-test"
+            ),
+        )
+        service = OwnerControlService(adapter)
+        current = _on_change_current_record()
+        await engine.write_record(current, [1.0] + [0.0] * 255)
+        token = (
+            await engine.group_observation(
+                validate_scope("PROJECT", project_id="project-a"),
+                str(current["contradiction_key"]),
+            )
+        )["public"]["observed_group_token"]
+        return engine, service, current, token
+
+    engine, service, current, token = asyncio.run(setup())
+    try:
+        with running_server(service) as server:
+            cookie, csrf = bootstrap(server)
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            status, _, body = request(
+                server,
+                "GET",
+                f"/owner/memories/{current['memory_id']}",
+                headers={"Cookie": cookie},
+            )
+            detail_page = body.decode("utf-8")
+            assert status == 200
+            assert 'data-action="MANUAL_RECHECK"' in detail_page
+            assert token in detail_page
+
+            evidence = {
+                "origin": "OWNER_SUPPLIED",
+                "claim": "OBSERVED_HASH",
+                "recheck_ref": current["freshness_policy"]["recheck_ref"],
+                "observed_at": "2026-11-02T00:30:00Z",
+                "observed_source_hash": current["source_provenance"]["source_hash"],
+                "evidence_ref": "ui-manual-recheck-evidence",
+                "method": "OWNER_HASHED_SOURCE",
+            }
+            status, _, body = request(
+                server,
+                "POST",
+                f"/owner/ui/memories/{current['memory_id']}/recheck",
+                headers={"Cookie": cookie, "Origin": origin},
+                form_body={
+                    "_csrf": csrf,
+                    "expected_record_id": str(current["record_id"]),
+                    "expected_revision": "1",
+                    "observed_group_token": token,
+                    "idempotency_key": "ui-real-manual-recheck",
+                    "evidence_json": json.dumps(evidence, separators=(",", ":")),
+                },
+            )
+            result_page = body.decode("utf-8")
+            assert status == 200
+            assert "MANUAL_RECHECK completed" in result_page
+
+        scope = validate_scope("PROJECT", project_id="project-a")
+        history = asyncio.run(engine.get_record(str(current["memory_id"]), scope, history=True))
+        assert history[0]["lifecycle_state"] == "VALIDATED_CURRENT"
+        assert history[0]["revision"] == 2
+        assert history[0]["last_verified_at"] == "2026-11-02T00:30:00Z"
+        assert history[1]["lifecycle_state"] == "SUPERSEDED"
+    finally:
+        asyncio.run(engine.close())
+
+
+def test_on_change_manual_recheck_stale_group_fails_closed_with_real_owner_service(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage_module, "iso_now", lambda: "2026-11-02T01:00:00Z")
+
+    async def setup() -> tuple[SQLiteVecEngine, OwnerControlService, dict[str, Any], str]:
+        engine = SQLiteVecEngine(str(tmp_path / "owner-webui-recheck-stale.db"), _real_profile())
+        await engine.open()
+        adapter = MemoryAdapter(
+            engine,
+            _RealProvider(),
+            trusted_write_context=trusted_write_context_for_profile(
+                "owner-current", contributor_ref="owner-webui-test"
+            ),
+        )
+        service = OwnerControlService(adapter)
+        current = _on_change_current_record()
+        await engine.write_record(current, [1.0] + [0.0] * 255)
+        scope = validate_scope("PROJECT", project_id="project-a")
+        token = (await engine.group_observation(scope, str(current["contradiction_key"])))["public"][
+            "observed_group_token"
+        ]
+        return engine, service, current, token
+
+    engine, service, current, token = asyncio.run(setup())
+    try:
+        with running_server(service) as server:
+            cookie, csrf = bootstrap(server)
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            status, _, _ = request(
+                server,
+                "GET",
+                f"/owner/memories/{current['memory_id']}",
+                headers={"Cookie": cookie},
+            )
+            assert status == 200
+
+            candidate = _candidate_record("9", str(current["contradiction_key"]), "New conflicting candidate")
+            asyncio.run(engine.write_record(candidate, [1.0] + [0.0] * 255))
+
+            evidence = {
+                "origin": "OWNER_SUPPLIED",
+                "claim": "OBSERVED_HASH",
+                "recheck_ref": current["freshness_policy"]["recheck_ref"],
+                "observed_at": "2026-11-02T00:30:00Z",
+                "observed_source_hash": current["source_provenance"]["source_hash"],
+                "evidence_ref": "ui-manual-recheck-stale-evidence",
+                "method": "OWNER_HASHED_SOURCE",
+            }
+            status, _, body = request(
+                server,
+                "POST",
+                f"/owner/ui/memories/{current['memory_id']}/recheck",
+                headers={"Cookie": cookie, "Origin": origin},
+                form_body={
+                    "_csrf": csrf,
+                    "expected_record_id": str(current["record_id"]),
+                    "expected_revision": "1",
+                    "observed_group_token": token,
+                    "idempotency_key": "ui-real-manual-recheck-stale",
+                    "evidence_json": json.dumps(evidence, separators=(",", ":")),
+                },
+            )
+            error_page = body.decode("utf-8")
+            assert status == 409
+            assert "GROUP_VERSION_CONFLICT" in error_page
+            assert "Review current state" in error_page
+
+        scope = validate_scope("PROJECT", project_id="project-a")
+        history = asyncio.run(engine.get_record(str(current["memory_id"]), scope, history=True))
+        assert len(history) == 1
+        assert history[0]["record_id"] == current["record_id"]
+        assert history[0]["revision"] == 1
+    finally:
+        asyncio.run(engine.close())
 
 
 def test_all_mutation_routes_delegate_only_to_owner_service_methods() -> None:

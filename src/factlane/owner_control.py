@@ -173,6 +173,47 @@ class OwnerControlService:
         observation = await self._engine.group_observation(scope, contradiction_key)
         return observation["public"]
 
+    async def _candidate_verification_seeds(
+        self,
+        scope: ScopeContext,
+        group: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        members = group.get("members", []) if isinstance(group, dict) else []
+        record_ids = [
+            str(member.get("record_id"))
+            for member in members
+            if isinstance(member, dict)
+            and member.get("lifecycle_state") == "CANDIDATE"
+            and isinstance(member.get("record_id"), str)
+        ]
+        if not record_ids:
+            return {}
+
+        def query() -> list[dict[str, Any]]:
+            assert self._engine.conn is not None
+            where, params = self._engine._scope_where(scope)
+            marks = ",".join("?" for _ in record_ids)
+            rows = self._engine.conn.execute(
+                self._engine._select_sql(
+                    f"WHERE a.record_id IN ({marks}) AND a.lifecycle_state='CANDIDATE' AND {where}"
+                ),
+                [*record_ids, *params],
+            ).fetchall()
+            return [self._engine._row_to_dict(row) for row in rows]
+
+        records = await self._engine._run(query)
+        seeds: dict[str, dict[str, Any]] = {}
+        for record in records:
+            seeds[str(record["record_id"])] = {
+                "source_provenance": self._decode_json_field(record.get("source_provenance"), {}),
+                "freshness_policy": self._decode_json_field(record.get("freshness_policy"), {}),
+                "source_timestamp": record.get("source_timestamp"),
+                "verified_by": "OWNER",
+                "confidence": record.get("confidence"),
+                "tags": self._decode_json_field(record.get("tags"), []),
+            }
+        return seeds
+
     async def inventory(
         self,
         *,
@@ -268,6 +309,7 @@ class OwnerControlService:
         agent_id: str | None = None,
         limit: int = 100,
         cursor: str | None = None,
+        event_cursor: str | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
         memory_id = self._uuid(memory_id, "memory_id")
@@ -275,6 +317,8 @@ class OwnerControlService:
         page_size = validate_owner_page_size(limit)
         filters = {"kind": "detail", "memory_id": memory_id}
         after = decode_page_cursor(cursor, scope_context, filters)
+        event_filters = {"kind": "detail_events", "memory_id": memory_id}
+        event_after = decode_page_cursor(event_cursor, scope_context, event_filters)
 
         def query() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
             assert self._engine.conn is not None
@@ -298,10 +342,15 @@ class OwnerControlService:
                 [memory_id, *params],
             ).fetchone()
             latest = self._engine._row_to_dict(latest_row) if latest_row is not None else None
+            event_clauses = ["e.memory_id=?", where]
+            event_values: list[Any] = [memory_id, *params]
+            if event_after is not None:
+                event_clauses.append("(e.occurred_at > ? OR (e.occurred_at = ? AND e.event_id > ?))")
+                event_values.extend([event_after[0], event_after[0], event_after[1]])
             event_rows = self._engine.conn.execute(
                 f"SELECT {_EVENT_SELECT} FROM lifecycle_events e JOIN adapter_records a ON a.record_id=e.record_id "
-                f"WHERE e.memory_id=? AND {where} ORDER BY e.occurred_at,e.event_id LIMIT 100",
-                [memory_id, *params],
+                f"WHERE {' AND '.join(event_clauses)} ORDER BY e.occurred_at,e.event_id LIMIT ?",
+                [*event_values, page_size + 1],
             ).fetchall()
             event_names = (
                 "event_id",
@@ -335,6 +384,9 @@ class OwnerControlService:
         has_more = len(records) > page_size
         visible_rows = records[:page_size]
         public_records = [await self._owner_record(record) for record in visible_rows]
+        latest_public = await self._owner_record(latest)
+        has_more_events = len(events) > page_size
+        visible_events = events[:page_size]
         group_cas = await self._group_for_key(scope_context, latest["contradiction_key"])
         next_cursor = None
         if has_more and visible_rows:
@@ -345,15 +397,26 @@ class OwnerControlService:
                 created_at=last["created_at"],
                 record_id=last["record_id"],
             )
+        events_next_cursor = None
+        if has_more_events and visible_events:
+            last_event = visible_events[-1]
+            events_next_cursor = encode_page_cursor(
+                scope_context,
+                event_filters,
+                created_at=str(last_event["occurred_at"]),
+                record_id=str(last_event["event_id"]),
+            )
         return {
             "status": "OK",
             "request_id": self._request_id(request_id),
             "scope": scope_context.to_dict(),
             "memory_id": memory_id,
+            "latest": latest_public,
             "records": public_records,
-            "events": events,
+            "events": visible_events,
             "group_cas": group_cas,
             "next_cursor": next_cursor,
+            "events_next_cursor": events_next_cursor,
         }
 
     async def conflicts(
@@ -403,13 +466,19 @@ class OwnerControlService:
         rows = await self._engine._run(query)
         has_more = len(rows) > page_size
         visible = rows[:page_size]
-        items = [
-            {
-                "contradiction_key": contradiction_key,
-                "group_cas": await self._group_for_key(scope_context, contradiction_key),
-            }
-            for _, contradiction_key in visible
-        ]
+        items: list[dict[str, Any]] = []
+        for _, contradiction_key in visible:
+            group = await self._group_for_key(scope_context, contradiction_key)
+            items.append(
+                {
+                    "contradiction_key": contradiction_key,
+                    "group_cas": group,
+                    "candidate_verification_seeds": await self._candidate_verification_seeds(
+                        scope_context,
+                        group,
+                    ),
+                }
+            )
         next_cursor = None
         if has_more and visible:
             last_created_at, last_key = visible[-1]

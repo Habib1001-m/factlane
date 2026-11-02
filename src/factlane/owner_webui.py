@@ -361,15 +361,22 @@ def _layout(title: str, body: str, *, active_path: str) -> str:
     )
 
 
-def _pagination(payload: Any, path: str) -> str:
+def _pagination(
+    payload: Any,
+    path: str,
+    *,
+    cursor_field: str = "next_cursor",
+    query_name: str = "cursor",
+    label: str = "Next page",
+) -> str:
     if not isinstance(payload, dict):
         return ""
-    cursor = payload.get("next_cursor")
+    cursor = payload.get(cursor_field)
     if not isinstance(cursor, str) or not cursor:
         return ""
     return (
         '<div class="pagination">'
-        f'<a class="button" href="{_escape(path)}?cursor={quote(cursor, safe="")}">Next page</a>'
+        f'<a class="button" href="{_escape(path)}?{_escape(query_name)}={quote(cursor, safe="")}">{_escape(label)}</a>'
         "</div>"
     )
 
@@ -495,7 +502,7 @@ def _record_actions(record: dict[str, Any], group: dict[str, Any], csrf_token: s
             ).replace('method="post"', f'method="post" action="/owner/ui/memories/{quote(memory_id, safe="")}/replace"', 1)
         )
         freshness = record.get("freshness_policy")
-        if isinstance(freshness, dict) and freshness.get("mode") == "on_change":
+        if isinstance(freshness, dict) and freshness.get("kind") == "on_change":
             evidence = _json_text(
                 {
                     "origin": "OWNER_SUPPLIED",
@@ -564,13 +571,23 @@ def _record_actions(record: dict[str, Any], group: dict[str, Any], csrf_token: s
     return '<div class="actions">' + "".join(actions) + "</div>"
 
 
-def _group_observation(group: Any, csrf_token: str, *, contradiction_key: str | None = None) -> str:
+def _group_observation(
+    group: Any,
+    csrf_token: str,
+    *,
+    contradiction_key: str | None = None,
+    candidate_verification_seeds: Any = None,
+) -> str:
     if not isinstance(group, dict):
         return '<div class="notice">No complete group observation is available.</div>'
     token = group.get("observed_group_token")
     members = group.get("members", [])
     if not isinstance(members, list):
         members = []
+    blocking_member = any(
+        isinstance(member, dict) and member.get("lifecycle_state") in {"STALE", "QUARANTINED"}
+        for member in members
+    )
     member_rows: list[str] = []
     resolve_forms: list[str] = []
     for member in members:
@@ -583,12 +600,32 @@ def _group_observation(group: Any, csrf_token: str, *, contradiction_key: str | 
             f'<td>{_badge(member.get("lifecycle_state"))}</td><td>{_badge(member.get("contradiction_state"))}</td>'
             f'<td>{_badge(member.get("freshness_gate_state"))}</td></tr>'
         )
-        if contradiction_key is not None and isinstance(token, str) and _is_group_token(token):
+        if (
+            contradiction_key is not None
+            and isinstance(token, str)
+            and _is_group_token(token)
+            and not blocking_member
+        ):
             verification = ""
             if member.get("lifecycle_state") == "CANDIDATE":
+                record_id = str(member.get("record_id", ""))
+                seed = (
+                    candidate_verification_seeds.get(record_id)
+                    if isinstance(candidate_verification_seeds, dict)
+                    else None
+                )
+                if not isinstance(seed, dict):
+                    seed = {
+                        "source_provenance": {},
+                        "freshness_policy": {},
+                        "source_timestamp": None,
+                        "verified_by": "OWNER",
+                    }
                 verification = (
-                    '<label>Candidate verification payload</label>'
-                    '<textarea name="verification_json" required>{}</textarea>'
+                    '<label>Candidate fresh verification payload</label>'
+                    '<div class="muted">Review and update this stored Candidate proof before promotion; '
+                    'freshness is revalidated at commit time.</div>'
+                    f'<textarea name="verification_json" required>{_json_text(seed)}</textarea>'
                 )
             fields = (
                 _hidden("_csrf", csrf_token)
@@ -620,6 +657,11 @@ def _group_observation(group: Any, csrf_token: str, *, contradiction_key: str | 
         + "</tbody></table></div>"
     )
     resolve = '<div class="actions">' + "".join(resolve_forms) + "</div>" if resolve_forms else ""
+    if contradiction_key is not None and blocking_member:
+        resolve = (
+            '<div class="notice">Resolve is unavailable while the observed group contains '
+            'STALE or QUARANTINED blocking members. Review and normalize that state first.</div>'
+        )
     return (
         f'<div class="card"><h3>Group observation</h3><div class="muted">Members: {_escape(group.get("member_count"))}</div>'
         f'<code class="token">{token_html}</code>{table}</div>{resolve}'
@@ -629,10 +671,11 @@ def _group_observation(group: Any, csrf_token: str, *, contradiction_key: str | 
 def _detail_body(payload: dict[str, Any], csrf_token: str) -> str:
     records = payload.get("records", [])
     events = payload.get("events", [])
-    if not isinstance(records, list) or not records:
+    latest_value = payload.get("latest")
+    if not isinstance(records, list) or not records or not isinstance(latest_value, dict):
         return '<div class="notice bad">No visible revisions were returned for this memory.</div>'
     valid_records = [record for record in records if isinstance(record, dict)]
-    latest = max(valid_records, key=lambda record: int(record.get("revision", 0)))
+    latest = latest_value
     provenance = latest.get("source_provenance", {})
     freshness = latest.get("freshness_policy", {})
     scope = latest.get("scope", {})
@@ -657,13 +700,14 @@ def _detail_body(payload: dict[str, Any], csrf_token: str) -> str:
     revision_rows = "".join(
         "<tr>"
         f'<td>{_escape(record.get("revision"))}</td><td>{_escape(record.get("record_id"))}</td>'
+        f'<td>{_escape(record.get("parent_record_id"))}</td><td>{_escape(record.get("supersedes"))}</td>'
         f'<td>{_badge(record.get("lifecycle_state"))}</td><td>{_escape(record.get("created_at"))}</td>'
         f'<td>{_escape(record.get("last_verified_at"))}</td></tr>'
         for record in valid_records
     )
     detail += (
         '<section class="card"><h2>Revision history</h2><div class="table-wrap"><table><thead><tr>'
-        '<th>Rev</th><th>Record</th><th>Lifecycle</th><th>Created</th><th>Verified</th>'
+        '<th>Rev</th><th>Record</th><th>Parent</th><th>Supersedes</th><th>Lifecycle</th><th>Created</th><th>Verified</th>'
         f'</tr></thead><tbody>{revision_rows}</tbody></table></div></section>'
     )
     event_rows = ""
@@ -696,7 +740,12 @@ def _conflicts_body(payload: dict[str, Any], csrf_token: str) -> str:
         key = str(item.get("contradiction_key", ""))
         sections.append(
             f'<section class="card"><h2>{_escape(key)}</h2><div class="muted">Choose only after reviewing the displayed exact group.</div></section>'
-            + _group_observation(item.get("group_cas"), csrf_token, contradiction_key=key)
+            + _group_observation(
+                item.get("group_cas"),
+                csrf_token,
+                contradiction_key=key,
+                candidate_verification_seeds=item.get("candidate_verification_seeds"),
+            )
         )
     return '<div class="section-stack">' + "".join(sections) + "</div>"
 
@@ -735,7 +784,17 @@ def _page_template(title: str, payload: Any, csrf_token: str, active_path: str) 
     elif title == "Conflicts":
         body = _conflicts_body(payload, csrf_token) + _pagination(payload, active_path)
     elif title == "Memory detail":
-        body = _detail_body(payload, csrf_token) + _pagination(payload, active_path)
+        body = (
+            _detail_body(payload, csrf_token)
+            + _pagination(payload, active_path, label="Next revisions")
+            + _pagination(
+                payload,
+                active_path,
+                cursor_field="events_next_cursor",
+                query_name="event_cursor",
+                label="Next lifecycle events",
+            )
+        )
     elif title == "Needs Review":
         retention = payload.get("retention", {})
         freshness_counts = retention.get("freshness_review_counts", {}) if isinstance(retention, dict) else {}
@@ -743,16 +802,23 @@ def _page_template(title: str, payload: Any, csrf_token: str, active_path: str) 
             '<section class="card"><h2>Freshness review counts</h2>'
             '<div class="muted">Bounded status counts for TTL, manual and on-change review obligations.</div>'
             f'<pre>{_json_text(freshness_counts)}</pre></section>'
-            '<section class="card"><h2>Unresolved</h2>' + _record_rows(payload.get("unresolved", {})) + "</section>"
-            '<section class="card"><h2>Stale</h2>' + _record_rows(payload.get("stale", {})) + "</section>"
-            '<section class="card"><h2>Conflict groups</h2>' + _conflicts_body(payload.get("conflicts", {}), csrf_token) + "</section>"
+            '<section class="card"><h2>Unresolved</h2>' + _record_rows(payload.get("unresolved", {}))
+            + _pagination(payload.get("unresolved", {}), active_path, query_name="unresolved_cursor") + "</section>"
+            '<section class="card"><h2>Stale</h2>' + _record_rows(payload.get("stale", {}))
+            + _pagination(payload.get("stale", {}), active_path, query_name="stale_cursor") + "</section>"
+            '<section class="card"><h2>Conflict groups</h2>' + _conflicts_body(payload.get("conflicts", {}), csrf_token)
+            + _pagination(payload.get("conflicts", {}), active_path, query_name="conflicts_cursor") + "</section>"
         )
     elif title == "History":
         body = (
-            '<section class="card"><h2>Historical</h2>' + _record_rows(payload.get("historical", {})) + "</section>"
-            '<section class="card"><h2>Superseded</h2>' + _record_rows(payload.get("superseded", {})) + "</section>"
-            '<section class="card"><h2>Revoked</h2>' + _record_rows(payload.get("revoked", {})) + "</section>"
-            '<section class="card"><h2>Rejected</h2>' + _record_rows(payload.get("rejected", {})) + "</section>"
+            '<section class="card"><h2>Historical</h2>' + _record_rows(payload.get("historical", {}))
+            + _pagination(payload.get("historical", {}), active_path, query_name="historical_cursor") + "</section>"
+            '<section class="card"><h2>Superseded</h2>' + _record_rows(payload.get("superseded", {}))
+            + _pagination(payload.get("superseded", {}), active_path, query_name="superseded_cursor") + "</section>"
+            '<section class="card"><h2>Revoked</h2>' + _record_rows(payload.get("revoked", {}))
+            + _pagination(payload.get("revoked", {}), active_path, query_name="revoked_cursor") + "</section>"
+            '<section class="card"><h2>Rejected</h2>' + _record_rows(payload.get("rejected", {}))
+            + _pagination(payload.get("rejected", {}), active_path, query_name="rejected_cursor") + "</section>"
         )
     elif title == "System Health":
         body = _object_card("Runtime health", payload.get("health", {})) + _object_card("Retention and capacity", payload.get("retention", {}))
@@ -788,6 +854,28 @@ def _operation_error_page(error: AdapterError, *, review_path: str) -> str:
         f'<a class="button" href="{_escape(review_path)}">Review current state</a></section>'
     )
     return _layout("Action blocked", body, active_path=review_path)
+
+
+def _read_error_page(error: AdapterError, *, review_path: str) -> str:
+    safe_details = {
+        key: error.details[key]
+        for key in ("member_count", "limit", "serialized_bytes")
+        if key in error.details
+    }
+    details = f'<pre>{_json_text(safe_details)}</pre>' if safe_details else ""
+    if error.code in {"GROUP_LIMIT_EXCEEDED", "GROUP_OBSERVATION_TOO_LARGE"}:
+        guidance = (
+            "The exact contradiction group is outside the mutation-safe observation bound. "
+            "No partial group is presented and governed mutation controls remain unavailable."
+        )
+    else:
+        guidance = error.safe_message
+    body = (
+        '<section class="card notice bad">'
+        f'<h2>{_escape(error.code)}</h2><p>{_escape(guidance)}</p>{details}'
+        f'<a class="button" href="{_escape(review_path)}">Review again</a></section>'
+    )
+    return _layout("View blocked", body, active_path=review_path)
 
 
 class OwnerWebUIRequestHandler(BaseHTTPRequestHandler):
@@ -946,7 +1034,7 @@ class OwnerWebUIRequestHandler(BaseHTTPRequestHandler):
             return self._call_service("retention_status", **scope)
         match = re.fullmatch(r"/owner/api/v1/memories/([^/]+)", path)
         if match is not None:
-            values = _single_query_values(query, frozenset({"limit", "cursor"}))
+            values = _single_query_values(query, frozenset({"limit", "cursor", "event_cursor"}))
             limit_value = values.pop("limit", None)
             kwargs = dict(values)
             if limit_value is not None:
@@ -985,29 +1073,69 @@ class OwnerWebUIRequestHandler(BaseHTTPRequestHandler):
             values = _single_query_values(query, frozenset({"cursor"}))
             return "Conflicts", self._call_service("conflicts", limit=20, cursor=values.get("cursor"), **scope)
         if path == "/owner/needs-review":
-            if query:
-                raise _transport_error("INVALID_ENVELOPE", "Needs Review does not accept query parameters")
+            values = _single_query_values(
+                query,
+                frozenset({"unresolved_cursor", "stale_cursor", "conflicts_cursor"}),
+            )
             return (
                 "Needs Review",
                 {
                     "retention": self._call_service("retention_status", **scope),
                     "unresolved": self._call_service(
-                        "inventory", contradiction_state="UNRESOLVED", limit=20, **scope
+                        "inventory",
+                        contradiction_state="UNRESOLVED",
+                        limit=20,
+                        cursor=values.get("unresolved_cursor"),
+                        **scope,
                     ),
-                    "stale": self._call_service("inventory", lifecycle_state="STALE", limit=20, **scope),
-                    "conflicts": self._call_service("conflicts", limit=20, **scope),
+                    "stale": self._call_service(
+                        "inventory",
+                        lifecycle_state="STALE",
+                        limit=20,
+                        cursor=values.get("stale_cursor"),
+                        **scope,
+                    ),
+                    "conflicts": self._call_service(
+                        "conflicts", limit=20, cursor=values.get("conflicts_cursor"), **scope
+                    ),
                 },
             )
         if path == "/owner/history":
-            if query:
-                raise _transport_error("INVALID_ENVELOPE", "History does not accept query parameters")
+            values = _single_query_values(
+                query,
+                frozenset({"historical_cursor", "superseded_cursor", "revoked_cursor", "rejected_cursor"}),
+            )
             return (
                 "History",
                 {
-                    "historical": self._call_service("inventory", lifecycle_state="HISTORICAL", limit=20, **scope),
-                    "superseded": self._call_service("inventory", lifecycle_state="SUPERSEDED", limit=20, **scope),
-                    "revoked": self._call_service("inventory", lifecycle_state="REVOKED", limit=20, **scope),
-                    "rejected": self._call_service("inventory", lifecycle_state="REJECTED", limit=20, **scope),
+                    "historical": self._call_service(
+                        "inventory",
+                        lifecycle_state="HISTORICAL",
+                        limit=20,
+                        cursor=values.get("historical_cursor"),
+                        **scope,
+                    ),
+                    "superseded": self._call_service(
+                        "inventory",
+                        lifecycle_state="SUPERSEDED",
+                        limit=20,
+                        cursor=values.get("superseded_cursor"),
+                        **scope,
+                    ),
+                    "revoked": self._call_service(
+                        "inventory",
+                        lifecycle_state="REVOKED",
+                        limit=20,
+                        cursor=values.get("revoked_cursor"),
+                        **scope,
+                    ),
+                    "rejected": self._call_service(
+                        "inventory",
+                        lifecycle_state="REJECTED",
+                        limit=20,
+                        cursor=values.get("rejected_cursor"),
+                        **scope,
+                    ),
                     "guidance": "Open an authenticated memory detail to inspect bounded per-memory revision and lifecycle-event history.",
                 },
             )
@@ -1023,17 +1151,33 @@ class OwnerWebUIRequestHandler(BaseHTTPRequestHandler):
             )
         match = re.fullmatch(r"/owner/memories/([^/]+)", path)
         if match is not None:
-            values = _single_query_values(query, frozenset({"cursor"}))
+            values = _single_query_values(query, frozenset({"cursor", "event_cursor"}))
             memory_id = unquote(match.group(1), errors="strict")
             return (
                 "Memory detail",
                 self._call_service(
-                    "detail", memory_id=memory_id, limit=100, cursor=values.get("cursor"), **scope
+                    "detail",
+                    memory_id=memory_id,
+                    limit=100,
+                    cursor=values.get("cursor"),
+                    event_cursor=values.get("event_cursor"),
+                    **scope,
                 ),
             )
         return None
 
+    def _observe_page_result(self, session: _Session, title: str, payload: Any) -> None:
+        # Only credit mutation-capable Group CAS observations that the rendered
+        # HTML actually exposes to the Owner. Inventory payloads carry group_cas
+        # structurally, but list rows intentionally do not render those tokens.
+        if title in {"Conflicts", "Memory detail"}:
+            self.state.observe_result(session, payload)
+            return
+        if title == "Needs Review" and isinstance(payload, dict):
+            self.state.observe_result(session, payload.get("conflicts"))
+
     def do_GET(self) -> None:
+        path = ""
         try:
             if not self._require_common_request_security():
                 return
@@ -1062,10 +1206,17 @@ class OwnerWebUIRequestHandler(BaseHTTPRequestHandler):
                 self._send_simple_error(404, "NOT_FOUND", "Owner WebUI route was not found")
                 return
             title, payload = page
-            self.state.observe_result(session, payload)
+            self._observe_page_result(session, title, payload)
             self._send_html(200, _page_template(title, payload, session.csrf_token, path))
         except AdapterError as exc:
-            self._send_adapter_error(exc)
+            owner_page = (path in {"/owner", "/owner/"} or path.startswith("/owner/")) and not (
+                path.startswith("/owner/api/") or path.startswith("/owner/assets/")
+            )
+            if owner_page:
+                review_path = path if path else "/owner/"
+                self._send_html(_adapter_status(exc.code), _read_error_page(exc, review_path=review_path))
+            else:
+                self._send_adapter_error(exc)
         except (UnicodeDecodeError, ValueError):
             self._send_simple_error(400, "INVALID_ENVELOPE", "Owner WebUI request is invalid")
         except Exception:

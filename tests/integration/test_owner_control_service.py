@@ -195,6 +195,123 @@ def test_inventory_is_scope_bound_and_keyset_paginated(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_detail_exposes_exact_latest_and_independent_record_event_cursors(tmp_path) -> None:
+    async def run() -> None:
+        engine, service = await _service(tmp_path)
+        try:
+            row = _record(
+                marker="e",
+                project_id="project-a",
+                lifecycle="VALIDATED_CURRENT",
+                contradiction_key="detail-pagination-key",
+                created_at="2026-11-01T20:00:00Z",
+            )
+            await engine.write_record(row, [1.0] + [0.0] * 255)
+            scope = validate_scope("PROJECT", project_id="project-a")
+
+            parent = row
+            for index in (2, 3):
+                token = (await engine.group_observation(scope, "detail-pagination-key"))["public"][
+                    "observed_group_token"
+                ]
+                result = await service.reverify(
+                    memory_id=row["memory_id"],
+                    expected_record_id=parent["record_id"],
+                    expected_revision=index - 1,
+                    observed_group_token=token,
+                    idempotency_key=f"detail-pagination-reverify-{index}",
+                    verification={"source_timestamp": "2026-11-01T20:00:00Z", "verified_by": "OWNER"},
+                    scope="PROJECT",
+                    project_id="project-a",
+                )
+                parent = result["results"][0]
+
+            token = (await engine.group_observation(scope, "detail-pagination-key"))["public"][
+                "observed_group_token"
+            ]
+            await service.revoke(
+                memory_id=row["memory_id"],
+                expected_record_id=parent["record_id"],
+                expected_revision=3,
+                observed_group_token=token,
+                idempotency_key="detail-pagination-revoke-1",
+                reason_code="OUTDATED",
+                scope="PROJECT",
+                project_id="project-a",
+            )
+
+            revoked_token = (await engine.group_observation(scope, "detail-pagination-key"))["public"][
+                "observed_group_token"
+            ]
+            await service.readmit(
+                memory_id=row["memory_id"],
+                revoked_record_id=parent["record_id"],
+                expected_revoked_revision=3,
+                observed_group_token=revoked_token,
+                idempotency_key="detail-pagination-readmit",
+                verification={
+                    "source_provenance": {
+                        "source_class": "TEST",
+                        "source_ref": "detail-pagination-source",
+                        "source_hash": "7" * 64,
+                        "review_ref": "detail-pagination-review",
+                        "extraction_method": "owner-check",
+                    },
+                    "freshness_policy": {"kind": "manual"},
+                    "source_timestamp": "2026-11-01T21:00:00Z",
+                    "verified_by": "OWNER",
+                    "tags": row["tags"],
+                },
+                scope="PROJECT",
+                project_id="project-a",
+            )
+            current = (await engine.get_record(row["memory_id"], scope, history=False))[0]
+            token = (await engine.group_observation(scope, "detail-pagination-key"))["public"][
+                "observed_group_token"
+            ]
+            await service.revoke(
+                memory_id=row["memory_id"],
+                expected_record_id=current["record_id"],
+                expected_revision=4,
+                observed_group_token=token,
+                idempotency_key="detail-pagination-revoke-2",
+                reason_code="OUTDATED",
+                scope="PROJECT",
+                project_id="project-a",
+            )
+
+            first = await service.detail(
+                memory_id=row["memory_id"],
+                scope="PROJECT",
+                project_id="project-a",
+                limit=1,
+            )
+            assert first["records"][0]["revision"] == 1
+            assert first["latest"]["revision"] == 4
+            assert first["latest"]["record_id"] == current["record_id"]
+            assert first["latest"]["lifecycle_state"] == "REVOKED"
+            assert first["next_cursor"] is not None
+            assert len(first["events"]) == 1
+            assert first["events_next_cursor"] is not None
+
+            second = await service.detail(
+                memory_id=row["memory_id"],
+                scope="PROJECT",
+                project_id="project-a",
+                limit=1,
+                cursor=first["next_cursor"],
+                event_cursor=first["events_next_cursor"],
+            )
+            assert second["records"][0]["revision"] == 2
+            assert second["latest"]["revision"] == 4
+            assert len(second["events"]) == 1
+            assert second["events"][0]["event_id"] != first["events"][0]["event_id"]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_detail_conflicts_and_health_are_exact_scope_reads(tmp_path) -> None:
     async def run() -> None:
         engine, service = await _service(tmp_path)
@@ -241,6 +358,11 @@ def test_detail_conflicts_and_health_are_exact_scope_reads(tmp_path) -> None:
             assert len(conflicts["items"]) == 1
             assert conflicts["items"][0]["contradiction_key"] == key
             assert conflicts["items"][0]["group_cas"]["member_count"] == 2
+            seed = conflicts["items"][0]["candidate_verification_seeds"][candidate["record_id"]]
+            assert seed["source_provenance"]["source_ref"] == "source:f"
+            assert seed["freshness_policy"] == {"kind": "manual"}
+            assert seed["source_timestamp"] == candidate["source_timestamp"]
+            assert seed["verified_by"] == "OWNER"
 
             health = await service.health(scope="PROJECT", project_id="project-a")
             assert health["status"] == "OK"
