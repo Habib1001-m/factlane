@@ -584,6 +584,12 @@ def test_owner_pages_render_visible_operator_workflows_and_record_detail() -> No
         assert "script-src 'self'" in headers["content-security-policy"]
         assert '<script src="/owner/assets/owner.js" defer></script>' in text
 
+        status, _, script = request(server, "GET", "/owner/assets/owner.js", headers={"Cookie": cookie})
+        assert status == 200
+        script_text = script.decode("utf-8")
+        assert "fetch(form.action" in script_text
+        assert "history.replaceState" not in script_text
+
         status, _, body = request(server, "GET", f"/owner/memories/{memory_id}", headers={"Cookie": cookie})
         detail = body.decode("utf-8")
         assert status == 200

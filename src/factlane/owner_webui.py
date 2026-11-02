@@ -72,7 +72,6 @@ _OWNER_JS = """
       const parsed = new DOMParser().parseFromString(body, 'text/html');
       document.title = parsed.title;
       document.body.replaceWith(parsed.body);
-      history.replaceState(null, '', form.action);
     } catch (_error) {
       if (button) button.disabled = false;
       const notice = document.createElement('div');
