@@ -78,7 +78,7 @@ Some facts are long-lived:
 
 Others become stale quickly:
 
-> “The current release is v0.1.4.”
+> “The latest published release is v0.1.4, while this source checkout is the 0.1.5 local RC.”
 
 FactLane stores freshness policy with memory so current-state retrieval can exclude facts that
 are no longer eligible.
@@ -130,6 +130,19 @@ fact/scope/type/subject.
 
 This distinction prevents a “verification” operation from quietly turning into an unrelated
 reclassification.
+
+Public Contract Revision 3 adds two direct-Owner dispositions to the same `memory_update` tool:
+`REVOKE` for a `VALIDATED_CURRENT` logical memory and `REJECT` for a `CANDIDATE` that should not be
+admitted. Both use exact revision plus contradiction-group CAS. Their
+resulting `REVOKED` and `REJECTED` states are logical terminal states, not physical erasure.
+
+An Owner can later **readmit** an eligible `REVOKED` logical memory only after new verification and
+CAS checks. Readmission is different from restoring a database backup, and it cannot recreate data
+removed by sensitive-memory recovery.
+
+For `on_change` freshness, the policy names evidence that must be rechecked; FactLane does not run
+an automatic watcher. The Owner supplies a new bounded observation through the manual recheck path.
+Changed, unavailable, indeterminate, stale, or mismatched evidence fails closed for review.
 
 ### History is different from Current
 

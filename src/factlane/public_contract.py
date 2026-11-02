@@ -56,7 +56,11 @@ RetrievalKindValue = _enum_field(
     "Retrieval strategy: EXACT, KEYWORD, SEMANTIC, or HYBRID. In REVIEW_HISTORY, compacted HISTORICAL rows no longer carry vectors; SEMANTIC/HYBRID therefore return degradation=HISTORY_SEMANTIC_PARTIAL when semantic history is incomplete. If result-budget truncation also occurs, budget.truncated=true reports that condition while degradation=HISTORY_SEMANTIC_PARTIAL remains. Use KEYWORD/EXACT or memory_get for compacted history that must not depend on vectors.",
     default="SEMANTIC",
 )
-UpdateModeValue = _enum_field(UPDATE_MODES, "REVERIFY preserves the logical memory; REPLACE creates a new logical revision.")
+UpdateModeValue = _enum_field(
+    UPDATE_MODES,
+    "REVERIFY preserves the logical memory; REPLACE creates a governed successor; "
+    "Owner-only REVOKE and REJECT apply terminal lifecycle disposition with observed Group CAS.",
+)
 MemoryTypeValue = _enum_field(MEMORY_TYPES, "Fact category for one bounded memory record.")
 VerifiedByValue = _enum_field(VERIFIED_BY, "Verification source. UNVERIFIED stores a candidate, not a current fact.", default="UNVERIFIED")
 FreshnessKindValue = _enum_field(
@@ -181,6 +185,12 @@ class MemoryUpdateRequest(ScopeFields, total=False):
     expected_revision: Required[Annotated[int, Field(ge=1, description="Current revision from memory_get; required for CAS protection.")]]
     mode: Required[UpdateModeValue]
     idempotency_key: Required[Annotated[str, Field(description="Unique stable key for this update; safe retries reuse it.")]]
+    observed_group_token: NotRequired[
+        Annotated[str, Field(description="Exact Group CAS token displayed to the Owner; required for REVOKE/REJECT.")]
+    ]
+    reason_code: NotRequired[
+        Annotated[str, Field(description="Bounded enumerated disposition reason; required for REVOKE/REJECT.")]
+    ]
     replacement: NotRequired[
         Annotated[
             ReplacementPayload,
@@ -207,7 +217,7 @@ TOOL_DESCRIPTIONS = {
     "memory_search": "Search validated supporting memory in one exact scope; inspect this request schema before choosing enums.",
     "memory_get": "Read one logical memory record in one exact scope, optionally including revision history.",
     "memory_store": "Persist one bounded, provenance-bearing fact when the trusted launcher profile authorizes a write; normal agent writes are Candidate-only.",
-    "memory_update": "Reverify or explicitly replace one logical memory record using expected_revision CAS protection.",
+    "memory_update": "Reverify/replace a logical memory or apply Owner-only REVOKE/REJECT using exact revision and Group CAS protection.",
     "memory_status": "Inspect bounded backend and embedding-profile health for one exact scope.",
 }
 
@@ -305,7 +315,8 @@ def render_tool_help(tool_name: str | None = None) -> str:
         "Retrieval kinds: " + ", ".join(sorted(RETRIEVAL_MODE_KINDS)) + " (default SEMANTIC).",
         "Writes require trusted launcher authorization; normal agent profiles are Candidate-only. "
         "Store a bounded fact with source_provenance, freshness_policy, and idempotency_key; update "
-        "with current expected_revision, idempotency_key, and mode REVERIFY or REPLACE.",
+        "with current expected_revision, idempotency_key, and a Rev3 mode. Owner-only REVOKE/REJECT additionally require "
+        "the observed_group_token and bounded reason_code returned/defined by governed review surfaces.",
         "Governed FactLane errors return the normal MCP result shape with status=BLOCKED, a stable error_code, "
         "a safe message, empty results, and audit.retryable. Unexpected internal exceptions remain transport errors.",
         "Never guess an enum or field name: inspect live MCP schema or this help.",

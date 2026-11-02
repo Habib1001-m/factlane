@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import json
 import os
 import shutil
 import sqlite3
+import tempfile
 import time
 import urllib.parse
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -20,6 +23,9 @@ from .contract import (
     AdapterError,
     ScopeContext,
     canonical_json,
+    is_fresh,
+    iso_now,
+    native_hash,
     parse_iso,
     validate_freshness,
     validate_scope,
@@ -27,10 +33,11 @@ from .contract import (
 from .embeddings import EmbeddingProfile
 from .embedding_compatibility import parse_embedding_profile_metadata
 
-STORAGE_CONTRACT_VERSION = 2
+STORAGE_CONTRACT_VERSION = 3
 MIN_SQLITE_VERSION = (3, 42, 0)
-_WRITER_FUNCTION = "factlane_contract_v2_compat_writer"
+_WRITER_FUNCTION = "factlane_contract_v3_writer"
 _LEGACY_WRITER_FUNCTION = "factlane_contract_v2_writer"
+_RECOVERY_WRITER_FUNCTION = "factlane_recovery_v3_writer"
 _CASEFOLD_FUNCTION = "factlane_unicode_casefold"
 _LEGACY_ORIGIN_JSON = canonical_json({"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None})
 _MAINTENANCE_CAPABILITY_SECRET = object()
@@ -46,6 +53,36 @@ _CURRENT_VERIFICATIONS = frozenset({"OWNER", "CURRENT_REPO_CHECK", "AUTOMATED_CH
 _CROSS_PROJECT_MEMORY_TYPES = frozenset({"WORKFLOW_RULE", "DECISION_RATIONALE"})
 _MIN_BUSY_TIMEOUT_MS = 5000
 _SQLITE_FULL_CODE = getattr(sqlite3, "SQLITE_FULL", 13)
+MAX_CONTRADICTION_GROUP_MEMBERS = 32
+MAX_GROUP_CAS_BYTES = 12_288
+_GOVERNANCE_ACTIVE_STATES = frozenset({"VALIDATED_CURRENT", "CANDIDATE", "STALE", "QUARANTINED"})
+_ADVERSE_FRESHNESS_GATES = {
+    "CHANGED": "SOURCE_CHANGE_REVIEW_REQUIRED",
+    "UNAVAILABLE": "RECHECK_UNAVAILABLE",
+    "INDETERMINATE": "RECHECK_INDETERMINATE",
+}
+MAX_TRUST_RENEWAL_EVIDENCE_AGE_SECONDS = 86_400
+MAX_FUTURE_EVIDENCE_SKEW_SECONDS = 300
+
+_LIFECYCLE_EVENT_COLUMNS = (
+    "event_id", "operation_id", "memory_id", "record_id", "target_record_id", "target_revision",
+    "action", "prior_lifecycle_state", "result_lifecycle_state", "prior_contradiction_state",
+    "result_contradiction_state", "reason_code", "actor_class", "actor_ref_digest", "grant_ref_digest",
+    "occurred_at", "expected_revision", "result_revision", "related_record_id", "related_memory_id",
+    "freshness_outcome", "observation_origin", "observed_at", "accepted_at", "evidence_ref_digest",
+    "freshness_generation", "clock_anomaly",
+)
+
+_LIFECYCLE_OPERATION_COLUMNS = (
+    "idempotency_key", "request_fingerprint", "operation_id", "request_id", "operation_kind", "actor_class",
+    "actor_ref_digest", "grant_ref_digest", "scope_digest", "target_memory_id", "target_record_id",
+    "winner_memory_id", "winner_record_id", "winner_parent_record_id", "result_record_id", "result_revision",
+    "result_lifecycle_state", "result_contradiction_state", "result_outcome", "observed_at",
+    "affected_members_json", "event_ids_json",
+    "result_group_token", "result_group_count", "replay_status", "commit_timestamp", "decision_error",
+    "decision_at", "accepted_event_freshness_generation", "resulting_member_freshness_generation",
+    "recovery_event_id",
+)
 
 
 def _sqlite_pragma_compatibility_error() -> AdapterError:
@@ -98,6 +135,307 @@ def _assert_required_sqlite_pragmas(conn: sqlite3.Connection) -> None:
     busy_timeout_ms = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
     if journal_mode != "wal" or synchronous < 1 or busy_timeout_ms < _MIN_BUSY_TIMEOUT_MS:
         raise _sqlite_pragma_compatibility_error()
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> tuple[str, ...]:
+    return tuple(str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall())
+
+
+def _normalize_schema_sql(value: str | None) -> str:
+    if value is None:
+        return ""
+    compact = "".join(str(value).lower().split())
+    return compact.replace("ifnotexists", "")
+
+
+def _index_signature(conn: sqlite3.Connection, table: str, name: str) -> tuple[bool, bool, tuple[tuple[str, bool], ...]] | None:
+    row = next((item for item in conn.execute(f"PRAGMA index_list({table})") if str(item[1]) == name), None)
+    if row is None:
+        return None
+    unique = bool(row[2])
+    partial = bool(row[4]) if len(row) > 4 else False
+    columns = tuple(
+        (str(item[2]), bool(item[3]))
+        for item in conn.execute(f"PRAGMA index_xinfo({name})")
+        if int(item[5]) == 1 and item[2] is not None
+    )
+    return unique, partial, columns
+
+
+def _expected_v3_trigger_sql() -> dict[str, str]:
+    expected: dict[str, str] = {}
+    for name, action in (
+        ("factlane_v3_adapter_insert_fence", "INSERT"),
+        ("factlane_v3_adapter_update_fence", "UPDATE"),
+        ("factlane_v3_adapter_delete_fence", "DELETE"),
+    ):
+        expected[name] = (
+            f"CREATE TRIGGER {name} BEFORE {action} ON adapter_records "
+            f"WHEN {_WRITER_FUNCTION}() != 1 BEGIN "
+            "SELECT RAISE(ABORT, 'FACTLANE_STORAGE_V3_WRITER_REQUIRED'); END"
+        )
+    for table in ("lifecycle_events", "lifecycle_operations"):
+        for action in ("INSERT", "UPDATE", "DELETE"):
+            name = f"factlane_v3_{table}_{action.lower()}_fence"
+            if action == "INSERT":
+                predicate = f"{_WRITER_FUNCTION}() != 1"
+                error = "FACTLANE_STORAGE_V3_WRITER_REQUIRED"
+            elif table == "lifecycle_operations" and action == "UPDATE":
+                predicate = f"{_RECOVERY_WRITER_FUNCTION}() != 1"
+                error = "FACTLANE_RECOVERY_V3_WRITER_REQUIRED"
+            else:
+                predicate = "1 = 1"
+                error = "FACTLANE_V3_AUDIT_IMMUTABLE"
+            expected[name] = (
+                f"CREATE TRIGGER {name} BEFORE {action} ON {table} WHEN {predicate} "
+                f"BEGIN SELECT RAISE(ABORT, '{error}'); END"
+            )
+    expected["factlane_v3_adapter_global_idempotency"] = (
+        "CREATE TRIGGER factlane_v3_adapter_global_idempotency BEFORE INSERT ON adapter_records "
+        "WHEN EXISTS (SELECT 1 FROM lifecycle_operations WHERE idempotency_key = NEW.idempotency_key) "
+        "BEGIN SELECT RAISE(ABORT, 'FACTLANE_GLOBAL_IDEMPOTENCY_CONFLICT'); END"
+    )
+    expected["factlane_v3_operation_global_idempotency"] = (
+        "CREATE TRIGGER factlane_v3_operation_global_idempotency BEFORE INSERT ON lifecycle_operations "
+        "WHEN EXISTS (SELECT 1 FROM adapter_records WHERE idempotency_key = NEW.idempotency_key) "
+        "BEGIN SELECT RAISE(ABORT, 'FACTLANE_GLOBAL_IDEMPOTENCY_CONFLICT'); END"
+    )
+    return expected
+
+
+def _expected_v3_table_sql() -> dict[str, str]:
+    return {
+        "adapter_records": """
+            CREATE TABLE adapter_records (
+                record_id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                parent_record_id TEXT,
+                scope TEXT NOT NULL,
+                project_id TEXT,
+                worktree_id TEXT,
+                workflow_id TEXT,
+                agent_id TEXT,
+                memory_type TEXT NOT NULL,
+                fact TEXT NOT NULL,
+                source_provenance TEXT NOT NULL,
+                source_timestamp TEXT,
+                created_at TEXT NOT NULL,
+                last_verified_at TEXT,
+                verified_by TEXT NOT NULL,
+                authority_role TEXT NOT NULL,
+                contribution_origin TEXT,
+                freshness_policy TEXT NOT NULL,
+                supersedes TEXT NOT NULL,
+                contradiction_key TEXT NOT NULL,
+                contradiction_state TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                tags TEXT NOT NULL,
+                lifecycle_state TEXT NOT NULL,
+                native_content_hash TEXT NOT NULL UNIQUE,
+                payload_fingerprint TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                embedding_profile_id TEXT NOT NULL,
+                embedding_model_digest TEXT NOT NULL,
+                embedding_output_dimension INTEGER NOT NULL,
+                CHECK (confidence >= 0.0 AND confidence <= 1.0)
+            )
+        """,
+        "lifecycle_events": """
+            CREATE TABLE lifecycle_events (
+                event_id TEXT PRIMARY KEY,
+                operation_id TEXT,
+                memory_id TEXT NOT NULL,
+                record_id TEXT NOT NULL,
+                target_record_id TEXT,
+                target_revision INTEGER,
+                action TEXT NOT NULL,
+                prior_lifecycle_state TEXT,
+                result_lifecycle_state TEXT,
+                prior_contradiction_state TEXT,
+                result_contradiction_state TEXT,
+                reason_code TEXT,
+                actor_class TEXT NOT NULL,
+                actor_ref_digest TEXT,
+                grant_ref_digest TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                expected_revision INTEGER,
+                result_revision INTEGER,
+                related_record_id TEXT,
+                related_memory_id TEXT,
+                freshness_outcome TEXT,
+                observation_origin TEXT,
+                observed_at TEXT,
+                accepted_at TEXT,
+                evidence_ref_digest TEXT,
+                freshness_generation INTEGER,
+                clock_anomaly TEXT NOT NULL DEFAULT 'NONE',
+                CHECK (clock_anomaly IN ('NONE','CLOCK_UNTRUSTED_TIME')),
+                CHECK (freshness_generation IS NULL OR freshness_generation > 0)
+            )
+        """,
+        "lifecycle_operations": """
+            CREATE TABLE lifecycle_operations (
+                idempotency_key TEXT PRIMARY KEY,
+                request_fingerprint TEXT,
+                operation_id TEXT NOT NULL UNIQUE,
+                request_id TEXT NOT NULL,
+                operation_kind TEXT NOT NULL,
+                actor_class TEXT NOT NULL,
+                actor_ref_digest TEXT,
+                grant_ref_digest TEXT NOT NULL,
+                scope_digest TEXT NOT NULL,
+                target_memory_id TEXT,
+                target_record_id TEXT,
+                winner_memory_id TEXT,
+                winner_record_id TEXT,
+                winner_parent_record_id TEXT,
+                result_record_id TEXT,
+                result_revision INTEGER,
+                result_lifecycle_state TEXT,
+                result_contradiction_state TEXT,
+                result_outcome TEXT,
+                observed_at TEXT,
+                affected_members_json TEXT,
+                event_ids_json TEXT,
+                result_group_token TEXT,
+                result_group_count INTEGER,
+                replay_status TEXT NOT NULL,
+                commit_timestamp TEXT NOT NULL,
+                decision_error TEXT,
+                decision_at TEXT,
+                accepted_event_freshness_generation INTEGER,
+                resulting_member_freshness_generation INTEGER,
+                recovery_event_id TEXT
+            )
+        """,
+    }
+
+
+def _validate_existing_v3_schema(conn: sqlite3.Connection) -> None:
+    """Validate FactLane-owned v3 schema without repairing it during ordinary runtime open."""
+    required_tables = {"adapter_meta", "adapter_records", "lifecycle_events", "lifecycle_operations"}
+    present = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?,?,?,?)",
+            tuple(sorted(required_tables)),
+        ).fetchall()
+    }
+    if present != required_tables:
+        raise AdapterError("SCHEMA_MISMATCH", "storage v3 is incomplete; migration/operator reconciliation is required")
+    adapter_columns = set(_table_columns(conn, "adapter_records"))
+    required_adapter = set(_RECORD_COLUMNS) if "_RECORD_COLUMNS" in globals() else {
+        "record_id", "memory_id", "revision", "parent_record_id", "scope", "project_id", "worktree_id",
+        "workflow_id", "agent_id", "memory_type", "fact", "source_provenance", "source_timestamp",
+        "created_at", "last_verified_at", "verified_by", "authority_role", "contribution_origin",
+        "freshness_policy", "supersedes", "contradiction_key", "contradiction_state", "confidence", "tags",
+        "lifecycle_state", "native_content_hash", "payload_fingerprint", "idempotency_key", "embedding_profile_id",
+        "embedding_model_digest", "embedding_output_dimension",
+    }
+    if required_adapter != adapter_columns:
+        raise AdapterError("SCHEMA_MISMATCH", "storage v3 adapter_records schema is not exact")
+    if _table_columns(conn, "lifecycle_events") != _LIFECYCLE_EVENT_COLUMNS:
+        raise AdapterError("SCHEMA_MISMATCH", "storage v3 lifecycle_events schema is not exact")
+    if _table_columns(conn, "lifecycle_operations") != _LIFECYCLE_OPERATION_COLUMNS:
+        raise AdapterError("SCHEMA_MISMATCH", "storage v3 lifecycle_operations schema is not exact")
+    expected_tables = _expected_v3_table_sql()
+    for table, expected_sql in expected_tables.items():
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if row is None or _normalize_schema_sql(row[0]) != _normalize_schema_sql(expected_sql):
+            raise AdapterError("SCHEMA_MISMATCH", f"storage v3 table {table} definition is not exact")
+    required_indexes = {
+        ("adapter_records", "idx_adapter_scope_current"): (False, False, (("scope", False), ("project_id", False), ("worktree_id", False), ("workflow_id", False), ("agent_id", False), ("lifecycle_state", False))),
+        ("adapter_records", "idx_adapter_memory_id"): (False, False, (("memory_id", False), ("revision", False))),
+        ("adapter_records", "idx_adapter_contradiction"): (False, False, (("contradiction_key", False), ("lifecycle_state", False))),
+        ("adapter_records", "uq_adapter_memory_revision"): (True, False, (("memory_id", False), ("revision", False))),
+        ("adapter_records", "uq_adapter_parent_record"): (True, True, (("parent_record_id", False),)),
+        ("lifecycle_events", "uq_lifecycle_event_target_generation"): (True, True, (("target_record_id", False), ("target_revision", False), ("freshness_generation", False))),
+        ("lifecycle_events", "idx_lifecycle_event_target_generation"): (False, True, (("target_record_id", False), ("target_revision", False), ("freshness_generation", True))),
+        ("lifecycle_events", "idx_lifecycle_event_memory"): (False, False, (("memory_id", False), ("occurred_at", False), ("event_id", False))),
+        ("lifecycle_operations", "idx_lifecycle_operation_target"): (False, False, (("target_memory_id", False), ("target_record_id", False))),
+    }
+    for (table, name), expected in required_indexes.items():
+        if _index_signature(conn, table, name) != expected:
+            raise AdapterError("SCHEMA_MISMATCH", f"storage v3 index {name} is not exact")
+    parent_sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_adapter_parent_record'").fetchone()
+    generation_unique_sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_lifecycle_event_target_generation'").fetchone()
+    generation_lookup_sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_lifecycle_event_target_generation'").fetchone()
+    if not parent_sql or "whereparent_record_idisnotnull" not in _normalize_schema_sql(parent_sql[0]):
+        raise AdapterError("SCHEMA_MISMATCH", "storage v3 parent lineage guard predicate is not exact")
+    for row, name in (
+        (generation_unique_sql, "uq_lifecycle_event_target_generation"),
+        (generation_lookup_sql, "idx_lifecycle_event_target_generation"),
+    ):
+        if not row or "wherefreshness_generationisnotnull" not in _normalize_schema_sql(row[0]):
+            raise AdapterError("SCHEMA_MISMATCH", f"storage v3 index {name} predicate is not exact")
+
+    expected_triggers = _expected_v3_trigger_sql()
+    actual_triggers = {
+        str(name): str(sql)
+        for name, sql in conn.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'factlane_v3_%'"
+        ).fetchall()
+    }
+    if set(actual_triggers) != set(expected_triggers):
+        raise AdapterError("SCHEMA_MISMATCH", "storage v3 governance trigger set is not exact")
+    for name, expected_sql in expected_triggers.items():
+        if _normalize_schema_sql(actual_triggers[name]) != _normalize_schema_sql(expected_sql):
+            raise AdapterError("SCHEMA_MISMATCH", f"storage v3 trigger {name} is not exact")
+    clock_rows = conn.execute(
+        "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+    ).fetchall()
+    if len(clock_rows) != 1:
+        raise AdapterError("SCHEMA_MISMATCH", "storage v3 trust-clock high-water is missing")
+    try:
+        parse_iso(clock_rows[0][0], required=True)
+    except (ValueError, TypeError, AdapterError) as exc:
+        raise AdapterError("SCHEMA_MISMATCH", "storage v3 trust-clock high-water is malformed") from exc
+
+
+def inspect_storage_contract_version(db_path: str) -> int | None:
+    """Read FactLane contract metadata from a disposable byte copy, never the live DB.
+
+    Copying the main/WAL/SHM trio before SQLite inspection keeps ordinary v0.1.5
+    launch from creating/checkpointing sidecars or otherwise mutating a v2 database.
+    """
+    canonical = os.path.realpath(os.path.abspath(db_path))
+    if not os.path.exists(canonical) or os.path.getsize(canonical) == 0:
+        return None
+    with tempfile.TemporaryDirectory(prefix="factlane-contract-preflight-") as td:
+        copied = os.path.join(td, "factlane.db")
+        shutil.copy2(canonical, copied)
+        for suffix in ("-wal", "-shm"):
+            source = canonical + suffix
+            if os.path.exists(source):
+                shutil.copy2(source, copied + suffix)
+        conn: sqlite3.Connection | None = None
+        try:
+            uri = "file:" + urllib.parse.quote(copied, safe="/") + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            has_meta = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='adapter_meta'"
+            ).fetchone()
+            if has_meta is None:
+                raise AdapterError("SCHEMA_MISMATCH", "existing database has no FactLane storage contract metadata")
+            row = conn.execute("SELECT value FROM adapter_meta WHERE key='contract_version'").fetchone()
+            if row is None:
+                raise AdapterError("SCHEMA_MISMATCH", "existing database has no FactLane storage contract version")
+            try:
+                version = int(row[0])
+            except (TypeError, ValueError) as exc:
+                raise AdapterError("SCHEMA_MISMATCH", "storage contract version is invalid") from exc
+            if version == STORAGE_CONTRACT_VERSION:
+                _validate_existing_v3_schema(conn)
+            return version
+        except sqlite3.Error as exc:
+            raise AdapterError("SCHEMA_MISMATCH", "existing database contract metadata could not be inspected") from exc
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def _validate_current_authority_metadata(record: dict[str, Any]) -> None:
@@ -371,20 +709,36 @@ class RecordUniquenessConflict(RuntimeError):
         self.constraint = constraint
 
 
-def register_storage_v2_writer(conn: sqlite3.Connection) -> None:
-    """Mark one trusted FactLane connection as a compatibility-aware storage-v2 writer."""
+def register_storage_v3_writer(conn: sqlite3.Connection) -> None:
+    """Mark one trusted FactLane connection as a governed storage-v3 writer."""
     conn.create_function(_WRITER_FUNCTION, 0, lambda: 1)
     # Legacy v0.1.3 trigger bodies may still name the old writer function while
     # the database is being inspected. Resolve that function fail-closed so a
     # no-op schema normalization can open the DB without granting legacy write
     # authority before compatibility is proven and the fences are replaced.
     conn.create_function(_LEGACY_WRITER_FUNCTION, 0, lambda: 0)
+    conn.create_function(_RECOVERY_WRITER_FUNCTION, 0, lambda: 0)
     conn.create_function(_CASEFOLD_FUNCTION, 1, lambda value: str(value).casefold(), deterministic=True)
+
+
+def register_storage_v2_writer(conn: sqlite3.Connection) -> None:
+    """Compatibility alias retained for private recovery/test callers while v3 lands."""
+    register_storage_v3_writer(conn)
 
 
 def register_storage_legacy_maintenance_writer(conn: sqlite3.Connection) -> None:
     """Permit a maintenance-only connection to operate on pre-compatibility v2 trigger fences."""
     conn.create_function(_LEGACY_WRITER_FUNCTION, 0, lambda: 1)
+    conn.create_function(_WRITER_FUNCTION, 0, lambda: 0)
+    conn.create_function(_RECOVERY_WRITER_FUNCTION, 0, lambda: 0)
+    conn.create_function(_CASEFOLD_FUNCTION, 1, lambda value: str(value).casefold(), deterministic=True)
+
+
+def register_storage_recovery_writer(conn: sqlite3.Connection) -> None:
+    """Enable the exact privileged writer functions required by sensitive Recovery v3."""
+    conn.create_function(_WRITER_FUNCTION, 0, lambda: 1)
+    conn.create_function(_LEGACY_WRITER_FUNCTION, 0, lambda: 1)
+    conn.create_function(_RECOVERY_WRITER_FUNCTION, 0, lambda: 1)
     conn.create_function(_CASEFOLD_FUNCTION, 1, lambda value: str(value).casefold(), deterministic=True)
 
 
@@ -480,6 +834,14 @@ class SQLiteVecEngine:
             raise AdapterError("ADMIN_OPERATION_DENIED", "external embedding providers are disabled")
         _assert_required_sqlite_pragma_environment()
         assert_supported_sqlite_runtime()
+        existing_contract = inspect_storage_contract_version(self.db_path)
+        if existing_contract == 2:
+            raise AdapterError(
+                "MIGRATION_REQUIRED",
+                "storage contract v2 requires the explicit migrate-storage-v3 operator before v0.1.5 runtime can open it",
+            )
+        if existing_contract is not None and existing_contract != STORAGE_CONTRACT_VERSION:
+            raise AdapterError("SCHEMA_MISMATCH", "storage contract version is unsupported by v0.1.5")
         if self._maintenance_capability is None:
             self._maintenance_lease_handle = _acquire_runtime_maintenance_lease(self.db_path)
         else:
@@ -515,7 +877,7 @@ class SQLiteVecEngine:
             if self.conn is None:
                 raise AdapterError("BACKEND_UNAVAILABLE", "SQLite-vec backend did not expose a connection")
             _assert_required_sqlite_pragmas(self.conn)
-            register_storage_v2_writer(self.conn)
+            register_storage_v3_writer(self.conn)
             self.vector_dimension = await self._run(self._read_dimension)
             self.native_columns = await self._run(self._read_native_columns)
             required = {"content_hash", "content", "metadata", "created_at", "updated_at"}
@@ -580,16 +942,14 @@ class SQLiteVecEngine:
             self.conn.execute(
                 "CREATE TABLE IF NOT EXISTS adapter_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
-            version_row = self.conn.execute(
-                "SELECT value FROM adapter_meta WHERE key='contract_version'"
-            ).fetchone()
+            version_row = self.conn.execute("SELECT value FROM adapter_meta WHERE key='contract_version'").fetchone()
             if version_row is not None:
                 try:
                     existing_version = int(version_row[0])
                 except (TypeError, ValueError) as exc:
                     raise AdapterError("SCHEMA_MISMATCH", "storage contract version is invalid") from exc
-                if existing_version not in {1, STORAGE_CONTRACT_VERSION}:
-                    raise AdapterError("SCHEMA_MISMATCH", "storage contract version is unsupported")
+                if existing_version != STORAGE_CONTRACT_VERSION:
+                    raise AdapterError("SCHEMA_MISMATCH", "ordinary runtime cannot migrate an older storage contract")
             self.conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS adapter_records (
@@ -628,22 +988,8 @@ class SQLiteVecEngine:
                 )
                 """
             )
-            columns = {row[1] for row in self.conn.execute("PRAGMA table_info(adapter_records)")}
-            migrating_v1 = "contribution_origin" not in columns
-            if migrating_v1:
-                self.conn.execute("ALTER TABLE adapter_records ADD COLUMN contribution_origin TEXT")
-                self._migration_checkpoint("after_add_field")
-            self.conn.execute(
-                "UPDATE adapter_records SET contribution_origin = ? WHERE contribution_origin IS NULL",
-                (_LEGACY_ORIGIN_JSON,),
-            )
-            if migrating_v1:
-                self._migration_checkpoint("after_backfill")
-            remaining_null = self.conn.execute(
-                "SELECT COUNT(*) FROM adapter_records WHERE contribution_origin IS NULL"
-            ).fetchone()[0]
-            if remaining_null:
-                raise AdapterError("SCHEMA_MISMATCH", "storage v2 contribution-origin backfill is incomplete")
+            if set(_table_columns(self.conn, "adapter_records")) != set(_RECORD_COLUMNS):
+                raise AdapterError("SCHEMA_MISMATCH", "storage v3 adapter_records schema is not exact")
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_adapter_scope_current "
                 "ON adapter_records(scope, project_id, worktree_id, workflow_id, agent_id, lifecycle_state)"
@@ -654,16 +1000,151 @@ class SQLiteVecEngine:
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_adapter_contradiction ON adapter_records(contradiction_key, lifecycle_state)"
             )
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_adapter_memory_revision ON adapter_records(memory_id, revision)"
+            )
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_adapter_parent_record ON adapter_records(parent_record_id) "
+                "WHERE parent_record_id IS NOT NULL"
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lifecycle_events (
+                    event_id TEXT PRIMARY KEY,
+                    operation_id TEXT,
+                    memory_id TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    target_record_id TEXT,
+                    target_revision INTEGER,
+                    action TEXT NOT NULL,
+                    prior_lifecycle_state TEXT,
+                    result_lifecycle_state TEXT,
+                    prior_contradiction_state TEXT,
+                    result_contradiction_state TEXT,
+                    reason_code TEXT,
+                    actor_class TEXT NOT NULL,
+                    actor_ref_digest TEXT,
+                    grant_ref_digest TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    expected_revision INTEGER,
+                    result_revision INTEGER,
+                    related_record_id TEXT,
+                    related_memory_id TEXT,
+                    freshness_outcome TEXT,
+                    observation_origin TEXT,
+                    observed_at TEXT,
+                    accepted_at TEXT,
+                    evidence_ref_digest TEXT,
+                    freshness_generation INTEGER,
+                    clock_anomaly TEXT NOT NULL DEFAULT 'NONE',
+                    CHECK (clock_anomaly IN ('NONE','CLOCK_UNTRUSTED_TIME')),
+                    CHECK (freshness_generation IS NULL OR freshness_generation > 0)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lifecycle_operations (
+                    idempotency_key TEXT PRIMARY KEY,
+                    request_fingerprint TEXT,
+                    operation_id TEXT NOT NULL UNIQUE,
+                    request_id TEXT NOT NULL,
+                    operation_kind TEXT NOT NULL,
+                    actor_class TEXT NOT NULL,
+                    actor_ref_digest TEXT,
+                    grant_ref_digest TEXT NOT NULL,
+                    scope_digest TEXT NOT NULL,
+                    target_memory_id TEXT,
+                    target_record_id TEXT,
+                    winner_memory_id TEXT,
+                    winner_record_id TEXT,
+                    winner_parent_record_id TEXT,
+                    result_record_id TEXT,
+                    result_revision INTEGER,
+                    result_lifecycle_state TEXT,
+                    result_contradiction_state TEXT,
+                    result_outcome TEXT,
+                    observed_at TEXT,
+                    affected_members_json TEXT,
+                    event_ids_json TEXT,
+                    result_group_token TEXT,
+                    result_group_count INTEGER,
+                    replay_status TEXT NOT NULL,
+                    commit_timestamp TEXT NOT NULL,
+                    decision_error TEXT,
+                    decision_at TEXT,
+                    accepted_event_freshness_generation INTEGER,
+                    resulting_member_freshness_generation INTEGER,
+                    recovery_event_id TEXT
+                )
+                """
+            )
+            if _table_columns(self.conn, "lifecycle_events") != _LIFECYCLE_EVENT_COLUMNS:
+                raise AdapterError("SCHEMA_MISMATCH", "storage v3 lifecycle_events schema is not exact")
+            if _table_columns(self.conn, "lifecycle_operations") != _LIFECYCLE_OPERATION_COLUMNS:
+                raise AdapterError("SCHEMA_MISMATCH", "storage v3 lifecycle_operations schema is not exact")
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_lifecycle_event_target_generation "
+                "ON lifecycle_events(target_record_id, target_revision, freshness_generation) "
+                "WHERE freshness_generation IS NOT NULL"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lifecycle_event_target_generation "
+                "ON lifecycle_events(target_record_id, target_revision, freshness_generation DESC) "
+                "WHERE freshness_generation IS NOT NULL"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lifecycle_event_memory ON lifecycle_events(memory_id, occurred_at, event_id)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lifecycle_operation_target "
+                "ON lifecycle_operations(target_memory_id, target_record_id)"
+            )
             for name, action in (
-                ("factlane_v2_adapter_insert_fence", "INSERT"),
-                ("factlane_v2_adapter_update_fence", "UPDATE"),
-                ("factlane_v2_adapter_delete_fence", "DELETE"),
+                ("factlane_v3_adapter_insert_fence", "INSERT"),
+                ("factlane_v3_adapter_update_fence", "UPDATE"),
+                ("factlane_v3_adapter_delete_fence", "DELETE"),
             ):
                 self.conn.execute(
                     f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {action} ON adapter_records "
                     f"WHEN {_WRITER_FUNCTION}() != 1 BEGIN "
-                    "SELECT RAISE(ABORT, 'FACTLANE_STORAGE_V2_WRITER_REQUIRED'); END"
+                    "SELECT RAISE(ABORT, 'FACTLANE_STORAGE_V3_WRITER_REQUIRED'); END"
                 )
+            for table in ("lifecycle_events", "lifecycle_operations"):
+                for action in ("INSERT", "UPDATE", "DELETE"):
+                    name = f"factlane_v3_{table}_{action.lower()}_fence"
+                    if action == "INSERT":
+                        predicate = f"{_WRITER_FUNCTION}() != 1"
+                        error = "FACTLANE_STORAGE_V3_WRITER_REQUIRED"
+                    elif table == "lifecycle_operations" and action == "UPDATE":
+                        predicate = f"{_RECOVERY_WRITER_FUNCTION}() != 1"
+                        error = "FACTLANE_RECOVERY_V3_WRITER_REQUIRED"
+                    else:
+                        predicate = "1 = 1"
+                        error = "FACTLANE_V3_AUDIT_IMMUTABLE"
+                    self.conn.execute(
+                        f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {action} ON {table} "
+                        f"WHEN {predicate} BEGIN SELECT RAISE(ABORT, '{error}'); END"
+                    )
+            self.conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS factlane_v3_adapter_global_idempotency
+                BEFORE INSERT ON adapter_records
+                WHEN EXISTS (SELECT 1 FROM lifecycle_operations WHERE idempotency_key = NEW.idempotency_key)
+                BEGIN SELECT RAISE(ABORT, 'FACTLANE_GLOBAL_IDEMPOTENCY_CONFLICT'); END
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS factlane_v3_operation_global_idempotency
+                BEFORE INSERT ON lifecycle_operations
+                WHEN EXISTS (SELECT 1 FROM adapter_records WHERE idempotency_key = NEW.idempotency_key)
+                BEGIN SELECT RAISE(ABORT, 'FACTLANE_GLOBAL_IDEMPOTENCY_CONFLICT'); END
+                """
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO adapter_meta(key, value) VALUES ('trust_clock_high_water_at','1970-01-01T00:00:00Z')"
+            )
             self.conn.execute(
                 "INSERT INTO adapter_meta(key, value) VALUES ('contract_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -922,6 +1403,1605 @@ class SQLiteVecEngine:
 
         return await self._run(query)
 
+    def _latest_freshness_event_sync(self, record_id: str, revision: int) -> dict[str, Any]:
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT event_id,freshness_outcome,freshness_generation FROM lifecycle_events "
+            "WHERE target_record_id=? AND target_revision=? AND freshness_generation IS NOT NULL "
+            "ORDER BY freshness_generation DESC LIMIT 1",
+            (record_id, revision),
+        ).fetchone()
+        if row is None:
+            return {
+                "freshness_gate_state": "NONE",
+                "latest_freshness_event_id": None,
+                "freshness_generation": 0,
+            }
+        outcome = str(row[1]) if row[1] is not None else None
+        return {
+            "freshness_gate_state": _ADVERSE_FRESHNESS_GATES.get(outcome, "NONE"),
+            "latest_freshness_event_id": str(row[0]),
+            "freshness_generation": int(row[2]),
+        }
+
+    async def freshness_state(self, record_id: str, revision: int) -> dict[str, Any]:
+        return await self._run(self._latest_freshness_event_sync, record_id, revision)
+
+    def _group_observation_sync(self, scope: ScopeContext, contradiction_key: str) -> dict[str, Any]:
+        assert self.conn is not None
+        where, params = self._scope_where(scope)
+        state_marks = ",".join("?" for _ in _GOVERNANCE_ACTIVE_STATES)
+        ordered_states = sorted(_GOVERNANCE_ACTIVE_STATES)
+        count = int(
+            self.conn.execute(
+                f"SELECT COUNT(*) FROM adapter_records a WHERE a.contradiction_key=? AND {where} "
+                f"AND a.lifecycle_state IN ({state_marks})",
+                [contradiction_key, *params, *ordered_states],
+            ).fetchone()[0]
+        )
+        if count > MAX_CONTRADICTION_GROUP_MEMBERS:
+            raise AdapterError(
+                "GROUP_LIMIT_EXCEEDED",
+                "contradiction group exceeds the mutation-safe member bound",
+                member_count=count,
+                limit=MAX_CONTRADICTION_GROUP_MEMBERS,
+            )
+        rows = self.conn.execute(
+            self._select_sql(
+                f"WHERE a.contradiction_key=? AND {where} AND a.lifecycle_state IN ({state_marks}) "
+                "ORDER BY a.record_id"
+            ),
+            [contradiction_key, *params, *ordered_states],
+        ).fetchall()
+        members: list[dict[str, Any]] = []
+        compact_members: list[dict[str, Any]] = []
+        for raw in rows:
+            record = self._row_to_dict(raw)
+            freshness = self._latest_freshness_event_sync(record["record_id"], int(record["revision"]))
+            hidden = {
+                "memory_id": record["memory_id"],
+                "record_id": record["record_id"],
+                "parent_record_id": record["parent_record_id"],
+                "revision": int(record["revision"]),
+                "lifecycle_state": record["lifecycle_state"],
+                "contradiction_state": record["contradiction_state"],
+                "payload_fingerprint": record["payload_fingerprint"],
+                **freshness,
+            }
+            member_token = hashlib.sha256(
+                canonical_json(
+                    {
+                        "parent_record_id": hidden["parent_record_id"],
+                        "payload_fingerprint": hidden["payload_fingerprint"],
+                        "latest_freshness_event_id": hidden["latest_freshness_event_id"],
+                        "freshness_generation": hidden["freshness_generation"],
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            members.append(hidden)
+            compact_members.append(
+                {
+                    "memory_id": hidden["memory_id"],
+                    "record_id": hidden["record_id"],
+                    "revision": hidden["revision"],
+                    "lifecycle_state": hidden["lifecycle_state"],
+                    "contradiction_state": hidden["contradiction_state"],
+                    "freshness_gate_state": hidden["freshness_gate_state"],
+                    "member_token": member_token,
+                }
+            )
+        server_observation = {
+            "schema_version": 2,
+            "scope": scope.to_dict(),
+            "contradiction_key": contradiction_key,
+            "member_count": count,
+            "members": members,
+        }
+        observed_group_token = hashlib.sha256(canonical_json(server_observation).encode("utf-8")).hexdigest()
+        compact = {
+            "schema_version": 2,
+            "scope": scope.to_dict(),
+            "contradiction_key": contradiction_key,
+            "member_count": count,
+            "observed_group_token": observed_group_token,
+            "members": compact_members,
+        }
+        encoded_size = len(canonical_json(compact).encode("utf-8"))
+        if encoded_size > MAX_GROUP_CAS_BYTES:
+            raise AdapterError(
+                "GROUP_OBSERVATION_TOO_LARGE",
+                "contradiction group observation exceeds the mutation-safe byte bound",
+                member_count=count,
+                serialized_bytes=encoded_size,
+                limit=MAX_GROUP_CAS_BYTES,
+            )
+        return {"server": server_observation, "public": compact}
+
+    async def group_observation(self, scope: ScopeContext, contradiction_key: str) -> dict[str, Any]:
+        return await self._run(self._group_observation_sync, scope, contradiction_key)
+
+    def _require_group_token_sync(
+        self,
+        scope: ScopeContext,
+        contradiction_key: str,
+        observed_group_token: str,
+    ) -> dict[str, Any]:
+        observed = self._group_observation_sync(scope, contradiction_key)
+        if observed["public"]["observed_group_token"] != observed_group_token:
+            raise AdapterError(
+                "GROUP_VERSION_CONFLICT",
+                "contradiction group changed after Owner observation",
+                refetch_required=True,
+                current_group_token=observed["public"]["observed_group_token"],
+                member_count=observed["public"]["member_count"],
+            )
+        return observed
+
+    @staticmethod
+    def _normalized_fact(value: str) -> str:
+        return " ".join(value.casefold().split())
+
+    def _operation_row_sync(self, idempotency_key: str) -> dict[str, Any] | None:
+        assert self.conn is not None
+        columns = ",".join(_LIFECYCLE_OPERATION_COLUMNS)
+        row = self.conn.execute(
+            f"SELECT {columns} FROM lifecycle_operations WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        return dict(zip(_LIFECYCLE_OPERATION_COLUMNS, row, strict=True)) if row else None
+
+    async def operation_by_idempotency(self, idempotency_key: str) -> dict[str, Any] | None:
+        return await self._run(self._operation_row_sync, idempotency_key)
+
+    def _idempotency_owner_sync(self, idempotency_key: str) -> str | None:
+        assert self.conn is not None
+        rows = self.conn.execute(
+            "SELECT owner FROM ("
+            "SELECT 'operation' AS owner FROM lifecycle_operations WHERE idempotency_key=? "
+            "UNION ALL "
+            "SELECT 'adapter' AS owner FROM adapter_records WHERE idempotency_key=?"
+            ") LIMIT 2",
+            (idempotency_key, idempotency_key),
+        ).fetchall()
+        if len(rows) > 1:
+            raise AdapterError("STORAGE_INTEGRITY", "idempotency key is reserved in multiple global namespaces")
+        return str(rows[0][0]) if rows else None
+
+    async def idempotency_owner(self, idempotency_key: str) -> str | None:
+        return await self._run(self._idempotency_owner_sync, idempotency_key)
+
+    def _operation_replay_sync(
+        self,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> dict[str, Any] | None:
+        assert self.conn is not None
+        if self.conn.execute(
+            "SELECT 1 FROM adapter_records WHERE idempotency_key=? LIMIT 1", (idempotency_key,)
+        ).fetchone():
+            raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by a legacy write")
+        replay = self._operation_row_sync(idempotency_key)
+        if replay is None:
+            return None
+        if replay["replay_status"] == "RECOVERY_INVALIDATED":
+            raise AdapterError(
+                "RECOVERY_INVALIDATED_REPLAY",
+                "operation replay was invalidated by sensitive Recovery",
+            )
+        if replay["request_fingerprint"] != request_fingerprint:
+            raise AdapterError(
+                "IDEMPOTENCY_CONFLICT",
+                "idempotency key is bound to another governed operation",
+            )
+        return self._operation_result(replay, replay=True)
+
+    async def operation_replay(
+        self,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> dict[str, Any] | None:
+        return await self._run(self._operation_replay_sync, idempotency_key, request_fingerprint)
+
+    @staticmethod
+    def _operation_result(operation: dict[str, Any], *, replay: bool) -> dict[str, Any]:
+        if operation["operation_kind"] == "MANUAL_RECHECK" and operation["replay_status"] == "BLOCKED":
+            return {
+                "status": "BLOCKED",
+                "error": operation["decision_error"],
+                "request_id": operation["request_id"],
+                "operation_id": operation["operation_id"],
+                "decision_at": operation["decision_at"],
+                "idempotent_replay": replay,
+            }
+        affected = json.loads(operation["affected_members_json"] or "[]")
+        event_ids = json.loads(operation["event_ids_json"] or "[]")
+        if operation["operation_kind"] == "MANUAL_RECHECK":
+            gate = {
+                "CHANGED": "SOURCE_CHANGE_REVIEW_REQUIRED",
+                "UNAVAILABLE": "RECHECK_UNAVAILABLE",
+                "INDETERMINATE": "RECHECK_INDETERMINATE",
+            }.get(operation["result_outcome"], "NONE")
+            return {
+                "status": "OK",
+                "operation_id": operation["operation_id"],
+                "event_ids": event_ids,
+                "request_id": operation["request_id"],
+                "idempotent_replay": replay,
+                "target_memory_id": operation["target_memory_id"],
+                "prior_record_id": operation["target_record_id"],
+                "resulting_record_id": operation["result_record_id"],
+                "resulting_revision": operation["result_revision"],
+                "outcome": operation["result_outcome"],
+                "observed_at": operation["observed_at"],
+                "accepted_at": operation["commit_timestamp"],
+                "freshness_gate_state": gate,
+                "action_required": (
+                    "NONE"
+                    if gate == "NONE"
+                    else "REPLACE_OR_RESOLVE_OR_REVOKE"
+                    if gate == "SOURCE_CHANGE_REVIEW_REQUIRED"
+                    else "RETRY_WITH_NEW_EVIDENCE"
+                ),
+                "resulting_group_token": operation["result_group_token"],
+                "accepted_event_freshness_generation": operation["accepted_event_freshness_generation"],
+                "resulting_member_freshness_generation": operation["resulting_member_freshness_generation"],
+            }
+        if operation["operation_kind"] == "RESOLVE":
+            return {
+                "status": "OK",
+                "action": "RESOLVE",
+                "operation_id": operation["operation_id"],
+                "request_id": operation["request_id"],
+                "idempotent_replay": replay,
+                "winner": {
+                    "memory_id": operation["winner_memory_id"],
+                    "parent_record_id": operation["winner_parent_record_id"],
+                    "result_record_id": operation["result_record_id"],
+                    "resulting_revision": operation["result_revision"],
+                    "lifecycle_state": "VALIDATED_CURRENT",
+                },
+                "affected_count": len(affected),
+                "affected_members": affected,
+                "event_ids": event_ids,
+                "resulting_group": {
+                    "conflict_state": "CLOSED",
+                    "member_count": operation["result_group_count"],
+                    "group_token": operation["result_group_token"],
+                },
+            }
+        if operation["operation_kind"] == "READMIT":
+            result: dict[str, Any] = {
+                "status": operation["result_outcome"] or "OK",
+                "operation_id": operation["operation_id"],
+                "event_ids": event_ids,
+                "request_id": operation["request_id"],
+                "idempotent_replay": replay,
+                "memory_id": operation["target_memory_id"],
+                "revoked_record_id": operation["target_record_id"],
+                "result_record_id": operation["result_record_id"],
+                "resulting_revision": operation["result_revision"],
+                "resulting_lifecycle": operation["result_lifecycle_state"],
+                "resulting_contradiction_state": operation["result_contradiction_state"],
+                "resulting_group_token": operation["result_group_token"],
+            }
+            return result
+        return {
+            "status": "OK",
+            "action": operation["operation_kind"],
+            "operation_id": operation["operation_id"],
+            "request_id": operation["request_id"],
+            "idempotent_replay": replay,
+            "target_memory_id": operation["target_memory_id"],
+            "target_record_id": operation["target_record_id"],
+            "result_record_id": operation["result_record_id"],
+            "resulting_revision": operation["result_revision"],
+            "resulting_lifecycle_state": operation["result_lifecycle_state"],
+            "resulting_contradiction_state": operation["result_contradiction_state"],
+            "affected_count": len(affected),
+            "affected_members": affected,
+            "event_ids": event_ids,
+            "resulting_group": {
+                "member_count": operation["result_group_count"],
+                "group_token": operation["result_group_token"],
+            },
+        }
+
+    def _insert_lifecycle_event_sync(
+        self,
+        *,
+        event_id: str,
+        operation_id: str | None,
+        record: dict[str, Any],
+        action: str,
+        actor_class: str,
+        actor_ref_digest: str | None,
+        grant_ref_digest: str,
+        occurred_at: str,
+        prior_lifecycle_state: str | None = None,
+        result_lifecycle_state: str | None = None,
+        prior_contradiction_state: str | None = None,
+        result_contradiction_state: str | None = None,
+        reason_code: str | None = None,
+        expected_revision: int | None = None,
+        result_revision: int | None = None,
+        related_record_id: str | None = None,
+        related_memory_id: str | None = None,
+        freshness_outcome: str | None = None,
+        observation_origin: str | None = None,
+        observed_at: str | None = None,
+        accepted_at: str | None = None,
+        evidence_ref_digest: str | None = None,
+        freshness_generation: int | None = None,
+        clock_anomaly: str = "NONE",
+    ) -> None:
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT INTO lifecycle_events("
+            "event_id,operation_id,memory_id,record_id,target_record_id,target_revision,action,"
+            "prior_lifecycle_state,result_lifecycle_state,prior_contradiction_state,result_contradiction_state,"
+            "reason_code,actor_class,actor_ref_digest,grant_ref_digest,occurred_at,expected_revision,result_revision,"
+            "related_record_id,related_memory_id,freshness_outcome,observation_origin,observed_at,accepted_at,"
+            "evidence_ref_digest,freshness_generation,clock_anomaly"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                event_id,
+                operation_id,
+                record["memory_id"],
+                record["record_id"],
+                record["record_id"],
+                int(record["revision"]),
+                action,
+                prior_lifecycle_state,
+                result_lifecycle_state,
+                prior_contradiction_state,
+                result_contradiction_state,
+                reason_code,
+                actor_class,
+                actor_ref_digest,
+                grant_ref_digest,
+                occurred_at,
+                expected_revision,
+                result_revision,
+                related_record_id,
+                related_memory_id,
+                freshness_outcome,
+                observation_origin,
+                observed_at,
+                accepted_at,
+                evidence_ref_digest,
+                freshness_generation,
+                clock_anomaly,
+            ),
+        )
+
+    def _recompute_candidate_contradictions_sync(
+        self,
+        scope: ScopeContext,
+        contradiction_key: str,
+        *,
+        operation_id: str,
+        actor_class: str,
+        actor_ref_digest: str | None,
+        grant_ref_digest: str,
+        occurred_at: str,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        assert self.conn is not None
+        where, params = self._scope_where(scope)
+        marks = ",".join("?" for _ in _GOVERNANCE_ACTIVE_STATES)
+        states = sorted(_GOVERNANCE_ACTIVE_STATES)
+        rows = [
+            self._row_to_dict(row)
+            for row in self.conn.execute(
+                self._select_sql(
+                    f"WHERE a.contradiction_key=? AND {where} AND a.lifecycle_state IN ({marks}) ORDER BY a.record_id"
+                ),
+                [contradiction_key, *params, *states],
+            ).fetchall()
+        ]
+        currents = [row for row in rows if row["lifecycle_state"] == "VALIDATED_CURRENT"]
+        if len({self._normalized_fact(row["fact"]) for row in currents}) > 1:
+            raise AdapterError("LIFECYCLE_INVARIANT_VIOLATION", "contradiction group contains incompatible Current rows")
+        affected: list[dict[str, Any]] = []
+        event_ids: list[str] = []
+        for candidate in (row for row in rows if row["lifecycle_state"] == "CANDIDATE"):
+            candidate_fact = self._normalized_fact(candidate["fact"])
+            incompatible = any(
+                peer["record_id"] != candidate["record_id"]
+                and self._normalized_fact(peer["fact"]) != candidate_fact
+                for peer in rows
+            )
+            desired = "UNRESOLVED" if incompatible else "NONE"
+            if candidate["contradiction_state"] == desired:
+                continue
+            prior = candidate["contradiction_state"]
+            self.conn.execute(
+                "UPDATE adapter_records SET contradiction_state=? WHERE record_id=?",
+                (desired, candidate["record_id"]),
+            )
+            event_id = str(uuid.uuid4())
+            self._insert_lifecycle_event_sync(
+                event_id=event_id,
+                operation_id=operation_id,
+                record=candidate,
+                action="CONTRADICTION_RECOMPUTED",
+                actor_class=actor_class,
+                actor_ref_digest=actor_ref_digest,
+                grant_ref_digest=grant_ref_digest,
+                occurred_at=occurred_at,
+                prior_lifecycle_state=candidate["lifecycle_state"],
+                result_lifecycle_state=candidate["lifecycle_state"],
+                prior_contradiction_state=prior,
+                result_contradiction_state=desired,
+                expected_revision=int(candidate["revision"]),
+                result_revision=int(candidate["revision"]),
+            )
+            affected.append(
+                {
+                    "memory_id": candidate["memory_id"],
+                    "record_id": candidate["record_id"],
+                    "from_lifecycle_state": candidate["lifecycle_state"],
+                    "to_lifecycle_state": candidate["lifecycle_state"],
+                    "from_contradiction_state": prior,
+                    "to_contradiction_state": desired,
+                }
+            )
+            event_ids.append(event_id)
+        return affected, event_ids
+
+    def _terminal_disposition_sync(
+        self,
+        scope: ScopeContext,
+        *,
+        action: str,
+        memory_id: str,
+        expected_record_id: str,
+        expected_revision: int,
+        observed_group_token: str,
+        idempotency_key: str,
+        request_fingerprint: str,
+        request_id: str,
+        reason_code: str,
+        actor_class: str,
+        actor_ref_digest: str | None,
+        grant_ref_digest: str,
+        committed_at: str,
+    ) -> dict[str, Any]:
+        assert self.conn is not None
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            replay = self._operation_row_sync(idempotency_key)
+            if replay is not None:
+                if replay["replay_status"] == "RECOVERY_INVALIDATED":
+                    raise AdapterError("RECOVERY_INVALIDATED_REPLAY", "operation replay was invalidated by sensitive Recovery")
+                if replay["request_fingerprint"] != request_fingerprint:
+                    raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to another governed operation")
+                result = self._operation_result(replay, replay=True)
+                self.conn.rollback()
+                return result
+            adapter_collision = self.conn.execute(
+                "SELECT 1 FROM adapter_records WHERE idempotency_key=? LIMIT 1", (idempotency_key,)
+            ).fetchone()
+            if adapter_collision is not None:
+                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is already reserved by another write")
+            self._sample_trust_clock_sync(iso_now())
+            self._sample_trust_clock_sync(committed_at)
+            where, params = self._scope_where(scope)
+            target_row = self.conn.execute(
+                self._select_sql(
+                    f"WHERE a.memory_id=? AND a.record_id=? AND {where} LIMIT 1"
+                ),
+                [memory_id, expected_record_id, *params],
+            ).fetchone()
+            if target_row is None:
+                outside = self.conn.execute(
+                    f"SELECT 1 FROM adapter_records a WHERE a.memory_id=? AND NOT ({where}) LIMIT 1",
+                    [memory_id, *params],
+                ).fetchone()
+                if outside is not None:
+                    raise AdapterError("CROSS_SCOPE_DENIED", "memory_id exists outside the requested scope")
+                raise AdapterError("NOT_FOUND", "target record was not found in the requested scope")
+            target = self._row_to_dict(target_row)
+            required_state = "VALIDATED_CURRENT" if action == "REVOKE" else "CANDIDATE"
+            if target["lifecycle_state"] != required_state:
+                raise AdapterError("VERSION_CONFLICT", f"{action} target is no longer {required_state}")
+            if int(target["revision"]) != expected_revision:
+                raise AdapterError("VERSION_CONFLICT", "expected_revision does not match the target revision")
+            observed = self._group_observation_sync(scope, target["contradiction_key"])
+            if observed["public"]["observed_group_token"] != observed_group_token:
+                raise AdapterError(
+                    "GROUP_VERSION_CONFLICT",
+                    "contradiction group changed after Owner observation",
+                    refetch_required=True,
+                    current_group_token=observed["public"]["observed_group_token"],
+                    member_count=observed["public"]["member_count"],
+                )
+            if any(
+                member["lifecycle_state"] in {"STALE", "QUARANTINED"}
+                for member in observed["server"]["members"]
+            ):
+                raise AdapterError("GROUP_MEMBER_NOT_ADMISSIBLE", "group contains a stale or quarantined blocking member")
+            operation_id = str(uuid.uuid4())
+            result_state = "REVOKED" if action == "REVOKE" else "REJECTED"
+            prior_contradiction = target["contradiction_state"]
+            self.conn.execute(
+                "UPDATE adapter_records SET lifecycle_state=?, contradiction_state='RESOLVED' WHERE record_id=?",
+                (result_state, target["record_id"]),
+            )
+            target_event = str(uuid.uuid4())
+            self._insert_lifecycle_event_sync(
+                event_id=target_event,
+                operation_id=operation_id,
+                record=target,
+                action=action,
+                actor_class=actor_class,
+                actor_ref_digest=actor_ref_digest,
+                grant_ref_digest=grant_ref_digest,
+                occurred_at=committed_at,
+                prior_lifecycle_state=target["lifecycle_state"],
+                result_lifecycle_state=result_state,
+                prior_contradiction_state=prior_contradiction,
+                result_contradiction_state="RESOLVED",
+                reason_code=reason_code,
+                expected_revision=expected_revision,
+                result_revision=expected_revision,
+            )
+            affected = [
+                {
+                    "memory_id": target["memory_id"],
+                    "record_id": target["record_id"],
+                    "from_lifecycle_state": target["lifecycle_state"],
+                    "to_lifecycle_state": result_state,
+                    "from_contradiction_state": prior_contradiction,
+                    "to_contradiction_state": "RESOLVED",
+                }
+            ]
+            recomputed, recompute_events = self._recompute_candidate_contradictions_sync(
+                scope,
+                target["contradiction_key"],
+                operation_id=operation_id,
+                actor_class=actor_class,
+                actor_ref_digest=actor_ref_digest,
+                grant_ref_digest=grant_ref_digest,
+                occurred_at=committed_at,
+            )
+            affected.extend(recomputed)
+            event_ids = [target_event, *recompute_events]
+            resulting_group = self._group_observation_sync(scope, target["contradiction_key"])["public"]
+            self.conn.execute(
+                "INSERT INTO lifecycle_operations("
+                "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,actor_ref_digest,"
+                "grant_ref_digest,scope_digest,target_memory_id,target_record_id,result_record_id,result_revision,"
+                "result_lifecycle_state,result_contradiction_state,affected_members_json,event_ids_json,"
+                "result_group_token,result_group_count,replay_status,commit_timestamp"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    idempotency_key,
+                    request_fingerprint,
+                    operation_id,
+                    request_id,
+                    action,
+                    actor_class,
+                    actor_ref_digest,
+                    grant_ref_digest,
+                    hashlib.sha256(scope.key().encode("utf-8")).hexdigest(),
+                    memory_id,
+                    expected_record_id,
+                    expected_record_id,
+                    expected_revision,
+                    result_state,
+                    "RESOLVED",
+                    canonical_json(affected),
+                    canonical_json(event_ids),
+                    resulting_group["observed_group_token"],
+                    resulting_group["member_count"],
+                    "COMMITTED",
+                    committed_at,
+                ),
+            )
+            operation = self._operation_row_sync(idempotency_key)
+            assert operation is not None
+            self.conn.commit()
+            return self._operation_result(operation, replay=False)
+        except BaseException:
+            self.conn.rollback()
+            raise
+
+    async def terminal_disposition(
+        self,
+        scope: ScopeContext,
+        **values: Any,
+    ) -> dict[str, Any]:
+        return await self._run(lambda: self._terminal_disposition_sync(scope, **values))
+
+    def _copy_materialized_successor_sync(
+        self,
+        parent: dict[str, Any],
+        successor: dict[str, Any],
+    ) -> None:
+        """Insert an immutable-fact successor while reusing the parent's qualified embedding bytes."""
+        assert self.conn is not None
+        _validate_current_authority_metadata(successor)
+        if successor["memory_id"] != parent["memory_id"]:
+            raise AdapterError("INVALID_ENVELOPE", "governed successor must preserve memory_id")
+        if successor["parent_record_id"] != parent["record_id"] or int(successor["revision"]) != int(parent["revision"]) + 1:
+            raise AdapterError("INVALID_ENVELOPE", "governed successor lineage is invalid")
+        if self._normalized_fact(successor["fact"]) != self._normalized_fact(parent["fact"]):
+            raise AdapterError("INVALID_ENVELOPE", "governed proof-only successor cannot change fact content")
+        native_row = self.conn.execute(
+            "SELECT id FROM memories WHERE content_hash=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
+            (parent["native_content_hash"],),
+        ).fetchone()
+        if native_row is None:
+            raise AdapterError("BACKEND_CORRUPT", "parent native materialization is unavailable")
+        embedding_row = self.conn.execute(
+            "SELECT content_embedding,store FROM memory_embeddings WHERE rowid=? AND store=? LIMIT 1",
+            (int(native_row[0]), self.embedding_store_key),
+        ).fetchone()
+        if embedding_row is None:
+            raise AdapterError("PROFILE_MISMATCH", "parent embedding materialization is unavailable for current store")
+        values = [
+            successor["record_id"], successor["memory_id"], successor["revision"], successor.get("parent_record_id"),
+            successor["scope"], successor.get("project_id"), successor.get("worktree_id"), successor.get("workflow_id"),
+            successor.get("agent_id"), successor["memory_type"], successor["fact"], canonical_json(successor["source_provenance"]),
+            successor.get("source_timestamp"), successor["created_at"], successor.get("last_verified_at"), successor["verified_by"],
+            successor["authority_role"], canonical_json(successor.get("contribution_origin") or {"contributor_class": "LEGACY_UNKNOWN", "contributor_ref": None}),
+            canonical_json(successor["freshness_policy"]), canonical_json(successor.get("supersedes", [])), successor["contradiction_key"],
+            successor["contradiction_state"], successor["confidence"], canonical_json(successor.get("tags", [])), successor["lifecycle_state"],
+            successor["native_content_hash"], successor["payload_fingerprint"], successor["idempotency_key"], successor["embedding_profile_id"],
+            successor["embedding_model_digest"], successor["embedding_output_dimension"],
+        ]
+        self.conn.execute(
+            f"INSERT INTO adapter_records ({','.join(_RECORD_COLUMNS)}) VALUES ({','.join('?' for _ in _RECORD_COLUMNS)})",
+            values,
+        )
+        native_metadata = canonical_json(
+            {
+                "adapter_record_id": successor["record_id"],
+                "adapter_memory_id": successor["memory_id"],
+                "embedding_profile_id": successor["embedding_profile_id"],
+                "lifecycle_state": successor["lifecycle_state"],
+            }
+        )
+        native_values: dict[str, Any] = {
+            "content_hash": successor["native_content_hash"],
+            "content": successor["fact"],
+            "tags": ",".join(successor.get("tags", [])),
+            "memory_type": successor["memory_type"],
+            "metadata": native_metadata,
+            "created_at": parse_iso(successor["created_at"], required=True).timestamp(),
+            "updated_at": parse_iso(successor["created_at"], required=True).timestamp(),
+            "created_at_iso": successor["created_at"],
+            "updated_at_iso": successor["created_at"],
+            "store": self.embedding_store_key,
+        }
+        if "confidence" in self.native_columns:
+            native_values["confidence"] = successor["confidence"]
+        if "last_accessed" in self.native_columns:
+            native_values["last_accessed"] = None
+        native_fields = [field for field in native_values if field in self.native_columns]
+        cursor = self.conn.execute(
+            f"INSERT INTO memories ({','.join(native_fields)}) VALUES ({','.join('?' for _ in native_fields)})",
+            [native_values[field] for field in native_fields],
+        )
+        if cursor.lastrowid is None:
+            raise AdapterError("BACKEND_CORRUPT", "successor native row could not be materialized")
+        self.conn.execute(
+            "INSERT INTO memory_embeddings(rowid,content_embedding,store) VALUES (?,?,?)",
+            (cursor.lastrowid, embedding_row[0], embedding_row[1]),
+        )
+
+    def _resolve_group_sync(
+        self,
+        scope: ScopeContext,
+        *,
+        contradiction_key: str,
+        observed_group_token: str,
+        winner_memory_id: str,
+        winner_record_id: str,
+        winner_expected_revision: int,
+        idempotency_key: str,
+        request_fingerprint: str,
+        request_id: str,
+        reason_code: str,
+        actor_class: str,
+        actor_ref_digest: str | None,
+        grant_ref_digest: str,
+        committed_at: str,
+        candidate_successor: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        assert self.conn is not None
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            replay = self._operation_row_sync(idempotency_key)
+            if replay is not None:
+                if replay["replay_status"] == "RECOVERY_INVALIDATED":
+                    raise AdapterError("RECOVERY_INVALIDATED_REPLAY", "operation replay was invalidated by sensitive Recovery")
+                if replay["request_fingerprint"] != request_fingerprint:
+                    raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to another governed operation")
+                result = self._operation_result(replay, replay=True)
+                self.conn.rollback()
+                return result
+            if self.conn.execute("SELECT 1 FROM adapter_records WHERE idempotency_key=? LIMIT 1", (idempotency_key,)).fetchone():
+                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is already reserved by another write")
+            self._sample_trust_clock_sync(iso_now())
+            self._sample_trust_clock_sync(committed_at)
+            observed = self._group_observation_sync(scope, contradiction_key)
+            if observed["public"]["observed_group_token"] != observed_group_token:
+                raise AdapterError(
+                    "GROUP_VERSION_CONFLICT",
+                    "contradiction group changed after Owner observation",
+                    refetch_required=True,
+                    current_group_token=observed["public"]["observed_group_token"],
+                    member_count=observed["public"]["member_count"],
+                )
+            if any(member["lifecycle_state"] in {"STALE", "QUARANTINED"} for member in observed["server"]["members"]):
+                raise AdapterError("GROUP_MEMBER_NOT_ADMISSIBLE", "group contains a stale or quarantined blocking member")
+            where, params = self._scope_where(scope)
+            winner_row = self.conn.execute(
+                self._select_sql(
+                    f"WHERE a.contradiction_key=? AND a.memory_id=? AND a.record_id=? AND {where} LIMIT 1"
+                ),
+                [contradiction_key, winner_memory_id, winner_record_id, *params],
+            ).fetchone()
+            if winner_row is None:
+                raise AdapterError("INVALID_WINNER", "winner is not a member of the observed contradiction group")
+            winner = self._row_to_dict(winner_row)
+            if int(winner["revision"]) != winner_expected_revision:
+                raise AdapterError("VERSION_CONFLICT", "winner expected_revision no longer matches")
+            if winner["lifecycle_state"] not in {"VALIDATED_CURRENT", "CANDIDATE"}:
+                raise AdapterError("INVALID_WINNER", "winner lifecycle is not admissible")
+            if winner["lifecycle_state"] == "VALIDATED_CURRENT":
+                gate = self._latest_freshness_event_sync(winner_record_id, winner_expected_revision)["freshness_gate_state"]
+                if gate != "NONE":
+                    raise AdapterError("GROUP_MEMBER_NOT_ADMISSIBLE", "freshness-held Current cannot be retained as RESOLVE winner")
+                if candidate_successor is not None:
+                    raise AdapterError("WINNER_PROOF_INVALID", "existing Current winner does not accept candidate verification payload")
+            else:
+                if candidate_successor is None:
+                    raise AdapterError("WINNER_PROOF_REQUIRED", "Candidate RESOLVE winner requires complete fresh verification")
+                if (
+                    candidate_successor.get("memory_id") != winner["memory_id"]
+                    or candidate_successor.get("parent_record_id") != winner["record_id"]
+                    or int(candidate_successor.get("revision", 0)) != int(winner["revision"]) + 1
+                    or candidate_successor.get("contradiction_key") != contradiction_key
+                    or candidate_successor.get("lifecycle_state") != "VALIDATED_CURRENT"
+                    or candidate_successor.get("contradiction_state") != "NONE"
+                ):
+                    raise AdapterError("WINNER_PROOF_INVALID", "Candidate winner successor identity is invalid")
+                for field, value in (
+                    ("scope", scope.scope),
+                    ("project_id", scope.project_id),
+                    ("worktree_id", scope.worktree_id),
+                    ("workflow_id", scope.workflow_id),
+                    ("agent_id", scope.agent_id),
+                ):
+                    if candidate_successor.get(field) != value:
+                        raise AdapterError("WINNER_PROOF_INVALID", "Candidate winner successor changed exact scope")
+            operation_id = str(uuid.uuid4())
+            affected: list[dict[str, Any]] = []
+            event_ids: list[str] = []
+
+            active_rows = [
+                self._row_to_dict(row)
+                for row in self.conn.execute(
+                    self._select_sql(
+                        f"WHERE a.contradiction_key=? AND {where} AND a.lifecycle_state IN ('VALIDATED_CURRENT','CANDIDATE') ORDER BY a.record_id"
+                    ),
+                    [contradiction_key, *params],
+                ).fetchall()
+            ]
+            current_rows = [row for row in active_rows if row["lifecycle_state"] == "VALIDATED_CURRENT"]
+            if len(current_rows) > 1:
+                raise AdapterError("LIFECYCLE_INVARIANT_VIOLATION", "RESOLVE cannot proceed with multiple Current rows")
+            if winner["lifecycle_state"] == "CANDIDATE":
+                assert candidate_successor is not None
+                self._require_transactional_freshness_sync(
+                    candidate_successor,
+                    error_code="WINNER_PROOF_INVALID",
+                    safe_message="Candidate winner verification expired before Current admission",
+                )
+
+            result_record_id = winner["record_id"]
+            result_revision = int(winner["revision"])
+            winner_parent_record_id = winner.get("parent_record_id")
+            if winner["lifecycle_state"] == "CANDIDATE":
+                assert candidate_successor is not None
+                for current in current_rows:
+                    prior_contradiction = current["contradiction_state"]
+                    self.conn.execute(
+                        "UPDATE adapter_records SET lifecycle_state='SUPERSEDED',contradiction_state='RESOLVED' WHERE record_id=?",
+                        (current["record_id"],),
+                    )
+                    event_id = str(uuid.uuid4())
+                    self._insert_lifecycle_event_sync(
+                        event_id=event_id,
+                        operation_id=operation_id,
+                        record=current,
+                        action="RESOLVE_SUPERSEDE_CURRENT",
+                        actor_class=actor_class,
+                        actor_ref_digest=actor_ref_digest,
+                        grant_ref_digest=grant_ref_digest,
+                        occurred_at=committed_at,
+                        prior_lifecycle_state="VALIDATED_CURRENT",
+                        result_lifecycle_state="SUPERSEDED",
+                        prior_contradiction_state=prior_contradiction,
+                        result_contradiction_state="RESOLVED",
+                        reason_code=reason_code,
+                        expected_revision=int(current["revision"]),
+                        result_revision=int(current["revision"]),
+                        related_record_id=candidate_successor["record_id"],
+                        related_memory_id=candidate_successor["memory_id"],
+                    )
+                    event_ids.append(event_id)
+                    affected.append(
+                        {
+                            "memory_id": current["memory_id"],
+                            "record_id": current["record_id"],
+                            "from_lifecycle_state": "VALIDATED_CURRENT",
+                            "to_lifecycle_state": "SUPERSEDED",
+                            "from_contradiction_state": prior_contradiction,
+                            "to_contradiction_state": "RESOLVED",
+                        }
+                    )
+                prior_winner_contradiction = winner["contradiction_state"]
+                self.conn.execute(
+                    "UPDATE adapter_records SET lifecycle_state='SUPERSEDED',contradiction_state='RESOLVED' WHERE record_id=?",
+                    (winner["record_id"],),
+                )
+                self._copy_materialized_successor_sync(winner, candidate_successor)
+                winner_event = str(uuid.uuid4())
+                self._insert_lifecycle_event_sync(
+                    event_id=winner_event,
+                    operation_id=operation_id,
+                    record=winner,
+                    action="RESOLVE_PROMOTE_CANDIDATE",
+                    actor_class=actor_class,
+                    actor_ref_digest=actor_ref_digest,
+                    grant_ref_digest=grant_ref_digest,
+                    occurred_at=committed_at,
+                    prior_lifecycle_state="CANDIDATE",
+                    result_lifecycle_state="SUPERSEDED",
+                    prior_contradiction_state=prior_winner_contradiction,
+                    result_contradiction_state="RESOLVED",
+                    reason_code=reason_code,
+                    expected_revision=int(winner["revision"]),
+                    result_revision=int(candidate_successor["revision"]),
+                    related_record_id=candidate_successor["record_id"],
+                    related_memory_id=candidate_successor["memory_id"],
+                )
+                event_ids.append(winner_event)
+                affected.append(
+                    {
+                        "memory_id": winner["memory_id"],
+                        "record_id": winner["record_id"],
+                        "from_lifecycle_state": "CANDIDATE",
+                        "to_lifecycle_state": "SUPERSEDED",
+                        "from_contradiction_state": prior_winner_contradiction,
+                        "to_contradiction_state": "RESOLVED",
+                    }
+                )
+                result_record_id = candidate_successor["record_id"]
+                result_revision = int(candidate_successor["revision"])
+                winner_parent_record_id = winner["record_id"]
+            else:
+                retain_event = str(uuid.uuid4())
+                self._insert_lifecycle_event_sync(
+                    event_id=retain_event,
+                    operation_id=operation_id,
+                    record=winner,
+                    action="RESOLVE_RETAIN_CURRENT",
+                    actor_class=actor_class,
+                    actor_ref_digest=actor_ref_digest,
+                    grant_ref_digest=grant_ref_digest,
+                    occurred_at=committed_at,
+                    prior_lifecycle_state="VALIDATED_CURRENT",
+                    result_lifecycle_state="VALIDATED_CURRENT",
+                    prior_contradiction_state=winner["contradiction_state"],
+                    result_contradiction_state=winner["contradiction_state"],
+                    reason_code=reason_code,
+                    expected_revision=int(winner["revision"]),
+                    result_revision=int(winner["revision"]),
+                )
+                event_ids.append(retain_event)
+
+            for loser in active_rows:
+                if loser["record_id"] == winner["record_id"] or loser["lifecycle_state"] != "CANDIDATE":
+                    continue
+                prior = loser["contradiction_state"]
+                self.conn.execute(
+                    "UPDATE adapter_records SET lifecycle_state='REJECTED',contradiction_state='RESOLVED' WHERE record_id=?",
+                    (loser["record_id"],),
+                )
+                event_id = str(uuid.uuid4())
+                self._insert_lifecycle_event_sync(
+                    event_id=event_id,
+                    operation_id=operation_id,
+                    record=loser,
+                    action="RESOLVE_REJECT_CANDIDATE",
+                    actor_class=actor_class,
+                    actor_ref_digest=actor_ref_digest,
+                    grant_ref_digest=grant_ref_digest,
+                    occurred_at=committed_at,
+                    prior_lifecycle_state="CANDIDATE",
+                    result_lifecycle_state="REJECTED",
+                    prior_contradiction_state=prior,
+                    result_contradiction_state="RESOLVED",
+                    reason_code=reason_code,
+                    expected_revision=int(loser["revision"]),
+                    result_revision=int(loser["revision"]),
+                    related_record_id=result_record_id,
+                    related_memory_id=winner["memory_id"],
+                )
+                event_ids.append(event_id)
+                affected.append(
+                    {
+                        "memory_id": loser["memory_id"],
+                        "record_id": loser["record_id"],
+                        "from_lifecycle_state": "CANDIDATE",
+                        "to_lifecycle_state": "REJECTED",
+                        "from_contradiction_state": prior,
+                        "to_contradiction_state": "RESOLVED",
+                    }
+                )
+            resulting_group = self._group_observation_sync(scope, contradiction_key)["public"]
+            self.conn.execute(
+                "INSERT INTO lifecycle_operations("
+                "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,actor_ref_digest,"
+                "grant_ref_digest,scope_digest,target_memory_id,target_record_id,winner_memory_id,winner_record_id,"
+                "winner_parent_record_id,result_record_id,result_revision,result_lifecycle_state,result_contradiction_state,"
+                "affected_members_json,event_ids_json,result_group_token,result_group_count,replay_status,commit_timestamp"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    idempotency_key,
+                    request_fingerprint,
+                    operation_id,
+                    request_id,
+                    "RESOLVE",
+                    actor_class,
+                    actor_ref_digest,
+                    grant_ref_digest,
+                    hashlib.sha256(scope.key().encode("utf-8")).hexdigest(),
+                    winner_memory_id,
+                    winner_record_id,
+                    winner_memory_id,
+                    winner_record_id,
+                    winner_parent_record_id,
+                    result_record_id,
+                    result_revision,
+                    "VALIDATED_CURRENT",
+                    "NONE",
+                    canonical_json(affected),
+                    canonical_json(event_ids),
+                    resulting_group["observed_group_token"],
+                    resulting_group["member_count"],
+                    "COMMITTED",
+                    committed_at,
+                ),
+            )
+            operation = self._operation_row_sync(idempotency_key)
+            assert operation is not None
+            self.conn.commit()
+            return self._operation_result(operation, replay=False)
+        except BaseException:
+            self.conn.rollback()
+            raise
+
+    async def resolve_group(self, scope: ScopeContext, **values: Any) -> dict[str, Any]:
+        return await self._run(lambda: self._resolve_group_sync(scope, **values))
+
+    def _require_transactional_freshness_sync(
+        self,
+        record: dict[str, Any],
+        *,
+        error_code: str,
+        safe_message: str,
+    ) -> None:
+        """Recheck Current-admission freshness at the serialized write boundary."""
+        assert self.conn is not None
+        _, effective_now = self._sample_trust_clock_sync(iso_now())
+        if is_fresh(
+            record["freshness_policy"],
+            record.get("last_verified_at"),
+            record["source_provenance"],
+            now=parse_iso(effective_now, required=True),
+        ):
+            return
+        # No lifecycle/native/vector/adjudication write is allowed before this
+        # point. Preserve only the monotonic trust-clock safety observation so a
+        # later wall-clock rollback cannot resurrect proof already seen expired.
+        self.conn.commit()
+        raise AdapterError(error_code, safe_message)
+
+    def _sample_trust_clock_sync(self, sampled_at: str) -> tuple[bool, str]:
+        """Return clock health and monotonically maintain the durable audit high-water mark."""
+        assert self.conn is not None
+        sample = parse_iso(sampled_at, required=True)
+        row = self.conn.execute(
+            "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+        ).fetchone()
+        highwater_text = str(row[0]) if row is not None else "1970-01-01T00:00:00Z"
+        highwater = parse_iso(highwater_text, required=True)
+        healthy = sample >= highwater
+        if sample > highwater:
+            self.conn.execute(
+                "INSERT INTO adapter_meta(key,value) VALUES ('trust_clock_high_water_at',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (sampled_at,),
+            )
+            highwater_text = sampled_at
+        return healthy, highwater_text
+
+    def _insert_manual_recheck_operation_sync(
+        self,
+        *,
+        idempotency_key: str,
+        request_fingerprint: str,
+        operation_id: str,
+        request_id: str,
+        actor_class: str,
+        actor_ref_digest: str | None,
+        grant_ref_digest: str,
+        scope: ScopeContext,
+        target: dict[str, Any],
+        outcome: str | None,
+        event_ids: list[str],
+        result_record_id: str | None,
+        result_revision: int | None,
+        result_group_token: str | None,
+        result_group_count: int | None,
+        replay_status: str,
+        accepted_at: str,
+        observed_at: str,
+        decision_error: str | None,
+        accepted_event_freshness_generation: int | None,
+        resulting_member_freshness_generation: int | None,
+    ) -> None:
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT INTO lifecycle_operations("
+            "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,actor_ref_digest,"
+            "grant_ref_digest,scope_digest,target_memory_id,target_record_id,result_record_id,"
+            "result_revision,result_lifecycle_state,result_outcome,observed_at,affected_members_json,event_ids_json,"
+            "result_group_token,result_group_count,replay_status,commit_timestamp,decision_error,decision_at,"
+            "accepted_event_freshness_generation,resulting_member_freshness_generation"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                idempotency_key,
+                request_fingerprint,
+                operation_id,
+                request_id,
+                "MANUAL_RECHECK",
+                actor_class,
+                actor_ref_digest,
+                grant_ref_digest,
+                hashlib.sha256(scope.key().encode("utf-8")).hexdigest(),
+                target["memory_id"],
+                target["record_id"],
+                result_record_id,
+                result_revision,
+                target["lifecycle_state"] if result_record_id == target["record_id"] else "VALIDATED_CURRENT" if result_record_id else None,
+                outcome,
+                observed_at,
+                "[]",
+                canonical_json(event_ids),
+                result_group_token,
+                result_group_count,
+                replay_status,
+                accepted_at,
+                decision_error,
+                accepted_at if decision_error else None,
+                accepted_event_freshness_generation,
+                resulting_member_freshness_generation,
+            ),
+        )
+
+    def _manual_recheck_sync(
+        self,
+        scope: ScopeContext,
+        *,
+        memory_id: str,
+        expected_record_id: str,
+        expected_revision: int,
+        observed_group_token: str,
+        idempotency_key: str,
+        request_fingerprint: str,
+        request_id: str,
+        claim: str,
+        recheck_ref: str,
+        observed_at: str,
+        observed_source_hash: str | None,
+        evidence_ref_digest: str | None,
+        method: str,
+        actor_class: str,
+        actor_ref_digest: str | None,
+        grant_ref_digest: str,
+    ) -> dict[str, Any]:
+        assert self.conn is not None
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            replay = self._operation_row_sync(idempotency_key)
+            if replay is not None:
+                if replay["replay_status"] == "RECOVERY_INVALIDATED":
+                    raise AdapterError("RECOVERY_INVALIDATED_REPLAY", "operation replay was invalidated by sensitive Recovery")
+                if replay["request_fingerprint"] != request_fingerprint:
+                    raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to another governed operation")
+                result = self._operation_result(replay, replay=True)
+                self.conn.rollback()
+                return result
+            if self.conn.execute("SELECT 1 FROM adapter_records WHERE idempotency_key=? LIMIT 1", (idempotency_key,)).fetchone():
+                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is already reserved by another write")
+            where, params = self._scope_where(scope)
+            row = self.conn.execute(
+                self._select_sql(
+                    f"WHERE a.memory_id=? AND a.record_id=? AND a.lifecycle_state='VALIDATED_CURRENT' AND {where} LIMIT 1"
+                ),
+                [memory_id, expected_record_id, *params],
+            ).fetchone()
+            if row is None:
+                raise AdapterError("VERSION_CONFLICT", "manual recheck target is no longer the exact Current revision")
+            target = self._row_to_dict(row)
+            if int(target["revision"]) != expected_revision:
+                raise AdapterError("VERSION_CONFLICT", "manual recheck expected_revision no longer matches")
+            observed_group = self._group_observation_sync(scope, target["contradiction_key"])
+            if observed_group["public"]["observed_group_token"] != observed_group_token:
+                raise AdapterError(
+                    "GROUP_VERSION_CONFLICT",
+                    "contradiction group changed after Owner observation",
+                    refetch_required=True,
+                    current_group_token=observed_group["public"]["observed_group_token"],
+                )
+            freshness = json.loads(target["freshness_policy"])
+            provenance = json.loads(target["source_provenance"])
+            if freshness.get("kind") != "on_change":
+                raise AdapterError("NOT_ON_CHANGE", "manual recheck requires an on_change Current")
+            if freshness.get("recheck_ref") != recheck_ref:
+                raise AdapterError("EVIDENCE_BINDING_MISMATCH", "recheck_ref does not match the Current policy")
+            if freshness.get("source_fingerprint") != provenance.get("source_hash"):
+                raise AdapterError("EVIDENCE_BINDING_MISMATCH", "stored source fingerprint no longer matches Current provenance")
+            observed_dt = parse_iso(observed_at, required=True)
+            last_verified_dt = parse_iso(target["last_verified_at"], required=True)
+            latest_observation = self.conn.execute(
+                "SELECT observed_at FROM lifecycle_events WHERE target_record_id=? AND target_revision=? "
+                "AND freshness_generation IS NOT NULL AND observed_at IS NOT NULL "
+                "ORDER BY freshness_generation DESC LIMIT 1",
+                (target["record_id"], int(target["revision"])),
+            ).fetchone()
+            latest_dt = parse_iso(str(latest_observation[0]), required=True) if latest_observation else last_verified_dt
+            if observed_dt <= last_verified_dt or observed_dt <= latest_dt:
+                raise AdapterError("EVIDENCE_STALE", "observed_at is not newer than accepted verification/recheck evidence")
+            accepted_at = iso_now()
+            accepted_dt = parse_iso(accepted_at, required=True)
+            clock_healthy, _ = self._sample_trust_clock_sync(accepted_at)
+            delta_seconds = (accepted_dt - observed_dt).total_seconds()
+            if claim == "OBSERVED_HASH":
+                if not isinstance(observed_source_hash, str) or len(observed_source_hash) != 64:
+                    raise AdapterError("EVIDENCE_INVALID", "OBSERVED_HASH requires a SHA-256 observed_source_hash")
+                outcome = "UNCHANGED" if observed_source_hash.lower() == str(provenance.get("source_hash", "")).lower() else "CHANGED"
+            elif claim in {"UNAVAILABLE", "INDETERMINATE"}:
+                if observed_source_hash is not None:
+                    raise AdapterError("EVIDENCE_INVALID", f"{claim} must not include observed_source_hash")
+                outcome = claim
+            else:
+                raise AdapterError("EVIDENCE_INVALID", "manual recheck claim is invalid")
+            operation_id = str(uuid.uuid4())
+
+            def durable_reject(error: str) -> dict[str, Any]:
+                self._insert_manual_recheck_operation_sync(
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=request_fingerprint,
+                    operation_id=operation_id,
+                    request_id=request_id,
+                    actor_class=actor_class,
+                    actor_ref_digest=actor_ref_digest,
+                    grant_ref_digest=grant_ref_digest,
+                    scope=scope,
+                    target=target,
+                    outcome=None,
+                    event_ids=[],
+                    result_record_id=None,
+                    result_revision=None,
+                    result_group_token=None,
+                    result_group_count=None,
+                    replay_status="BLOCKED",
+                    accepted_at=accepted_at,
+                    observed_at=observed_at,
+                    decision_error=error,
+                    accepted_event_freshness_generation=None,
+                    resulting_member_freshness_generation=None,
+                )
+                op = self._operation_row_sync(idempotency_key)
+                assert op is not None
+                self.conn.commit()
+                return self._operation_result(op, replay=False)
+
+            if outcome == "UNCHANGED":
+                if clock_healthy and delta_seconds < -MAX_FUTURE_EVIDENCE_SKEW_SECONDS:
+                    raise AdapterError("EVIDENCE_INVALID", "observed_at exceeds the healthy-clock future-skew bound")
+                if not clock_healthy:
+                    return durable_reject("TRUST_CLOCK_UNRELIABLE")
+                if delta_seconds < 0:
+                    return durable_reject("EVIDENCE_NOT_YET_OBSERVED")
+                if delta_seconds > MAX_TRUST_RENEWAL_EVIDENCE_AGE_SECONDS:
+                    return durable_reject("EVIDENCE_TOO_OLD_FOR_TRUST_RENEWAL")
+            elif clock_healthy and delta_seconds < -MAX_FUTURE_EVIDENCE_SKEW_SECONDS:
+                raise AdapterError("EVIDENCE_INVALID", "adverse observed_at exceeds the healthy-clock future-skew bound")
+
+            generation_row = self.conn.execute(
+                "SELECT MAX(freshness_generation) FROM lifecycle_events WHERE target_record_id=? AND target_revision=?",
+                (target["record_id"], int(target["revision"])),
+            ).fetchone()
+            latest_generation = int(generation_row[0] or 0)
+            if latest_generation >= 9_223_372_036_854_775_807:
+                raise AdapterError("FRESHNESS_SEQUENCE_EXHAUSTED", "freshness generation cannot be incremented")
+            generation = latest_generation + 1
+            clock_anomaly = "NONE" if clock_healthy or delta_seconds >= -MAX_FUTURE_EVIDENCE_SKEW_SECONDS else "CLOCK_UNTRUSTED_TIME"
+            event_id = str(uuid.uuid4())
+            result_record_id = target["record_id"]
+            result_revision = int(target["revision"])
+            resulting_member_generation = generation
+            if outcome == "UNCHANGED":
+                successor_id = str(uuid.uuid4())
+                successor = dict(target)
+                successor.update(
+                    {
+                        "record_id": successor_id,
+                        "revision": int(target["revision"]) + 1,
+                        "parent_record_id": target["record_id"],
+                        "created_at": accepted_at,
+                        "last_verified_at": observed_at,
+                        "verified_by": "OWNER",
+                        "lifecycle_state": "VALIDATED_CURRENT",
+                        "contradiction_state": target["contradiction_state"],
+                        "native_content_hash": native_hash(scope, target["fact"], revision_key=successor_id),
+                        "payload_fingerprint": request_fingerprint,
+                        "idempotency_key": f"internal-recheck-{operation_id}",
+                    }
+                )
+                successor_provenance = dict(provenance)
+                if evidence_ref_digest is not None:
+                    successor_provenance["review_ref"] = f"evidence:{evidence_ref_digest[:24]}"
+                successor_provenance["extraction_method"] = method
+                successor["source_provenance"] = successor_provenance
+                self.conn.execute(
+                    "UPDATE adapter_records SET lifecycle_state='SUPERSEDED' WHERE record_id=?",
+                    (target["record_id"],),
+                )
+                self._copy_materialized_successor_sync(target, successor)
+                if "superseded_by" in self.native_columns:
+                    self.conn.execute(
+                        "UPDATE memories SET superseded_by=? WHERE content_hash=?",
+                        (successor["native_content_hash"], target["native_content_hash"]),
+                    )
+                result_record_id = successor_id
+                result_revision = int(successor["revision"])
+                resulting_member_generation = 0
+            self._insert_lifecycle_event_sync(
+                event_id=event_id,
+                operation_id=operation_id,
+                record=target,
+                action="MANUAL_RECHECK",
+                actor_class=actor_class,
+                actor_ref_digest=actor_ref_digest,
+                grant_ref_digest=grant_ref_digest,
+                occurred_at=accepted_at,
+                prior_lifecycle_state="VALIDATED_CURRENT",
+                result_lifecycle_state="SUPERSEDED" if outcome == "UNCHANGED" else "VALIDATED_CURRENT",
+                prior_contradiction_state=target["contradiction_state"],
+                result_contradiction_state=target["contradiction_state"],
+                expected_revision=expected_revision,
+                result_revision=result_revision,
+                related_record_id=result_record_id if result_record_id != target["record_id"] else None,
+                related_memory_id=memory_id,
+                freshness_outcome=outcome,
+                observation_origin="OWNER_SUPPLIED",
+                observed_at=observed_at,
+                accepted_at=accepted_at,
+                evidence_ref_digest=evidence_ref_digest,
+                freshness_generation=generation,
+                clock_anomaly=clock_anomaly,
+            )
+            resulting_group = self._group_observation_sync(scope, target["contradiction_key"])["public"]
+            self._insert_manual_recheck_operation_sync(
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+                operation_id=operation_id,
+                request_id=request_id,
+                actor_class=actor_class,
+                actor_ref_digest=actor_ref_digest,
+                grant_ref_digest=grant_ref_digest,
+                scope=scope,
+                target=target,
+                outcome=outcome,
+                event_ids=[event_id],
+                result_record_id=result_record_id,
+                result_revision=result_revision,
+                result_group_token=resulting_group["observed_group_token"],
+                result_group_count=resulting_group["member_count"],
+                replay_status="COMMITTED",
+                accepted_at=accepted_at,
+                observed_at=observed_at,
+                decision_error=None,
+                accepted_event_freshness_generation=generation,
+                resulting_member_freshness_generation=resulting_member_generation,
+            )
+            operation = self._operation_row_sync(idempotency_key)
+            assert operation is not None
+            self.conn.commit()
+            return self._operation_result(operation, replay=False)
+        except BaseException:
+            self.conn.rollback()
+            raise
+
+    async def manual_recheck(self, scope: ScopeContext, **values: Any) -> dict[str, Any]:
+        return await self._run(lambda: self._manual_recheck_sync(scope, **values))
+
+    def _readmit_sync(
+        self,
+        scope: ScopeContext,
+        *,
+        memory_id: str,
+        revoked_record_id: str,
+        expected_revoked_revision: int,
+        observed_group_token: str,
+        idempotency_key: str,
+        request_fingerprint: str,
+        request_id: str,
+        verified_successor: dict[str, Any],
+        actor_class: str,
+        actor_ref_digest: str | None,
+        grant_ref_digest: str,
+        committed_at: str,
+    ) -> dict[str, Any]:
+        assert self.conn is not None
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            replay = self._operation_row_sync(idempotency_key)
+            if replay is not None:
+                if replay["replay_status"] == "RECOVERY_INVALIDATED":
+                    raise AdapterError("RECOVERY_INVALIDATED_REPLAY", "operation replay was invalidated by sensitive Recovery")
+                if replay["request_fingerprint"] != request_fingerprint:
+                    raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to another governed operation")
+                result = self._operation_result(replay, replay=True)
+                self.conn.rollback()
+                return result
+            if self.conn.execute("SELECT 1 FROM adapter_records WHERE idempotency_key=? LIMIT 1", (idempotency_key,)).fetchone():
+                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is already reserved by another write")
+
+            self._sample_trust_clock_sync(iso_now())
+            self._sample_trust_clock_sync(committed_at)
+
+            where, params = self._scope_where(scope)
+            target_row = self.conn.execute(
+                self._select_sql(f"WHERE a.memory_id=? AND a.record_id=? AND {where} LIMIT 1"),
+                [memory_id, revoked_record_id, *params],
+            ).fetchone()
+            if target_row is None:
+                outside = self.conn.execute(
+                    f"SELECT 1 FROM adapter_records a WHERE a.memory_id=? AND NOT ({where}) LIMIT 1",
+                    [memory_id, *params],
+                ).fetchone()
+                if outside is not None:
+                    raise AdapterError("CROSS_SCOPE_DENIED", "readmit target exists outside the requested scope")
+                raise AdapterError("NOT_REVOKED", "readmit target was not found")
+            target = self._row_to_dict(target_row)
+            if target["lifecycle_state"] == "QUARANTINED":
+                raise AdapterError("READMIT_RECOVERY_PURGED_DENIED", "Recovery-quarantined target cannot be readmitted")
+            if target["lifecycle_state"] != "REVOKED":
+                raise AdapterError("NOT_REVOKED", "readmit target is not REVOKED")
+            if int(target["revision"]) != expected_revoked_revision:
+                raise AdapterError("VERSION_CONFLICT", "readmit expected_revoked_revision no longer matches")
+
+            lineage_rows = [
+                self._row_to_dict(row)
+                for row in self.conn.execute(
+                    self._select_sql("WHERE a.memory_id=? ORDER BY a.revision,a.created_at,a.record_id"),
+                    (memory_id,),
+                ).fetchall()
+            ]
+            higher = [row for row in lineage_rows if int(row["revision"]) > expected_revoked_revision]
+            # Parent linkage is global: REPLACE may create a successor with a
+            # different memory_id. Same-memory lineage alone is insufficient.
+            direct_children = [
+                self._row_to_dict(row)
+                for row in self.conn.execute(
+                    self._select_sql("WHERE a.parent_record_id=? ORDER BY a.record_id"),
+                    (revoked_record_id,),
+                ).fetchall()
+            ]
+            if higher or direct_children:
+                if any(row["lifecycle_state"] == "QUARANTINED" for row in [*higher, *direct_children]):
+                    raise AdapterError(
+                        "READMIT_RECOVERY_PURGED_DENIED",
+                        "Recovery-quarantined descendant permanently blocks older revoked readmission",
+                    )
+                raise AdapterError("LINEAGE_CHANGED", "revoked target is no longer the unique latest lineage tip")
+            latest_revision = max(int(row["revision"]) for row in lineage_rows)
+            if latest_revision != expected_revoked_revision:
+                raise AdapterError("LINEAGE_CHANGED", "revoked target is not the unique latest lineage tip")
+
+            observed = self._group_observation_sync(scope, target["contradiction_key"])
+            if observed["public"]["observed_group_token"] != observed_group_token:
+                raise AdapterError(
+                    "GROUP_VERSION_CONFLICT",
+                    "contradiction group changed after Owner observation",
+                    refetch_required=True,
+                    current_group_token=observed["public"]["observed_group_token"],
+                )
+            if any(
+                member["lifecycle_state"] in {"STALE", "QUARANTINED"}
+                or (member["lifecycle_state"] == "VALIDATED_CURRENT" and member["freshness_gate_state"] != "NONE")
+                for member in observed["server"]["members"]
+            ):
+                raise AdapterError("GROUP_MEMBER_NOT_ADMISSIBLE", "blocking group member prevents readmission")
+
+            if (
+                verified_successor.get("memory_id") != memory_id
+                or verified_successor.get("parent_record_id") != revoked_record_id
+                or int(verified_successor.get("revision", 0)) != expected_revoked_revision + 1
+                or verified_successor.get("memory_type") != target["memory_type"]
+                or verified_successor.get("contradiction_key") != target["contradiction_key"]
+                or self._normalized_fact(str(verified_successor.get("fact", "")))
+                != self._normalized_fact(target["fact"])
+            ):
+                raise AdapterError("SEMANTIC_IDENTITY_MISMATCH", "readmit successor changes logical/semantic identity")
+            for field, value in (
+                ("scope", scope.scope),
+                ("project_id", scope.project_id),
+                ("worktree_id", scope.worktree_id),
+                ("workflow_id", scope.workflow_id),
+                ("agent_id", scope.agent_id),
+            ):
+                if verified_successor.get(field) != value:
+                    raise AdapterError("SEMANTIC_IDENTITY_MISMATCH", "readmit successor changes exact scope")
+            if verified_successor.get("verified_by") != "OWNER":
+                raise AdapterError("VERIFICATION_REQUIRED", "readmit requires fresh Owner verification")
+            parse_iso(verified_successor.get("source_timestamp"), required=True)
+            parse_iso(verified_successor.get("last_verified_at"), required=True)
+            native = self.conn.execute(
+                "SELECT id FROM memories WHERE content_hash=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
+                (target["native_content_hash"],),
+            ).fetchone()
+            if native is None:
+                raise AdapterError("READMIT_RECOVERY_PURGED_DENIED", "readmit target payload was physically purged")
+            self._require_transactional_freshness_sync(
+                verified_successor,
+                error_code="VERIFICATION_REQUIRED",
+                safe_message="readmit verification expired before Current admission",
+            )
+
+            active_rows = [
+                self._row_to_dict(row)
+                for row in self.conn.execute(
+                    self._select_sql(
+                        f"WHERE a.contradiction_key=? AND {where} "
+                        "AND a.lifecycle_state IN ('VALIDATED_CURRENT','CANDIDATE','STALE','QUARANTINED') "
+                        "ORDER BY a.record_id"
+                    ),
+                    [target["contradiction_key"], *params],
+                ).fetchall()
+            ]
+            target_fact = self._normalized_fact(target["fact"])
+            equivalent_current = next(
+                (
+                    row for row in active_rows
+                    if row["lifecycle_state"] == "VALIDATED_CURRENT"
+                    and self._normalized_fact(row["fact"]) == target_fact
+                ),
+                None,
+            )
+            equivalent_candidate = next(
+                (
+                    row for row in active_rows
+                    if row["lifecycle_state"] == "CANDIDATE"
+                    and self._normalized_fact(row["fact"]) == target_fact
+                ),
+                None,
+            )
+            operation_id = str(uuid.uuid4())
+            event_ids: list[str] = []
+            result_status = "OK"
+            result_record_id: str | None = None
+            result_revision: int | None = None
+            result_lifecycle: str | None = None
+            result_contradiction: str | None = None
+
+            if equivalent_current is not None:
+                result_status = "ALREADY_CURRENT_EQUIVALENT"
+            elif equivalent_candidate is not None:
+                result_status = "ALREADY_CANDIDATE_EQUIVALENT"
+            else:
+                incompatible = [row for row in active_rows if self._normalized_fact(row["fact"]) != target_fact]
+                successor = dict(verified_successor)
+                if incompatible:
+                    successor["lifecycle_state"] = "CANDIDATE"
+                    successor["contradiction_state"] = "UNRESOLVED"
+                    successor["authority_role"] = "UNRESOLVED"
+                    result_lifecycle = "CANDIDATE"
+                    result_contradiction = "UNRESOLVED"
+                else:
+                    successor["lifecycle_state"] = "VALIDATED_CURRENT"
+                    successor["contradiction_state"] = "NONE"
+                    result_lifecycle = "VALIDATED_CURRENT"
+                    result_contradiction = "NONE"
+                self._copy_materialized_successor_sync(target, successor)
+                result_record_id = str(successor["record_id"])
+                result_revision = int(successor["revision"])
+                event_id = str(uuid.uuid4())
+                self._insert_lifecycle_event_sync(
+                    event_id=event_id,
+                    operation_id=operation_id,
+                    record=target,
+                    action="READMIT",
+                    actor_class=actor_class,
+                    actor_ref_digest=actor_ref_digest,
+                    grant_ref_digest=grant_ref_digest,
+                    occurred_at=committed_at,
+                    prior_lifecycle_state="REVOKED",
+                    result_lifecycle_state=result_lifecycle,
+                    prior_contradiction_state=target["contradiction_state"],
+                    result_contradiction_state=result_contradiction,
+                    expected_revision=expected_revoked_revision,
+                    result_revision=result_revision,
+                    related_record_id=result_record_id,
+                    related_memory_id=memory_id,
+                )
+                event_ids.append(event_id)
+                if result_lifecycle == "CANDIDATE":
+                    _, recompute_events = self._recompute_candidate_contradictions_sync(
+                        scope,
+                        target["contradiction_key"],
+                        operation_id=operation_id,
+                        actor_class=actor_class,
+                        actor_ref_digest=actor_ref_digest,
+                        grant_ref_digest=grant_ref_digest,
+                        occurred_at=committed_at,
+                    )
+                    event_ids.extend(recompute_events)
+
+            resulting_group = self._group_observation_sync(scope, target["contradiction_key"])["public"]
+            self.conn.execute(
+                "INSERT INTO lifecycle_operations("
+                "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,actor_ref_digest,"
+                "grant_ref_digest,scope_digest,target_memory_id,target_record_id,result_record_id,result_revision,"
+                "result_lifecycle_state,result_contradiction_state,result_outcome,affected_members_json,event_ids_json,"
+                "result_group_token,result_group_count,replay_status,commit_timestamp"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    idempotency_key,
+                    request_fingerprint,
+                    operation_id,
+                    request_id,
+                    "READMIT",
+                    actor_class,
+                    actor_ref_digest,
+                    grant_ref_digest,
+                    hashlib.sha256(scope.key().encode("utf-8")).hexdigest(),
+                    memory_id,
+                    revoked_record_id,
+                    result_record_id,
+                    result_revision,
+                    result_lifecycle,
+                    result_contradiction,
+                    result_status,
+                    "[]",
+                    canonical_json(event_ids),
+                    resulting_group["observed_group_token"],
+                    resulting_group["member_count"],
+                    "COMMITTED",
+                    committed_at,
+                ),
+            )
+            operation = self._operation_row_sync(idempotency_key)
+            assert operation is not None
+            self.conn.commit()
+            return self._operation_result(operation, replay=False)
+        except BaseException:
+            self.conn.rollback()
+            raise
+
+    async def readmit(self, scope: ScopeContext, **values: Any) -> dict[str, Any]:
+        return await self._run(lambda: self._readmit_sync(scope, **values))
+
     def _insert_materialized_record(self, record: dict[str, Any], embedding: list[float]) -> None:
         """Insert one adapter/native/vector record inside an existing transaction."""
         assert self.conn is not None
@@ -973,6 +3053,8 @@ class SQLiteVecEngine:
         record: dict[str, Any],
         embedding: list[float],
         supersede_record_id: str | None = None,
+        *,
+        observed_group_token: str | None = None,
     ) -> None:
         self.require_embedding_compatibility()
         def transaction() -> None:
@@ -980,6 +3062,13 @@ class SQLiteVecEngine:
             now = time.time()
             self.conn.execute("BEGIN IMMEDIATE")
             try:
+                owner = self._idempotency_owner_sync(str(record["idempotency_key"]))
+                if owner == "operation":
+                    raise RecordUniquenessConflict("global_idempotency")
+                if owner == "adapter":
+                    raise RecordUniquenessConflict("idempotency_key")
+                self._sample_trust_clock_sync(iso_now())
+                self._sample_trust_clock_sync(str(record["created_at"]))
                 _validate_current_authority_metadata(record)
                 if supersede_record_id is None and (
                     record.get("revision") != 1
@@ -1002,7 +3091,7 @@ class SQLiteVecEngine:
                 if supersede_record_id is not None:
                     old = self.conn.execute(
                         "SELECT native_content_hash, lifecycle_state,scope,project_id,worktree_id,workflow_id,agent_id,"
-                        "memory_id,revision,contradiction_state "
+                        "memory_id,revision,contradiction_state,contradiction_key "
                         "FROM adapter_records WHERE record_id = ?",
                         (supersede_record_id,),
                     ).fetchone()
@@ -1011,6 +3100,15 @@ class SQLiteVecEngine:
                             "VERSION_CONFLICT",
                             "expected revision is no longer the current lineage parent",
                         )
+                    if observed_group_token is not None:
+                        exact_scope = ScopeContext(
+                            str(old[2]),
+                            old[3],
+                            old[4],
+                            old[5],
+                            old[6],
+                        )
+                        self._require_group_token_sync(exact_scope, str(old[10]), observed_group_token)
                     if record.get("parent_record_id") != supersede_record_id:
                         raise AdapterError("VERSION_CONFLICT", "update lineage parent does not match expected revision")
                     if (
@@ -1170,6 +3268,8 @@ class SQLiteVecEngine:
             except sqlite3.IntegrityError as exc:
                 self.conn.rollback()
                 message = str(exc)
+                if "FACTLANE_GLOBAL_IDEMPOTENCY_CONFLICT" in message:
+                    raise RecordUniquenessConflict("global_idempotency") from None
                 if "adapter_records.native_content_hash" in message:
                     raise RecordUniquenessConflict("native_content_hash") from None
                 if "adapter_records.idempotency_key" in message:
@@ -1189,6 +3289,7 @@ class SQLiteVecEngine:
         *,
         expected_record_id: str,
         expected_revision: int,
+        observed_group_token: str | None = None,
     ) -> dict[str, Any] | None:
         """Atomically promote one exact Candidate lineage parent to validated current."""
         self.require_embedding_compatibility()
@@ -1198,6 +3299,15 @@ class SQLiteVecEngine:
             assert self.conn is not None
             self.conn.execute("BEGIN IMMEDIATE")
             try:
+                if self._operation_row_sync(str(record["idempotency_key"])) is not None:
+                    raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by another governed write")
+                if self.conn.execute(
+                    "SELECT 1 FROM adapter_records WHERE idempotency_key=? LIMIT 1",
+                    (record["idempotency_key"],),
+                ).fetchone():
+                    raise RecordUniquenessConflict("idempotency_key")
+                self._sample_trust_clock_sync(iso_now())
+                self._sample_trust_clock_sync(str(record["created_at"]))
                 _validate_current_authority_metadata(record)
                 parent_row = self.conn.execute(
                     self._select_sql(
@@ -1209,6 +3319,8 @@ class SQLiteVecEngine:
                 if parent_row is None:
                     raise AdapterError("VERSION_CONFLICT", "candidate lineage parent no longer matches expected record and revision")
                 parent = self._row_to_dict(parent_row)
+                if observed_group_token is not None:
+                    self._require_group_token_sync(scope, parent["contradiction_key"], observed_group_token)
                 if parent["contradiction_state"] in {"UNRESOLVED", "QUARANTINED"}:
                     raise AdapterError("CONTRADICTION", "candidate has an unresolved contradiction and cannot be promoted")
                 if record.get("parent_record_id") != expected_record_id or record.get("revision") != expected_revision + 1:
@@ -1227,23 +3339,38 @@ class SQLiteVecEngine:
                         "INVALID_ENVELOPE",
                         "candidate REVERIFY successor cannot change logical or contradiction identity",
                     )
-
                 _validate_cross_project_storage_semantics(record)
                 _validate_current_contradiction_state(record)
 
-                current_rows = self.conn.execute(
+                state_marks = ",".join("?" for _ in _GOVERNANCE_ACTIVE_STATES)
+                active_rows = self.conn.execute(
                     self._select_sql(
-                        f"WHERE a.contradiction_key=? AND a.lifecycle_state='VALIDATED_CURRENT' AND {where} "
+                        f"WHERE a.contradiction_key=? AND a.lifecycle_state IN ({state_marks}) AND {where} "
                         "ORDER BY a.created_at, a.record_id"
                     ),
-                    [parent["contradiction_key"], *params],
+                    [parent["contradiction_key"], *sorted(_GOVERNANCE_ACTIVE_STATES), *params],
                 ).fetchall()
-                for current_row in current_rows:
-                    current = self._row_to_dict(current_row)
-                    if " ".join(current["fact"].casefold().split()) == " ".join(parent["fact"].casefold().split()):
-                        self.conn.commit()
-                        return current
-                    raise AdapterError("CONTRADICTION", "a different validated current fact already exists for this contradiction key")
+                equivalent_current: dict[str, Any] | None = None
+                parent_fact = self._normalized_fact(parent["fact"])
+                for active_row in active_rows:
+                    peer = self._row_to_dict(active_row)
+                    if peer["record_id"] == parent["record_id"]:
+                        continue
+                    if self._normalized_fact(peer["fact"]) != parent_fact:
+                        if peer["lifecycle_state"] in {"STALE", "QUARANTINED"}:
+                            raise AdapterError(
+                                "GROUP_MEMBER_NOT_ADMISSIBLE",
+                                "an incompatible stale or quarantined group member blocks Candidate promotion",
+                            )
+                        raise AdapterError(
+                            "CONTRADICTION",
+                            "an incompatible governance-active peer blocks Candidate promotion",
+                        )
+                    if peer["lifecycle_state"] == "VALIDATED_CURRENT":
+                        equivalent_current = peer
+                if equivalent_current is not None:
+                    self.conn.commit()
+                    return equivalent_current
 
                 self._insert_materialized_record(record, embedding)
                 updated = self.conn.execute(
@@ -1667,7 +3794,19 @@ class SQLiteVecEngine:
 
         def query() -> dict[str, Any]:
             assert self.conn is not None
-            counts = {state: 0 for state in ("CANDIDATE", "VALIDATED_CURRENT", "SUPERSEDED", "STALE", "QUARANTINED", "HISTORICAL")}
+            counts = {
+                state: 0
+                for state in (
+                    "CANDIDATE",
+                    "VALIDATED_CURRENT",
+                    "SUPERSEDED",
+                    "STALE",
+                    "QUARANTINED",
+                    "HISTORICAL",
+                    "REVOKED",
+                    "REJECTED",
+                )
+            }
             rows = self.conn.execute(
                 f"SELECT lifecycle_state, COUNT(*) FROM adapter_records a {suffix} GROUP BY lifecycle_state",
                 params,

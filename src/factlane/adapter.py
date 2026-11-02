@@ -91,6 +91,10 @@ _VERIFICATION_FIELDS = frozenset(
     }
 )
 _REPLACEMENT_FIELDS = _VERIFICATION_FIELDS | frozenset({"fact"})
+_REVOKE_REASON_CODES = frozenset({"INCORRECT", "OUTDATED", "WITHDRAWN", "POLICY_REVOKED"})
+_REJECT_REASON_CODES = frozenset(
+    {"INCORRECT", "DUPLICATE", "CONTRADICTED", "INSUFFICIENT_EVIDENCE", "POLICY_REJECTED"}
+)
 _UNSET = object()
 
 
@@ -569,7 +573,8 @@ class MemoryAdapter:
         "memory_update": frozenset(
             {
                 "memory_id", "expected_record_id", "scope", "project_id", "worktree_id", "workflow_id", "agent_id",
-                "expected_revision", "mode", "idempotency_key", "replacement", "verification", "request_id",
+                "expected_revision", "mode", "idempotency_key", "observed_group_token", "reason_code",
+                "replacement", "verification", "request_id",
             }
         ),
         "memory_status": frozenset({"scope", "project_id", "worktree_id", "workflow_id", "agent_id", "request_id"}),
@@ -902,6 +907,13 @@ class MemoryAdapter:
             if context.max_lifecycle != CURRENT_LIFECYCLE:
                 raise AdapterError("WRITE_AUTHORIZATION_DENIED", "trusted write context cannot update validated current authority")
             mode = effective.get("mode")
+            if mode in {"REVOKE", "REJECT"}:
+                if context.authorization_class != "DIRECT_OWNER_OPERATOR":
+                    raise AdapterError(
+                        "WRITE_AUTHORIZATION_DENIED",
+                        "terminal lifecycle disposition requires direct Owner operator authority",
+                    )
+                return effective
             payload_key = "verification" if mode == "REVERIFY" else "replacement"
             payload = dict(effective.get(payload_key) or {})
             payload["verified_by"] = self._effective_current_verification(payload.get("verified_by"))
@@ -1160,6 +1172,7 @@ class MemoryAdapter:
             "confidence": record["confidence"],
             "tags": json.loads(record["tags"]),
             "lifecycle_state": record["lifecycle_state"],
+            "freshness_gate_state": record.get("freshness_gate_state", "NONE"),
             "relevance_score": relevance_score,
             "retrieval_rank": retrieval_rank,
         }
@@ -1287,19 +1300,34 @@ class MemoryAdapter:
             "contribution_origin": self._contribution_origin(),
         }
         payload_fingerprint = self._payload_fingerprint(fingerprint_input)
-        async with self._get_write_lock():
+
+        async def reconcile_store_idempotency() -> dict[str, Any] | None:
+            owner = await self.engine.idempotency_owner(idempotency_key)
+            if owner == "operation":
+                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by another governed write")
+            if owner is None:
+                return None
             existing = await self.engine.find_idempotency(idempotency_key)
-            if existing:
-                if existing["payload_fingerprint"] != payload_fingerprint:
-                    raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different payload")
-                envelope = self._base_envelope(request_id, "memory_store", scope_context)
-                envelope["results"] = [self._public(existing)]
-                envelope["idempotent_replay"] = True
-                envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
-                return envelope
+            if existing is None:
+                raise AdapterError("STORAGE_INTEGRITY", "adapter idempotency reservation disappeared during replay")
+            if existing["payload_fingerprint"] != payload_fingerprint:
+                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different payload")
+            envelope = self._base_envelope(request_id, "memory_store", scope_context)
+            envelope["results"] = [self._public(existing)]
+            envelope["idempotent_replay"] = True
+            envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
+            return envelope
+
+        async with self._get_write_lock():
+            replay = await reconcile_store_idempotency()
+            if replay is not None:
+                return replay
             stable_hash = native_hash(scope_context, fact)
             exact = await self.engine.find_exact(stable_hash)
             if exact:
+                replay = await reconcile_store_idempotency()
+                if replay is not None:
+                    return replay
                 envelope = self._base_envelope(request_id, "memory_store", scope_context)
                 envelope["status"] = "DUPLICATE"
                 envelope["results"] = [self._public(exact)]
@@ -1358,15 +1386,9 @@ class MemoryAdapter:
             try:
                 await self.engine.write_record(record, embedding)
             except RecordUniquenessConflict:
-                concurrent_idempotent = await self.engine.find_idempotency(idempotency_key)
-                if concurrent_idempotent:
-                    if concurrent_idempotent["payload_fingerprint"] != payload_fingerprint:
-                        raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different payload")
-                    envelope = self._base_envelope(request_id, "memory_store", scope_context)
-                    envelope["results"] = [self._public(concurrent_idempotent)]
-                    envelope["idempotent_replay"] = True
-                    envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
-                    return envelope
+                replay = await reconcile_store_idempotency()
+                if replay is not None:
+                    return replay
                 concurrent_exact = await self.engine.find_exact(stable_hash)
                 if concurrent_exact:
                     envelope = self._base_envelope(request_id, "memory_store", scope_context)
@@ -1416,16 +1438,28 @@ class MemoryAdapter:
             if await self.engine.memory_exists_outside_scope(memory_id, scope_context):
                 raise AdapterError("CROSS_SCOPE_DENIED", "memory_id exists outside the requested scope")
             raise AdapterError("NOT_FOUND", "memory_id was not found in the requested scope")
+        group_cas = None
+        if rows:
+            group_cas = (await self.engine.group_observation(scope_context, rows[0]["contradiction_key"]))["public"]
+            for row in rows:
+                row.update(await self.engine.freshness_state(row["record_id"], int(row["revision"])))
         stale_only = False
+        freshness_hold = False
         if retrieval_mode == "CURRENT":
             fresh_rows = [row for row in rows if self._fresh_current(row)]
             stale_only = not fresh_rows
+            freshness_hold = stale_only and any(
+                row.get("freshness_gate_state")
+                in {"SOURCE_CHANGE_REVIEW_REQUIRED", "RECHECK_UNAVAILABLE", "RECHECK_INDETERMINATE"}
+                for row in rows
+            )
             rows = fresh_rows
         envelope = self._base_envelope(request_id, "memory_get", scope_context)
         envelope["results"] = [self._public(row) for row in rows[: self.limits.max_memories_hard_max]]
+        envelope["group_cas"] = group_cas
         if stale_only:
             envelope["status"] = "DEGRADED"
-            envelope["degradation"] = "STALE_ONLY"
+            envelope["degradation"] = "FRESHNESS_HOLD" if freshness_hold else "STALE_ONLY"
         envelope["budget"]["returned"] = len(envelope["results"])
         return self._fit_budget(envelope)
 
@@ -1435,6 +1469,12 @@ class MemoryAdapter:
 
     def _fresh_current(self, record: dict[str, Any]) -> bool:
         if not self._current_record(record) or record["verified_by"] == "UNVERIFIED" or not record["last_verified_at"]:
+            return False
+        if record.get("freshness_gate_state") in {
+            "SOURCE_CHANGE_REVIEW_REQUIRED",
+            "RECHECK_UNAVAILABLE",
+            "RECHECK_INDETERMINATE",
+        }:
             return False
         return is_fresh(
             json.loads(record["freshness_policy"]),
@@ -1606,6 +1646,7 @@ class MemoryAdapter:
         stale_count = 0
         safe: list[tuple[dict[str, Any], float]] = []
         for row, score in scored:
+            row.update(await self.engine.freshness_state(row["record_id"], int(row["revision"])))
             if not history:
                 if row["lifecycle_state"] == CURRENT_LIFECYCLE and not self._fresh_current(row):
                     stale_count += 1
@@ -1641,6 +1682,8 @@ class MemoryAdapter:
         expected_revision: int,
         mode: str,
         idempotency_key: str,
+        observed_group_token: str | None = None,
+        reason_code: str | None = None,
         replacement: dict[str, Any] | None = None,
         verification: dict[str, Any] | None = None,
         project_id: str | None = None,
@@ -1655,9 +1698,14 @@ class MemoryAdapter:
         self._authorize_write(
             "memory_update",
             scope_context,
-            {"mode": mode, "verification": verification, "replacement": replacement},
+            {
+                "mode": mode,
+                "verification": verification,
+                "replacement": replacement,
+                "observed_group_token": observed_group_token,
+                "reason_code": reason_code,
+            },
         )
-        embedding_runtime_fingerprint = await self._ensure_embedding_compatibility()
         if mode not in UPDATE_MODES:
             raise AdapterError(
                 "INVALID_ENUM",
@@ -1673,6 +1721,64 @@ class MemoryAdapter:
             uuid.UUID(memory_id)
         except (ValueError, AttributeError) as exc:
             raise AdapterError("INVALID_ENVELOPE", "memory_id must be a UUID") from exc
+        if mode in {"REVOKE", "REJECT"}:
+            if replacement is not None or verification is not None:
+                raise AdapterError("INVALID_ENVELOPE", f"{mode} does not accept replacement or verification payloads")
+            if expected_record_id is None:
+                raise AdapterError("INVALID_ENVELOPE", f"{mode} requires expected_record_id")
+            try:
+                uuid.UUID(expected_record_id)
+            except (ValueError, AttributeError) as exc:
+                raise AdapterError("INVALID_ENVELOPE", "expected_record_id must be a UUID") from exc
+            if (
+                not isinstance(observed_group_token, str)
+                or len(observed_group_token) != 64
+                or any(ch not in "0123456789abcdefABCDEF" for ch in observed_group_token)
+            ):
+                raise AdapterError("INVALID_ENVELOPE", f"{mode} requires an exact 64-hex observed_group_token")
+            allowed_reasons = _REVOKE_REASON_CODES if mode == "REVOKE" else _REJECT_REASON_CODES
+            if reason_code not in allowed_reasons:
+                raise AdapterError(
+                    "INVALID_ENUM",
+                    f"{mode} reason_code is invalid; choose one of: {supported_values(allowed_reasons)}",
+                )
+            context = self._trusted_write_context
+            actor_ref = context.contributor_ref
+            request_fingerprint = self._payload_fingerprint(
+                {
+                    "memory_id": memory_id,
+                    "expected_record_id": expected_record_id,
+                    "expected_revision": expected_revision,
+                    "scope": scope_context.to_dict(),
+                    "mode": mode,
+                    "observed_group_token": observed_group_token.lower(),
+                    "reason_code": reason_code,
+                    "actor_class": context.contributor_class,
+                    "actor_ref_digest": digest(actor_ref) if actor_ref is not None else None,
+                    "grant_ref_digest": digest(context.grant_ref),
+                }
+            )
+            result = await self.engine.terminal_disposition(
+                scope_context,
+                action=mode,
+                memory_id=memory_id,
+                expected_record_id=expected_record_id,
+                expected_revision=expected_revision,
+                observed_group_token=observed_group_token.lower(),
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+                request_id=request_id,
+                reason_code=reason_code,
+                actor_class=context.contributor_class,
+                actor_ref_digest=digest(actor_ref) if actor_ref is not None else None,
+                grant_ref_digest=digest(context.grant_ref),
+                committed_at=iso_now(),
+            )
+            envelope = self._base_envelope(request_id, "memory_update", scope_context)
+            envelope.update(result)
+            envelope["results"] = []
+            return envelope
+        embedding_runtime_fingerprint = await self._ensure_embedding_compatibility()
         update_request_fingerprint = self._payload_fingerprint({
             "memory_id": memory_id,
             "expected_record_id": expected_record_id,
@@ -1683,42 +1789,92 @@ class MemoryAdapter:
             "verification": verification or {},
             "contribution_origin": self._contribution_origin(),
         })
-        replay = await self.engine.find_idempotency(idempotency_key)
-        if replay:
-            if replay["payload_fingerprint"] != update_request_fingerprint:
+        update_group_token: str | None = None
+        if observed_group_token is not None:
+            if (
+                not isinstance(observed_group_token, str)
+                or len(observed_group_token) != 64
+                or any(ch not in "0123456789abcdefABCDEF" for ch in observed_group_token)
+            ):
+                raise AdapterError("INVALID_ENVELOPE", f"{mode} observed_group_token must be an exact 64-hex token")
+            update_group_token = observed_group_token.lower()
+        async def reconcile_preflight_idempotent_update() -> dict[str, Any] | None:
+            owner = await self.engine.idempotency_owner(idempotency_key)
+            if owner == "operation":
+                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by another governed write")
+            if owner is None:
+                return None
+            concurrent = await self.engine.find_idempotency(idempotency_key)
+            if concurrent is None:
+                raise AdapterError("STORAGE_INTEGRITY", "adapter idempotency reservation disappeared during replay")
+            if concurrent["payload_fingerprint"] != update_request_fingerprint:
                 raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different update")
             envelope = self._base_envelope(request_id, "memory_update", scope_context)
-            envelope["results"] = [self._public(replay)]
+            envelope["results"] = [self._public(concurrent)]
             envelope["idempotent_replay"] = True
             return envelope
+
+        replay = await reconcile_preflight_idempotent_update()
+        if replay is not None:
+            return replay
+
         current_rows = await self.engine.get_record(memory_id, scope_context, history=False)
         candidate_promotion = False
         if current_rows:
             old = current_rows[0]
             if expected_record_id is not None and expected_record_id != old["record_id"]:
+                concurrent_replay = await reconcile_preflight_idempotent_update()
+                if concurrent_replay is not None:
+                    return concurrent_replay
                 raise AdapterError("VERSION_CONFLICT", "expected_record_id does not match the current lineage parent")
         else:
             history_rows = await self.engine.get_record(memory_id, scope_context, history=True)
             candidates = [row for row in history_rows if row["lifecycle_state"] == "CANDIDATE"]
             if candidates:
                 if mode == "REPLACE":
+                    concurrent_replay = await reconcile_preflight_idempotent_update()
+                    if concurrent_replay is not None:
+                        return concurrent_replay
                     raise AdapterError("CANDIDATE_REPLACE_DENIED", "Candidate records cannot be replaced before promotion")
                 if expected_record_id is None:
                     raise AdapterError("INVALID_ENVELOPE", "Candidate REVERIFY requires expected_record_id")
                 matching = [row for row in candidates if row["record_id"] == expected_record_id]
                 if not matching:
+                    concurrent_replay = await reconcile_preflight_idempotent_update()
+                    if concurrent_replay is not None:
+                        return concurrent_replay
                     raise AdapterError("VERSION_CONFLICT", "expected_record_id does not match the Candidate lineage parent")
                 old = matching[0]
                 candidate_promotion = True
             else:
                 if await self.engine.memory_exists_outside_scope(memory_id, scope_context):
                     raise AdapterError("CROSS_SCOPE_DENIED", "memory_id exists outside the requested scope")
+                concurrent_replay = await reconcile_preflight_idempotent_update()
+                if concurrent_replay is not None:
+                    return concurrent_replay
                 raise AdapterError("NOT_FOUND", "current memory_id was not found")
         if old["revision"] != expected_revision:
+            concurrent_replay = await reconcile_preflight_idempotent_update()
+            if concurrent_replay is not None:
+                return concurrent_replay
             raise AdapterError(
                 "VERSION_CONFLICT",
                 "expected_revision does not match current revision; read memory_get and retry with that revision",
             )
+        if mode == "REVERIFY" and old["lifecycle_state"] == "VALIDATED_CURRENT":
+            freshness_state = await self.engine.freshness_state(old["record_id"], int(old["revision"]))
+            if freshness_state["freshness_gate_state"] in {
+                "SOURCE_CHANGE_REVIEW_REQUIRED",
+                "RECHECK_UNAVAILABLE",
+                "RECHECK_INDETERMINATE",
+            }:
+                concurrent_replay = await reconcile_preflight_idempotent_update()
+                if concurrent_replay is not None:
+                    return concurrent_replay
+                raise AdapterError(
+                    "RECHECK_EVIDENCE_REQUIRED",
+                    "ordinary REVERIFY cannot clear an active on_change manual-recheck hold",
+                )
         old_provenance = json.loads(old["source_provenance"])
         old_freshness = json.loads(old["freshness_policy"])
         old_tags = json.loads(old["tags"])
@@ -1848,25 +2004,12 @@ class MemoryAdapter:
         fingerprint = update_request_fingerprint
 
         async def reconcile_concurrent_idempotent_update() -> dict[str, Any] | None:
-            concurrent = await self.engine.find_idempotency(idempotency_key)
-            if concurrent is None:
-                return None
-            if concurrent["payload_fingerprint"] != fingerprint:
-                raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different update")
-            envelope = self._base_envelope(request_id, "memory_update", scope_context)
-            envelope["results"] = [self._public(concurrent)]
-            envelope["idempotent_replay"] = True
-            return envelope
+            return await reconcile_preflight_idempotent_update()
 
         async with self._get_write_lock():
-            existing = await self.engine.find_idempotency(idempotency_key)
-            if existing:
-                if existing["payload_fingerprint"] != fingerprint:
-                    raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is bound to a different update")
-                envelope = self._base_envelope(request_id, "memory_update", scope_context)
-                envelope["results"] = [self._public(existing)]
-                envelope["idempotent_replay"] = True
-                return envelope
+            replay = await reconcile_preflight_idempotent_update()
+            if replay is not None:
+                return replay
             record_id = str(uuid.uuid4())
             if mode == "REVERIFY":
                 origin = old.get("contribution_origin")
@@ -1927,6 +2070,7 @@ class MemoryAdapter:
                         scope_context,
                         expected_record_id=old["record_id"],
                         expected_revision=expected_revision,
+                        observed_group_token=update_group_token,
                     )
                     if equivalent is not None:
                         envelope = self._base_envelope(request_id, "memory_update", scope_context)
@@ -1934,8 +2078,15 @@ class MemoryAdapter:
                         envelope["results"] = [self._public(equivalent)]
                         return self._fit_budget(envelope)
                 else:
-                    await self.engine.write_record(record, embedding, supersede_record_id=old["record_id"])
+                    await self.engine.write_record(
+                        record,
+                        embedding,
+                        supersede_record_id=old["record_id"],
+                        observed_group_token=update_group_token,
+                    )
             except RecordUniquenessConflict:
+                if await self.engine.operation_by_idempotency(idempotency_key) is not None:
+                    raise AdapterError("IDEMPOTENCY_CONFLICT", "idempotency key is reserved by another governed write")
                 concurrent_replay = await reconcile_concurrent_idempotent_update()
                 if concurrent_replay is not None:
                     return concurrent_replay
@@ -2043,7 +2194,7 @@ class MemoryAdapter:
         if include_graph_links or direct_truth_available or user_supplied:
             raise AdapterError(
                 "INVALID_ENVELOPE",
-                "routing hints and graph expansion are not accepted by the revision-2 adapter boundary",
+                "routing hints and graph expansion are not accepted by the public adapter boundary",
             )
         request = self._public_request(
                 query=query,
@@ -2148,6 +2299,8 @@ class MemoryAdapter:
         mode: str,
         idempotency_key: str,
         expected_record_id: str | None | object = _UNSET,
+        observed_group_token: str | None | object = _UNSET,
+        reason_code: str | None | object = _UNSET,
         replacement: dict[str, Any] | None | object = _UNSET,
         verification: dict[str, Any] | None | object = _UNSET,
         project_id: str | None | object = _UNSET,
@@ -2163,6 +2316,8 @@ class MemoryAdapter:
                 expected_revision=expected_revision,
                 mode=mode,
                 idempotency_key=idempotency_key,
+                observed_group_token=observed_group_token,
+                reason_code=reason_code,
                 replacement=replacement,
                 verification=verification,
                 request_id=request_id,

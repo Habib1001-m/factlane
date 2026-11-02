@@ -27,7 +27,8 @@ Start with the outcome rather than the protocol:
 
 ### Do I need to be a developer to benefit from it?
 
-Not necessarily for normal use, but **the current v0.1.4 setup is still technical**.
+Not necessarily for normal use, but **the setup is still technical**. `v0.1.4` is the latest
+published production release; the current `0.1.5` source line is a local release candidate.
 
 FactLane is not a separate chatbot. It runs locally as a memory service behind a compatible AI
 agent host. Someone must install and configure that connection. After it is connected, the useful
@@ -51,9 +52,14 @@ embedding details until you are ready to install it yourself.
 
 ## Current public release
 
-FactLane **v0.1.4** is the current production release. Its qualified public profile is
+FactLane **v0.1.4** is the latest published production release. Its qualified public profile is
 intentionally bounded: Python 3.11+, linked SQLite 3.42.0+, command-launched stdio MCP, supported
 local Ollama embeddings, and the documented local POSIX storage/recovery contract.
+
+The current **0.1.5 source/RC line** keeps exactly the same five-tool stdio MCP surface while moving
+to Public Contract Revision 3 and storage contract v3. It adds governed Owner lifecycle actions,
+manual freshness recheck, readmission, `factlane-owner`, and a loopback Owner WebUI. It has no
+`v0.1.5` release tag, published artifact identity, deployment, or publication authority yet.
 
 The live MCP schema and `factlane --help-tools` are authoritative for exact request signatures
 and enum values.

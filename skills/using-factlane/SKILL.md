@@ -12,47 +12,38 @@ verified live sources outrank it.
 ## Decide whether memory is needed
 
 - A self-contained task needs no recall. Search only when durable context could change the task.
-- Candidate capture needs explicit content consent: the user asks to remember/store it, or the
-  agent proposes it and asks first. Consent never elevates launcher/write authority. Never perform
-  autonomous post-turn `memory_store` or `memory_update`.
+- Candidate capture needs explicit content consent. If the agent proposes it, obtain that consent first.
+  Consent never elevates launcher/write authority;
+  never perform autonomous post-turn `memory_store` or `memory_update`.
 - A `CANDIDATE` or `UNVERIFIED` record is **not** `VALIDATED_CURRENT`.
 - Inspect the live MCP schema or `factlane --help-tools` for supported fields and enums;
   never guess.
 
-This Skill targets **Public Contract Revision 2**.
+This Skill targets **Public Contract Revision 3** in the current `0.1.5` source/RC line. The MCP
+surface remains exactly five tools over stdio. `v0.1.4` is still the latest published release and
+uses Public Contract Revision 2.
 
-For host-neutral setup/registration evidence, read `references/host-bootstrap.md`; never guess a
-host-specific Skill path or mechanism.
+For host setup evidence, read `references/host-bootstrap.md`.
 
-Governed failures return `status=BLOCKED` with stable `error_code`, safe `message`, and
-`audit.retryable`; branch on the code. Unexpected internal exceptions remain transport errors.
+For `status=BLOCKED`, branch on stable `error_code`; unexpected exceptions remain transport errors.
 
 ## Read within one exact scope
 
-Select one scope. `PROJECT` needs exact `project_id`; `WORKFLOW` needs that ID + `workflow_id`;
-`GLOBAL_USER` is unbound; `TOOL_ENVIRONMENT` needs `agent_id`. `CROSS_PROJECT_WORKFLOW`
-**forbids** project/worktree/workflow/agent IDs, including explicit nulls.
+Select one exact scope and required IDs from the live schema. `CROSS_PROJECT_WORKFLOW` forbids
+project/worktree/workflow/agent IDs, including explicit nulls. In a trusted bound session, omit
+host-supplied scope IDs; explicit IDs must match trusted bindings.
 
-In a trusted bound session, omit host-supplied scope IDs; do not reconstruct them. Explicit scope
-IDs must match trusted bindings. Other permitted filters remain caller-directed.
-
-Choose an `intent_class`: `CURRENT_PROJECT_STATE`, `PROJECT_DESIGN_RATIONALE`,
-`USER_PREFERENCE_OR_DURABLE_FACT`, `WORKFLOW_RULE`, `TOOL_ENVIRONMENT_STATE`,
-`HISTORICAL_QUESTION`, or `GENERAL_TASK_NO_MEMORY_REQUIRED`.
+Choose `intent_class` from the live schema; never guess.
 
 Choose `EXACT`, `KEYWORD`, `SEMANTIC`, or `HYBRID`. Use `CURRENT` for validated current facts and
 `REVIEW_HISTORY` for Candidates/history. Use `memory_get` when provenance/revision matters. Do not
 invent routing overrides or admin-only graph expansion.
 
-For `CROSS_PROJECT_WORKFLOW`, permitted search intent/mode pairs are
-`WORKFLOW_RULE + CURRENT`, `WORKFLOW_RULE + REVIEW_HISTORY`, and
-`HISTORICAL_QUESTION + REVIEW_HISTORY`. `GENERAL_TASK_NO_MEMORY_REQUIRED` returns
-`NO_MEMORY_NEEDED` after request validation. Other combinations fail closed; there is no
-implicit cross-scope fanout.
+For `CROSS_PROJECT_WORKFLOW`, follow the live search matrix. Unsupported combinations fail closed;
+there is no implicit cross-scope fanout.
 
-Compaction may remove `HISTORICAL` vectors. In `REVIEW_HISTORY`, incomplete `SEMANTIC`/`HYBRID`
-coverage reports `HISTORY_SEMANTIC_PARTIAL`; use `KEYWORD`, `EXACT`, or `memory_get` for complete
-history. Concurrent result-budget loss still sets `budget.truncated=true`.
+For complete history, prefer `KEYWORD`, `EXACT`, or `memory_get` when `REVIEW_HISTORY` has partial
+semantic coverage.
 
 ## Write only with trusted authority
 
@@ -69,8 +60,16 @@ For `CROSS_PROJECT_WORKFLOW`, freshness is `manual` (no recheck/fingerprint) or 
 
 A trusted verifier uses `memory_update` with `expected_revision`, unique `idempotency_key`, and
 `REVERIFY`/`REPLACE`. Candidate promotion requires `REVERIFY` + exact `expected_record_id`.
-`REPLACE` needs `replacement.fact`, `.source_provenance`, `.freshness_policy`, `.source_timestamp`,
-and `.verified_by`; omitted `.last_verified_at` is generated.
+
+Direct Owner authority may additionally use `REVOKE` or `REJECT`; both require the exact displayed
+`observed_group_token`, current revision/record identity, and a bounded reason code. Do not attempt
+Owner lifecycle actions from a delegated-agent session. `REVOKED` and `REJECTED` are logical terminal
+states, not physical erasure.
+
+For an `on_change` Current, FactLane does not monitor the source automatically. A trusted Owner
+performs an explicit manual recheck with fresh observation evidence. Readmission of a `REVOKED`
+memory is also a separate Owner operation with new verification and Group CAS; it is not database
+restore and must not be used to recreate recovery-purged content.
 
 Keep each memory small, scoped, and attributable. Recheck the current source of truth before
 relying on it.

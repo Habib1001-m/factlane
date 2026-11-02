@@ -37,10 +37,11 @@ That distinction is the core of FactLane: **remembered context can support a dec
 > FactLane memory is **supporting evidence**, not execution authority. Current user instructions, current repository or product state, and verified live sources outrank remembered facts.
 
 > [!NOTE]
-> The moving Development source can contain accepted changes newer than the latest official
-> release. The successor identity is `v0.1.4`, but Development/RC artifacts remain **qualification-only**
-> until the annotated tag and published artifact digests are sealed. Official `v0.1.4` means the
-> exact tag, commit/tree, and published digests recorded in [Release operations](docs/RELEASE_OPERATIONS.md).
+> `v0.1.4` is the latest published production release. The current source line identifies itself as
+> `0.1.5` and is being qualified as a local release candidate. That source identity does **not**
+> create a `v0.1.5` tag, published artifact digest, deployment, or publication authority. Official
+> `v0.1.4` still means the exact tag, commit/tree, and published digests recorded in
+> [Release operations](docs/RELEASE_OPERATIONS.md).
 
 ## How FactLane works
 
@@ -57,7 +58,13 @@ The key boundary is the transition from **Candidate** to **Current**:
   consent; that consent does not grant or elevate launcher authority;
 - it cannot self-promote by claiming privileged authority;
 - trusted promotion uses `memory_update` with `REVERIFY`, revision checks, and the Candidate's expected record identity;
+- Public Contract Revision 3 also lets direct Owner authority apply `REVOKE` or `REJECT` as terminal
+  logical lifecycle dispositions using exact revision and contradiction-group CAS;
 - `CURRENT` retrieval excludes unverified Candidates, even when they are a closer semantic match.
+
+`REVOKED` and `REJECTED` are logical lifecycle states. They remove a record from normal current
+eligibility; they do not claim physical erasure from SQLite pages, backups, snapshots, logs, or
+external copies. Sensitive-content erasure remains the separate operator recovery procedure.
 
 For semantic `CURRENT` search, FactLane applies validation eligibility before the KNN result limit, so closer unverified Candidates cannot crowd out eligible current facts.
 
@@ -86,6 +93,23 @@ uv run factlane --help-tools
 The SQLite check intentionally runs through the same project interpreter that launches FactLane. Python 3.11+ alone does **not** guarantee a compatible linked SQLite runtime.
 
 For exact tag/tree verification, published wheel and source-distribution digests, upgrade planning, rollback boundaries, and post-install reverification, see [Release operations](docs/RELEASE_OPERATIONS.md).
+
+### Evaluate the local `0.1.5` release-candidate source
+
+The current checkout is a source/RC line, not a published `v0.1.5` release. From that checkout:
+
+```bash
+uv sync --frozen
+uv run python -c 'from importlib.metadata import version; print(version("factlane"))'
+uv run factlane --help-tools
+uv run factlane-owner --help
+uv run factlane-migrate-storage-v3 --help
+```
+
+The package version should report `0.1.5`, `factlane --help-tools` should report Public Contract
+Revision 3 and exactly five MCP tools, and the operator commands should be present. If the database
+is storage contract v2, the v0.1.5 runtime fails closed until the explicit v2 → v3 migration is run
+with a verified pre-migration backup. See [Release operations](docs/RELEASE_OPERATIONS.md).
 
 ### Launch for a local stdio MCP host
 
@@ -116,7 +140,7 @@ FactLane keeps the public surface deliberately small:
 | `memory_search` | Search facts within one exact scope using current or historical retrieval. |
 | `memory_get` | Retrieve one logical memory record and its provenance/revision details. |
 | `memory_store` | Contribute one bounded fact with source and freshness metadata. |
-| `memory_update` | Reverify a Candidate or replace a current revision under governed compare-and-swap rules. |
+| `memory_update` | Reverify/replace a logical memory, or apply Owner-only `REVOKE`/`REJECT`, under governed CAS rules. |
 | `memory_status` | Inspect storage and embedding-profile health for a scope. |
 
 The live MCP schema and `factlane --help-tools` are authoritative for request fields and supported values.
@@ -145,6 +169,26 @@ A trusted verifier can use `memory_update` to:
 
 - **`REVERIFY`** a Candidate while preserving its logical contradiction identity; or
 - **`REPLACE`** a current revision when the semantic identity itself changes.
+
+With direct Owner authority, Public Contract Revision 3 also permits **`REVOKE`** and **`REJECT`**.
+Those modes require the exact displayed contradiction-group token as well as the current revision
+and a bounded reason code. The separate `OwnerControlService` exposes inventory, conflict, health,
+retention, recheck, readmission, and adjudication workflows to trusted local operator surfaces.
+`factlane-owner` is the packaged command-line client for that service. The packaged
+`factlane-owner-webui` launcher exposes the same Owner boundary through a local WebUI and binds
+exactly to loopback `127.0.0.1`. On startup it prints a READY JSON object containing the bound
+`origin` and a short-lived one-use bootstrap token. Exchange that token only in the
+`X-FactLane-Bootstrap` request header at `/owner/bootstrap`; never place it in a URL or
+`localStorage`. A successful exchange consumes the bootstrap token, establishes the authenticated
+session, and returns the CSRF token used for later Owner mutations. The WebUI is not an MCP
+transport and does not add a sixth public MCP tool.
+
+For `on_change` freshness, FactLane records a recheck contract; it does not run a background source
+watcher. An Owner supplies fresh bounded evidence through the manual recheck path. A healthy
+unchanged observation renews eligibility; changed, unavailable, or indeterminate observations fail
+closed for review. Readmission is also explicit: it can admit a previously `REVOKED` logical memory
+after new verification and CAS checks. It is not database restore and cannot resurrect content that
+sensitive-memory recovery removed from the governed local store.
 
 Revision compare-and-swap, expected record identity, contradiction handling, and idempotency checks prevent stale or unauthorized transitions from becoming durable current state.
 
@@ -178,7 +222,7 @@ Read the full [Architecture](docs/ARCHITECTURE.md) for the exact request path, s
 
 ## Production-qualified profile
 
-**FactLane `v0.1.4` is the current production release.** It is production-qualified for the documented local deployment profile:
+**FactLane `v0.1.4` is the latest published production release.** It is production-qualified for the documented local deployment profile:
 
 - Python **3.11+**;
 - linked SQLite **3.42.0+**;
@@ -189,6 +233,12 @@ Read the full [Architecture](docs/ARCHITECTURE.md) for the exact request path, s
 Qualification covered package installation, backup/restore compatibility, bounded concurrent operation, crash/restart behavior, configured host startup, production-derived corpus retrieval, and fail-closed SQLite capacity handling.
 
 This is deliberately a **bounded support statement**, not a universal deployment claim.
+
+The current `0.1.5` source/RC line advances the public contract to **Revision 3** and durable storage
+to **contract v3** while keeping the MCP surface at exactly five tools over stdio. It adds governed
+Owner lifecycle dispositions, manual freshness recheck, readmission, the Owner service/CLI and a
+loopback Owner WebUI. These source bytes are local-RC material until a separate publication decision
+creates a release identity.
 
 ### Current limits
 
@@ -206,7 +256,10 @@ See [Environment and compatibility](docs/ENVIRONMENT.md) for the supported runti
 
 A release is more than a version string. FactLane records an official release by its versioned tag together with the corresponding commit/tree and published artifact digests.
 
-`v0.1.3` remains the first official production release and is the supported predecessor for the `v0.1.4` transition documented in Release operations.
+`v0.1.3` remains the first official production release and `v0.1.4` is the latest published production
+release. The `0.1.5` source/RC transition changes durable storage from contract v2 to v3; it therefore
+requires the explicit migration and verified pre-v3 backup/rollback procedure documented in Release
+operations rather than a package-only upgrade assumption.
 
 Package/runtime rollback and durable-data rollback are separate compatibility questions. A package manager being able to replace one installed version with another does not prove that an older runtime can safely open a database modified by a newer release.
 

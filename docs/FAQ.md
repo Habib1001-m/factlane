@@ -10,8 +10,8 @@ assistant or coding agent; the host connects it to FactLane's memory tools.
 
 ## Do I need to be a developer?
 
-Not necessarily for normal use after FactLane is connected, but **v0.1.4 setup is still
-technical**. Someone must install FactLane, provide a compatible command-launched stdio MCP host,
+Not necessarily for normal use after FactLane is connected, but **setup is still technical**.
+Someone must install FactLane, provide a compatible command-launched stdio MCP host,
 and configure local storage and a supported local embedding model.
 
 If nobody can perform that setup, FactLane is not currently a zero-configuration memory feature.
@@ -38,15 +38,20 @@ FactLane is not:
 - a general search/indexing system for arbitrary corpora;
 - a backup service;
 - a managed remote memory cloud;
-- an HTTP/SSE/Streamable HTTP MCP server in v0.1.4;
+- an HTTP/SSE/Streamable HTTP MCP server; the public MCP transport remains stdio-only in published
+  v0.1.4 and the current 0.1.5 source/RC;
 - an automatic permission system for an agent.
 
 Facts are bounded to 2,000 UTF-8 bytes.
 
 ## Where does the data live?
 
-The qualified v0.1.4 profile uses local SQLite/SQLite-vec storage and supported local Ollama
+The qualified published v0.1.4 profile uses local SQLite/SQLite-vec storage and supported local Ollama
 embeddings. The shipped embedding path does not fall back to a remote provider automatically.
+
+The current 0.1.5 source/RC uses Public Contract Revision 3 and storage contract v3. A v0.1.4/v2
+database requires the explicit v2 → v3 migration with a verified pre-migration backup before the
+0.1.5 runtime can open it for normal service.
 
 Read [Environment and compatibility](ENVIRONMENT.md) for the exact supported profile.
 
@@ -57,6 +62,11 @@ separate trusted verification operation. Seeing `memory_update` in tool discover
 verifier authority.
 
 Read [Core concepts](CORE_CONCEPTS.md) for the Candidate → Current model.
+
+In Revision 3, direct Owner authority can also `REVOKE` or `REJECT` through `memory_update` after
+reviewing the exact contradiction group. These are logical terminal states, not physical erasure.
+The separate Owner service/CLI/WebUI also provides manual `on_change` recheck and governed
+readmission of eligible `REVOKED` memory.
 
 ## What wins if memory conflicts with what I say now?
 

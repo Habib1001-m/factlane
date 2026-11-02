@@ -10,7 +10,8 @@
     "sourceCue": "These summaries do not replace the docs. Follow the source links for the full contract; the live MCP schema and factlane --help-tools remain authoritative for exact tool fields and enums.",
     "factsLabel": "Verified product facts",
     "facts": [
-      {"strong": "v0.1.4", "rest": " supported named release"},
+      {"strong": "v0.1.4", "rest": " latest published release"},
+      {"strong": "0.1.5", "rest": " current local RC source line"},
       {"strong": "5", "rest": " public MCP tools"},
       {"strong": "stdio", "rest": " command-launched transport"},
       {"strong": "local", "rest": " SQLite + supported Ollama profile"}
@@ -39,7 +40,7 @@
       {
         "id": "when-not-fit",
         "question": "When is FactLane not the right tool?",
-        "answer": "FactLane is not a transcript archive, arbitrary-corpus crawler or search index, backup service, managed remote memory cloud, or automatic permission system. In v0.1.4 it is also not an HTTP, SSE, or Streamable HTTP MCP server.",
+        "answer": "FactLane is not a transcript archive, arbitrary-corpus crawler or search index, backup service, managed remote memory cloud, or automatic permission system. Public MCP is stdio-only in published v0.1.4 and the current 0.1.5 source/RC; the RC Owner WebUI is a separate loopback-only control surface, not an HTTP MCP server.",
         "sources": [
           {"label": "FAQ", "to": "/docs/FAQ/"},
           {"label": "Environment and compatibility", "to": "/docs/ENVIRONMENT/"}
@@ -75,7 +76,7 @@
       {
         "id": "five-tools",
         "question": "What are the five public MCP tools?",
-        "answer": "The public MCP surface is exactly memory_search, memory_get, memory_store, memory_update, and memory_status. The live MCP schema and factlane --help-tools are authoritative for exact request fields, enums, and signatures.",
+        "answer": "The public MCP surface is exactly memory_search, memory_get, memory_store, memory_update, and memory_status. Public Contract Revision 3 in the 0.1.5 source/RC adds Owner-only REVOKE/REJECT modes to memory_update without adding a sixth tool. The live MCP schema and factlane --help-tools are authoritative for exact request fields, enums, and signatures.",
         "sources": [
           {"label": "Five MCP tools", "to": "/docs/TOOLS/"}
         ]
@@ -83,7 +84,7 @@
       {
         "id": "supported-environment",
         "question": "What environment does v0.1.4 support?",
-        "answer": "The qualified v0.1.4 profile uses Python 3.11+, linked SQLite 3.42.0+, command-launched local stdio MCP, local SQLite and SQLite-vec storage, supported local Ollama embeddings over loopback, and the documented local POSIX storage and recovery contract. There is no automatic remote embedding fallback.",
+        "answer": "The qualified v0.1.4 profile uses Python 3.11+, linked SQLite 3.42.0+, command-launched local stdio MCP, local SQLite and SQLite-vec storage, supported local Ollama embeddings over loopback, and the documented local POSIX storage and recovery contract. The current 0.1.5 source/RC keeps that stdio/five-tool boundary while moving to Public Contract Revision 3 and storage v3 with explicit v2 migration; it has no published v0.1.5 release identity. There is no automatic remote embedding fallback.",
         "sources": [
           {"label": "Environment and compatibility", "to": "/docs/ENVIRONMENT/"},
           {"label": "Architecture", "to": "/docs/ARCHITECTURE/"}
@@ -118,7 +119,8 @@
     "sourceCue": "هذه الملخصات لا تستبدل الوثائق. ارجع إلى روابط المصادر للعقد الكامل؛ ويظل مخطط MCP الحي والأمر factlane --help-tools المرجع النهائي لحقول الأدوات وتعداداتها الدقيقة.",
     "factsLabel": "حقائق منتج مؤكدة",
     "facts": [
-      {"strong": "v0.1.4", "rest": " الإصدار المسمى المدعوم"},
+      {"strong": "v0.1.4", "rest": " آخر إصدار منشور"},
+      {"strong": "0.1.5", "rest": " خط مصدر RC محلي حالي"},
       {"strong": "5", "rest": " أدوات MCP عامة"},
       {"strong": "stdio", "rest": " نقل يُشغَّل بأمر"},
       {"strong": "محلي", "rest": " SQLite + ملف تعريف Ollama مدعوم"}
@@ -147,7 +149,7 @@
       {
         "id": "when-not-fit",
         "question": "متى لا يكون FactLane هو الأداة المناسبة؟",
-        "answer": "FactLane ليس أرشيفًا لنصوص المحادثات، ولا crawler أو فهرس بحث لمجموعات محتوى عشوائية، ولا خدمة نسخ احتياطي، ولا سحابة ذاكرة مُدارة عن بُعد، ولا نظامًا تلقائيًا لصلاحيات الوكيل. وفي v0.1.4 ليس خادم MCP عبر HTTP أو SSE أو Streamable HTTP.",
+        "answer": "FactLane ليس أرشيفًا لنصوص المحادثات، ولا crawler أو فهرس بحث لمجموعات محتوى عشوائية، ولا خدمة نسخ احتياطي، ولا سحابة ذاكرة مُدارة عن بُعد، ولا نظامًا تلقائيًا لصلاحيات الوكيل. يبقى MCP العام عبر stdio فقط في v0.1.4 المنشور وخط المصدر 0.1.5 RC الحالي؛ وOwner WebUI في الـRC سطح تحكم منفصل عبر loopback فقط وليس خادم MCP عبر HTTP.",
         "sources": [
           {"label": "الأسئلة الشائعة", "to": "/docs/FAQ/"},
           {"label": "البيئة والتوافق", "to": "/docs/ENVIRONMENT/"}
@@ -183,7 +185,7 @@
       {
         "id": "five-tools",
         "question": "ما أدوات MCP العامة الخمس؟",
-        "answer": "واجهة MCP العامة هي بالضبط memory_search وmemory_get وmemory_store وmemory_update وmemory_status. ويظل مخطط MCP الحي والأمر factlane --help-tools المرجع النهائي لحقول الطلبات والتعدادات والتواقيع الدقيقة.",
+        "answer": "واجهة MCP العامة هي بالضبط memory_search وmemory_get وmemory_store وmemory_update وmemory_status. يضيف Public Contract Revision 3 في خط 0.1.5 RC وضعي REVOKE/REJECT بصلاحية Owner فقط داخل memory_update من دون إضافة أداة سادسة. ويظل مخطط MCP الحي والأمر factlane --help-tools المرجع النهائي لحقول الطلبات والتعدادات والتواقيع الدقيقة.",
         "sources": [
           {"label": "أدوات MCP الخمس", "to": "/docs/TOOLS/"}
         ]
@@ -191,7 +193,7 @@
       {
         "id": "supported-environment",
         "question": "ما البيئة التي يدعمها v0.1.4؟",
-        "answer": "يستخدم ملف التعريف المحلي الموثق والمؤهّل في v0.1.4 Python 3.11+ وSQLite 3.42.0+ المرتبط وMCP محليًا عبر stdio يُشغَّل بأمر وتخزين SQLite وSQLite-vec محليًا وتضمينات Ollama محلية مدعومة عبر loopback وعقد التخزين والاستعادة المحلي الموثق على POSIX. ولا يوجد fallback تلقائي إلى تضمينات بعيدة.",
+        "answer": "يستخدم ملف التعريف المحلي الموثق والمؤهّل في v0.1.4 Python 3.11+ وSQLite 3.42.0+ المرتبط وMCP محليًا عبر stdio يُشغَّل بأمر وتخزين SQLite وSQLite-vec محليًا وتضمينات Ollama محلية مدعومة عبر loopback وعقد التخزين والاستعادة المحلي الموثق على POSIX. يحافظ خط المصدر 0.1.5 RC الحالي على حد stdio والأدوات الخمس مع Public Contract Revision 3 وتخزين v3 وترحيل v2 صريح، ولا يملك بعد هوية إصدار v0.1.5 منشورة. ولا يوجد fallback تلقائي إلى تضمينات بعيدة.",
         "sources": [
           {"label": "البيئة والتوافق", "to": "/docs/ENVIRONMENT/"},
           {"label": "المعمارية", "to": "/docs/ARCHITECTURE/"}

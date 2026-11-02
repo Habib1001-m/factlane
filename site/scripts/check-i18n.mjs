@@ -232,6 +232,7 @@ const requiredUiTranslationKeys = {
     'item.label.Use cases',
     'item.label.How it works',
     'item.label.Docs',
+    'item.label.Answers',
     'item.label.GitHub',
     'item.label.Get started',
   ],

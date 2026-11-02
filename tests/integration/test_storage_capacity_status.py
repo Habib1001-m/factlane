@@ -182,6 +182,16 @@ def test_status_adds_retention_and_capacity_without_dropping_backend_keys(tmp_pa
         try:
             status = await engine.status(_scope(adapter))
             assert {"available", "backend", "profile", "counts", "native_columns"} <= status.keys()
+            assert set(status["counts"]) == {
+                "CANDIDATE",
+                "VALIDATED_CURRENT",
+                "SUPERSEDED",
+                "STALE",
+                "QUARANTINED",
+                "HISTORICAL",
+                "REVOKED",
+                "REJECTED",
+            }
             assert set(status) == {
                 "available", "backend", "profile", "counts", "native_columns", "retention", "capacity",
                 "embedding_compatibility",

@@ -141,6 +141,37 @@ def test_unknown_propagation_is_u1_and_cannot_construct_mutating_plan(tmp_path: 
         RecoveryPlan(operation_id="unknown-propagation", db_path=str(tmp_path / "memory.db"), profile=profile(), targets=(target,), propagation_state="UNKNOWN")
 
 
+def test_recovery_preflight_rejects_same_name_drifted_governance_trigger_before_mutation(tmp_path: Path) -> None:
+    async def prepare() -> tuple[dict[str, Any], Path]:
+        engine, adapter = await _open_adapter(tmp_path)
+        item = await _store(adapter, key="trigger-drift", fact="Trigger drift target remains intact.", marker="d")
+        row = await _target_row(engine, item["memory_id"])
+        db = Path(engine.db_path)
+        await adapter.close()
+        return row, db
+
+    row, db = asyncio.run(prepare())
+    before = db.read_bytes()
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DROP TRIGGER factlane_v3_operation_global_idempotency")
+        conn.execute(
+            "CREATE TRIGGER factlane_v3_operation_global_idempotency BEFORE INSERT ON lifecycle_operations "
+            "BEGIN SELECT RAISE(ABORT,'FACTLANE_DRIFTED_TRIGGER'); END"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    drifted = db.read_bytes()
+    assert drifted != before
+
+    plan = _plan(db, row, operation="trigger-drift-hold")
+    with pytest.raises(RecoveryHold) as caught:
+        _run(plan, tmp_path)
+    assert caught.value.code == "HOLD_UNEXPECTED_DERIVED_STATE_NO_MUTATION"
+    assert db.read_bytes() == drifted
+
+
 def test_recovery_rejects_unsupported_sqlite_before_lock_or_state(tmp_path: Path, monkeypatch) -> None:
     db = tmp_path / "memory.db"
     receipt = tmp_path / "runtime-floor.receipt.json"
@@ -299,6 +330,279 @@ def test_pm1_success_scrubs_payload_and_preserves_unrelated_record(tmp_path: Pat
     assert receipt["post_sealing_db_fts_verification"] == "PASS"
     assert receipt["raw_content_logged"] is False
 
+
+def test_v3_recovery_preserves_events_invalidates_target_operations_and_appends_purge_event(tmp_path: Path) -> None:
+    async def prepare() -> tuple[dict[str, Any], tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]]:
+        engine, adapter = await _open_adapter(tmp_path)
+        target = await _store(
+            adapter,
+            key="v3-audit-target",
+            fact="V3 Recovery target lifecycle evidence.",
+            marker="7",
+        )
+        survivor = await _store(
+            adapter,
+            key="v3-audit-survivor",
+            fact="V3 Recovery unrelated lifecycle evidence.",
+            marker="8",
+        )
+        target_row = await _target_row(engine, target["memory_id"])
+        survivor_row = await _target_row(engine, survivor["memory_id"])
+        assert engine.conn is not None
+        engine.conn.execute(
+            "INSERT INTO lifecycle_events("
+            "event_id,memory_id,record_id,target_record_id,target_revision,action,actor_class,grant_ref_digest,occurred_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                "prior-target-event",
+                target_row["memory_id"],
+                target_row["record_id"],
+                target_row["record_id"],
+                target_row["revision"],
+                "PRIOR_STRUCTURAL_EVENT",
+                "OWNER",
+                "prior-target-grant",
+                "2026-09-29T00:00:01Z",
+            ),
+        )
+        engine.conn.execute(
+            "INSERT INTO lifecycle_operations("
+            "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,grant_ref_digest,"
+            "scope_digest,target_memory_id,target_record_id,affected_members_json,event_ids_json,result_group_token,"
+            "replay_status,commit_timestamp"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "target-linked-replay-key",
+                "sensitive-request-commitment",
+                "target-linked-operation",
+                "target-request",
+                "REVOKE",
+                "OWNER",
+                "target-grant",
+                "target-scope",
+                target_row["memory_id"],
+                target_row["record_id"],
+                "[]",
+                '["prior-target-event"]',
+                "sensitive-group-commitment",
+                "COMMITTED",
+                "2026-09-29T00:00:02Z",
+            ),
+        )
+        engine.conn.execute(
+            "INSERT INTO lifecycle_operations("
+            "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,grant_ref_digest,"
+            "scope_digest,target_memory_id,target_record_id,affected_members_json,event_ids_json,result_group_token,"
+            "replay_status,commit_timestamp"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "cross-namespace-unrelated-key",
+                "cross-namespace-unrelated-fingerprint",
+                "cross-namespace-unrelated-operation",
+                "cross-namespace-unrelated-request",
+                "REVOKE",
+                "OWNER",
+                "cross-namespace-unrelated-grant",
+                "unrelated-scope",
+                survivor_row["memory_id"],
+                target_row["memory_id"],  # record-id namespace collision only; not a target relation.
+                "[]",
+                "[]",
+                "cross-namespace-unrelated-group-token",
+                "COMMITTED",
+                "2026-09-29T00:00:05Z",
+            ),
+        )
+        engine.conn.execute(
+            "INSERT INTO lifecycle_operations("
+            "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,grant_ref_digest,"
+            "scope_digest,affected_members_json,event_ids_json,result_group_token,replay_status,commit_timestamp"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "affected-only-replay-key",
+                "affected-sensitive-request-commitment",
+                "affected-only-operation",
+                "affected-request",
+                "RESOLVE",
+                "OWNER",
+                "affected-grant",
+                "target-scope",
+                json.dumps([{"memory_id": target_row["memory_id"], "record_id": target_row["record_id"]}]),
+                "[]",
+                "affected-sensitive-group-commitment",
+                "COMMITTED",
+                "2026-09-29T00:00:03Z",
+            ),
+        )
+        engine.conn.execute(
+            "INSERT INTO lifecycle_operations("
+            "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,grant_ref_digest,"
+            "scope_digest,target_memory_id,target_record_id,affected_members_json,event_ids_json,result_group_token,"
+            "replay_status,commit_timestamp"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "unrelated-replay-key",
+                "unrelated-request-fingerprint",
+                "unrelated-operation",
+                "unrelated-request",
+                "REVOKE",
+                "OWNER",
+                "unrelated-grant",
+                "unrelated-scope",
+                survivor_row["memory_id"],
+                survivor_row["record_id"],
+                "[]",
+                "[]",
+                "unrelated-group-token",
+                "COMMITTED",
+                "2026-09-29T00:00:04Z",
+            ),
+        )
+        prior_event = tuple(
+            engine.conn.execute("SELECT * FROM lifecycle_events WHERE event_id='prior-target-event'").fetchone()
+        )
+        unrelated_operation = tuple(
+            engine.conn.execute(
+                "SELECT * FROM lifecycle_operations WHERE idempotency_key='unrelated-replay-key'"
+            ).fetchone()
+        )
+        cross_namespace_operation = tuple(
+            engine.conn.execute(
+                "SELECT * FROM lifecycle_operations WHERE idempotency_key='cross-namespace-unrelated-key'"
+            ).fetchone()
+        )
+        engine.conn.commit()
+        await adapter.close()
+        return target_row, prior_event, unrelated_operation, cross_namespace_operation
+
+    target_row, prior_event, unrelated_operation, cross_namespace_operation = asyncio.run(prepare())
+    _run(_plan(tmp_path / "memory.db", target_row, operation="v3-audit-recovery"), tmp_path)
+
+    conn = sqlite3.connect(tmp_path / "memory.db")
+    conn.row_factory = sqlite3.Row
+    try:
+        assert tuple(conn.execute("SELECT * FROM lifecycle_events WHERE event_id='prior-target-event'").fetchone()) == prior_event
+        purge = conn.execute(
+            "SELECT * FROM lifecycle_events WHERE operation_id='v3-audit-recovery' AND action='SENSITIVE_PURGE'"
+        ).fetchone()
+        assert purge is not None
+        assert conn.execute(
+            "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+        ).fetchone()[0] >= purge["occurred_at"]
+        assert purge["memory_id"] == target_row["memory_id"]
+        assert purge["record_id"] == target_row["record_id"]
+        assert purge["prior_lifecycle_state"] == target_row["lifecycle_state"]
+        assert purge["result_lifecycle_state"] == "QUARANTINED"
+        assert purge["result_contradiction_state"] == "QUARANTINED"
+        for key in ("target-linked-replay-key", "affected-only-replay-key"):
+            operation = conn.execute(
+                "SELECT * FROM lifecycle_operations WHERE idempotency_key=?",
+                (key,),
+            ).fetchone()
+            assert operation is not None
+            assert operation["request_fingerprint"] is None
+            assert operation["result_group_token"] is None
+            assert operation["replay_status"] == "RECOVERY_INVALIDATED"
+            assert operation["recovery_event_id"] == purge["event_id"]
+        assert tuple(
+            conn.execute(
+                "SELECT * FROM lifecycle_operations WHERE idempotency_key='unrelated-replay-key'"
+            ).fetchone()
+        ) == unrelated_operation
+        assert tuple(
+            conn.execute(
+                "SELECT * FROM lifecycle_operations WHERE idempotency_key='cross-namespace-unrelated-key'"
+            ).fetchone()
+        ) == cross_namespace_operation
+    finally:
+        conn.close()
+
+
+def test_v3_recovery_unrelated_lifecycle_snapshot_aborts_and_rolls_back_drift(tmp_path: Path) -> None:
+    class DriftUnrelatedLifecycleBeforeCommit(SensitiveMemoryRecoveryOperator):
+        @staticmethod
+        def _tombstone_lifecycle_operations(conn, linked_operations):
+            SensitiveMemoryRecoveryOperator._tombstone_lifecycle_operations(conn, linked_operations)
+            conn.execute(
+                "UPDATE lifecycle_operations SET result_group_token='tampered' "
+                "WHERE idempotency_key='unrelated-preservation-key'"
+            )
+
+    async def prepare() -> tuple[dict[str, Any], tuple[Any, ...]]:
+        engine, adapter = await _open_adapter(tmp_path)
+        target = await _store(
+            adapter,
+            key="v3-preservation-target",
+            fact="V3 preservation target lifecycle evidence.",
+            marker="9",
+        )
+        survivor = await _store(
+            adapter,
+            key="v3-preservation-survivor",
+            fact="V3 preservation unrelated lifecycle evidence.",
+            marker="a",
+        )
+        target_row = await _target_row(engine, target["memory_id"])
+        survivor_row = await _target_row(engine, survivor["memory_id"])
+        assert engine.conn is not None
+        engine.conn.execute(
+            "INSERT INTO lifecycle_operations("
+            "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,grant_ref_digest,"
+            "scope_digest,target_memory_id,target_record_id,affected_members_json,event_ids_json,result_group_token,"
+            "replay_status,commit_timestamp"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "unrelated-preservation-key",
+                "unrelated-preservation-fingerprint",
+                "unrelated-preservation-operation",
+                "unrelated-preservation-request",
+                "REVOKE",
+                "OWNER",
+                "unrelated-preservation-grant",
+                "unrelated-preservation-scope",
+                survivor_row["memory_id"],
+                survivor_row["record_id"],
+                "[]",
+                "[]",
+                "unrelated-preservation-group-token",
+                "COMMITTED",
+                "2026-09-29T00:00:06Z",
+            ),
+        )
+        before = tuple(
+            engine.conn.execute(
+                "SELECT * FROM lifecycle_operations WHERE idempotency_key='unrelated-preservation-key'"
+            ).fetchone()
+        )
+        engine.conn.commit()
+        await adapter.close()
+        return target_row, before
+
+    target_row, before = asyncio.run(prepare())
+    db = tmp_path / "memory.db"
+    operator = DriftUnrelatedLifecycleBeforeCommit(foreign_handle_provider=lambda _: [])
+    with pytest.raises(RecoveryHold) as caught:
+        _run(_plan(db, target_row, operation="v3-preservation-drift"), tmp_path, operator=operator)
+    assert caught.value.code == "HOLD_UNRELATED_LIFECYCLE_DRIFT_NO_MUTATION"
+
+    conn = sqlite3.connect(db)
+    try:
+        assert tuple(
+            conn.execute(
+                "SELECT * FROM lifecycle_operations WHERE idempotency_key='unrelated-preservation-key'"
+            ).fetchone()
+        ) == before
+        row = conn.execute(
+            "SELECT lifecycle_state,fact FROM adapter_records WHERE record_id=?",
+            (target_row["record_id"],),
+        ).fetchone()
+        assert row == (target_row["lifecycle_state"], target_row["fact"])
+        assert conn.execute(
+            "SELECT COUNT(*) FROM lifecycle_events WHERE operation_id='v3-preservation-drift' AND action='SENSITIVE_PURGE'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
 # APPEND_CHECK
 
 async def _replace_for_history(adapter: MemoryAdapter, current: dict[str, Any]) -> dict[str, Any]:
@@ -355,10 +659,11 @@ def test_multi_record_target_set_gets_unique_tombstone_fields(tmp_path: Path) ->
     try:
         rows = conn.execute("SELECT contradiction_key, native_content_hash, payload_fingerprint, idempotency_key FROM adapter_records ORDER BY record_id").fetchall()
         assert len(rows) == 2
-        for index in range(4):
+        for index in range(3):
             assert len({row[index] for row in rows}) == 2
-        old_values = {value for source in (first_row, second_row) for value in (source["contradiction_key"], source["native_content_hash"], source["payload_fingerprint"], source["idempotency_key"])}
-        assert not any(value in old_values for row in rows for value in row)
+        old_values = {value for source in (first_row, second_row) for value in (source["contradiction_key"], source["native_content_hash"], source["payload_fingerprint"])}
+        assert not any(value in old_values for row in rows for value in row[:3])
+        assert {row[3] for row in rows} == {first_row["idempotency_key"], second_row["idempotency_key"]}
     finally:
         conn.close()
 
@@ -1085,11 +1390,12 @@ def test_r09_r11_tombstone_allowlist_preserves_only_safe_identity_and_replaces_s
         assert after["confidence"] == 0.0
         assert json.loads(after["tags"]) == []
         assert after["lifecycle_state"] == "QUARANTINED"
-        for field in ("contradiction_key", "native_content_hash", "payload_fingerprint", "idempotency_key"):
+        for field in ("contradiction_key", "native_content_hash", "payload_fingerprint"):
             assert after[field] != row[field]
+        assert after["idempotency_key"] == row["idempotency_key"]
         serialized = json.dumps(dict(after), sort_keys=True)
         assert marker not in serialized
-        for field in ("contradiction_key", "native_content_hash", "payload_fingerprint", "idempotency_key"):
+        for field in ("contradiction_key", "native_content_hash", "payload_fingerprint"):
             assert str(row[field]) not in serialized
     finally:
         conn.close()
@@ -1618,6 +1924,9 @@ def test_r08_lineage_fork_is_unexpected_derived_state(tmp_path: Path) -> None:
         source = engine.conn.execute("SELECT * FROM adapter_records WHERE record_id = ?", (row["record_id"],)).fetchone()
         columns = [value[1] for value in engine.conn.execute("PRAGMA table_info(adapter_records)").fetchall()]
         base = dict(zip(columns, source, strict=True))
+        # Recovery still detects a pre-existing lineage fork, but valid v3 cannot
+        # create one. Drop the guard only inside this deliberately corrupt fixture.
+        engine.conn.execute("DROP INDEX uq_adapter_parent_record")
         for index in (1, 2):
             child = dict(base)
             child["record_id"] = f"r08-fork-child-{index}"

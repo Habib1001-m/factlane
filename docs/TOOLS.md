@@ -64,13 +64,17 @@ It is not an arbitrary transcript or directory dump.
 
 Use it for governed revision operations.
 
-Two important modes are:
+Public Contract Revision 3 supports four modes:
 
 - **`REVERIFY`** — trusted verification of the same logical memory identity;
-- **`REPLACE`** — a new current revision when the semantic identity changes.
+- **`REPLACE`** — a governed successor when the semantic identity changes;
+- **`REVOKE`** — direct-Owner terminal disposition of a `VALIDATED_CURRENT` logical memory;
+- **`REJECT`** — direct-Owner terminal disposition of a `CANDIDATE` that should not be admitted.
 
 Promotion checks expected record identity and revision so a stale writer cannot silently replace a
-newer state.
+newer state. Owner `REVOKE`/`REJECT` additionally require the exact displayed
+`observed_group_token` and a bounded reason code, so an Owner decision is bound to the contradiction
+group that was actually reviewed.
 
 An ordinary delegated agent does not gain verifier authority simply because this tool is visible.
 
@@ -78,7 +82,7 @@ An ordinary delegated agent does not gain verifier authority simply because this
 
 Use it for bounded, read-only observations about a scope's storage and embedding-profile state.
 
-In `v0.1.4`, the backend status also reports the persisted embedding
+In published `v0.1.4`, the backend status also reports the persisted embedding
 compatibility state/binding and whether the observed runtime fingerprint still matches that binding.
 `memory_status` does not run a compatibility migration or silently requalify a changed runtime.
 When a legacy database is `UNPROVEN` or `INCOMPATIBLE`, safe non-semantic reads (`memory_get`,
@@ -86,6 +90,19 @@ When a legacy database is `UNPROVEN` or `INCOMPATIBLE`, safe non-semantic reads 
 fail closed with `PROFILE_MISMATCH` until an explicit compatible migration/re-embedding path exists.
 
 It is not a full monitoring platform, backup facility, or maintenance daemon.
+
+The current `0.1.5` source/RC adds a separate `OwnerControlService`, packaged `factlane-owner` CLI,
+and packaged `factlane-owner-webui` loopback launcher for inventory, conflict review,
+health/retention views, lifecycle actions, manual recheck, and readmission. The WebUI binds only to
+`127.0.0.1`; its one-use terminal bootstrap token is exchanged through the
+`X-FactLane-Bootstrap` header, never through a URL or `localStorage`. These Owner surfaces do not
+add MCP tools: the public MCP surface remains exactly the five names at the top of this page, over
+stdio only.
+
+An `on_change` freshness policy does not start a background monitor. Manual recheck requires fresh
+Owner-supplied observation evidence. `REVOKED`/`REJECTED` are logical terminal states; sensitive
+physical removal remains a separate recovery operation. Readmission applies only to eligible
+`REVOKED` logical memory and is not database restore.
 
 ## Governed failures
 

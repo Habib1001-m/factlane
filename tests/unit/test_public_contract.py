@@ -199,7 +199,7 @@ def test_public_request_schemas_are_closed_even_when_runtime_preserves_raw_extra
     for name in TOOL_NAMES:
         schema = _request_schema(name)
         assert schema.get("additionalProperties") is False
-        assert schema.get("x-factlane-public-contract-revision") == 2
+        assert schema.get("x-factlane-public-contract-revision") == 3
 
 
 def test_help_documents_cross_project_search_and_freshness_matrix() -> None:
@@ -222,7 +222,9 @@ def test_store_and_update_contracts_explain_governed_write_fields() -> None:
     assert "idempotency_key" in store["required"]
     assert "authority_role" not in store["properties"]
     assert "expected_revision" in update["required"]
-    assert set(update["properties"]["mode"]["enum"]) == {"REVERIFY", "REPLACE"}
+    assert set(update["properties"]["mode"]["enum"]) == {"REVERIFY", "REPLACE", "REVOKE", "REJECT"}
+    assert "observed_group_token" in update["properties"]
+    assert "reason_code" in update["properties"]
     assert "required for replace" in update["properties"]["replacement"]["description"].casefold()
     raw_update = public_request_schema("memory_update")
     verification = raw_update["$defs"]["VerificationPayload"]["properties"]
@@ -383,6 +385,12 @@ def test_public_scope_authority_claim_is_denied_before_role_derivation() -> None
 
 def test_replace_error_explains_conditional_replacement_requirements() -> None:
     class ExistingRecordEngine:
+        async def idempotency_owner(self, key: str) -> None:
+            return None
+
+        async def operation_by_idempotency(self, key: str) -> None:
+            return None
+
         async def find_idempotency(self, key: str) -> None:
             return None
 

@@ -132,7 +132,8 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       proofsLabel: 'FactLane at a glance',
       proofs: [
         {strong: 'Apache-2.0', rest: ' open source'},
-        {strong: 'v0.1.4', rest: ' production-qualified local profile'},
+        {strong: 'v0.1.4', rest: ' latest published production release'},
+        {strong: '0.1.5', rest: ' current local RC source line'},
         {strong: 'Five tools', rest: ' focused MCP surface'},
       ],
       developerLabel: 'Prefer manual setup?',
@@ -285,7 +286,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       eyebrow: 'A bounded production claim',
       title: 'Production-qualified for one documented local profile — not marketed as universal infrastructure.',
       intro:
-        'FactLane v0.1.4 is the current production release. The support statement is intentionally specific enough to verify and narrow enough to be honest.',
+        'FactLane v0.1.4 is the latest published production release. The current 0.1.5 source line is a local RC with Public Contract Revision 3 and storage v3; it has no published v0.1.5 release identity yet.',
       supportedLabel: 'Supported profile',
       supportedItems: [
         'Python 3.11+',
@@ -313,7 +314,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
         ['memory_search', 'Find eligible facts inside one exact scope.'],
         ['memory_get', 'Inspect one memory and its provenance or revision details.'],
         ['memory_store', 'Contribute one bounded fact when the launcher allows it.'],
-        ['memory_update', 'Reverify or replace under trusted revision rules.'],
+        ['memory_update', 'Reverify/replace, or apply Owner-only REVOKE/REJECT, under governed CAS rules.'],
         ['memory_status', 'Inspect bounded storage and embedding-profile health.'],
       ],
       link: 'Read the tool guide →',
@@ -324,7 +325,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       intro:
         'The current supported profile is a command-launched stdio MCP server with local embeddings and local SQLite/SQLite-vec storage.',
       noteBodies: [
-        'No HTTP, SSE or Streamable HTTP server transport in v0.1.4.',
+        'Public MCP remains stdio-only in v0.1.4 and the 0.1.5 RC; the RC Owner WebUI is a separate loopback-only control surface.',
         'The shipped provider uses Ollama over loopback HTTP.',
         'The storage backend does not decide who is allowed to promote memory.',
       ],
@@ -357,7 +358,8 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       proofsLabel: 'FactLane باختصار',
       proofs: [
         {strong: 'Apache-2.0', rest: ' مفتوح المصدر'},
-        {strong: 'v0.1.4', rest: ' ملف محلي مؤهل إنتاجيًا'},
+        {strong: 'v0.1.4', rest: ' آخر إصدار إنتاجي منشور'},
+        {strong: '0.1.5', rest: ' خط مصدر RC محلي حالي'},
         {strong: 'خمس أدوات', rest: ' سطح MCP مركز'},
       ],
       developerLabel: 'تفضّل الإعداد بنفسك؟',
@@ -509,7 +511,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       eyebrow: 'ادعاء إنتاجي محدد',
       title: 'مؤهل إنتاجيًا لملف محلي موثق — وليس ادعاءً بأننا بنية تحتية مناسبة لكل بيئة.',
       intro:
-        'FactLane v0.1.4 هو الإصدار الإنتاجي الحالي. تعمدنا أن يكون نطاق الدعم محددًا بما يكفي لإثباته وصريحًا بما يكفي لعدم المبالغة.',
+        'FactLane v0.1.4 هو آخر إصدار إنتاجي منشور. خط المصدر 0.1.5 الحالي هو RC محلي بعقد عام Revision 3 وتخزين v3، ولا يملك بعد هوية إصدار v0.1.5 منشورة.',
       supportedLabel: 'ملف التشغيل المدعوم',
       supportedItems: [
         'Python 3.11+',
@@ -537,7 +539,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
         ['memory_search', 'ابحث عن الحقائق المؤهلة داخل scope محدد بدقة.'],
         ['memory_get', 'افحص حقيقة واحدة مع provenance أو تفاصيل revision الخاصة بها.'],
         ['memory_store', 'ساهم بحقيقة محدودة عندما يسمح launcher بذلك.'],
-        ['memory_update', 'نفّذ reverify أو replace وفق قواعد revision موثوقة.'],
+        ['memory_update', 'نفّذ reverify أو replace، أو REVOKE/REJECT بصلاحية Owner فقط، وفق قواعد CAS المحكومة.'],
         ['memory_status', 'افحص صحة التخزين وembedding profile ضمن الحدود المدعومة.'],
       ],
       link: 'اقرأ دليل الأدوات',
@@ -548,7 +550,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       intro:
         'ملف التشغيل المدعوم حاليًا هو stdio MCP server يُشغَّل بالأمر، مع embeddings محلية وتخزين محلي SQLite/SQLite-vec.',
       noteBodies: [
-        'لا يوجد HTTP أو SSE أو Streamable HTTP server transport في v0.1.4.',
+        'يبقى MCP العام عبر stdio فقط في v0.1.4 و0.1.5 RC؛ أما Owner WebUI في الـRC فهو سطح تحكم منفصل عبر loopback فقط.',
         'الـprovider المرفق يستخدم Ollama عبر loopback HTTP.',
         'طبقة التخزين لا تقرر من يملك صلاحية ترقية الذاكرة.',
       ],
@@ -772,7 +774,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
       eyebrow: 'Quality you can inspect',
       title: 'Free and open source. Production-qualified where we claim support.',
       intro:
-        'FactLane v0.1.4 is an official production release for a deliberately bounded local profile. The quality claim is tied to explicit contracts, fail-closed behavior and documented qualification — not adjectives.',
+        'FactLane v0.1.4 is the latest official production release for a deliberately bounded local profile. The current 0.1.5 source line remains a local RC until a separate release/publication decision seals its identity.',
       cards: [
         {
           title: 'Small public surface',
@@ -944,7 +946,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
       eyebrow: 'جودة يمكنك فحصها',
       title: 'مجاني ومفتوح المصدر. ومؤهل إنتاجيًا ضمن نطاق الدعم المعلن.',
       intro:
-        'FactLane v0.1.4 إصدار إنتاج رسمي لملف محلي محدد عمدًا. ادعاء الجودة مربوط بعقود صريحة وفشل مغلق وتأهيل موثّق — لا بصفات تسويقية.',
+        'FactLane v0.1.4 هو آخر إصدار إنتاج رسمي لملف محلي محدد عمدًا. خط المصدر 0.1.5 الحالي يظل RC محليًا حتى يَحسم قرار إصدار/نشر مستقل هويته.',
       cards: [
         {
           title: 'سطح عام صغير',

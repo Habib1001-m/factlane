@@ -65,7 +65,7 @@ only after an explicit user remember/store request or an agent proposal that the
 authorizes. Content consent does not change the launcher profile or grant verifier authority.
 
 Promotion is a distinct `memory_update` operation: a trusted verifier uses `REVERIFY`, the
-expected revision, and the exact Candidate `expected_record_id`. Storage contract v2 keeps
+expected revision, and the exact Candidate `expected_record_id`. Storage contract v3 keeps
 `contribution_origin` separate from verification and preserves it on promotion. The verifier
 is recorded separately; an older record is not silently rewritten as if it had been
 contributed by the verifier. `REVERIFY` also preserves contradiction identity: the fact,
@@ -78,15 +78,44 @@ revision, lifecycle, and contradiction checks occur inside the same SQLite trans
 Duplicate or retried requests are resolved through the governed idempotency rules; an
 idempotency key from a more privileged request is not an authorization token.
 
-Storage contract v2 also blocks stale legacy writers from inserting, updating, or deleting
-adapter records through an untrusted raw SQLite connection. The trusted maintenance path has
-a separate authorization boundary; it does not make arbitrary direct SQL writes part of the
-public API. Because writer authorization is a connection-local SQLite function, an unregistered
-raw connection against a compatibility-bound Development database is rejected at function
-resolution for `factlane_contract_v2_compat_writer`. When opening an exact legacy v0.1.3 database,
-the current runtime resolves the older `factlane_contract_v2_writer` as **deny** until compatibility
-is proven and the persistent fences are replaced atomically. Only the separately authorized
-maintenance/recovery path can enable that legacy writer capability for its bounded operation.
+Storage contract v3 also blocks stale or untrusted writers from inserting, updating, or deleting
+governed adapter/lifecycle state. The trusted writer capability is connection-local; lifecycle
+event history is append-only for ordinary governed writes and lifecycle-operation state has a
+separate Recovery-only decision path. Global idempotency spans ordinary adapter writes and Owner
+lifecycle operations so the same key cannot silently mean two different mutations.
+
+The current `0.1.5` source/RC refuses to open a storage-v2 database for normal service. The
+separately authorized migration operator validates the exact v2 schema and lineage, creates and
+verifies an operator-named v2 backup, installs the v3 governance schema/fences, and advances the
+contract version only after the schema work succeeds. That explicit transition is separate from
+the older v0.1.4 embedding-space compatibility migration.
+
+## Owner control plane
+
+Public Contract Revision 3 keeps the normal MCP surface at exactly five tools. Direct Owner
+lifecycle work is coordinated by `OwnerControlService`, which provides bounded inventory/detail,
+conflict review, health/retention inspection, `REVOKE`/`REJECT`, contradiction resolution,
+reverification/replacement, manual freshness recheck, and readmission.
+
+The packaged `factlane-owner` CLI creates the service under a trusted `owner-current` launcher
+context. Scope and launcher identity come from CLI arguments; mutation JSON cannot override them.
+Every mutation is revision/idempotency protected, and operations that can affect a contradiction
+group require the exact observed Group CAS token.
+
+The packaged `factlane-owner-webui` launcher is another presentation layer over the same service.
+Its server binds exactly to `127.0.0.1` and one immutable scope. Startup prints the bound origin and
+a short-lived one-use bootstrap token. That token is accepted only through the
+`X-FactLane-Bootstrap` header on `/owner/bootstrap`; URL credentials are rejected and the UI does
+not persist the bootstrap token in `localStorage`. A successful exchange consumes the token,
+establishes an `HttpOnly; SameSite=Strict` authenticated session, and returns the CSRF token used by
+later mutations. The WebUI is not an HTTP MCP transport and does not add a sixth MCP tool.
+
+For `on_change` freshness, FactLane stores a recheck contract but does not run a source watcher.
+An Owner manual recheck supplies fresh observation evidence; changed, unavailable, indeterminate,
+stale, or mismatched evidence blocks renewed eligibility. `REVOKED` and `REJECTED` are logical
+terminal states. Readmission can create a governed successor for an eligible `REVOKED` logical
+memory after new verification and CAS checks; it is distinct from restoring database bytes and
+cannot recreate content removed by sensitive-memory Recovery.
 
 ## Retrieval and history
 
@@ -206,6 +235,13 @@ documentation or development changes on `main` do not change the recorded identi
 published release. The exact release-identity and transition procedure lives in
 [Release operations](RELEASE_OPERATIONS.md).
 
+The current `0.1.5` source/RC changes durable storage from contract v2 to v3 and therefore has an
+explicit migration boundary. `factlane-migrate-storage-v3 migrate` requires an exact v2 database,
+creates and integrity-checks a pre-v3 backup, applies v3 schema/fences transactionally, then verifies
+the result as v3. Rollback of that migration is restoration of the verified pre-v3 backup through
+`factlane-migrate-storage-v3 restore`; opening a v3 database directly with v0.1.4 is not a supported
+downgrade path.
+
 ## Qualification boundary
 
 The `v0.1.4` qualification includes native Windows x64/AMD64 standard
@@ -221,6 +257,13 @@ Python runtime, linked SQLite/SQLite-vec storage contract, stdio MCP surface, su
 embedding profile, and configured local host integrations. The qualification exercised
 backup/restore compatibility, bounded concurrent operation, crash/restart rollback,
 production-derived retrieval, and fail-closed SQLite capacity behavior.
+
+The current 0.1.5 source/RC keeps Python 3.11+, linked SQLite 3.42.0+, local Ollama, and stdio-only
+MCP as its normal runtime boundary while advancing to Public Contract Revision 3/storage v3. Normal
+runtime support remains separate from sensitive maintenance: the native Windows x64 runtime claim
+does not create a Windows sensitive-Recovery or v2→v3 maintenance-lock claim. Those maintenance
+operations depend on the documented POSIX `fcntl`/`flock` exclusion contract. The 0.1.5 line remains
+local-RC source until a separate release/publication decision creates official release identity.
 
 That evidence does not establish support for every MCP client, arbitrary filesystem,
 production-scale ingestion pattern, unlimited-duration load, or every language mix.

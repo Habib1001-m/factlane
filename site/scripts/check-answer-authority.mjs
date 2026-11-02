@@ -46,6 +46,18 @@ function visibleText(html) {
   );
 }
 
+function topNavbarLinks(html) {
+  const nav = html.match(/<nav\b[^>]*class="[^"]*\bnavbar\b[^"]*"[^>]*>([\s\S]*?)<\/nav>/i)?.[1] ?? '';
+  return [...nav.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)]
+    .map((match) => {
+      const attrs = match[1];
+      const href = decodeHtml(attrs.match(/\bhref="([^"]+)"/i)?.[1] ?? '');
+      const classes = (attrs.match(/\bclass="([^"]+)"/i)?.[1] ?? '').split(/\s+/).filter(Boolean);
+      return {href, classes, text: visibleText(match[2])};
+    })
+    .filter((link) => link.classes.includes('navbar__item') && link.classes.includes('navbar__link'));
+}
+
 function answerRoute(locale) {
   return locale === 'en' ? '/answers/' : '/ar/answers/';
 }
@@ -108,6 +120,7 @@ for (const locale of ['en', 'ar']) {
   const page = parsePage(html);
   const route = answerRoute(locale);
   const expectedCanonical = `${origin}${route}`;
+  const expectedNavbarLabel = locale === 'en' ? 'Answers' : 'الإجابات';
   const expectedAlternates = {
     en: `${origin}/answers/`,
     ar: `${origin}/ar/answers/`,
@@ -135,6 +148,12 @@ for (const locale of ['en', 'ar']) {
   assert(page.text.includes(copy.title), `SSR H1 text missing: ${locale}`);
   assert(page.text.includes(copy.sourceCue), `SSR provenance cue missing: ${locale}`);
   assert(page.answerIds.size === copy.answers.length, `Answer count mismatch: ${locale}`);
+  const answerNavbarLink = topNavbarLinks(html).find((link) => link.href === route);
+  assert(answerNavbarLink, `Top navbar missing Answers route ${locale}: ${route}`);
+  assert(
+    answerNavbarLink.text === expectedNavbarLabel,
+    `Top navbar Answers label mismatch ${locale}: ${answerNavbarLink.text}`,
+  );
 
   for (const answer of copy.answers) {
     assert(page.answerIds.has(answer.id), `Missing answer ID ${locale}#${answer.id}`);

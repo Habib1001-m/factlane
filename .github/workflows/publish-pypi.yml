@@ -1,0 +1,361 @@
+name: Publish FactLane v0.1.5 to PyPI
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: factlane-pypi-v0.1.5
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TAG: v0.1.5
+      PROJECT: factlane
+      VERSION: 0.1.5
+      WHEEL: factlane-0.1.5-py3-none-any.whl
+      WHEEL_SHA256: 1fe01c514d592c7be3d994ba09c2d3c9cdbf537e1a311a91e41b30c3a569e826
+      SDIST: factlane-0.1.5.tar.gz
+      SDIST_SHA256: 5c55aeb7aa74007a1db0015c38848120fefa4cd4550e7101dab94df15d99f9a6
+      RELEASE_MANIFEST: factlane-v0.1.5-release-manifest.json
+      SHA256SUMS: SHA256SUMS.txt
+      UV_VERSION: 0.11.26
+      PYPI_UPLOAD_URL: https://upload.pypi.org/legacy/
+      PYPI_CHECK_URL: https://pypi.org/simple/
+
+    steps:
+      - name: Guard dispatch context and forbid credential fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]
+          [[ "${GITHUB_REF}" == "refs/tags/${TAG}" ]]
+          command -v gh >/dev/null
+          command -v jq >/dev/null
+          command -v python3 >/dev/null
+          command -v curl >/dev/null
+
+          for name in UV_PUBLISH_TOKEN UV_PUBLISH_USERNAME UV_PUBLISH_PASSWORD TWINE_USERNAME TWINE_PASSWORD PYPI_TOKEN PYPI_API_TOKEN PYPI_PASSWORD; do
+            if [[ -v "$name" && -n "${!name}" ]]; then
+              echo "::error::forbidden package-publishing credential variable is present: ${name}"
+              exit 1
+            fi
+          done
+
+      - name: Verify exact annotated tag, release commit tree, reachability, and GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p state release-assets
+
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" > state/tag-ref.json
+          [[ "$(jq -er '.object.type' state/tag-ref.json)" == "tag" ]]
+          tag_object="$(jq -er '.object.sha' state/tag-ref.json)"
+
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}" > state/tag-object.json
+          [[ "$(jq -er '.object.type' state/tag-object.json)" == "commit" ]]
+          release_commit="$(jq -er '.object.sha' state/tag-object.json)"
+          [[ "${GITHUB_SHA}" == "${release_commit}" ]]
+
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/git/commits/${release_commit}" > state/release-commit.json
+          release_tree="$(jq -er '.tree.sha' state/release-commit.json)"
+
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/compare/${release_commit}...main" > state/reachability.json
+          [[ "$(jq -er '.merge_base_commit.sha' state/reachability.json)" == "${release_commit}" ]]
+
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > state/release.json
+          [[ "$(jq -er '.tag_name' state/release.json)" == "${TAG}" ]]
+          [[ "$(jq -er '.name' state/release.json)" == "FactLane v0.1.5" ]]
+          [[ "$(jq -er '.draft' state/release.json)" == "false" ]]
+          [[ "$(jq -er '.prerelease' state/release.json)" == "false" ]]
+          [[ "$(jq -er '.assets | length' state/release.json)" == "4" ]]
+
+          expected_names="$(printf '%s\n' "${WHEEL}" "${SDIST}" "${RELEASE_MANIFEST}" "${SHA256SUMS}" | sort)"
+          actual_names="$(jq -er '.assets[].name' state/release.json | sort)"
+          [[ "${actual_names}" == "${expected_names}" ]]
+
+          {
+            echo "TAG_OBJECT=${tag_object}"
+            echo "RELEASE_COMMIT=${release_commit}"
+            echo "RELEASE_TREE=${release_tree}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Download and verify the exact four GitHub Release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir release-assets \
+            --pattern "${WHEEL}" \
+            --pattern "${SDIST}" \
+            --pattern "${RELEASE_MANIFEST}" \
+            --pattern "${SHA256SUMS}"
+
+          python3 - <<'PY'
+          import email
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import tarfile
+          import zipfile
+
+          root = pathlib.Path("release-assets")
+          names = {
+              os.environ["WHEEL"],
+              os.environ["SDIST"],
+              os.environ["RELEASE_MANIFEST"],
+              os.environ["SHA256SUMS"],
+          }
+          actual = {p.name for p in root.iterdir() if p.is_file()}
+          assert actual == names, (actual, names)
+
+          def sha256(path: pathlib.Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          expected_hashes = {
+              os.environ["WHEEL"]: os.environ["WHEEL_SHA256"],
+              os.environ["SDIST"]: os.environ["SDIST_SHA256"],
+          }
+          for filename, expected in expected_hashes.items():
+              assert sha256(root / filename) == expected
+
+          release = json.loads(pathlib.Path("state/release.json").read_text())
+          assets = {a["name"]: a for a in release["assets"]}
+          assert set(assets) == names
+          for filename in names:
+              local_digest = sha256(root / filename)
+              assert assets[filename].get("digest") == f"sha256:{local_digest}"
+
+          expected_sums = (
+              f'{os.environ["WHEEL_SHA256"]}  {os.environ["WHEEL"]}\n'
+              f'{os.environ["SDIST_SHA256"]}  {os.environ["SDIST"]}\n'
+          ).encode()
+          assert (root / os.environ["SHA256SUMS"]).read_bytes() == expected_sums
+
+          manifest = json.loads((root / os.environ["RELEASE_MANIFEST"]).read_text())
+          expected_manifest = {
+              "schemaVersion": 1,
+              "release": "FactLane v0.1.5",
+              "tag": os.environ["TAG"],
+              "tagObject": os.environ["TAG_OBJECT"],
+              "commit": os.environ["RELEASE_COMMIT"],
+              "tree": os.environ["RELEASE_TREE"],
+              "packageVersion": os.environ["VERSION"],
+              "pythonRequires": ">=3.11",
+              "linkedSqliteMinimum": "3.42.0",
+              "publicContractRevision": 3,
+              "storageContractVersion": 3,
+              "transport": "stdio",
+              "tools": [
+                  "memory_search",
+                  "memory_get",
+                  "memory_store",
+                  "memory_update",
+                  "memory_status",
+              ],
+              "artifacts": {
+                  "wheel": {"name": os.environ["WHEEL"], "sha256": os.environ["WHEEL_SHA256"]},
+                  "sdist": {"name": os.environ["SDIST"], "sha256": os.environ["SDIST_SHA256"]},
+              },
+          }
+          assert manifest == expected_manifest
+
+          with zipfile.ZipFile(root / os.environ["WHEEL"]) as zf:
+              metadata_names = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
+              assert len(metadata_names) == 1
+              msg = email.message_from_bytes(zf.read(metadata_names[0]))
+              assert msg["Name"] == os.environ["PROJECT"]
+              assert msg["Version"] == os.environ["VERSION"]
+              assert msg["Requires-Python"] == ">=3.11"
+              assert not any(n.startswith(".github/") for n in zf.namelist())
+
+          with tarfile.open(root / os.environ["SDIST"], "r:gz") as tf:
+              members = [m for m in tf.getmembers() if m.isfile()]
+              assert not any("/.github/" in f"/{m.name}/" for m in members)
+              pkg_infos = [
+                  m for m in members
+                  if m.name.endswith("/PKG-INFO") and m.name.count("/") == 1
+              ]
+              assert len(pkg_infos) == 1
+              f = tf.extractfile(pkg_infos[0])
+              assert f is not None
+              msg = email.message_from_bytes(f.read())
+              assert msg["Name"] == os.environ["PROJECT"]
+              assert msg["Version"] == os.environ["VERSION"]
+              assert msg["Requires-Python"] == ">=3.11"
+          PY
+
+      - name: Require expected-absent real PyPI project and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_status="$(curl --silent --show-error --output state/pypi-project.json --write-out '%{http_code}' "https://pypi.org/pypi/${PROJECT}/json")"
+          version_status="$(curl --silent --show-error --output state/pypi-version.json --write-out '%{http_code}' "https://pypi.org/pypi/${PROJECT}/${VERSION}/json")"
+          [[ "${project_status}" == "404" ]]
+          [[ "${version_status}" == "404" ]]
+
+      - name: Install exact uv publisher tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv state/uv-venv
+          env -u PIP_INDEX_URL -u PIP_EXTRA_INDEX_URL -u PIP_NO_INDEX -u PIP_FIND_LINKS \
+            PIP_CONFIG_FILE=/dev/null \
+            state/uv-venv/bin/python -m pip install \
+              --disable-pip-version-check \
+              --no-input \
+              --index-url "${PYPI_CHECK_URL}" \
+              "uv==${UV_VERSION}"
+          [[ "$(state/uv-venv/bin/uv --version)" == "uv ${UV_VERSION}" ]]
+
+      - name: Acquire trusted-publishing OIDC inside the publication job
+        shell: bash
+        run: |
+          set -euo pipefail
+          state/uv-venv/bin/uv publish \
+            --dry-run \
+            --no-config \
+            --publish-url "${PYPI_UPLOAD_URL}" \
+            --check-url "${PYPI_CHECK_URL}" \
+            --trusted-publishing always \
+            --keyring-provider disabled \
+            --no-attestations \
+            "release-assets/${WHEEL}" \
+            "release-assets/${SDIST}"
+
+      - name: Revalidate immutable release identity immediately before PyPI write
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" > state/tag-ref-pre-publish.json
+          [[ "$(jq -er '.object.type' state/tag-ref-pre-publish.json)" == "tag" ]]
+          [[ "$(jq -er '.object.sha' state/tag-ref-pre-publish.json)" == "${TAG_OBJECT}" ]]
+
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT}" > state/tag-object-pre-publish.json
+          [[ "$(jq -er '.object.type' state/tag-object-pre-publish.json)" == "commit" ]]
+          [[ "$(jq -er '.object.sha' state/tag-object-pre-publish.json)" == "${RELEASE_COMMIT}" ]]
+
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/git/commits/${RELEASE_COMMIT}" > state/release-commit-pre-publish.json
+          [[ "$(jq -er '.tree.sha' state/release-commit-pre-publish.json)" == "${RELEASE_TREE}" ]]
+
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/compare/${RELEASE_COMMIT}...main" > state/reachability-pre-publish.json
+          [[ "$(jq -er '.merge_base_commit.sha' state/reachability-pre-publish.json)" == "${RELEASE_COMMIT}" ]]
+
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > state/release-pre-publish.json
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+
+          before = json.loads(pathlib.Path("state/release.json").read_text())
+          now = json.loads(pathlib.Path("state/release-pre-publish.json").read_text())
+          assert now["id"] == before["id"]
+          assert now["tag_name"] == os.environ["TAG"]
+          assert now["name"] == "FactLane v0.1.5"
+          assert now["draft"] is False
+          assert now["prerelease"] is False
+
+          def identity(release):
+              return sorted(
+                  (a["id"], a["name"], a.get("digest"), a["size"])
+                  for a in release["assets"]
+              )
+
+          assert identity(now) == identity(before)
+
+          root = pathlib.Path("release-assets")
+          assert len(now["assets"]) == 4
+          for asset in now["assets"]:
+              path = root / asset["name"]
+              assert path.is_file()
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              assert asset.get("digest") == f"sha256:{digest}"
+          PY
+
+          project_status="$(curl --silent --show-error --output state/pypi-project-pre-publish.json --write-out '%{http_code}' "https://pypi.org/pypi/${PROJECT}/json")"
+          version_status="$(curl --silent --show-error --output state/pypi-version-pre-publish.json --write-out '%{http_code}' "https://pypi.org/pypi/${PROJECT}/${VERSION}/json")"
+          [[ "${project_status}" == "404" ]]
+          [[ "${version_status}" == "404" ]]
+
+      - name: Publish exact wheel and sdist to real PyPI with trusted publishing only
+        shell: bash
+        run: |
+          set -euo pipefail
+          state/uv-venv/bin/uv publish \
+            --no-config \
+            --publish-url "${PYPI_UPLOAD_URL}" \
+            --check-url "${PYPI_CHECK_URL}" \
+            --trusted-publishing always \
+            --keyring-provider disabled \
+            --no-attestations \
+            "release-assets/${WHEEL}" \
+            "release-assets/${SDIST}"
+
+      - name: Verify exact PyPI filenames and SHA-256 digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
+          url = f'https://pypi.org/pypi/{os.environ["PROJECT"]}/{os.environ["VERSION"]}/json'
+          data = None
+          for _ in range(12):
+              try:
+                  with urllib.request.urlopen(url, timeout=15) as response:
+                      if response.status == 200:
+                          data = json.load(response)
+                          break
+              except urllib.error.HTTPError as exc:
+                  if exc.code != 404:
+                      raise
+              time.sleep(5)
+
+          assert data is not None, "PyPI version did not become readable"
+          assert data["info"]["name"].lower() == os.environ["PROJECT"]
+          assert data["info"]["version"] == os.environ["VERSION"]
+
+          expected = {
+              os.environ["WHEEL"]: (os.environ["WHEEL_SHA256"], "bdist_wheel"),
+              os.environ["SDIST"]: (os.environ["SDIST_SHA256"], "sdist"),
+          }
+          actual = {entry["filename"]: entry for entry in data["urls"]}
+          assert set(actual) == set(expected)
+          for filename, (digest, package_type) in expected.items():
+              assert actual[filename]["digests"]["sha256"] == digest
+              assert actual[filename]["packagetype"] == package_type
+          PY

@@ -27,6 +27,14 @@ stdio host integration, production-derived retrieval, and fail-closed SQLite cap
 handling. The release remains local-first and keeps the five-tool public MCP contract at
 revision 2. The 0.1.4 line preserves that contract while adding the qualified embedding-compatibility migration, native Windows standard-runtime evidence, host/bootstrap hardening, and release/publication controls.
 
+The current 0.1.5 source/RC line advances the public contract to revision 3 and storage to contract
+v3 without expanding the five-tool MCP surface. It adds Owner `REVOKE`/`REJECT`, contradiction-group
+CAS, lifecycle event/operation records, manual `on_change` recheck, governed readmission,
+`OwnerControlService`, the `factlane-owner` CLI, and a loopback Owner WebUI. Storage-v2 data moves
+forward only through an explicit migration that creates and verifies a pre-v3 backup. The source
+line remains a local release candidate until a separate publication decision creates release
+identity and artifacts.
+
 Qualification does not turn FactLane into a universal retrieval or deployment platform.
 Language and semantic-ranking quality remain workload-specific, and operators remain
 responsible for deployment-specific backup retention, monitoring, and recovery procedures.

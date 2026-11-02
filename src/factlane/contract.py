@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from collections.abc import Iterable
 from typing import Any
 
-PUBLIC_CONTRACT_REVISION = 2
+PUBLIC_CONTRACT_REVISION = 3
 PUBLIC_TOOL_NAMES = ("memory_search", "memory_get", "memory_store", "memory_update", "memory_status")
 SCOPES = {"GLOBAL_USER", "PROJECT", "WORKFLOW", "TOOL_ENVIRONMENT", "CROSS_PROJECT_WORKFLOW"}
 INTENT_CLASSES = {
@@ -23,7 +23,7 @@ INTENT_CLASSES = {
 }
 RETRIEVAL_MODES = {"CURRENT", "REVIEW_HISTORY"}
 RETRIEVAL_MODE_KINDS = {"EXACT", "KEYWORD", "SEMANTIC", "HYBRID"}
-UPDATE_MODES = {"REVERIFY", "REPLACE"}
+UPDATE_MODES = {"REVERIFY", "REPLACE", "REVOKE", "REJECT"}
 MEMORY_TYPES = {
     "USER_FACT",
     "PREFERENCE",
@@ -49,6 +49,8 @@ LIFECYCLE_STATES = {
     "STALE",
     "QUARANTINED",
     "HISTORICAL",
+    "REVOKED",
+    "REJECTED",
 }
 CONTRADICTION_STATES = {"NONE", "UNRESOLVED", "RESOLVED", "QUARANTINED"}
 FRESHNESS_KINDS = {"never", "ttl", "on_change", "manual"}

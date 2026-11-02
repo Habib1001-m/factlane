@@ -319,6 +319,7 @@ const config: Config = {
           position: 'left',
           activeBaseRegex: '^/docs/',
         },
+        {to: '/answers/', label: 'Answers', position: 'left'},
         {
           href: 'https://github.com/Habib1001-m/factlane',
           label: 'GitHub',
