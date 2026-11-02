@@ -1,20 +1,11 @@
 import {readFile, writeFile} from 'node:fs/promises';
+import {readFileSync} from 'node:fs';
 import path from 'node:path';
 
-const docIds = [
-  'INTRO',
-  'USE_CASES',
-  'FAQ',
-  'CORE_CONCEPTS',
-  'QUICKSTART',
-  'TOOLS',
-  'USING_FACTLANE_SKILL',
-  'ARCHITECTURE',
-  'ENVIRONMENT',
-  'SECURITY',
-  'RELEASE_OPERATIONS',
-  'PROJECT_HISTORY',
-];
+const publicDocs = JSON.parse(
+  readFileSync(new URL('../public-docs.json', import.meta.url), 'utf8'),
+);
+const docIds = publicDocs.map((doc) => doc.id);
 
 function assert(condition, message) {
   if (!condition) throw new Error(`SEO regression guard: ${message}`);
@@ -154,7 +145,7 @@ function llmsText(origin) {
 
 > FactLane is a free, local-first governed MCP memory layer for compatible AI agents. It keeps bounded reusable facts with scope, provenance, freshness, and trusted Candidate → Current verification.
 
-FactLane is not a universal memory replacement or a general agent-safety system. Current user instructions, live project state, and verified live sources outrank remembered facts. The latest published named release is v0.1.4 over command-launched stdio with a compatible MCP host. The current 0.1.5 source line is a local release candidate with Public Contract Revision 3 and storage v3; it has no published v0.1.5 release identity yet.
+FactLane is not a universal memory replacement or a general agent-safety system. Current user instructions, live project state, and verified live sources outrank remembered facts. Public MCP stays deliberately small at five command-launched stdio tools; trusted local Owner control is a separate operator surface for lifecycle, conflicts, freshness rechecks, history, and readmission.
 
 ## Canonical answers
 
@@ -165,17 +156,21 @@ FactLane is not a universal memory replacement or a general agent-safety system.
 
 - [Core concepts](${origin}/docs/CORE_CONCEPTS/): Scope, provenance, freshness, Candidate, Current, and authority boundaries.
 - [Five MCP tools](${origin}/docs/TOOLS/): The exact public MCP surface and tool semantics.
-- [Environment and compatibility](${origin}/docs/ENVIRONMENT/): Published v0.1.4 support and the current 0.1.5 RC runtime/storage boundary.
+- [Environment and compatibility](${origin}/docs/ENVIRONMENT/): Current runtime, storage, host, and maintenance support boundaries.
 - [Quick Start](${origin}/docs/QUICKSTART/): Establish a supported read-only connection before enabling Candidate writes.
 - [Security](${origin}/docs/SECURITY/): Host identity, write authority, scope, and sensitive-memory boundaries.
+- [Changelog](${origin}/docs/CHANGELOG/): User-facing changes by release.
+- [Release operations](${origin}/docs/RELEASE_OPERATIONS/): Current published release identity, exact install target, migration, and rollback guidance.
 - [Source repository](https://github.com/Habib1001-m/factlane): Apache-2.0 source for FactLane.
 
 ## Arabic product contract
 
 - [المفاهيم الأساسية](${origin}/ar/docs/CORE_CONCEPTS/): النطاق والمصدر والحداثة ودورة Candidate → Current وحدود الصلاحيات.
 - [أدوات MCP الخمس](${origin}/ar/docs/TOOLS/): الواجهة العامة الدقيقة للأدوات ودلالاتها.
-- [البيئة والتوافق](${origin}/ar/docs/ENVIRONMENT/): حدود v0.1.4 المنشور وخط 0.1.5 RC الحالي للتشغيل والتخزين.
+- [البيئة والتوافق](${origin}/ar/docs/ENVIRONMENT/): حدود التشغيل والتخزين والمضيف والصيانة الحالية.
 - [البدء السريع](${origin}/ar/docs/QUICKSTART/): إنشاء اتصال مدعوم للقراءة فقط قبل تفعيل كتابة Candidate.
+- [سجل التغييرات](${origin}/ar/docs/CHANGELOG/): التغييرات التي تهم المستخدمين حسب الإصدار.
+- [عمليات الإصدار](${origin}/ar/docs/RELEASE_OPERATIONS/): هوية الإصدار المنشور الحالية وهدف التثبيت الدقيق والترحيل والتراجع.
 `;
 }
 
@@ -258,7 +253,7 @@ export default function seoRegressionGuard(context) {
         for (const tool of ['memory_search', 'memory_get', 'memory_store', 'memory_update', 'memory_status']) {
           assert(byId['five-tools'].includes(tool), `answer authority missing ${tool}: ${answerLocale}`);
         }
-        for (const token of ['v0.1.4', '0.1.5', 'Python 3.11+', 'SQLite 3.42.0+', 'stdio', 'Ollama']) {
+        for (const token of ['Python 3.11+', 'SQLite 3.42.0+', 'stdio', 'Ollama']) {
           assert(
             byId['supported-environment'].includes(token),
             `answer authority environment missing ${token}: ${answerLocale}`,
@@ -434,8 +429,8 @@ export default function seoRegressionGuard(context) {
           assert(llms.includes(`${origin}/ar/docs/TOOLS/`), 'public llms.txt missing AR tool contract');
           assert(llms.includes(`${origin}/ar/docs/ENVIRONMENT/`), 'public llms.txt missing AR environment contract');
           assert(llms.includes(`${origin}/ar/docs/QUICKSTART/`), 'public llms.txt missing AR Quick Start');
-          assert(llms.includes('v0.1.4'), 'public llms.txt missing supported release boundary');
-          assert(llms.includes('0.1.5'), 'public llms.txt missing local RC source boundary');
+          assert(llms.includes(`${origin}/docs/CHANGELOG/`), 'public llms.txt missing changelog');
+          assert(llms.includes(`${origin}/docs/RELEASE_OPERATIONS/`), 'public llms.txt missing release operations');
           assert(llms.includes('not a universal memory replacement'), 'public llms.txt missing product-scope boundary');
         } else {
           assert(!(await fileExists(llmsPath)), 'localized /ar/llms.txt must not be emitted');

@@ -76,7 +76,29 @@ assert(
 assert(composition.composedArtifact?.files === a.manifest.size, 'Composition receipt file count mismatch');
 
 const routes = composition.routes;
-assert(Array.isArray(routes) && routes.length === 28, `Expected 28 canonical routes, found ${routes?.length}`);
+const publicDocs = await readJson(path.join(siteRoot, 'public-docs.json'));
+assert(Array.isArray(publicDocs) && publicDocs.length > 0, 'Public documentation manifest is empty');
+const expectedRoutes = [
+  `${origin}/`,
+  `${origin}/answers/`,
+  `${origin}/ar/`,
+  `${origin}/ar/answers/`,
+];
+for (const doc of publicDocs) {
+  assert(typeof doc?.id === 'string' && doc.id.length > 0, 'Public documentation manifest contains an invalid id');
+  for (const localePrefix of ['', '/ar']) {
+    const pathname = doc.id === 'INTRO'
+      ? `${localePrefix}/docs/`
+      : `${localePrefix}/docs/${doc.id}/`;
+    expectedRoutes.push(`${origin}${pathname}`);
+  }
+}
+expectedRoutes.sort();
+assert(Array.isArray(routes), 'Composition route inventory must be an array');
+assert(
+  JSON.stringify(routes) === JSON.stringify(expectedRoutes),
+  `Composition route inventory does not match public-docs contract: expected ${expectedRoutes.length}, found ${routes.length}`,
+);
 const routesText = `${routes.join('\n')}\n`;
 assert(sha256Text(routesText) === composition.routeInventorySha256, 'Composition route inventory digest mismatch');
 
@@ -175,6 +197,8 @@ try {
   const authorityDestination = path.join(packageDir, 'consumer', 'src', 'content', 'answerAuthority.json');
   await mkdir(path.dirname(authorityDestination), {recursive: true});
   await copyFile(path.join(siteRoot, 'src', 'content', 'answerAuthority.json'), authorityDestination);
+  const publicDocsDestination = path.join(packageDir, 'consumer', 'public-docs.json');
+  await copyFile(path.join(siteRoot, 'public-docs.json'), publicDocsDestination);
 
   const archiveSha256 = archiveShaA;
   const overlayManifestPath = path.join(siteRoot, 'publication', 'overlays', 'manifest.json');
@@ -199,6 +223,7 @@ try {
   const consumerStaticSha = await sha256File(path.join(packageDir, 'consumer', 'scripts', 'serve-publication-static.mjs'));
   const consumerReadinessSha = await sha256File(path.join(packageDir, 'consumer', 'scripts', 'check-publication-readiness.mjs'));
   const consumerAuthoritySha = await sha256File(authorityDestination);
+  const consumerPublicDocsSha = await sha256File(publicDocsDestination);
   const handoffSha = await sha256File(path.join(packageDir, 'CONSUMER_HANDOFF.md'));
   const eligibilitySha = await sha256File(path.join(packageDir, 'PUBLICATION_ELIGIBILITY.json'));
   const compositionSha = await sha256File(path.join(packageDir, 'OVERLAY_COMPOSITION.json'));
@@ -260,6 +285,7 @@ try {
     `CONSUMER_STATIC_HOST_SHA256=${consumerStaticSha}`,
     `CONSUMER_READINESS_HARNESS_SHA256=${consumerReadinessSha}`,
     `CONSUMER_ANSWER_AUTHORITY_SHA256=${consumerAuthoritySha}`,
+    `CONSUMER_PUBLIC_DOCS_SHA256=${consumerPublicDocsSha}`,
     `CONSUMER_HANDOFF_SHA256=${handoffSha}`,
     `CONSUMER_NODE_PROFILE=${process.version}`,
     'CONSUMER_TRUSTED_SHA256SUM_BOOTSTRAP=REQUIRED_BEFORE_PACKAGE_CODE',

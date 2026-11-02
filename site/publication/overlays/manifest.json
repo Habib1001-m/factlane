@@ -11,8 +11,8 @@
     {
       "kind": "HOST_STABLE",
       "source": "../host/redirects.txt",
-      "sha256": "5260ded049a08409062d8c12fd176b3148f61e40cdd8282697c71af8b526ce92",
-      "expectedRuleCount": 28
+      "sha256": "3f9c28a6a1100a6b2c3f2bd37812f08d88c8de950bbc9d5c1b51e4fc08353c9d",
+      "expectedRuleCount": 30
     }
   ],
   "files": [

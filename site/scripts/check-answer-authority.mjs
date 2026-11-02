@@ -192,7 +192,8 @@ if (mode === 'public') {
   assert(llms.includes(`${origin}/ar/docs/ENVIRONMENT/`), 'llms.txt missing AR environment contract');
   assert(llms.includes(`${origin}/ar/docs/QUICKSTART/`), 'llms.txt missing AR Quick Start');
   assert(!llms.includes('/docs/PROJECT_HISTORY/'), 'llms.txt should not include project-history noise');
-  assert(!llms.includes('/docs/RELEASE_OPERATIONS/'), 'llms.txt should not include release-operations noise');
+  assert(llms.includes(`${origin}/docs/CHANGELOG/`), 'llms.txt missing changelog');
+  assert(llms.includes(`${origin}/docs/RELEASE_OPERATIONS/`), 'llms.txt missing release operations');
 
   const enSitemap = await readFile(path.join(buildRoot, 'sitemap.xml'), 'utf8');
   const arSitemap = await readFile(path.join(buildRoot, 'ar', 'sitemap.xml'), 'utf8');

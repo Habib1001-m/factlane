@@ -1,29 +1,33 @@
 import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
+import publicDocs from './public-docs.json';
+
+const ids = (group: string) =>
+  publicDocs.filter((doc) => doc.group === group).map((doc) => doc.id);
 
 const sidebars: SidebarsConfig = {
   docs: [
-    'INTRO',
+    ...ids('root'),
     {
       type: 'category',
       label: 'Start here',
       collapsed: false,
-      items: ['USE_CASES', 'FAQ', 'CORE_CONCEPTS', 'QUICKSTART'],
+      items: ids('start'),
     },
     {
       type: 'category',
       label: 'For developers',
       collapsed: true,
-      items: ['TOOLS', 'USING_FACTLANE_SKILL'],
+      items: ids('developer'),
     },
     {
       type: 'category',
       label: 'Evaluate and operate',
-      items: ['ARCHITECTURE', 'ENVIRONMENT', 'SECURITY', 'RELEASE_OPERATIONS'],
+      items: ids('operate'),
     },
     {
       type: 'category',
       label: 'Background',
-      items: ['PROJECT_HISTORY'],
+      items: ids('background'),
     },
   ],
 };

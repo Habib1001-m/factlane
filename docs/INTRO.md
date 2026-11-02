@@ -4,62 +4,46 @@ slug: /
 
 # FactLane documentation
 
-FactLane gives compatible AI-agent hosts a local memory layer for **bounded facts**: useful
-preferences, project facts, workflow rules, and other durable information that should survive
-longer than one conversation.
+FactLane is a local-first MCP memory layer for **bounded reusable facts**. It helps compatible AI-agent hosts carry useful preferences, project facts, workflow rules, and other durable context across sessions without allowing remembered information to silently become execution authority or unquestioned current truth.
 
-The important part is not merely remembering. FactLane separates a fact that is **worth keeping**
-from one that is **trusted as Current**, and it keeps memory subordinate to current instructions
-and live authoritative state.
+The product centers on four boundaries:
+
+- **Candidate is not Current** — a contribution may be worth retaining before it is trusted.
+- **Current is still subordinate to reality** — current instructions, live project/product state, and verified live sources can outrank memory.
+- **Scope is explicit** — facts stay inside the exact user, project, workflow, tool-environment, or governed cross-project boundary selected for them.
+- **Authority is separate from visibility** — seeing a tool or remembering a policy does not grant write, verifier, or Owner permissions.
+
+The current product also includes a trusted local **Owner control plane** for inventory, history, conflicts, lifecycle actions, manual freshness recheck, readmission, health, and retention inspection. Those Owner surfaces remain separate from the public five-tool stdio MCP contract.
 
 ## New to FactLane?
 
-Start with the outcome rather than the protocol:
+Use this reading path:
 
-1. Read [Everyday use cases](USE_CASES.md) to see what FactLane can remember and where its
-   boundaries matter.
-2. Read the [FAQ](FAQ.md) to check fit before spending time on setup.
-3. Read [Core concepts](CORE_CONCEPTS.md) for the plain-language model of Candidate, Current,
-   scope, freshness, and authority.
-4. Follow the [Quick start](QUICKSTART.md) when you are ready to install and connect a supported
-   local MCP host.
-5. Use [Five MCP tools](TOOLS.md) as the developer reference once the connection works.
+1. [Everyday use cases](USE_CASES.md) — decide whether governed facts solve a real problem for you.
+2. [FAQ](FAQ.md) — check fit, non-goals, local-data behavior, and setup expectations.
+3. [Core concepts](CORE_CONCEPTS.md) — understand Candidate, Current, scope, freshness, provenance, and authority.
+4. [Quick Start](QUICKSTART.md) — install a supported release and establish a read-only connection.
+5. [Five MCP tools](TOOLS.md) — use the public MCP contract once connectivity is proven.
 
-### Do I need to be a developer to benefit from it?
+### Do I need to be a developer?
 
-Not necessarily for normal use, but **the setup is still technical**. `v0.1.4` is the latest
-published production release; the current `0.1.5` source line is a local release candidate.
+Not for everyday memory use after FactLane is connected, but setup is still technical. Someone needs to install the runtime, verify Python/SQLite/Ollama prerequisites, configure a compatible command-launched stdio MCP host, and choose the launcher authority profile.
 
-FactLane is not a separate chatbot. It runs locally as a memory service behind a compatible AI
-agent host. Someone must install and configure that connection. After it is connected, the useful
-part can feel much simpler: keep using the assistant while approved preferences, project facts and
-recurring rules remain available across sessions.
+If that is not practical in your environment, FactLane is not currently a zero-configuration memory feature.
 
-If you are mainly trying to understand whether this solves your problem, start with
-[Everyday use cases](USE_CASES.md) and the [FAQ](FAQ.md). You can leave Python, SQLite, MCP and
-embedding details until you are ready to install it yourself.
+## Building, integrating, or operating?
 
-## Building or integrating?
+Use the deeper references directly:
 
-- [Quick start](QUICKSTART.md) — establish a safe read-only connection first.
-- [Five MCP tools](TOOLS.md) — what each public tool is for after connectivity works.
-- [Architecture](ARCHITECTURE.md) — request path, scope/identity model, storage and recovery.
-- [Environment and compatibility](ENVIRONMENT.md) — Python, SQLite, embedding profiles and
-  deployment limits.
-- [Release operations](RELEASE_OPERATIONS.md) — exact release identity, upgrades, rollback and
-  reverification.
-- [Security](../SECURITY.md) — trust boundaries and sensitive-memory recovery.
+- [Architecture](ARCHITECTURE.md) — request path, lifecycle, storage, Owner control, migration, and Recovery.
+- [Environment and compatibility](ENVIRONMENT.md) — supported runtime, embedding, host, storage, and platform boundaries.
+- [Security](../SECURITY.md) — trust boundaries, consent, write authority, incident Recovery, and rollback safety.
+- [Release operations](RELEASE_OPERATIONS.md) — authoritative release identity, artifacts, installation, migration, and rollback.
+- [Changelog](CHANGELOG.md) — user-facing changes between releases.
+- [Project history](PROJECT_HISTORY.md) — why the public contract and product shape evolved.
 
-## Current public release
+The live MCP schema and `factlane --help-tools` are authoritative for exact public request fields and enums. Packaged operator CLIs remain authoritative for their own current flags and arguments.
 
-FactLane **v0.1.4** is the latest published production release. Its qualified public profile is
-intentionally bounded: Python 3.11+, linked SQLite 3.42.0+, command-launched stdio MCP, supported
-local Ollama embeddings, and the documented local POSIX storage/recovery contract.
+## Release status without coupling product docs to a version
 
-The current **0.1.5 source/RC line** keeps exactly the same five-tool stdio MCP surface while moving
-to Public Contract Revision 3 and storage contract v3. It adds governed Owner lifecycle actions,
-manual freshness recheck, readmission, `factlane-owner`, and a loopback Owner WebUI. It has no
-`v0.1.5` release tag, published artifact identity, deployment, or publication authority yet.
-
-The live MCP schema and `factlane --help-tools` are authoritative for exact request signatures
-and enum values.
+Evergreen product and installation documentation intentionally does not embed a specific FactLane release number. For the current published release, exact tag/tree, hashes, and release-status truth, use [Release operations](RELEASE_OPERATIONS.md). For what changed, use the [Changelog](CHANGELOG.md).

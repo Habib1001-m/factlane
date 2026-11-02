@@ -1,74 +1,57 @@
 # Everyday use cases
 
-You do not need to understand vector search or database internals to understand why FactLane
-exists.
+FactLane is useful when a small fact should survive a session **without becoming hidden authority**.
 
-The basic problem is simple: an AI assistant is more useful when it can reuse important facts
-from earlier work, but **old memory should not silently become the final authority over what is
-true now**.
-
-FactLane does not replace your assistant. It sits behind a **compatible AI-agent app or host** as
-its local memory layer. Once connected, the everyday experience can stay much simpler than the
-technical setup.
+It does not replace your assistant. It sits behind a compatible AI-agent host as a local governed memory layer. The technical setup is deliberate; everyday use can remain simple.
 
 ## Remember my preferences between sessions
 
-Imagine telling an assistant:
+You might tell an assistant:
 
 > Keep answers concise, explain in Arabic, and preserve English technical terms.
 
-That preference may be useful next week or in another session. FactLane can store it as a
-bounded fact rather than requiring the assistant to replay the old conversation.
+That preference can be stored as a bounded fact instead of replaying the old conversation every time.
 
-The important boundary is that a newer instruction still wins. If you later say:
+If you later say:
 
 > Go deep on this one.
 
-FactLane memory does not have the authority to override your current request.
+your current instruction wins. Memory helps; it does not overrule the active task.
 
-## Remember the important facts about my project
+## Remember important project facts
 
-You may repeatedly need an assistant to know things such as:
+Useful durable facts include:
 
-- the product goal;
-- the current supported release;
+- a product goal;
 - an architectural decision;
-- the repository or project scope;
-- an agreed workflow rule.
+- an ownership boundary;
+- a repository or project scope;
+- a recurring workflow rule;
+- a release or environment fact that is stored with an appropriate freshness policy.
 
-Instead of pasting a long project history into every session, a compatible host can retrieve
-eligible FactLane facts for the exact project scope.
+Facts that can change need stronger freshness discipline than stable preferences. A remembered “current release” or “production target” is only useful while its freshness and source still support it.
 
-Facts that can become stale still need freshness and verification discipline. “Current release is
-v0.1.4” or “this checkout is the 0.1.5 local RC” is not the same kind of memory as “I prefer concise answers.”
+## Remember recurring workflow rules
 
-## Remember how I like recurring work handled
+FactLane can carry durable workflow facts such as:
 
-FactLane can represent durable workflow facts such as:
-
-> Production changes require owner approval.
+> Production changes require Owner approval.
 
 or:
 
-> Run local tests before preparing a review.
+> Run local qualification before preparing a release review.
 
-The exact authority of the connected agent still comes from the host configuration and current
-instructions. A memory describing a rule is supporting state; it is not a mechanism for granting
-new execution permissions.
+The fact does not grant the permission it describes. Runtime authority still comes from the trusted launcher and current instructions.
 
-## Reuse approved facts across more than one agent host
+## Reuse governed facts across multiple agent hosts
 
-More than one compatible local agent host can use the same governed FactLane store when the
-operator configures them against that environment.
+More than one compatible local agent host can use the same governed FactLane store when the operator configures them against that environment.
 
-This lets the hosts reuse **facts** instead of sharing entire transcripts.
+This shares **bounded facts**, not full conversation transcripts. Hosts can have different launcher profiles, identities, and permissions even when they see the same public MCP tools.
 
-The hosts do not gain identical authority merely because they see the same tools. Launcher
-profiles and trusted context determine what each connection may do.
+## Let an agent propose memory without trusting it immediately
 
-## Let an assistant propose a useful memory without trusting it immediately
-
-An ordinary delegated agent can be allowed to contribute a **Candidate**:
+A normal delegated agent can be allowed to contribute a **Candidate** after explicit content consent:
 
 > This looks worth remembering.
 
@@ -76,29 +59,39 @@ That is deliberately different from:
 
 > This is verified Current truth.
 
-A separate trusted verification operation is required to promote an eligible Candidate. The
-agent cannot self-promote by putting a privileged identity claim into its request.
+Promotion requires a separate trusted verification operation with identity, revision, and lifecycle checks. The contributing agent cannot self-promote by asserting a privileged identity in the request.
 
-Read [Core concepts](CORE_CONCEPTS.md) for the Candidate → Current lifecycle.
+## Retire facts that are no longer Current
+
+A trusted Owner can govern lifecycle after a fact has been stored:
+
+- `REVOKE` an eligible Current fact that should no longer count as Current;
+- `REJECT` a Candidate that should not be admitted;
+- resolve a contradiction group after reviewing competing records;
+- reverify or replace when the underlying fact changes;
+- manually recheck `on_change` freshness with new bounded evidence;
+- readmit an eligible revoked logical memory only through a new governed verification path.
+
+These are logical lifecycle operations. They are not a claim of physical erasure and they do not replace sensitive-memory Recovery.
 
 ## Keep memory inside the right boundary
 
-FactLane does not treat memory as one giant bucket. A fact can belong to a user, one exact project,
-one workflow inside a project, one tool/agent environment, or a narrowly defined workflow rule
-that is deliberately allowed to cross projects.
+FactLane does not use one giant memory bucket. A fact belongs to one exact public scope:
 
-For example, a fact about one project should not implicitly fan out into another project merely
-because the same assistant is connected.
+- `GLOBAL_USER`;
+- `PROJECT`;
+- `WORKFLOW`;
+- `TOOL_ENVIRONMENT`;
+- `CROSS_PROJECT_WORKFLOW`.
 
-See [Core concepts](CORE_CONCEPTS.md) for the plain-language scope model and
-[Architecture](ARCHITECTURE.md) for the exact identity rules.
+A project fact does not silently fan out into another project merely because the same assistant is connected. `CROSS_PROJECT_WORKFLOW` is an explicit identity-free scope for deliberately cross-project workflow facts, not a command to search every project.
+
+## Use the Owner control plane when review matters
+
+The local Owner CLI and loopback Owner WebUI make the governance layer visible instead of hiding it behind raw database access. They provide bounded views for Current, Candidates, conflicts, history, health, and retention plus the governed lifecycle operations above.
+
+The Owner WebUI is a local operator surface, not an HTTP MCP server and not a sixth public tool.
 
 ## Next: check fit before setup
 
-If these examples match the problem you are trying to solve, use the [FAQ](FAQ.md) as the decision
-checkpoint. It covers fit, non-goals, where data lives, and what the current technical setup
-requires.
-
-One boundary is worth knowing now: FactLane still needs someone to install it and configure a
-compatible local host. If that is acceptable, continue with the [FAQ](FAQ.md), then
-[Core concepts](CORE_CONCEPTS.md).
+If these examples match your problem, use the [FAQ](FAQ.md), then [Core concepts](CORE_CONCEPTS.md). When you are ready to connect a host, follow the [Quick Start](QUICKSTART.md).

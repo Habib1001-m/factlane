@@ -42,7 +42,32 @@ npm run build:ar
 Arabic documentation translations live under
 `i18n/ar/docusaurus-plugin-content-docs/current/`. They are localized derivatives of the canonical
 English repository docs; the English sources remain authoritative for technical truth. Commands,
-paths, tool names, versions and other exact identifiers must remain unchanged inside translations.
+paths, tool names and other exact identifiers must remain unchanged inside translations.
+
+### Content ownership and anti-drift policy
+
+Public copy is split by responsibility so the same truth is not hand-maintained in multiple places:
+
+- **canonical English product docs** — repository `docs/*.md`, root `SECURITY.md`, and
+  `skills/using-factlane/SKILL.md`;
+- **generated English site docs** — `.generated-docs/`; never edit these directly;
+- **Arabic documentation** — tracked localized derivatives under
+  `i18n/ar/docusaurus-plugin-content-docs/current/`;
+- **site-owned product copy** — `src/content/homeCopy.ts` and
+  `src/content/answerAuthority.json`;
+- **release-bound history** — `docs/CHANGELOG.md`, `docs/RELEASE_OPERATIONS.md`,
+  `docs/PROJECT_HISTORY.md`, and immutable released-contract snapshots.
+
+`public-docs.json` is the shared documentation inventory for sidebar grouping, route/SEO coverage,
+Arabic completeness checks, and evergreen/release-bound classification. Add or reclassify a public
+document there instead of copying its identifier into multiple validation scripts.
+
+Evergreen product, installation, onboarding, Skill, homepage, answer, and footer copy must not embed
+a specific FactLane release number. Those surfaces point readers to Release operations or the
+Changelog for the current published identity. This keeps future release updates from requiring broad
+copy edits and prevents release-history language from leaking into the product contract.
+
+`npm run check:content` enforces that boundary before every production build.
 
 ### Dependency-audit boundary
 

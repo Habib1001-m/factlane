@@ -4,6 +4,9 @@ import {fileURLToPath} from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const siteRoot = path.resolve(here, '..');
+const publicDocs = JSON.parse(
+  await readFile(path.join(siteRoot, 'public-docs.json'), 'utf8'),
+);
 const generatedDocs = path.join(siteRoot, '.generated-docs');
 const arabicDocs = path.join(
   siteRoot,
@@ -13,20 +16,7 @@ const arabicDocs = path.join(
   'current',
 );
 
-const requiredDocs = [
-  'ARCHITECTURE.md',
-  'CORE_CONCEPTS.md',
-  'ENVIRONMENT.md',
-  'FAQ.md',
-  'INTRO.md',
-  'PROJECT_HISTORY.md',
-  'QUICKSTART.md',
-  'RELEASE_OPERATIONS.md',
-  'SECURITY.md',
-  'TOOLS.md',
-  'USE_CASES.md',
-  'USING_FACTLANE_SKILL.md',
-];
+const requiredDocs = publicDocs.map((doc) => doc.id + '.md');
 
 function fencedBlocks(markdown) {
   return markdown.match(/```[\s\S]*?```/g) ?? [];
@@ -112,7 +102,6 @@ const corpus = (
 ).join('\n');
 
 for (const invariant of [
-  'v0.1.4',
   'memory_search',
   'memory_get',
   'memory_store',
@@ -242,6 +231,7 @@ const requiredUiTranslationKeys = {
     'link.title.Project',
     'link.item.label.Use cases',
     'link.item.label.FAQ',
+    'link.item.label.Answers',
     'link.item.label.Core concepts',
     'link.item.label.Quick Start',
     'link.item.label.Tools',

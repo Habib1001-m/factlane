@@ -344,6 +344,7 @@ const config: Config = {
           items: [
             {label: 'Use cases', to: '/docs/USE_CASES'},
             {label: 'FAQ', to: '/docs/FAQ'},
+            {label: 'Answers', to: '/answers'},
             {label: 'Core concepts', to: '/docs/CORE_CONCEPTS'},
             {label: 'Quick Start', to: '/docs/QUICKSTART'},
           ],
@@ -373,7 +374,7 @@ const config: Config = {
         },
       ],
       copyright:
-        'FactLane v0.1.4 · Local-first governed memory for AI agents.',
+        'FactLane · Local-first governed memory for AI agents.',
     },
     prism: {
       additionalLanguages: ['bash', 'json', 'toml', 'yaml'],

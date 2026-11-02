@@ -18,11 +18,11 @@
     },
     "QUICKSTART": {
       "title": "Quick Start: local MCP server setup",
-      "description": "Install published FactLane v0.1.4 or evaluate the local 0.1.5 RC source, verify the five-tool stdio MCP surface, then use governed writes only with the right authority."
+      "description": "Resolve the current published release from Release operations, inspect storage, start read-only, verify five stdio MCP tools and memory_status, then enable only governed writes."
     },
     "TOOLS": {
       "title": "Five MCP tools",
-      "description": "Reference FactLane’s five MCP tools for search, retrieval, Candidate contribution, governed updates, and status checks within exact authority boundaries."
+      "description": "Reference FactLane’s five stdio MCP tools for search, retrieval, Candidate contribution, governed updates, Owner lifecycle dispositions, and bounded status checks."
     },
     "USING_FACTLANE_SKILL": {
       "title": "Using FactLane safely with MCP agents",
@@ -30,11 +30,11 @@
     },
     "ARCHITECTURE": {
       "title": "Architecture: MCP gateway, scope, and storage",
-      "description": "Explore FactLane’s local stdio MCP architecture: launcher bindings, exact scopes, Candidate verification, retrieval, SQLite-vec storage, and recovery."
+      "description": "Explore FactLane’s local stdio MCP architecture, OwnerControlService, CLI and loopback WebUI, exact scopes, lifecycle closure, SQLite-vec storage, and recovery."
     },
     "ENVIRONMENT": {
       "title": "Environment and compatibility requirements",
-      "description": "Compare the published v0.1.4 profile with the 0.1.5 local RC: Python/SQLite requirements, stdio MCP, Public Contract Rev3, storage v3, migration, and support limits."
+      "description": "Review the qualified local profile, Python and SQLite requirements, five-tool stdio MCP boundary, local Ollama storage dependencies, migration stops, and support limits."
     },
     "SECURITY": {
       "title": "Security policy",
@@ -42,11 +42,15 @@
     },
     "RELEASE_OPERATIONS": {
       "title": "Release operations: install, upgrade, rollback",
-      "description": "Verify the exact published v0.1.4 identity and operate the 0.1.5 local RC transition with explicit storage-v2 to v3 migration, verified backup, rollback, and reverification."
+      "description": "Resolve the exact current published identity, inspect storage, require a verified backup before migration, and follow documented install, upgrade, rollback, and reverification steps."
+    },
+    "CHANGELOG": {
+      "title": "Changelog: release-by-release FactLane changes",
+      "description": "Review release-bound FactLane changes, contract transitions, migration notes, and operator-visible behavior without coupling evergreen product guidance to one release number."
     },
     "PROJECT_HISTORY": {
       "title": "Project history and design evolution",
-      "description": "Follow FactLane from the bounded published v0.1.4 profile to the 0.1.5 local RC with Public Contract Rev3, storage v3, Owner lifecycle controls, and the same five MCP tools."
+      "description": "Follow FactLane’s design evolution toward five stdio MCP tools, governed Owner lifecycle controls, explicit migration boundaries, local operation, and durable audit history."
     }
   },
   "ar": {
@@ -68,11 +72,11 @@
     },
     "QUICKSTART": {
       "title": "البدء السريع: إعداد خادم MCP محلي",
-      "description": "ثبّت FactLane v0.1.4 المنشور أو قيّم مصدر 0.1.5 RC المحلي، وتحقق من أدوات MCP الخمس عبر stdio، ثم استخدم الكتابة المحكومة ضمن الصلاحية المناسبة."
+      "description": "استخرج الإصدار المنشور الحالي من Release operations، وافحص storage، وابدأ بوضع read-only، وتحقق من أدوات MCP الخمس عبر stdio وmemory_status قبل تفعيل الكتابة المحكومة."
     },
     "TOOLS": {
       "title": "أدوات MCP الخمس",
-      "description": "مرجع لأدوات FactLane الخمس عبر MCP: البحث والجلب وإضافة Candidate والتحديث المحكوم والحالة، مع حدود النطاق وصلاحية المتحقق."
+      "description": "مرجع لأدوات FactLane الخمس عبر stdio MCP: البحث والجلب وإضافة Candidate والتحديث المحكوم وقرارات Owner في دورة الحياة وفحوص الحالة المحدودة."
     },
     "USING_FACTLANE_SKILL": {
       "title": "استخدام FactLane بأمان مع وكلاء MCP",
@@ -80,11 +84,11 @@
     },
     "ARCHITECTURE": {
       "title": "المعمارية: بوابة MCP والنطاق والتخزين",
-      "description": "استعرض معمارية FactLane عبر stdio MCP: ربط المشغّل الموثوق، والنطاقات الدقيقة، والتحقق من Candidate، والاسترجاع، وSQLite-vec، والاستعادة."
+      "description": "استعرض معمارية FactLane عبر stdio MCP وOwnerControlService وCLI وOwner WebUI المحلي، مع النطاقات الدقيقة وإغلاق دورة الحياة وSQLite-vec والاستعادة."
     },
     "ENVIRONMENT": {
       "title": "البيئة ومتطلبات التوافق",
-      "description": "قارن ملف v0.1.4 المنشور مع 0.1.5 RC المحلي: متطلبات Python وSQLite وstdio MCP وPublic Contract Rev3 وتخزين v3 والترحيل وحدود الدعم."
+      "description": "راجع ملف التشغيل المحلي المؤهّل ومتطلبات Python وSQLite وحد أدوات MCP الخمس عبر stdio واعتماد Ollama المحلي ونقاط توقف migration وحدود الدعم."
     },
     "SECURITY": {
       "title": "سياسة الأمان",
@@ -92,11 +96,15 @@
     },
     "RELEASE_OPERATIONS": {
       "title": "عمليات الإصدار: التثبيت والترقية والتراجع",
-      "description": "تحقق من هوية v0.1.4 المنشورة الدقيقة وشغّل انتقال 0.1.5 RC المحلي بترحيل صريح من storage v2 إلى v3 ونسخة احتياطية موثقة وتراجع وإعادة تحقق."
+      "description": "استخرج هوية الإصدار المنشور الحالية بدقة، وافحص storage الموجود، ولا تنفذ migration مطلوبة إلا مع backup متحقق منه، ثم اتبع خطوات الترقية والتراجع وإعادة التحقق الموثقة."
+    },
+    "CHANGELOG": {
+      "title": "سجل التغييرات: تغييرات FactLane حسب كل إصدار",
+      "description": "راجع تغييرات FactLane المرتبطة بكل إصدار وانتقالات العقود وملاحظات migration والسلوك الظاهر للمشغّل من دون ربط إرشادات المنتج الدائمة برقم إصدار واحد."
     },
     "PROJECT_HISTORY": {
       "title": "تاريخ المشروع وتطور التصميم",
-      "description": "تتبّع تطور FactLane من ملف v0.1.4 المنشور المحدود إلى 0.1.5 RC المحلي مع Public Contract Rev3 وتخزين v3 وتحكم Owner ودون توسيع أدوات MCP الخمس."
+      "description": "تتبّع تطور تصميم FactLane نحو خمس أدوات MCP عبر stdio وتحكم Owner محكوم في دورة الحياة وحدود migration صريحة وتشغيل محلي وتاريخ audit دائم."
     }
   }
 }

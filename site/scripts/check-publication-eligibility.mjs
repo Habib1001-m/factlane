@@ -305,17 +305,18 @@ const unexpectedNamedVersions = [...namedVersions]
 const indexSource = await readFile(path.join(siteRoot, 'src', 'pages', 'index.tsx'), 'utf8');
 const softwareVersion = indexSource.match(/softwareVersion:\s*'([^']+)'/)?.[1];
 assert(
-  softwareVersion === authority.packageVersion || softwareVersion === currentPackageVersion,
-  `Published softwareVersion must match released authority ${authority.packageVersion} or current package ${currentPackageVersion}`,
+  softwareVersion === undefined ||
+    softwareVersion === authority.packageVersion ||
+    softwareVersion === currentPackageVersion,
+  `If present, published softwareVersion must match released authority ${authority.packageVersion} or current package ${currentPackageVersion}`,
 );
-const publishedVersionTag = `v${softwareVersion}`;
 const answerAuthority = await readJson(path.join(siteRoot, 'src', 'content', 'answerAuthority.json'));
 for (const locale of ['en', 'ar']) {
   const fiveTools = answerAuthority[locale]?.answers?.find((answer) => answer.id === 'five-tools')?.answer ?? '';
   for (const tool of authority.tools) assert(fiveTools.includes(tool), `Published ${locale} five-tool answer missing ${tool}`);
   const environment = answerAuthority[locale]?.answers?.find((answer) => answer.id === 'supported-environment')?.answer ?? '';
-  for (const token of [publishedVersionTag, 'Python 3.11+', 'SQLite 3.42.0+', authority.transport, authority.embeddingProvider]) {
-    assert(environment.includes(token), `Published ${locale} environment answer missing release-bound token ${token}`);
+  for (const token of ['Python 3.11+', 'SQLite 3.42.0+', authority.transport, authority.embeddingProvider]) {
+    assert(environment.includes(token), `Published ${locale} environment answer missing support token ${token}`);
   }
 }
 
@@ -327,7 +328,7 @@ const releaseClaimDrift =
   projectionRouteDiffs.length > 0 ||
   projectionFileDiffs.length > 0 ||
   unexpectedNamedVersions.length > 0 ||
-  softwareVersion !== authority.packageVersion;
+  (softwareVersion !== undefined && softwareVersion !== authority.packageVersion);
 
 let publicationClass = 'RELEASE_NEUTRAL';
 let publicationEligibility = 'ELIGIBLE_PENDING_OTHER_GATES';

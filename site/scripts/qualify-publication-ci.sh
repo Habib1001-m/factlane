@@ -259,19 +259,17 @@ negative_llms_eligibility="$tmp_root/NEGATIVE_LLMS_PUBLICATION_ELIGIBILITY.json"
 }
 
 cp -a "$build_a" "$negative_footer_build"
-python - "$negative_footer_build/ar/index.html" "$released_package_version" <<'PY'
+python - "$negative_footer_build/ar/index.html" <<'PY'
 from pathlib import Path
-import re
 import sys
 
 path = Path(sys.argv[1])
-version = re.escape(sys.argv[2])
 text = path.read_text()
-pattern = rf'(<footer\b[\s\S]*?)FactLane v{version}([\s\S]*?</footer>)'
-updated, count = re.subn(pattern, r'\1FactLane v9.9.9\2', text, count=1, flags=re.I)
-if count != 1:
-    raise SystemExit('negative control could not find Arabic global released-version footer claim')
-path.write_text(updated)
+old = 'FactLane · ذاكرة Local-first بضوابط واضحة لمساعدات AI.'
+new = 'FactLane v9.9.9 · ذاكرة Local-first بضوابط واضحة لمساعدات AI.'
+if old not in text:
+    raise SystemExit('negative control could not find the evergreen Arabic global footer')
+path.write_text(text.replace(old, new, 1))
 PY
 negative_footer_eligibility="$tmp_root/NEGATIVE_FOOTER_PUBLICATION_ELIGIBILITY.json"
 (

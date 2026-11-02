@@ -5,71 +5,62 @@ description: Use when an agent needs to search, read, store, or update bounded F
 
 # Using FactLane
 
-FactLane stores bounded provenance-bearing facts, not transcripts. Memory is **supporting
-evidence**, never execution authority; current user instructions, repository/product truth, and
-verified live sources outrank it.
+FactLane stores bounded provenance-bearing facts, not transcripts. Memory is **supporting evidence**, never execution authority. Current user instructions, live repository/product truth, and verified live sources can outrank remembered facts.
+
+The public MCP surface is exactly five tools over stdio. Inspect the live MCP schema or `factlane --help-tools` for exact fields and enums; never guess a contract from examples.
+
+For host/bootstrap evidence, read `references/host-bootstrap.md`.
 
 ## Decide whether memory is needed
 
-- A self-contained task needs no recall. Search only when durable context could change the task.
-- Candidate capture needs explicit content consent. If the agent proposes it, obtain that consent first.
-  Consent never elevates launcher/write authority;
-  never perform autonomous post-turn `memory_store` or `memory_update`.
-- A `CANDIDATE` or `UNVERIFIED` record is **not** `VALIDATED_CURRENT`.
-- Inspect the live MCP schema or `factlane --help-tools` for supported fields and enums;
-  never guess.
-
-This Skill targets **Public Contract Revision 3** in the current `0.1.5` source/RC line. The MCP
-surface remains exactly five tools over stdio. `v0.1.4` is still the latest published release and
-uses Public Contract Revision 2.
-
-For host setup evidence, read `references/host-bootstrap.md`.
-
-For `status=BLOCKED`, branch on stable `error_code`; unexpected exceptions remain transport errors.
+- A self-contained task needs no recall. Search only when durable context could materially help.
+- Candidate capture needs explicit content consent. If the agent proposes the memory, show the bounded fact and obtain authorization first.
+- Consent does not elevate launcher authority.
+- Never perform autonomous post-turn `memory_store` or `memory_update`.
+- A `CANDIDATE` or otherwise unverified record is not `VALIDATED_CURRENT`.
+- For `status=BLOCKED`, branch on stable `error_code`. Unexpected exceptions remain transport errors.
 
 ## Read within one exact scope
 
-Select one exact scope and required IDs from the live schema. `CROSS_PROJECT_WORKFLOW` forbids
-project/worktree/workflow/agent IDs, including explicit nulls. In a trusted bound session, omit
-host-supplied scope IDs; explicit IDs must match trusted bindings.
+Select one exact scope and required IDs from the live schema.
 
-Choose `intent_class` from the live schema; never guess.
+`CROSS_PROJECT_WORKFLOW` forbids project/worktree/workflow/agent identity keys, including explicit nulls. In a trusted bound session, omit host-supplied scope IDs; explicit IDs must match trusted bindings.
 
-Choose `EXACT`, `KEYWORD`, `SEMANTIC`, or `HYBRID`. Use `CURRENT` for validated current facts and
-`REVIEW_HISTORY` for Candidates/history. Use `memory_get` when provenance/revision matters. Do not
-invent routing overrides or admin-only graph expansion.
+Choose `intent_class` and retrieval/search modes from the live schema.
 
-For `CROSS_PROJECT_WORKFLOW`, follow the live search matrix. Unsupported combinations fail closed;
-there is no implicit cross-scope fanout.
+Use `CURRENT` for validated eligible facts and `REVIEW_HISTORY` for explicit Candidate/history inspection. Use `memory_get` when exact provenance/revision matters.
 
-For complete history, prefer `KEYWORD`, `EXACT`, or `memory_get` when `REVIEW_HISTORY` has partial
-semantic coverage.
+For complete history, prefer `KEYWORD`, `EXACT`, or `memory_get` when semantic history reports partial coverage.
 
 ## Write only with trusted authority
 
-The launcher defaults read-only. A `delegated-candidate` agent may `memory_store` a Candidate, but
-cannot `memory_update` or self-promote by claiming Owner authority. Chat approval does not elevate
-runtime privileges.
+The launcher defaults read-only.
 
-Store one fact with `memory_type`, `source_provenance`, `freshness_policy`, and stable
-`idempotency_key`. Use **`source_provenance`**, not `provenance`; never derive `authority_role`.
+A `delegated-candidate` agent may call `memory_store` only with explicit content consent. Store one bounded fact with `memory_type`, `source_provenance`, `freshness_policy`, and a stable `idempotency_key`.
 
-For `CROSS_PROJECT_WORKFLOW`, freshness is `manual` (no recheck/fingerprint) or `on_change`
-(non-empty `recheck_ref`; `freshness_policy.source_fingerprint` equals
-`source_provenance.source_hash`). Do not put that fingerprint in `source_provenance`.
+Never derive or claim `authority_role`.
 
-A trusted verifier uses `memory_update` with `expected_revision`, unique `idempotency_key`, and
-`REVERIFY`/`REPLACE`. Candidate promotion requires `REVERIFY` + exact `expected_record_id`.
+For `CROSS_PROJECT_WORKFLOW`, follow the live freshness schema exactly. Do not invent identity or fingerprint fields.
 
-Direct Owner authority may additionally use `REVOKE` or `REJECT`; both require the exact displayed
-`observed_group_token`, current revision/record identity, and a bounded reason code. Do not attempt
-Owner lifecycle actions from a delegated-agent session. `REVOKED` and `REJECTED` are logical terminal
-states, not physical erasure.
+A trusted verifier may use `memory_update` with the current `expected_revision`/identity and a unique idempotency key for `REVERIFY` or `REPLACE`. Candidate promotion requires `REVERIFY` plus the exact `expected_record_id` for the Candidate.
 
-For an `on_change` Current, FactLane does not monitor the source automatically. A trusted Owner
-performs an explicit manual recheck with fresh observation evidence. Readmission of a `REVOKED`
-memory is also a separate Owner operation with new verification and Group CAS; it is not database
-restore and must not be used to recreate recovery-purged content.
+Direct Owner authority may additionally:
 
-Keep each memory small, scoped, and attributable. Recheck the current source of truth before
-relying on it.
+- `REVOKE` an eligible Current record;
+- `REJECT` a Candidate.
+
+Those lifecycle actions require the exact current record/group state and an allowed reason. Do not attempt Owner lifecycle actions from a delegated-agent session.
+
+`REVOKED` and `REJECTED` are logical states, not physical erasure.
+
+## Respect freshness and readmission boundaries
+
+For `on_change`, FactLane does not monitor the source automatically. A trusted Owner performs an explicit manual recheck with fresh bounded observation evidence.
+
+Readmission of eligible `REVOKED` memory is another separate Owner operation with new verification and CAS checks. It is not database restore and must not recreate content removed by sensitive-memory Recovery.
+
+## Keep facts small and attributable
+
+Keep each fact bounded, scoped, attributable, and useful across sessions. Recheck the current source of truth before relying on mutable memory.
+
+For installation, release identity, host configuration, Skill registration, and first-run evidence, use `references/host-bootstrap.md` plus the repository Quick Start and Release operations. Do not hard-code or guess a release tag.

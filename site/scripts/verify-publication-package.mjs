@@ -299,6 +299,7 @@ for (const required of [
   'consumer/scripts/serve-publication-static.mjs',
   'consumer/scripts/check-publication-readiness.mjs',
   'consumer/src/content/answerAuthority.json',
+  'consumer/public-docs.json',
 ]) {
   assert(packageContents.has(required), `Frozen package missing required handoff file: ${required}`);
 }
@@ -361,6 +362,7 @@ for (const [relative, key] of [
   ['consumer/scripts/serve-publication-static.mjs', 'CONSUMER_STATIC_HOST_SHA256'],
   ['consumer/scripts/check-publication-readiness.mjs', 'CONSUMER_READINESS_HARNESS_SHA256'],
   ['consumer/src/content/answerAuthority.json', 'CONSUMER_ANSWER_AUTHORITY_SHA256'],
+  ['consumer/public-docs.json', 'CONSUMER_PUBLIC_DOCS_SHA256'],
   ['CONSUMER_HANDOFF.md', 'CONSUMER_HANDOFF_SHA256'],
 ]) {
   assert(provenance.get(key), `Provenance missing ${key}`);

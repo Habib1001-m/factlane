@@ -4,6 +4,7 @@
 /ar/answers.html /ar/answers/ 301
 /ar/docs.html /ar/docs/ 301
 /ar/docs/ARCHITECTURE.html /ar/docs/ARCHITECTURE/ 301
+/ar/docs/CHANGELOG.html /ar/docs/CHANGELOG/ 301
 /ar/docs/CORE_CONCEPTS.html /ar/docs/CORE_CONCEPTS/ 301
 /ar/docs/ENVIRONMENT.html /ar/docs/ENVIRONMENT/ 301
 /ar/docs/FAQ.html /ar/docs/FAQ/ 301
@@ -16,6 +17,7 @@
 /ar/docs/USING_FACTLANE_SKILL.html /ar/docs/USING_FACTLANE_SKILL/ 301
 /docs.html /docs/ 301
 /docs/ARCHITECTURE.html /docs/ARCHITECTURE/ 301
+/docs/CHANGELOG.html /docs/CHANGELOG/ 301
 /docs/CORE_CONCEPTS.html /docs/CORE_CONCEPTS/ 301
 /docs/ENVIRONMENT.html /docs/ENVIRONMENT/ 301
 /docs/FAQ.html /docs/FAQ/ 301

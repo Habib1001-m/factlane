@@ -11,37 +11,29 @@
 <div align="center">
 <br>
 
-[Quick Start](#quick-start) · [How it works](#how-factlane-works) · [Architecture](docs/ARCHITECTURE.md) · [Security](SECURITY.md) · [Release operations](docs/RELEASE_OPERATIONS.md)
+[Quick Start](#quick-start) · [How it works](#how-factlane-works) · [Owner control](#owner-control-plane) · [Architecture](docs/ARCHITECTURE.md) · [Security](SECURITY.md) · [Changelog](docs/CHANGELOG.md)
 
 </div>
 
 ---
 
-## Memory that supports decisions without becoming authority
+## Memory that can help without becoming authority
 
-FactLane is a local-first memory service for agents that communicate over the Model Context Protocol (MCP). It stores **bounded facts** with provenance, scope, and freshness metadata so agents can reuse durable information without treating a past conversation, an unverified contribution, or the memory store itself as authority over the current task.
+FactLane is a local-first MCP memory layer for AI-agent hosts. It stores **bounded reusable facts** with exact scope, provenance, freshness, lifecycle state, and governed authority so an agent can reuse durable context without treating an old conversation or an unverified contribution as current truth.
 
-A user may explicitly ask to remember a bounded fact, or an agent may propose a reusable fact and
-ask for explicit authorization. With the active launcher authority, approved content may be stored
-as a **Candidate**. A separately trusted verifier decides whether it becomes **Current**. Current
-retrieval admits only eligible, validated, fresh facts.
+The design is intentionally narrow:
 
-That distinction is the core of FactLane: **remembered context can support a decision without silently becoming current truth.**
-
-- **Governed memory** — proposed facts do not become current truth automatically.
-- **Exact scopes** — retrieval stays inside explicit scope and identity boundaries.
-- **Local-first runtime** — durable storage and the supported embedding path stay local to the operator environment.
-- **Focused MCP surface** — five public tools cover search, read, contribution, governed update, and status.
+- **Candidate → Current governance** — a fact can be worth retaining without being trusted as current.
+- **Current truth stays above memory** — current user instructions, live project/product state, and verified live sources can outrank remembered facts.
+- **Exact scopes** — facts stay inside explicit user, project, workflow, tool-environment, or governed cross-project boundaries.
+- **Local-first runtime** — the supported profile uses local SQLite/SQLite-vec storage and local Ollama embeddings.
+- **Small MCP contract** — exactly five public tools over command-launched stdio.
+- **Owner control plane** — trusted local operators can inspect inventory/history, resolve conflicts, govern lifecycle, recheck freshness, and readmit eligible revoked memory without expanding the public MCP surface.
 
 > [!IMPORTANT]
-> FactLane memory is **supporting evidence**, not execution authority. Current user instructions, current repository or product state, and verified live sources outrank remembered facts.
+> Memory is **supporting evidence**, not execution authority. Tool visibility, remembered policy, or a prior approval does not grant new runtime permissions.
 
-> [!NOTE]
-> `v0.1.4` is the latest published production release. The current source line identifies itself as
-> `0.1.5` and is being qualified as a local release candidate. That source identity does **not**
-> create a `v0.1.5` tag, published artifact digest, deployment, or publication authority. Official
-> `v0.1.4` still means the exact tag, commit/tree, and published digests recorded in
-> [Release operations](docs/RELEASE_OPERATIONS.md).
+For the current published release identity, artifact hashes, release status, and exact upgrade/rollback boundary, use [Release operations](docs/RELEASE_OPERATIONS.md). For user-facing changes between releases, use the [Changelog](docs/CHANGELOG.md).
 
 ## How FactLane works
 
@@ -52,66 +44,56 @@ That distinction is the core of FactLane: **remembered context can support a dec
   </picture>
 </p>
 
-The key boundary is the transition from **Candidate** to **Current**:
+A normal memory lifecycle separates contribution from verification:
 
-- an ordinary `delegated-candidate` agent can contribute a Candidate only after explicit content
-  consent; that consent does not grant or elevate launcher authority;
-- it cannot self-promote by claiming privileged authority;
-- trusted promotion uses `memory_update` with `REVERIFY`, revision checks, and the Candidate's expected record identity;
-- Public Contract Revision 3 also lets direct Owner authority apply `REVOKE` or `REJECT` as terminal
-  logical lifecycle dispositions using exact revision and contradiction-group CAS;
-- `CURRENT` retrieval excludes unverified Candidates, even when they are a closer semantic match.
+1. A user explicitly asks to remember a bounded fact, or an agent proposes one and obtains explicit content consent.
+2. A launcher with `delegated-candidate` authority may store that contribution as a **Candidate**.
+3. A separately trusted verifier may promote an eligible Candidate with `REVERIFY`, exact record identity, revision checks, and idempotency protection.
+4. **Current** retrieval admits only eligible validated facts inside the requested scope and freshness boundary.
+5. If current reality changes, trusted Owner operations can revoke a Current record, reject a Candidate, resolve contradictions, reverify/replace, or perform an explicit freshness recheck.
+6. A previously revoked logical memory may be readmitted only through a new governed verification path. Readmission is not database restore and cannot recreate content removed by sensitive-memory Recovery.
 
-`REVOKED` and `REJECTED` are logical lifecycle states. They remove a record from normal current
-eligibility; they do not claim physical erasure from SQLite pages, backups, snapshots, logs, or
-external copies. Sensitive-content erasure remains the separate operator recovery procedure.
-
-For semantic `CURRENT` search, FactLane applies validation eligibility before the KNN result limit, so closer unverified Candidates cannot crowd out eligible current facts.
+`REVOKED` and `REJECTED` are logical lifecycle states. They remove records from ordinary Current eligibility; they do not claim physical erasure from SQLite pages, backups, snapshots, logs, or external copies.
 
 ## Quick Start
 
 ### Requirements
 
-You need Python **3.11+**, a Python-linked SQLite runtime **3.42.0+**, [`uv`](https://docs.astral.sh/uv/), and a local [Ollama](https://ollama.com/) instance with the model for your selected embedding profile.
+The documented local profile requires:
 
-FactLane is CPU-capable. Docker, a GPU, and external embedding APIs are not required for the supported local profile.
+- Python **3.11+**;
+- a Python-linked SQLite runtime **3.42.0+**;
+- [`uv`](https://docs.astral.sh/uv/);
+- local [Ollama](https://ollama.com/) with a supported embedding model;
+- a compatible MCP host that can launch a local stdio command.
 
-### Install the exact `v0.1.4` release
+Docker, a GPU, a hosted memory service, and an external embedding API are not required for the supported local profile.
 
-Use the versioned release tag rather than the moving `main` branch:
+### Install a supported release without hard-coding it here
+
+Read [Release operations](docs/RELEASE_OPERATIONS.md) first and copy the current published tag from the release manifest. Then pin the checkout to that tag instead of following moving `main`:
 
 ```bash
-git clone --branch v0.1.4 --depth 1 https://github.com/Habib1001-m/factlane.git
+RELEASE_TAG="<published tag from Release operations>"
+git clone --branch "$RELEASE_TAG" --depth 1 https://github.com/Habib1001-m/factlane.git
 cd factlane
 uv sync --frozen
 uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
-ollama pull embeddinggemma:300m
 uv run factlane --help
 uv run factlane --help-tools
 ```
 
-The SQLite check intentionally runs through the same project interpreter that launches FactLane. Python 3.11+ alone does **not** guarantee a compatible linked SQLite runtime.
+The SQLite check intentionally runs through the same interpreter that launches FactLane. A compatible Python version alone does not prove a compatible linked SQLite runtime.
 
-For exact tag/tree verification, published wheel and source-distribution digests, upgrade planning, rollback boundaries, and post-install reverification, see [Release operations](docs/RELEASE_OPERATIONS.md).
-
-### Evaluate the local `0.1.5` release-candidate source
-
-The current checkout is a source/RC line, not a published `v0.1.5` release. From that checkout:
+Install the embedding model required by the profile you intend to use. For the built-in `embeddinggemma-300m-768` profile:
 
 ```bash
-uv sync --frozen
-uv run python -c 'from importlib.metadata import version; print(version("factlane"))'
-uv run factlane --help-tools
-uv run factlane-owner --help
-uv run factlane-migrate-storage-v3 --help
+ollama pull embeddinggemma:300m
 ```
 
-The package version should report `0.1.5`, `factlane --help-tools` should report Public Contract
-Revision 3 and exactly five MCP tools, and the operator commands should be present. If the database
-is storage contract v2, the v0.1.5 runtime fails closed until the explicit v2 → v3 migration is run
-with a verified pre-migration backup. See [Release operations](docs/RELEASE_OPERATIONS.md).
+If you are evaluating a source checkout rather than a published release, treat the checkout identity as source material only. A package version string by itself does not create release authority.
 
-### Launch for a local stdio MCP host
+### Launch read-only first
 
 ```bash
 uv run factlane \
@@ -120,30 +102,24 @@ uv run factlane \
   --host-id local-dev
 ```
 
-This first connection is intentionally **read-only**. Confirm the host can launch FactLane,
-discover exactly five tools, and complete a read-only `memory_status` call before considering any
-write profile. If Candidate contribution is later needed, `delegated-candidate` is a separate
-trusted launcher change; it still does not let the agent validate its own facts. Trusted verifier
-authority is configured separately by the operator.
+The first connection should stay read-only. Verify that the host launches FactLane, discovers exactly five tools, and completes an appropriate read-only `memory_status` request before enabling any write profile.
 
 > [!TIP]
-> FactLane is a **stdio process launched by the MCP host**, not a web service or an interactive REPL. If your host starts it from another working directory, use absolute executable and database paths.
+> FactLane is a **stdio process launched by the MCP host**, not a web service or interactive REPL. If the host launches from another working directory, use absolute executable and database paths.
 
-Full Codex and Hermes examples are in the [Quick Start guide](docs/QUICKSTART.md).
+Codex, Hermes, generic-host, and Skill-registration examples are in the [Quick Start guide](docs/QUICKSTART.md). Release-specific storage migration and trusted Owner-control commands live in [Release operations](docs/RELEASE_OPERATIONS.md) and the selected release's operator documentation so setup guidance does not hard-code a release.
 
 ## Five focused MCP tools
 
-FactLane keeps the public surface deliberately small:
-
 | Tool | Purpose |
 | --- | --- |
-| `memory_search` | Search facts within one exact scope using current or historical retrieval. |
-| `memory_get` | Retrieve one logical memory record and its provenance/revision details. |
-| `memory_store` | Contribute one bounded fact with source and freshness metadata. |
-| `memory_update` | Reverify/replace a logical memory, or apply Owner-only `REVOKE`/`REJECT`, under governed CAS rules. |
-| `memory_status` | Inspect storage and embedding-profile health for a scope. |
+| `memory_search` | Search bounded facts inside one exact scope using Current or explicit history retrieval. |
+| `memory_get` | Retrieve one logical memory with provenance, lifecycle, revision, and freshness details. |
+| `memory_store` | Contribute one bounded fact when launcher authority and content consent permit it. |
+| `memory_update` | Reverify/replace a logical memory, or apply direct Owner `REVOKE`/`REJECT`, under governed CAS rules. |
+| `memory_status` | Inspect bounded storage and embedding-profile health for one scope. |
 
-The live MCP schema and `factlane --help-tools` are authoritative for request fields and supported values.
+The live MCP schema and `factlane --help-tools` are authoritative for exact fields, enums, and signatures. Seeing a tool does not grant permission to perform its privileged operations.
 
 ## Exact scopes, explicit identity
 
@@ -157,47 +133,35 @@ FactLane defines five public scopes:
 | `TOOL_ENVIRONMENT` | Exact `agent_id`. |
 | `CROSS_PROJECT_WORKFLOW` | Identity-free; project, worktree, workflow, and agent identity keys must be absent. |
 
-A trusted host may bind applicable project, workflow, or tool identities. Conflicting caller-supplied bound IDs are rejected. Records never fan out implicitly into other scopes.
+A trusted host may bind applicable project, workflow, or tool identities. Conflicting caller-supplied values fail closed. Records never fan out implicitly into other scopes.
 
-`CROSS_PROJECT_WORKFLOW` does **not** mean “search every project.” It is a distinct identity-free scope with its own allowed intent/retrieval combinations.
+`CROSS_PROJECT_WORKFLOW` is a distinct governed scope for deliberately cross-project workflow facts; it does not mean “search every project.”
 
-## Built for explicit trust boundaries
+## Owner control plane
 
-The normal `delegated-candidate` write profile cannot promote its own contribution by supplying a privileged claim.
+FactLane keeps operator governance separate from ordinary agent memory use.
 
-A trusted verifier can use `memory_update` to:
+`OwnerControlService` provides bounded local operations for:
 
-- **`REVERIFY`** a Candidate while preserving its logical contradiction identity; or
-- **`REPLACE`** a current revision when the semantic identity itself changes.
+- inventory and record detail;
+- Candidate, Current, history, conflict, health, and retention views;
+- `REVOKE` of eligible Current records;
+- `REJECT` of Candidates;
+- contradiction resolution;
+- trusted reverify/replace;
+- explicit manual freshness recheck for `on_change` records;
+- governed readmission of eligible `REVOKED` memory.
 
-With direct Owner authority, Public Contract Revision 3 also permits **`REVOKE`** and **`REJECT`**.
-Those modes require the exact displayed contradiction-group token as well as the current revision
-and a bounded reason code. The separate `OwnerControlService` exposes inventory, conflict, health,
-retention, recheck, readmission, and adjudication workflows to trusted local operator surfaces.
-`factlane-owner` is the packaged command-line client for that service. The packaged
-`factlane-owner-webui` launcher exposes the same Owner boundary through a local WebUI and binds
-exactly to loopback `127.0.0.1`. On startup it prints a READY JSON object containing the bound
-`origin` and a short-lived one-use bootstrap token. Exchange that token only in the
-`X-FactLane-Bootstrap` request header at `/owner/bootstrap`; never place it in a URL or
-`localStorage`. A successful exchange consumes the bootstrap token, establishes the authenticated
-session, and returns the CSRF token used for later Owner mutations. The WebUI is not an MCP
-transport and does not add a sixth public MCP tool.
+The packaged `factlane-owner` CLI exposes that service for trusted local operators.
 
-For `on_change` freshness, FactLane records a recheck contract; it does not run a background source
-watcher. An Owner supplies fresh bounded evidence through the manual recheck path. A healthy
-unchanged observation renews eligibility; changed, unavailable, or indeterminate observations fail
-closed for review. Readmission is also explicit: it can admit a previously `REVOKED` logical memory
-after new verification and CAS checks. It is not database restore and cannot resurrect content that
-sensitive-memory recovery removed from the governed local store.
+The packaged `factlane-owner-webui` launcher exposes the same Owner boundary through a loopback-only WebUI. It binds exactly to `127.0.0.1`, uses a short-lived one-use bootstrap token exchanged through `X-FactLane-Bootstrap`, establishes an `HttpOnly; SameSite=Strict` session, and requires CSRF protection for later mutations. It is **not** an HTTP MCP transport and does not add a sixth public tool.
 
-Revision compare-and-swap, expected record identity, contradiction handling, and idempotency checks prevent stale or unauthorized transitions from becoming durable current state.
-
-Governed failures return `status=BLOCKED` with a stable `error_code`, a safe message, empty results, and retry metadata. Unexpected internal exceptions remain transport errors rather than being relabeled as governed outcomes.
+For `on_change` freshness, FactLane records a recheck contract but does not run a background source watcher. A trusted Owner supplies fresh bounded observation evidence. Healthy unchanged evidence may renew eligibility; changed, unavailable, indeterminate, stale, or mismatched evidence fails closed for review.
 
 ## Architecture
 
 ```text
-Local MCP host / trusted launcher
+Compatible MCP host / trusted launcher
         │
         ▼
 Immutable host + write-context bindings
@@ -211,93 +175,74 @@ Scope · identity · authority checks
         ▼
 Memory adapter · lifecycle · CAS · retrieval budgets
         │
-        ├──────────────► Local embedding provider (Ollama)
+        ├─────────────► Local embedding provider (Ollama)
         │
         └──────────────► SQLite / SQLite-vec storage
+
+Trusted local Owner
+        │
+        └──────────────► OwnerControlService
+                           ├─ factlane-owner CLI
+                           └─ loopback Owner WebUI
 ```
 
-The gateway enforces host identity and scope policy. The adapter owns request validation, authority, freshness, contradiction handling, revision/transaction semantics, and retrieval budgets. The pinned backend supplies SQLite connection and vector-storage mechanics; it does not decide FactLane authorization.
+The gateway enforces public request boundaries. The adapter owns FactLane validation, authority, freshness, contradiction handling, revision/transaction semantics, and retrieval budgets. The pinned backend supplies SQLite/SQLite-vec mechanics; it does not decide FactLane authorization.
 
-Read the full [Architecture](docs/ARCHITECTURE.md) for the exact request path, storage contract, recovery coordination, and qualification boundary.
+Read [Architecture](docs/ARCHITECTURE.md) for storage, migration, recovery, retrieval, and operator-control details.
 
-## Production-qualified profile
+## Supported profile and limits
 
-**FactLane `v0.1.4` is the latest published production release.** It is production-qualified for the documented local deployment profile:
+FactLane makes a deliberately bounded support claim. The documented profile covers Python 3.11+, linked SQLite 3.42.0+, command-launched stdio MCP, supported local Ollama embeddings, local SQLite/SQLite-vec storage, and the documented local POSIX storage/recovery contract. Normal runtime behavior is also qualified on native Windows x64/AMD64; sensitive-memory Recovery remains a separate POSIX-only boundary.
 
-- Python **3.11+**;
-- linked SQLite **3.42.0+**;
-- command-launched **stdio MCP**;
-- supported local Ollama embeddings;
-- documented local POSIX storage/recovery contract.
+Current product limits include:
 
-Qualification covered package installation, backup/restore compatibility, bounded concurrent operation, crash/restart behavior, configured host startup, production-derived corpus retrieval, and fail-closed SQLite capacity handling.
-
-This is deliberately a **bounded support statement**, not a universal deployment claim.
-
-The current `0.1.5` source/RC line advances the public contract to **Revision 3** and durable storage
-to **contract v3** while keeping the MCP surface at exactly five tools over stdio. It adds governed
-Owner lifecycle dispositions, manual freshness recheck, readmission, the Owner service/CLI and a
-loopback Owner WebUI. These source bytes are local-RC material until a separate publication decision
-creates a release identity.
-
-### Current limits
-
-- stdio only — no HTTP, SSE, or Streamable HTTP server transport;
-- local Ollama embeddings only — no remote embedding endpoint fallback;
+- no public HTTP, SSE, or Streamable HTTP MCP transport;
+- no remote embedding endpoint fallback;
+- no automatic background freshness watcher;
+- no transcript archive, bulk file crawler, general document index, or backup service;
+- facts are bounded to **2,000 UTF-8 bytes**;
 - language and semantic-ranking quality remain workload-specific;
-- arbitrary filesystem, client, language-mix, workload, or deployment-scale behavior is not implied;
-- deterministic SQLite capacity exhaustion and permission-read-only behavior were exercised, but true kernel `ENOSPC` and true `EROFS` mount behavior remain outside the exercised evidence;
-- a FactLane fact is bounded to **2,000 UTF-8 bytes**;
-- FactLane is not a transcript archive, bulk file crawler, general document search engine, or backup service.
+- arbitrary filesystem, scale, and deployment environments are not implied by the documented qualification.
 
-See [Environment and compatibility](docs/ENVIRONMENT.md) for the supported runtime and embedding profiles.
+See [Environment and compatibility](docs/ENVIRONMENT.md) for the exact support boundary.
 
-## Release integrity and version transitions
+## Storage migration, release integrity, and rollback
 
-A release is more than a version string. FactLane records an official release by its versioned tag together with the corresponding commit/tree and published artifact digests.
+Normal startup fails closed when durable storage requires an explicit contract migration. Use the packaged migration operator and the exact backup/restore procedure documented in [Release operations](docs/RELEASE_OPERATIONS.md); never infer database compatibility from a package manager’s ability to replace runtime files.
 
-`v0.1.3` remains the first official production release and `v0.1.4` is the latest published production
-release. The `0.1.5` source/RC transition changes durable storage from contract v2 to v3; it therefore
-requires the explicit migration and verified pre-v3 backup/rollback procedure documented in Release
-operations rather than a package-only upgrade assumption.
-
-Package/runtime rollback and durable-data rollback are separate compatibility questions. A package manager being able to replace one installed version with another does not prove that an older runtime can safely open a database modified by a newer release.
-
-Use [Release operations](docs/RELEASE_OPERATIONS.md) for:
-
-- exact release tag, commit, and tree identity;
-- wheel and source-distribution SHA-256 digests;
-- source vs packaged installation paths;
-- post-install reverification;
-- future upgrade classification;
-- package rollback vs database/schema rollback boundaries.
+An official release identity is defined by more than a version string. Release operations records the authoritative tag, commit/tree, published artifact hashes, migration boundary, and rollback rules. The [Changelog](docs/CHANGELOG.md) explains what changed for users and operators.
 
 ## Portable agent guidance
 
-FactLane ships a portable [`using-factlane` Skill](skills/using-factlane/SKILL.md) alongside the Python runtime.
+FactLane ships a portable [`using-factlane` Skill](skills/using-factlane/SKILL.md) with the Python runtime.
 
-The Skill teaches agents when memory is useful, how to select an exact scope, how user-authorized
-Candidate capture works, and how to respect Candidate/Current and authority boundaries. Its
-host-neutral bootstrap reference distinguishes runtime installation, MCP configuration, Skill
-presence, registration, discoverability, and loaded state. Installing the Python package does
-**not** automatically register or activate the Skill in an MCP host.
+The Skill teaches agents when governed memory is useful, how to choose an exact scope, how Candidate contribution and Current verification differ, and how to respect authority and freshness boundaries. Its host-neutral [bootstrap reference](skills/using-factlane/references/host-bootstrap.md) separates runtime installation, MCP configuration, Skill presence, registration, discoverability, and loaded state.
 
-## Security and sensitive-memory recovery
+Installing the Python package does **not** automatically register or activate the Skill in an MCP host.
 
-Sensitive-memory recovery is deliberately separate from normal MCP use. It is an operator-only procedure and is **not** a sixth public MCP tool.
+## Security and sensitive-memory Recovery
 
-Normal runtime engines and the recovery operator coordinate through maintenance and locking boundaries so a runtime cannot silently attach through a recovery promotion window. Recovery and deletion policy are documented in [Security](SECURITY.md) and [Architecture](docs/ARCHITECTURE.md).
+Sensitive-memory Recovery is a trusted operator procedure outside normal MCP use. It coordinates maintenance, locking, propagation, and postflight checks so ordinary runtime cannot silently continue through a recovery promotion window.
+
+Recovery removes targeted content from the governed local store under a strict procedure; it does not promise physical-media erasure or removal from backups, snapshots, logs, or external copies.
+
+Read [Security](SECURITY.md) for the trust model and recovery boundary.
 
 ## Documentation
 
 | Guide | Use it for |
 | --- | --- |
-| [Quick Start](docs/QUICKSTART.md) | First installation, host configuration, and connection verification. |
-| [Architecture](docs/ARCHITECTURE.md) | Request path, scopes, lifecycle, storage, recovery, and qualification boundaries. |
-| [Environment](docs/ENVIRONMENT.md) | Runtime requirements, embedding profiles, and compatibility limits. |
-| [Release operations](docs/RELEASE_OPERATIONS.md) | Exact release identity, install, upgrade, rollback, and reverification. |
-| [Security](SECURITY.md) | Trust boundaries, write authority, incident recovery, and version-transition safety. |
-| [Project history](docs/PROJECT_HISTORY.md) | How the current public contract and production profile evolved. |
+| [Introduction](docs/INTRO.md) | Product orientation and the recommended reading path. |
+| [Use cases](docs/USE_CASES.md) | Concrete examples and fit. |
+| [Core concepts](docs/CORE_CONCEPTS.md) | Candidate, Current, scope, freshness, provenance, and authority. |
+| [Quick Start](docs/QUICKSTART.md) | Installation, host connection, Skill bootstrap, migration checks, and first verification. |
+| [Five MCP tools](docs/TOOLS.md) | Public tool semantics and governed failures. |
+| [Architecture](docs/ARCHITECTURE.md) | Request path, storage, lifecycle, Owner control, migration, and recovery. |
+| [Environment](docs/ENVIRONMENT.md) | Runtime requirements, supported profiles, and compatibility limits. |
+| [Security](SECURITY.md) | Trust boundaries, write authority, and sensitive-memory Recovery. |
+| [Changelog](docs/CHANGELOG.md) | User-facing release changes. |
+| [Release operations](docs/RELEASE_OPERATIONS.md) | Exact release identity, artifact hashes, installation, migration, and rollback. |
+| [Project history](docs/PROJECT_HISTORY.md) | How the product and public contract evolved. |
 
 ## Develop
 

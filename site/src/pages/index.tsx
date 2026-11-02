@@ -512,9 +512,10 @@ function Authority({copy}: {copy: HomeCopy}) {
 
 function QuickStart({copy}: {copy: HomeCopy}) {
   const command = [
-    'git clone --branch v0.1.4 --depth 1 \\',
-    '  https://github.com/Habib1001-m/factlane.git',
+    'git clone https://github.com/Habib1001-m/factlane.git',
     'cd factlane',
+    '# Resolve the current published release from docs/RELEASE_OPERATIONS.md,',
+    '# then check out that exact published identity before installing.',
     'uv sync --frozen',
     "uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'",
     'ollama pull embeddinggemma:300m',
@@ -532,7 +533,7 @@ function QuickStart({copy}: {copy: HomeCopy}) {
         <div className={styles.codePanel}>
           <div className={styles.codeHeader}>
             <span>terminal</span>
-            <span>v0.1.4</span>
+            <span>current published release</span>
           </div>
           <pre><code>{command}</code></pre>
         </div>
@@ -684,6 +685,10 @@ function ProductLanding({
       <MemoryCoexistence copy={experience.coexistence} />
       <CompactTrust copy={experience.trust} />
       <EngineeringRigor copy={experience.rigor} whyNow={experience.whyNow} />
+      <QuickStart copy={copy} />
+      <Boundaries copy={copy} />
+      <Tools copy={copy} />
+      <Architecture copy={copy} />
       <FinalCta copy={copy} />
     </>
   );
@@ -703,7 +708,6 @@ export default function Home(): ReactNode {
     codeRepository: 'https://github.com/Habib1001-m/factlane',
     programmingLanguage: 'Python',
     runtimePlatform: 'Python 3.11+',
-    softwareVersion: '0.1.4',
     license: 'https://www.apache.org/licenses/LICENSE-2.0',
     inLanguage: locale,
     url: localeUrl,
