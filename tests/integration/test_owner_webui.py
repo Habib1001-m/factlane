@@ -6,6 +6,7 @@ import socket
 import threading
 from contextlib import contextmanager
 from typing import Any, Iterator
+from urllib.parse import urlencode
 
 import pytest
 
@@ -20,6 +21,7 @@ class FakeOwnerService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.failures: dict[str, AdapterError] = {}
+        self.detail_lifecycle = "VALIDATED_CURRENT"
 
     def _record(self, name: str, kwargs: dict[str, Any]) -> None:
         self.calls.append((name, dict(kwargs)))
@@ -50,15 +52,58 @@ class FakeOwnerService:
 
     async def detail(self, **kwargs: Any) -> dict[str, Any]:
         self._record("detail", kwargs)
+        memory_id = kwargs["memory_id"]
         return {
             "status": "OK",
-            "memory_id": kwargs["memory_id"],
-            "records": [],
-            "events": [],
+            "memory_id": memory_id,
+            "records": [
+                {
+                    "memory_id": memory_id,
+                    "record_id": "22222222-2222-4222-8222-222222222222",
+                    "revision": 1,
+                    "parent_record_id": None,
+                    "scope": {"scope": "PROJECT", "project_id": "project-a"},
+                    "memory_type": "FACT",
+                    "fact": "<script>alert(1)</script>",
+                    "source_provenance": {"source_class": "OWNER_SUPPLIED", "source_ref": "owner:test"},
+                    "source_timestamp": "2026-11-01T00:00:00Z",
+                    "created_at": "2026-11-01T00:00:00Z",
+                    "last_verified_at": "2026-11-01T00:00:00Z",
+                    "verified_by": "OWNER",
+                    "authority_role": "OWNER",
+                    "contribution_origin": {"contributor_class": "OWNER", "contributor_ref": "owner:test"},
+                    "freshness_policy": {"mode": "manual"},
+                    "supersedes": [],
+                    "contradiction_state": "NONE",
+                    "confidence": 1.0,
+                    "tags": ["subject:test"],
+                    "lifecycle_state": self.detail_lifecycle,
+                    "freshness_gate_state": "NONE",
+                }
+            ],
+            "events": [
+                {
+                    "event_id": "event-1",
+                    "action": "STORE",
+                    "occurred_at": "2026-11-01T00:00:00Z",
+                    "result_lifecycle_state": self.detail_lifecycle,
+                    "result_revision": 1,
+                }
+            ],
             "group_cas": {
                 "observed_group_token": GROUP_TOKEN,
                 "member_count": 1,
-                "members": [],
+                "members": [
+                    {
+                        "memory_id": memory_id,
+                        "record_id": "22222222-2222-4222-8222-222222222222",
+                        "revision": 1,
+                        "lifecycle_state": self.detail_lifecycle,
+                        "contradiction_state": "NONE",
+                        "freshness_gate_state": "NONE",
+                        "member_token": "b" * 64,
+                    }
+                ],
             },
             "next_cursor": None,
         }
@@ -72,8 +117,27 @@ class FakeOwnerService:
                     "contradiction_key": "subject:test",
                     "group_cas": {
                         "observed_group_token": GROUP_TOKEN,
-                        "member_count": 1,
-                        "members": [],
+                        "member_count": 2,
+                        "members": [
+                            {
+                                "memory_id": "11111111-1111-4111-8111-111111111111",
+                                "record_id": "22222222-2222-4222-8222-222222222222",
+                                "revision": 1,
+                                "lifecycle_state": "VALIDATED_CURRENT",
+                                "contradiction_state": "UNRESOLVED",
+                                "freshness_gate_state": "NONE",
+                                "member_token": "b" * 64,
+                            },
+                            {
+                                "memory_id": "33333333-3333-4333-8333-333333333333",
+                                "record_id": "44444444-4444-4444-8444-444444444444",
+                                "revision": 2,
+                                "lifecycle_state": "CANDIDATE",
+                                "contradiction_state": "UNRESOLVED",
+                                "freshness_gate_state": "NONE",
+                                "member_token": "c" * 64,
+                            },
+                        ],
                     },
                 }
             ],
@@ -143,15 +207,20 @@ def request(
     *,
     headers: dict[str, str] | None = None,
     json_body: dict[str, Any] | None = None,
+    form_body: dict[str, str] | None = None,
 ) -> tuple[int, dict[str, str], bytes]:
     port = server.server_address[1]
     request_headers = {"Host": f"127.0.0.1:{port}"}
     if headers:
         request_headers.update(headers)
     body: bytes | None = None
+    assert json_body is None or form_body is None
     if json_body is not None:
         body = json.dumps(json_body, separators=(",", ":")).encode("utf-8")
         request_headers["Content-Type"] = "application/json"
+    if form_body is not None:
+        body = urlencode(form_body).encode("utf-8")
+        request_headers["Content-Type"] = "application/x-www-form-urlencoded"
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
     try:
         conn.request(method, target, body=body, headers=request_headers)
@@ -496,6 +565,226 @@ def test_read_api_pages_are_scope_bound_safe_and_include_all_owner_views() -> No
             assert "<script>alert(1)</script>" not in text
             assert "localStorage" not in text
             assert_security_headers(headers)
+
+
+def test_owner_pages_render_visible_operator_workflows_and_record_detail() -> None:
+    service = FakeOwnerService()
+    memory_id = "11111111-1111-4111-8111-111111111111"
+    with running_server(service) as server:
+        cookie, _ = bootstrap(server)
+
+        status, headers, body = request(server, "GET", "/owner/current", headers={"Cookie": cookie})
+        text = body.decode("utf-8")
+        assert status == 200
+        assert '<table class="records-table"' in text
+        assert f'href="/owner/memories/{memory_id}"' in text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
+        assert "<script>alert(1)</script>" not in text
+        assert "style-src 'self'" in headers["content-security-policy"]
+        assert "script-src 'self'" in headers["content-security-policy"]
+        assert '<script src="/owner/assets/owner.js" defer></script>' in text
+
+        status, _, body = request(server, "GET", f"/owner/memories/{memory_id}", headers={"Cookie": cookie})
+        detail = body.decode("utf-8")
+        assert status == 200
+        for label in (
+            "Memory detail",
+            "Provenance",
+            "Freshness",
+            "Revision history",
+            "Lifecycle events",
+            "Group observation",
+        ):
+            assert label in detail
+        for action in ("REVOKE", "REVERIFY", "REPLACE"):
+            assert f'data-action="{action}"' in detail
+        assert GROUP_TOKEN in detail
+        assert "localStorage" not in detail
+
+
+def test_conflicts_page_renders_all_observed_members_and_resolve_controls() -> None:
+    service = FakeOwnerService()
+    with running_server(service) as server:
+        cookie, _ = bootstrap(server)
+        status, _, body = request(server, "GET", "/owner/conflicts", headers={"Cookie": cookie})
+        text = body.decode("utf-8")
+        assert status == 200
+        assert "subject:test" in text
+        assert "11111111-1111-4111-8111-111111111111" in text
+        assert "33333333-3333-4333-8333-333333333333" in text
+        assert text.count('data-action="RESOLVE"') == 2
+        assert GROUP_TOKEN in text
+
+
+def test_visible_revoke_form_submits_displayed_group_and_returns_operator_result() -> None:
+    service = FakeOwnerService()
+    memory_id = "11111111-1111-4111-8111-111111111111"
+    record_id = "22222222-2222-4222-8222-222222222222"
+    with running_server(service) as server:
+        cookie, csrf = bootstrap(server)
+        origin = f"http://127.0.0.1:{server.server_address[1]}"
+        status, _, _ = request(server, "GET", f"/owner/memories/{memory_id}", headers={"Cookie": cookie})
+        assert status == 200
+
+        status, _, body = request(
+            server,
+            "POST",
+            f"/owner/ui/memories/{memory_id}/revoke",
+            headers={"Cookie": cookie, "Referer": f"{origin}/owner/memories/{memory_id}"},
+            form_body={
+                "_csrf": csrf,
+                "expected_record_id": record_id,
+                "expected_revision": "1",
+                "observed_group_token": GROUP_TOKEN,
+                "idempotency_key": "ui-revoke-1",
+                "reason_code": "OUTDATED",
+            },
+        )
+        text = body.decode("utf-8")
+        assert status == 200
+        assert "REVOKE completed" in text
+        assert "Review updated memory" in text
+        call = [call for call in service.calls if call[0] == "revoke"][-1][1]
+        assert call["scope"] == "PROJECT"
+        assert call["project_id"] == "project-a"
+        assert call["observed_group_token"] == GROUP_TOKEN
+        assert call["expected_revision"] == 1
+
+
+def test_visible_mutation_conflict_stops_and_requires_explicit_refetch_review() -> None:
+    service = FakeOwnerService()
+    memory_id = "11111111-1111-4111-8111-111111111111"
+    with running_server(service) as server:
+        cookie, csrf = bootstrap(server)
+        origin = f"http://127.0.0.1:{server.server_address[1]}"
+        status, _, _ = request(server, "GET", f"/owner/memories/{memory_id}", headers={"Cookie": cookie})
+        assert status == 200
+        service.failures["revoke"] = AdapterError(
+            "GROUP_VERSION_CONFLICT",
+            "The contradiction group changed; inspect it again before mutation.",
+        )
+        before = len([call for call in service.calls if call[0] == "revoke"])
+
+        status, _, body = request(
+            server,
+            "POST",
+            f"/owner/ui/memories/{memory_id}/revoke",
+            headers={"Cookie": cookie, "Origin": origin},
+            form_body={
+                "_csrf": csrf,
+                "expected_record_id": "22222222-2222-4222-8222-222222222222",
+                "expected_revision": "1",
+                "observed_group_token": GROUP_TOKEN,
+                "idempotency_key": "ui-revoke-conflict",
+                "reason_code": "OUTDATED",
+            },
+        )
+        text = body.decode("utf-8")
+        assert status == 409
+        assert "GROUP_VERSION_CONFLICT" in text
+        assert "Review current state" in text
+        assert f'href="/owner/memories/{memory_id}"' in text
+        assert len([call for call in service.calls if call[0] == "revoke"]) == before + 1
+
+
+@pytest.mark.parametrize(
+    ("target", "form_body", "method_name"),
+    [
+        (
+            "/owner/ui/candidates/11111111-1111-4111-8111-111111111111/reject",
+            {
+                "expected_record_id": "22222222-2222-4222-8222-222222222222",
+                "expected_revision": "1",
+                "observed_group_token": GROUP_TOKEN,
+                "idempotency_key": "ui-reject-1",
+                "reason_code": "INSUFFICIENT_EVIDENCE",
+            },
+            "reject",
+        ),
+        (
+            "/owner/ui/memories/11111111-1111-4111-8111-111111111111/reverify",
+            {
+                "expected_record_id": "22222222-2222-4222-8222-222222222222",
+                "expected_revision": "1",
+                "observed_group_token": GROUP_TOKEN,
+                "idempotency_key": "ui-reverify-1",
+                "verification_json": '{"verified_by":"OWNER"}',
+            },
+            "reverify",
+        ),
+        (
+            "/owner/ui/memories/11111111-1111-4111-8111-111111111111/replace",
+            {
+                "expected_record_id": "22222222-2222-4222-8222-222222222222",
+                "expected_revision": "1",
+                "observed_group_token": GROUP_TOKEN,
+                "idempotency_key": "ui-replace-1",
+                "replacement_json": '{"fact":"replacement"}',
+            },
+            "replace",
+        ),
+        (
+            "/owner/ui/memories/11111111-1111-4111-8111-111111111111/recheck",
+            {
+                "expected_record_id": "22222222-2222-4222-8222-222222222222",
+                "expected_revision": "1",
+                "observed_group_token": GROUP_TOKEN,
+                "idempotency_key": "ui-recheck-1",
+                "evidence_json": '{"origin":"OWNER_SUPPLIED"}',
+            },
+            "manual_recheck",
+        ),
+        (
+            "/owner/ui/revoked/11111111-1111-4111-8111-111111111111/readmit",
+            {
+                "revoked_record_id": "22222222-2222-4222-8222-222222222222",
+                "expected_revoked_revision": "1",
+                "observed_group_token": GROUP_TOKEN,
+                "idempotency_key": "ui-readmit-1",
+                "verification_json": '{"verified_by":"OWNER"}',
+            },
+            "readmit",
+        ),
+        (
+            "/owner/ui/conflicts/subject%3Atest/resolve",
+            {
+                "observed_group_token": GROUP_TOKEN,
+                "winner_memory_id": "11111111-1111-4111-8111-111111111111",
+                "winner_record_id": "22222222-2222-4222-8222-222222222222",
+                "winner_expected_revision": "1",
+                "idempotency_key": "ui-resolve-1",
+                "reason_code": "OWNER_ADJUDICATION",
+                "verification_json": "",
+            },
+            "resolve",
+        ),
+    ],
+)
+def test_visible_forms_route_all_governed_actions_through_owner_service(
+    target: str,
+    form_body: dict[str, str],
+    method_name: str,
+) -> None:
+    service = FakeOwnerService()
+    with running_server(service) as server:
+        cookie, csrf = bootstrap(server)
+        origin = f"http://127.0.0.1:{server.server_address[1]}"
+        memory_id = "11111111-1111-4111-8111-111111111111"
+        status, _, _ = request(server, "GET", f"/owner/memories/{memory_id}", headers={"Cookie": cookie})
+        assert status == 200
+        if method_name == "resolve":
+            status, _, _ = request(server, "GET", "/owner/conflicts", headers={"Cookie": cookie})
+            assert status == 200
+        before = len([call for call in service.calls if call[0] == method_name])
+        status, _, body = request(
+            server,
+            "POST",
+            target,
+            headers={"Cookie": cookie, "Origin": origin},
+            form_body={"_csrf": csrf, **form_body},
+        )
+        assert status == 200, body
+        assert len([call for call in service.calls if call[0] == method_name]) == before + 1
 
 
 def test_all_mutation_routes_delegate_only_to_owner_service_methods() -> None:

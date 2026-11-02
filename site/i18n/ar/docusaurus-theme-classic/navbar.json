@@ -19,6 +19,10 @@
     "message": "التوثيق",
     "description": "Navbar item with label Docs"
   },
+  "item.label.Answers": {
+    "message": "الإجابات",
+    "description": "Navbar item with label Answers"
+  },
   "item.label.GitHub": {
     "message": "GitHub",
     "description": "Navbar item with label GitHub"
