@@ -150,7 +150,20 @@ class FakeOwnerService:
 
     async def retention_status(self, **kwargs: Any) -> dict[str, Any]:
         self._record("retention_status", kwargs)
-        return {"status": "OK", "logical_counts": {"VALIDATED_CURRENT": 1}}
+        return {
+            "status": "OK",
+            "logical_counts": {"VALIDATED_CURRENT": 1},
+            "freshness_review_counts": {
+                "observation": "EXACT",
+                "value": {
+                    "ttl_stale": 1,
+                    "manual_review": 2,
+                    "on_change_source_change_required": 3,
+                    "on_change_unavailable": 0,
+                    "on_change_indeterminate": 0,
+                },
+            },
+        }
 
     async def revoke(self, **kwargs: Any) -> dict[str, Any]:
         self._record("revoke", kwargs)
@@ -606,6 +619,25 @@ def test_owner_pages_render_visible_operator_workflows_and_record_detail() -> No
             assert f'data-action="{action}"' in detail
         assert GROUP_TOKEN in detail
         assert "localStorage" not in detail
+
+        status, _, body = request(server, "GET", "/owner/needs-review", headers={"Cookie": cookie})
+        needs_review = body.decode("utf-8")
+        assert status == 200
+        assert "Freshness review counts" in needs_review
+        assert "manual_review" in needs_review
+        assert "on_change_source_change_required" in needs_review
+
+        status, _, body = request(server, "GET", "/owner/history", headers={"Cookie": cookie})
+        history = body.decode("utf-8")
+        assert status == 200
+        for heading in ("Historical", "Superseded", "Revoked", "Rejected"):
+            assert f"<h2>{heading}</h2>" in history
+        history_states = {
+            call[1].get("lifecycle_state")
+            for call in service.calls
+            if call[0] == "inventory" and call[1].get("lifecycle_state") in {"HISTORICAL", "SUPERSEDED", "REVOKED", "REJECTED"}
+        }
+        assert history_states == {"HISTORICAL", "SUPERSEDED", "REVOKED", "REJECTED"}
 
 
 def test_conflicts_page_renders_all_observed_members_and_resolve_controls() -> None:

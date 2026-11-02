@@ -737,7 +737,12 @@ def _page_template(title: str, payload: Any, csrf_token: str, active_path: str) 
     elif title == "Memory detail":
         body = _detail_body(payload, csrf_token) + _pagination(payload, active_path)
     elif title == "Needs Review":
+        retention = payload.get("retention", {})
+        freshness_counts = retention.get("freshness_review_counts", {}) if isinstance(retention, dict) else {}
         body = (
+            '<section class="card"><h2>Freshness review counts</h2>'
+            '<div class="muted">Bounded status counts for TTL, manual and on-change review obligations.</div>'
+            f'<pre>{_json_text(freshness_counts)}</pre></section>'
             '<section class="card"><h2>Unresolved</h2>' + _record_rows(payload.get("unresolved", {})) + "</section>"
             '<section class="card"><h2>Stale</h2>' + _record_rows(payload.get("stale", {})) + "</section>"
             '<section class="card"><h2>Conflict groups</h2>' + _conflicts_body(payload.get("conflicts", {}), csrf_token) + "</section>"
@@ -746,6 +751,8 @@ def _page_template(title: str, payload: Any, csrf_token: str, active_path: str) 
         body = (
             '<section class="card"><h2>Historical</h2>' + _record_rows(payload.get("historical", {})) + "</section>"
             '<section class="card"><h2>Superseded</h2>' + _record_rows(payload.get("superseded", {})) + "</section>"
+            '<section class="card"><h2>Revoked</h2>' + _record_rows(payload.get("revoked", {})) + "</section>"
+            '<section class="card"><h2>Rejected</h2>' + _record_rows(payload.get("rejected", {})) + "</section>"
         )
     elif title == "System Health":
         body = _object_card("Runtime health", payload.get("health", {})) + _object_card("Retention and capacity", payload.get("retention", {}))
@@ -983,6 +990,7 @@ class OwnerWebUIRequestHandler(BaseHTTPRequestHandler):
             return (
                 "Needs Review",
                 {
+                    "retention": self._call_service("retention_status", **scope),
                     "unresolved": self._call_service(
                         "inventory", contradiction_state="UNRESOLVED", limit=20, **scope
                     ),
@@ -998,6 +1006,8 @@ class OwnerWebUIRequestHandler(BaseHTTPRequestHandler):
                 {
                     "historical": self._call_service("inventory", lifecycle_state="HISTORICAL", limit=20, **scope),
                     "superseded": self._call_service("inventory", lifecycle_state="SUPERSEDED", limit=20, **scope),
+                    "revoked": self._call_service("inventory", lifecycle_state="REVOKED", limit=20, **scope),
+                    "rejected": self._call_service("inventory", lifecycle_state="REJECTED", limit=20, **scope),
                     "guidance": "Open an authenticated memory detail to inspect bounded per-memory revision and lifecycle-event history.",
                 },
             )
