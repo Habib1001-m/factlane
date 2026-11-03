@@ -26,6 +26,9 @@ jobs:
       SDIST_SHA256: 7f997ecb85a519e5c0b44d136a774182f1453d832dda02a795463602d627a0ac
       RELEASE_MANIFEST: factlane-v0.1.5-release-manifest.json
       SHA256SUMS: SHA256SUMS.txt
+      EXPECTED_TAG_OBJECT: e4275fb33147c3336797bb230312699571a0afe5
+      EXPECTED_RELEASE_COMMIT: eaa75f8f17961cbaaf94d5d623e5a80083dad56f
+      EXPECTED_RELEASE_TREE: 6cc017b508571be0636f6f4b031aa4ca452893c4
       UV_VERSION: 0.11.26
       PYPI_UPLOAD_URL: https://upload.pypi.org/legacy/
       PYPI_CHECK_URL: https://pypi.org/simple/
@@ -36,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]
-          [[ "${GITHUB_REF}" == "refs/tags/${TAG}" ]]
+          [[ "${GITHUB_REF}" == "refs/heads/main" ]]
           command -v gh >/dev/null
           command -v jq >/dev/null
           command -v python3 >/dev/null
@@ -58,19 +61,26 @@ jobs:
           mkdir -p state release-assets
 
           gh api -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" > state/main-ref.json
+          [[ "$(jq -er '.object.type' state/main-ref.json)" == "commit" ]]
+          [[ "$(jq -er '.object.sha' state/main-ref.json)" == "${GITHUB_SHA}" ]]
+
+          gh api -H "Accept: application/vnd.github+json" \
             "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" > state/tag-ref.json
           [[ "$(jq -er '.object.type' state/tag-ref.json)" == "tag" ]]
           tag_object="$(jq -er '.object.sha' state/tag-ref.json)"
+          [[ "${tag_object}" == "${EXPECTED_TAG_OBJECT}" ]]
 
           gh api -H "Accept: application/vnd.github+json" \
             "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}" > state/tag-object.json
           [[ "$(jq -er '.object.type' state/tag-object.json)" == "commit" ]]
           release_commit="$(jq -er '.object.sha' state/tag-object.json)"
-          [[ "${GITHUB_SHA}" == "${release_commit}" ]]
+          [[ "${release_commit}" == "${EXPECTED_RELEASE_COMMIT}" ]]
 
           gh api -H "Accept: application/vnd.github+json" \
             "repos/${GITHUB_REPOSITORY}/git/commits/${release_commit}" > state/release-commit.json
           release_tree="$(jq -er '.tree.sha' state/release-commit.json)"
+          [[ "${release_tree}" == "${EXPECTED_RELEASE_TREE}" ]]
 
           gh api -H "Accept: application/vnd.github+json" \
             "repos/${GITHUB_REPOSITORY}/compare/${release_commit}...main" > state/reachability.json
@@ -226,7 +236,9 @@ jobs:
               --no-input \
               --index-url "${PYPI_CHECK_URL}" \
               "uv==${UV_VERSION}"
-          [[ "$(state/uv-venv/bin/uv --version)" == "uv ${UV_VERSION}" ]]
+          read -r uv_name uv_version _ <<< "$(state/uv-venv/bin/uv --version)"
+          [[ "${uv_name}" == "uv" ]]
+          [[ "${uv_version}" == "${UV_VERSION}" ]]
 
       - name: Acquire trusted-publishing OIDC inside the publication job
         shell: bash
@@ -251,18 +263,26 @@ jobs:
           set -euo pipefail
 
           gh api -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" > state/main-ref-pre-publish.json
+          [[ "$(jq -er '.object.type' state/main-ref-pre-publish.json)" == "commit" ]]
+          [[ "$(jq -er '.object.sha' state/main-ref-pre-publish.json)" == "${GITHUB_SHA}" ]]
+
+          gh api -H "Accept: application/vnd.github+json" \
             "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" > state/tag-ref-pre-publish.json
           [[ "$(jq -er '.object.type' state/tag-ref-pre-publish.json)" == "tag" ]]
           [[ "$(jq -er '.object.sha' state/tag-ref-pre-publish.json)" == "${TAG_OBJECT}" ]]
+          [[ "$(jq -er '.object.sha' state/tag-ref-pre-publish.json)" == "${EXPECTED_TAG_OBJECT}" ]]
 
           gh api -H "Accept: application/vnd.github+json" \
             "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT}" > state/tag-object-pre-publish.json
           [[ "$(jq -er '.object.type' state/tag-object-pre-publish.json)" == "commit" ]]
           [[ "$(jq -er '.object.sha' state/tag-object-pre-publish.json)" == "${RELEASE_COMMIT}" ]]
+          [[ "$(jq -er '.object.sha' state/tag-object-pre-publish.json)" == "${EXPECTED_RELEASE_COMMIT}" ]]
 
           gh api -H "Accept: application/vnd.github+json" \
             "repos/${GITHUB_REPOSITORY}/git/commits/${RELEASE_COMMIT}" > state/release-commit-pre-publish.json
           [[ "$(jq -er '.tree.sha' state/release-commit-pre-publish.json)" == "${RELEASE_TREE}" ]]
+          [[ "$(jq -er '.tree.sha' state/release-commit-pre-publish.json)" == "${EXPECTED_RELEASE_TREE}" ]]
 
           gh api -H "Accept: application/vnd.github+json" \
             "repos/${GITHUB_REPOSITORY}/compare/${RELEASE_COMMIT}...main" > state/reachability-pre-publish.json
