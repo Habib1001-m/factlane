@@ -5,6 +5,12 @@ portable `using-factlane` Skill available to that host. It is deliberately host-
 the installed host before changing machine or host configuration, and use only that host's
 supported MCP and Skill mechanisms.
 
+Resolve the FactLane runtime from the current published release recorded in the official repository's
+`docs/RELEASE_OPERATIONS.md`. Use that release's exact tag or verified published artifact identity;
+do not substitute the moving `main` branch or infer release authority from an arbitrary source
+checkout. A packaged Skill may not have the repository documentation beside it, so resolve that
+document from the official project source rather than inventing a relative install path.
+
 ## Do not collapse bootstrap states
 
 Report these states separately. One state does not imply the next.
@@ -31,7 +37,8 @@ Read-only inspection comes first:
 4. locate the intended FactLane executable and package/source identity;
 5. check Python and linked SQLite requirements;
 6. check local Ollama reachability and the intended embedding profile;
-7. inspect existing FactLane/Skill configuration before proposing edits.
+7. identify the intended database path and whether FactLane storage already exists there;
+8. inspect existing FactLane/Skill configuration before proposing edits.
 
 If the agent cannot inspect or change the required machine/host configuration, stop at guidance.
 Do not claim installation or registration that was not observed.
@@ -43,6 +50,14 @@ to remember a fact is not authorization for any of those mutations.
 When inspection finds a missing prerequisite, report the smallest required closure and its effect
 before changing anything. Install or modify only the prerequisite the operator authorizes; then
 re-run the relevant inspection instead of assuming the closure worked.
+
+If the database path already contains FactLane storage, inspect its deployment/source provenance
+before launching the newly selected runtime. Package installation success does not establish data
+compatibility. Use Release operations to determine whether the selected release can open that exact
+storage directly or requires an explicit migration. If compatibility is unknown, stop. If the
+runtime reports `MIGRATION_REQUIRED`, keep normal service stopped, preserve the release-required
+verified operator-owned backup, and follow the documented migration/rollback procedure exactly.
+Never improvise a migration through normal MCP startup.
 
 ## 2. Locate the portable Skill
 
@@ -89,6 +104,10 @@ The safe first-run objective is:
 Tool visibility is not write permission. A read-only launcher may still advertise `memory_store`
 and `memory_update`; governed runtime authorization must block mutation.
 
+Do not change the launcher profile merely because an agent asks to write or a user approves the
+content of one memory. Launcher/profile changes are machine or host-configuration mutations and
+require their own operator authority.
+
 ## 4. Register the Skill using the host's native mechanism
 
 Use the Skill root containing `SKILL.md` and `references/`. Follow the inspected host's supported
@@ -116,7 +135,18 @@ After registration, collect direct evidence separately for:
 If a host exposes no reliable loaded-state signal, report `loaded: unproven`; do not infer it from
 successful MCP calls.
 
-## 5. Enable Candidate contribution only as a separate authority change
+## 5. Use Owner control only as an optional trusted-operator path
+
+If the selected published release documents local Owner control surfaces such as `factlane-owner`
+or `factlane-owner-webui`, they remain separate trusted-operator interfaces. Their presence does not
+add an MCP tool, does not convert the loopback WebUI into an HTTP MCP transport, and does not grant an
+ordinary delegated agent Owner authority. Use them only with the exact trusted scope and the current
+revision/Group-CAS evidence required by that release.
+
+If the selected release does not document or install an Owner surface, do not invent one from this
+reference. Follow that release's Owner and security documentation for exact commands and boundaries.
+
+## 6. Enable Candidate contribution only as a separate authority change
 
 Keep the launcher read-only unless Candidate writes are actually needed and the operator separately
 authorizes changing the launcher to `delegated-candidate`.
@@ -136,7 +166,7 @@ Never perform autonomous post-turn storage.
 Respect the active privacy boundary as well: do not propose or store secrets or sensitive content
 that the applicable policy does not permit, even when the fact might be reusable.
 
-## 6. Produce a bootstrap evidence report
+## 7. Produce a bootstrap evidence report
 
 Record observed facts, not inferred success. A minimal report should contain:
 
@@ -145,6 +175,9 @@ FactLane source/package identity: <observed>
 FactLane executable: <observed absolute path>
 Python / linked SQLite: <observed>
 Embedding profile / Ollama endpoint: <observed>
+Database path / existing storage: <observed; absent|present>
+Storage compatibility: compatible|migration-required|unproven
+Verified backup required/present: yes|no|not-applicable|unproven
 MCP configured: yes|no|unproven
 Skill present: yes|no
 Skill registered: yes|no|unproven

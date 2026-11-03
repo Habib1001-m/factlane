@@ -5,6 +5,9 @@ import {fileURLToPath} from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const siteRoot = path.resolve(here, '..');
 const buildRoot = path.resolve(siteRoot, process.env.FACTLANE_BUILD_DIR ?? 'build');
+const publicDocs = JSON.parse(
+  await readFile(path.join(siteRoot, 'public-docs.json'), 'utf8'),
+);
 const httpBase = process.env.FACTLANE_HTTP_BASE;
 const mode = process.env.FACTLANE_SEO_MODE ?? 'public';
 const configuredSiteUrl = process.env.FACTLANE_SITE_URL ?? 'https://factlane.local';
@@ -143,7 +146,18 @@ function duplicateSlashVariant(route) {
 }
 
 const indexFiles = await discoverIndexFiles(buildRoot);
-assert(indexFiles.length === 28, `Expected 28 index pages, found ${indexFiles.length}`);
+const expectedCanonicalRoutes = [
+  '/',
+  '/answers/',
+  ...publicDocs.map((doc) => (doc.id === 'INTRO' ? '/docs/' : `/docs/${doc.id}/`)),
+  '/ar/',
+  '/ar/answers/',
+  ...publicDocs.map((doc) => (doc.id === 'INTRO' ? '/ar/docs/' : `/ar/docs/${doc.id}/`)),
+].sort();
+assert(
+  indexFiles.length === expectedCanonicalRoutes.length,
+  `Expected ${expectedCanonicalRoutes.length} index pages from public-docs.json, found ${indexFiles.length}`,
+);
 
 const canonicalPages = [];
 for (const file of indexFiles) {
@@ -158,6 +172,10 @@ for (const page of canonicalPages) {
   routeOwners.set(page.route, page.file);
 }
 const canonicalRoutes = [...routeOwners.keys()].sort();
+assert(
+  JSON.stringify(canonicalRoutes) === JSON.stringify(expectedCanonicalRoutes),
+  `Built canonical route set does not match public-docs.json: ${JSON.stringify(canonicalRoutes)}`,
+);
 assert(canonicalRoutes.includes('/'), 'Missing EN landing route');
 assert(canonicalRoutes.includes('/ar/'), 'Missing AR landing route');
 for (const route of canonicalRoutes) {

@@ -1,6 +1,6 @@
 # Architecture
 
-FactLane is a fact-sharing service for MCP agents. Its stored records support a decision but
+FactLane is a local governed-memory service for MCP agents. Its stored records support a decision but
 do not supersede the user's current instructions, repository state, or a live authoritative
 source. The system keeps the transport, authorization, fact lifecycle, and storage
 boundaries separate.
@@ -84,18 +84,12 @@ event history is append-only for ordinary governed writes and lifecycle-operatio
 separate Recovery-only decision path. Global idempotency spans ordinary adapter writes and Owner
 lifecycle operations so the same key cannot silently mean two different mutations.
 
-The current `0.1.5` source/RC refuses to open a storage-v2 database for normal service. The
-separately authorized migration operator validates the exact v2 schema and lineage, creates and
-verifies an operator-named v2 backup, installs the v3 governance schema/fences, and advances the
-contract version only after the schema work succeeds. That explicit transition is separate from
-the older v0.1.4 embedding-space compatibility migration.
-
 ## Owner control plane
 
-Public Contract Revision 3 keeps the normal MCP surface at exactly five tools. Direct Owner
-lifecycle work is coordinated by `OwnerControlService`, which provides bounded inventory/detail,
-conflict review, health/retention inspection, `REVOKE`/`REJECT`, contradiction resolution,
-reverification/replacement, manual freshness recheck, and readmission.
+The normal MCP surface remains exactly five tools. Direct Owner lifecycle work is coordinated by
+`OwnerControlService`, which provides bounded inventory/detail, conflict review, health/retention
+inspection, `REVOKE`/`REJECT`, contradiction resolution, reverification/replacement, manual
+freshness recheck, and readmission without expanding normal-agent authority.
 
 The packaged `factlane-owner` CLI creates the service under a trusted `owner-current` launcher
 context. Scope and launcher identity come from CLI arguments; mutation JSON cannot override them.
@@ -109,6 +103,13 @@ a short-lived one-use bootstrap token. That token is accepted only through the
 not persist the bootstrap token in `localStorage`. A successful exchange consumes the token,
 establishes an `HttpOnly; SameSite=Strict` authenticated session, and returns the CSRF token used by
 later mutations. The WebUI is not an HTTP MCP transport and does not add a sixth MCP tool.
+
+The WebUI exposes operator views for **Overview**, **Current**, **Candidates**, **Conflicts**,
+**Needs Review**, **History**, and **System Health**. Record and conflict views expose only the
+governed actions valid for the observed state, including `REVERIFY`, `REPLACE`, `REVOKE`, `REJECT`,
+manual recheck, readmission, and conflict resolution. Mutations remain bound to the trusted launcher
+scope, exact record revision, idempotency key, and the displayed contradiction-group CAS token where
+required.
 
 For `on_change` freshness, FactLane stores a recheck contract but does not run a source watcher.
 An Owner manual recheck supplies fresh observation evidence; changed, unavailable, indeterminate,
@@ -160,18 +161,18 @@ input-size checks fail closed. Potentially blocking provider calls are offloaded
 cloud embedding provider or automatic external fallback is shipped. See the
 [environment policy](ENVIRONMENT.md) for built-in profiles and exact prerequisites.
 
-The `v0.1.4` compatibility layer treats vector-space identity separately
-from runtime provenance. Semantic identity binds model identity/family, source and output dimensions,
+Vector-space compatibility treats semantic identity separately from runtime provenance. Semantic
+identity binds model identity/family, source and output dimensions,
 document/query prefixes, normalization, distance metric, projection revision, and FactLane's
 embedding-compatibility revision. Observed Ollama version and model digest remain runtime provenance;
 they are recorded on the binding and the per-record digest is preserved rather than retroactively
 rewritten. A runtime change may therefore be accepted only when the semantic identity still matches
 and a qualified, integrity-bound cross-space anchor proves direct old-vector/new-vector compatibility.
 
-For the exact known v0.1.3 `embeddinggemma-300m-768` legacy profile, a successful proof performs a
+For the packaged `embeddinggemma-300m-768` legacy compatibility path, a successful proof performs a
 metadata-only migration: existing vectors and adapter-record embedding provenance remain byte-for-byte
-and value-for-value unchanged, while revisioned compatibility metadata and the new stale-writer fence
-are committed atomically. Missing, unknown, mixed, or incompatible legacy identity remains
+and value-for-value unchanged, while revisioned compatibility metadata and the stale-writer fence are
+committed atomically. Missing, unknown, mixed, or incompatible legacy identity remains
 `UNPROVEN`/`INCOMPATIBLE`: `memory_get`, `EXACT`, `KEYWORD`, and read-only status remain available,
 but `SEMANTIC`, `HYBRID`, writes, and vector-mutating maintenance fail closed. FactLane does not apply
 an automatic rotation/projection repair and does not automatically re-embed durable facts; re-embedding
@@ -210,15 +211,16 @@ operator reconciliation.
 
 The exclusion guarantee is bounded to supported local POSIX filesystems with reliable `flock`
 semantics; sensitive-memory recovery maintenance remains unsupported on Windows and on unvalidated
-network/FUSE locking behavior. The `v0.1.4` standard runtime is qualified
-separately on native Windows x64/AMD64 for normal import/startup, stdio MCP, SQLite WAL/busy/CAS,
-process concurrency, durability, and valid Windows paths. That Windows qualification does not add a
-Windows recovery implementation: recovery imports safely but fails closed before mutation when the
-POSIX `fcntl`/`flock` capability is unavailable. The recovery exclusion boundary is cooperative,
-not a defense against arbitrary raw filesystem replacement by a privileged external process, so the
-independent quiescence inventory/full-stop procedure is still part of recovery.
+network/FUSE locking behavior. Native Windows x64/AMD64 is supported for normal import/startup,
+stdio MCP, SQLite WAL/busy/CAS, process concurrency, durability, and valid Windows paths. That
+normal-runtime support does not add a Windows sensitive-Recovery implementation or a Windows
+storage-migration maintenance claim: maintenance that depends on the POSIX `fcntl`/`flock`
+exclusion contract fails closed before mutation when that capability is unavailable. The recovery
+exclusion boundary is cooperative, not a defense against arbitrary raw filesystem replacement by a
+privileged external process, so the independent quiescence inventory/full-stop procedure is still
+part of recovery. No Windows ARM64 support claim is made.
 
-## Version and migration boundary
+## Storage migration boundary
 
 The Python package/runtime and the durable database are related but distinct compatibility
 surfaces. Installing a newer package does not itself migrate a database, and successful package
@@ -226,44 +228,28 @@ replacement does not prove that an older runtime can safely reopen state touched
 release. A release that changes stored schema or data semantics must provide an explicit
 migration contract, post-migration verification, and any supported rollback/restore path.
 
-`v0.1.3` is the first official production release and does not define a cross-version
-production-data downgrade contract. The release-operations runbook defines a published release
-by its recorded tag target, Git tree, and artifact digests, and requires later maintenance not to
-silently retarget that tag or replace its assets to match different bytes. Operators still verify
-those identities because the hosting platform can technically permit mutation. Later
-documentation or development changes on `main` do not change the recorded identity of an already
-published release. The exact release-identity and transition procedure lives in
-[Release operations](RELEASE_OPERATIONS.md).
-
-The current `0.1.5` source/RC changes durable storage from contract v2 to v3 and therefore has an
-explicit migration boundary. `factlane-migrate-storage-v3 migrate` requires an exact v2 database,
+Ordinary service opens storage contract v3. An exact storage-v2 database is detected but not
+silently upgraded; normal startup fails closed with `MIGRATION_REQUIRED`. The explicit
+`factlane-migrate-storage-v3 migrate` operator requires an exact v2 database and lineage,
 creates and integrity-checks a pre-v3 backup, applies v3 schema/fences transactionally, then verifies
 the result as v3. Rollback of that migration is restoration of the verified pre-v3 backup through
-`factlane-migrate-storage-v3 restore`; opening a v3 database directly with v0.1.4 is not a supported
-downgrade path.
+`factlane-migrate-storage-v3 restore`; package rollback alone is not a durable-data rollback path.
+Exact release identity and release-specific transition procedures live in
+[Release operations](RELEASE_OPERATIONS.md).
 
 ## Qualification boundary
 
-The `v0.1.4` qualification includes native Windows x64/AMD64 standard
-runtime behavior: package import, command startup, stdio discovery of exactly five public tools,
-default read-only authority, Candidate-only delegated contribution, verifier promotion, SQLite
-3.42.0+ with sqlite-vec, WAL/busy handling, cross-process CAS/concurrency, fresh-process durability,
-and valid Windows path handling. The pinned sqlite-vec dependency is qualified here on x64/AMD64;
-this is not a Windows ARM64 claim. Sensitive-memory recovery maintenance remains the POSIX-only
-capability described above.
+The supported local runtime boundary is Python 3.11+, linked SQLite 3.42.0+, SQLite/SQLite-vec,
+command-launched stdio MCP with exactly five public tools, and supported local Ollama embeddings.
+The normal runtime is qualified on native Windows x64/AMD64 as described above; sensitive-memory
+Recovery and storage-v2-to-v3 migration/restore remain POSIX-maintenance capabilities because they
+depend on the documented `fcntl`/`flock` exclusion contract.
 
-FactLane 0.1.4 is production-qualified for the documented local configuration: the packaged
-Python runtime, linked SQLite/SQLite-vec storage contract, stdio MCP surface, supported local
-embedding profile, and configured local host integrations. The qualification exercised
-backup/restore compatibility, bounded concurrent operation, crash/restart rollback,
-production-derived retrieval, and fail-closed SQLite capacity behavior.
-
-The current 0.1.5 source/RC keeps Python 3.11+, linked SQLite 3.42.0+, local Ollama, and stdio-only
-MCP as its normal runtime boundary while advancing to Public Contract Revision 3/storage v3. Normal
-runtime support remains separate from sensitive maintenance: the native Windows x64 runtime claim
-does not create a Windows sensitive-Recovery or v2→v3 maintenance-lock claim. Those maintenance
-operations depend on the documented POSIX `fcntl`/`flock` exclusion contract. The 0.1.5 line remains
-local-RC source until a separate release/publication decision creates official release identity.
+Qualification covers default read-only authority, Candidate-only delegated contribution, verifier
+promotion, governed Owner lifecycle operations, WAL/busy handling, cross-process CAS/concurrency,
+fresh-process durability, backup/restore compatibility, configured host startup,
+production-derived retrieval, and fail-closed SQLite capacity behavior. It remains a bounded support
+statement rather than a claim about every client, filesystem, workload, or deployment scale.
 
 That evidence does not establish support for every MCP client, arbitrary filesystem,
 production-scale ingestion pattern, unlimited-duration load, or every language mix.

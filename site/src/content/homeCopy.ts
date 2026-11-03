@@ -132,9 +132,9 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       proofsLabel: 'FactLane at a glance',
       proofs: [
         {strong: 'Apache-2.0', rest: ' open source'},
-        {strong: 'v0.1.4', rest: ' latest published production release'},
-        {strong: '0.1.5', rest: ' current local RC source line'},
-        {strong: 'Five tools', rest: ' focused MCP surface'},
+        {strong: 'Five tools', rest: ' stdio MCP surface'},
+        {strong: 'Owner control', rest: ' CLI + loopback WebUI'},
+        {strong: 'Lifecycle closure', rest: ' revoke, reject, resolve and recheck'},
       ],
       developerLabel: 'Prefer manual setup?',
       developerLink: 'Open the Quick Start →',
@@ -162,7 +162,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
         {
           eyebrow: 'Project state',
           title: 'Carry forward facts that change how work should continue.',
-          quote: '“The release is v0.1.4. Production changes still require owner approval.”',
+          quote: '“Use the published release identified by Release operations. Production changes still require owner approval.”',
           note: 'Current retrieval can reuse the verified fact without replaying the project history.',
         },
         {
@@ -196,7 +196,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
         },
         {
           title: 'Setup today is still technical.',
-          body: 'FactLane v0.1.4 runs locally through a compatible MCP host. Someone must configure that connection, even though normal use afterward does not require thinking about databases or vector search.',
+          body: 'FactLane runs locally through a compatible MCP host. Someone must configure that connection, even though normal use afterward does not require thinking about databases or vector search.',
         },
       ],
       beginnerCta: "I'm new — explain it simply",
@@ -211,7 +211,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       cards: [
         {
           title: 'Old information can become stale.',
-          body: '“The release is v0.1.2” might have been true last month and wrong today.',
+          body: '“This is the published release” can become stale after a newer release is published.',
         },
         {
           title: 'A new suggestion is not automatically trusted.',
@@ -277,16 +277,16 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       eyebrow: 'Ready to try it?',
       title: 'Start local. Keep the first run boring.',
       intro:
-        'Use the exact v0.1.4 release, verify the linked SQLite runtime, install a supported local embedding model, then connect your MCP host.',
+        'Resolve the current published release from Release operations, inspect any existing storage before launch, then establish a read-only MCP connection and verify memory_status.',
       panelTitle: 'New to the technical setup?',
-      body: 'The Quick Start explains the prerequisites one step at a time, including what launches FactLane and why “five tools discovered” does not automatically mean “writes are allowed.”',
+      body: 'The Quick Start explains the prerequisites, storage check, Skill registration, and why “five tools discovered” does not automatically mean “writes are allowed.” If storage requires migration, stop normal startup, make a verified backup, and follow Release operations.',
       cta: 'Follow the Quick Start',
     },
     boundaries: {
       eyebrow: 'A bounded production claim',
       title: 'Production-qualified for one documented local profile — not marketed as universal infrastructure.',
       intro:
-        'FactLane v0.1.4 is the latest published production release. The current 0.1.5 source line is a local RC with Public Contract Revision 3 and storage v3; it has no published v0.1.5 release identity yet.',
+        'The exact published release identity belongs in Release operations. The supported product keeps a five-tool stdio MCP surface and adds a separate Owner control plane for lifecycle review and closure.',
       supportedLabel: 'Supported profile',
       supportedItems: [
         'Python 3.11+',
@@ -314,7 +314,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
         ['memory_search', 'Find eligible facts inside one exact scope.'],
         ['memory_get', 'Inspect one memory and its provenance or revision details.'],
         ['memory_store', 'Contribute one bounded fact when the launcher allows it.'],
-        ['memory_update', 'Reverify/replace, or apply Owner-only REVOKE/REJECT, under governed CAS rules.'],
+        ['memory_update', 'REVERIFY/REPLACE, plus Owner-only REVOKE of Current and REJECT of Candidate, under governed CAS rules.'],
         ['memory_status', 'Inspect bounded storage and embedding-profile health.'],
       ],
       link: 'Read the tool guide →',
@@ -325,9 +325,9 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       intro:
         'The current supported profile is a command-launched stdio MCP server with local embeddings and local SQLite/SQLite-vec storage.',
       noteBodies: [
-        'Public MCP remains stdio-only in v0.1.4 and the 0.1.5 RC; the RC Owner WebUI is a separate loopback-only control surface.',
-        'The shipped provider uses Ollama over loopback HTTP.',
-        'The storage backend does not decide who is allowed to promote memory.',
+        'Public MCP stays exactly five tools over stdio; Owner operations use a separate trusted control surface.',
+        'OwnerControlService powers the factlane-owner CLI and loopback Owner WebUI for inventory, conflicts, history, resolve, recheck, readmit, reverify, replace, revoke and reject.',
+        'The shipped provider uses local Ollama over loopback HTTP with local SQLite/SQLite-vec storage; the storage backend does not grant authority.',
       ],
       link: 'Read the architecture →',
     },
@@ -358,9 +358,9 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       proofsLabel: 'FactLane باختصار',
       proofs: [
         {strong: 'Apache-2.0', rest: ' مفتوح المصدر'},
-        {strong: 'v0.1.4', rest: ' آخر إصدار إنتاجي منشور'},
-        {strong: '0.1.5', rest: ' خط مصدر RC محلي حالي'},
-        {strong: 'خمس أدوات', rest: ' سطح MCP مركز'},
+        {strong: 'خمس أدوات', rest: ' سطح MCP عبر stdio'},
+        {strong: 'Owner control', rest: ' CLI + WebUI محلي عبر loopback'},
+        {strong: 'Lifecycle closure', rest: ' revoke وreject وresolve وإعادة الفحص'},
       ],
       developerLabel: 'تفضّل الإعداد بنفسك؟',
       developerLink: 'افتح Quick Start للمطور',
@@ -387,7 +387,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
         {
           eyebrow: 'حالة المشروع',
           title: 'انقل الحقائق التي تغيّر كيف يجب أن يستمر العمل.',
-          quote: '«الإصدار الحالي v0.1.4. تغييرات الإنتاج ما زالت تحتاج موافقة المالك.»',
+          quote: '«استخدم الإصدار المنشور الذي تحدده Release operations. تغييرات الإنتاج ما زالت تحتاج موافقة المالك.»',
           note: 'يمكن للاسترجاع الحالي إعادة استخدام الحقيقة المتحقَّق منها من دون إعادة تاريخ المشروع كله.',
         },
         {
@@ -436,7 +436,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       cards: [
         {
           title: 'المعلومة القديمة قد تصبح غير صالحة.',
-          body: 'قد تكون عبارة «الإصدار هو v0.1.2» صحيحة الشهر الماضي وخاطئة اليوم.',
+          body: 'قد تصبح عبارة «هذا هو الإصدار المنشور» قديمة بعد نشر إصدار أحدث.',
         },
         {
           title: 'الاقتراح الجديد ليس موثوقًا تلقائيًا.',
@@ -502,16 +502,16 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       eyebrow: 'جاهز للتجربة؟',
       title: 'ابدأ محليًا. واجعل التشغيل الأول بسيطًا ومملًا.',
       intro:
-        'استخدم إصدار v0.1.4 المحدد، وتحقق من SQLite المرتبط، وثبّت embedding model محليًا ومدعومًا، ثم صِل MCP host.',
+        'استخرج الإصدار المنشور الحالي من Release operations، وافحص أي storage موجود قبل التشغيل، ثم أنشئ اتصال MCP بوضع read-only وتحقق من memory_status.',
       panelTitle: 'جديد على الإعداد التقني؟',
-      body: 'يشرح Quick Start المتطلبات خطوة بخطوة، بما في ذلك ما الذي يشغّل FactLane ولماذا ظهور «خمس أدوات» لا يعني تلقائيًا أن الكتابة مسموحة.',
+      body: 'يشرح Quick Start المتطلبات وفحص storage وتسجيل Skill، ولماذا ظهور «خمس أدوات» لا يعني تلقائيًا أن الكتابة مسموحة. إذا كانت migration مطلوبة فأوقف التشغيل العادي، أنشئ backup متحققًا منه، واتبع Release operations.',
       cta: 'اتبع Quick Start',
     },
     boundaries: {
       eyebrow: 'ادعاء إنتاجي محدد',
       title: 'مؤهل إنتاجيًا لملف محلي موثق — وليس ادعاءً بأننا بنية تحتية مناسبة لكل بيئة.',
       intro:
-        'FactLane v0.1.4 هو آخر إصدار إنتاجي منشور. خط المصدر 0.1.5 الحالي هو RC محلي بعقد عام Revision 3 وتخزين v3، ولا يملك بعد هوية إصدار v0.1.5 منشورة.',
+        'هوية الإصدار المنشور الدقيقة مكانها Release operations. المنتج المدعوم يحافظ على خمس أدوات MCP عبر stdio ويضيف سطح Owner منفصلًا لمراجعة دورة الحياة وإغلاقها.',
       supportedLabel: 'ملف التشغيل المدعوم',
       supportedItems: [
         'Python 3.11+',
@@ -539,7 +539,7 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
         ['memory_search', 'ابحث عن الحقائق المؤهلة داخل scope محدد بدقة.'],
         ['memory_get', 'افحص حقيقة واحدة مع provenance أو تفاصيل revision الخاصة بها.'],
         ['memory_store', 'ساهم بحقيقة محدودة عندما يسمح launcher بذلك.'],
-        ['memory_update', 'نفّذ reverify أو replace، أو REVOKE/REJECT بصلاحية Owner فقط، وفق قواعد CAS المحكومة.'],
+        ['memory_update', 'نفّذ REVERIFY أو REPLACE، أو REVOKE لذاكرة Current وREJECT لـCandidate بصلاحية Owner فقط، وفق قواعد CAS المحكومة.'],
         ['memory_status', 'افحص صحة التخزين وembedding profile ضمن الحدود المدعومة.'],
       ],
       link: 'اقرأ دليل الأدوات',
@@ -550,9 +550,9 @@ export const homeCopy: Record<'en' | 'ar', HomeCopy> = {
       intro:
         'ملف التشغيل المدعوم حاليًا هو stdio MCP server يُشغَّل بالأمر، مع embeddings محلية وتخزين محلي SQLite/SQLite-vec.',
       noteBodies: [
-        'يبقى MCP العام عبر stdio فقط في v0.1.4 و0.1.5 RC؛ أما Owner WebUI في الـRC فهو سطح تحكم منفصل عبر loopback فقط.',
-        'الـprovider المرفق يستخدم Ollama عبر loopback HTTP.',
-        'طبقة التخزين لا تقرر من يملك صلاحية ترقية الذاكرة.',
+        'يبقى MCP العام خمس أدوات بالضبط عبر stdio؛ وتستخدم عمليات Owner سطح تحكم موثوقًا ومنفصلًا.',
+        'تشغّل OwnerControlService كلاً من factlane-owner CLI وOwner WebUI المحلي عبر loopback للمخزون والتعارضات والتاريخ وresolve وrecheck وreadmit وreverify وreplace وrevoke وreject.',
+        'يستخدم الـprovider المرفق Ollama محليًا عبر loopback HTTP مع SQLite/SQLite-vec محلي؛ وطبقة التخزين لا تمنح الصلاحية.',
       ],
       link: 'اقرأ المعمارية',
     },
@@ -726,7 +726,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
         },
         {
           title: 'If the agent has access, install read-only',
-          body: 'Use the exact v0.1.4 release, the supported local profile and a compatible MCP host. Verify all five tools and a suitable memory_status call before enabling writes.',
+          body: 'Resolve the current published release from Release operations, inspect existing storage, configure a compatible MCP host read-only, then verify all five tools and a suitable memory_status call before enabling writes.',
         },
         {
           title: 'Enable contribution only after the boundary is clear',
@@ -735,7 +735,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
       ],
       promptLabel: 'Prompt for your agent',
       promptTitle: 'Copy this, then adapt it to your workflow.',
-      promptBody: `Official FactLane repository:\nhttps://github.com/Habib1001-m/factlane\n\nBefore changing anything on my machine:\n1) Read the project and official docs. Explain what FactLane adds beside the memory systems I already use and whether it fits my workflow.\n2) Give me concrete use cases, and explain Candidate, Current, freshness, scope and the authority boundary in plain language.\n3) If you have Terminal, file and MCP-host configuration access, inspect the prerequisites and install the exact supported v0.1.4 release. Configure it read-only first.\n4) Verify that my host discovers exactly five FactLane tools and that an appropriate memory_status request succeeds.\n5) Before enabling any write capability, explain delegated-candidate versus verifier authority and ask me before changing the write profile.\n\nIf you do not have the required machine or MCP-host access, do not claim you installed or configured anything. Explain and guide me instead.`,
+      promptBody: `Official FactLane repository:\nhttps://github.com/Habib1001-m/factlane\n\nBefore changing anything on my machine:\n1) Read the project and official docs. Explain what FactLane adds beside the memory systems I already use and whether it fits my workflow. Explain Candidate, Current, freshness, scope, lifecycle history and the authority boundary.\n2) Read the official Release operations guide and resolve the current published release from that authority. If I supplied an exact published tag, wheel or source distribution, verify that artifact against its own immutable release identity. If the applicable release authority is missing, stale, ambiguous or contradictory, stop and report the conflict; do not guess, hardcode or install a release.\n3) If you have Terminal, file and MCP-host configuration access, inspect prerequisites and any existing FactLane storage before launch. If migration is required, stop normal startup, create and verify the required backup, and follow Release operations before continuing.\n4) Configure the MCP connection read-only first. Verify that the host discovers exactly five FactLane tools and that an appropriate memory_status request succeeds.\n5) If the host supports Skills, register the shipped FactLane Skill using the host's documented mechanism, then verify registration and loaded/active evidence separately; do not treat file presence as proof that the Skill is loaded.\n6) If the selected release's official docs expose OwnerControlService, factlane-owner, or the loopback Owner WebUI, explain those exact operator surfaces and the lifecycle actions that release supports before using them. Do not claim Owner-control features that are absent from the selected release. Before enabling any write capability, explain delegated-candidate versus verifier/Owner authority and ask me before changing the write profile.\n\nIf you do not have the required machine or MCP-host access, do not claim you installed, configured, registered or loaded anything. Explain what you can verify and guide me through the rest.`,
       copyAction: 'Copy prompt',
       copiedAction: 'Prompt copied',
       copyFailedAction: 'Automatic copy failed — select and copy the prompt manually',
@@ -774,7 +774,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
       eyebrow: 'Quality you can inspect',
       title: 'Free and open source. Production-qualified where we claim support.',
       intro:
-        'FactLane v0.1.4 is the latest official production release for a deliberately bounded local profile. The current 0.1.5 source line remains a local RC until a separate release/publication decision seals its identity.',
+        'FactLane publishes against a deliberately bounded local profile. Release operations owns the exact published identity; evergreen product copy stays focused on the supported behavior and authority boundaries.',
       cards: [
         {
           title: 'Small public surface',
@@ -785,7 +785,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
           body: 'Read-only is the default. Unsupported runtime/provider conditions and unauthorized transitions fail closed instead of silently degrading into broader authority.',
         },
         {
-          title: 'Production qualification',
+          title: 'Bounded support evidence',
           body: 'The documented profile was exercised for installation, backup/restore, bounded concurrency, crash/restart behavior, configured host startup, production-derived retrieval and SQLite capacity failure.',
         },
         {
@@ -898,7 +898,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
         },
         {
           title: 'إن كان قادرًا، ثبّت read-only أولًا',
-          body: 'استخدم الإصدار v0.1.4 بالضبط وملف التشغيل المحلي المدعوم وMCP host متوافقًا. تحقّق من الأدوات الخمس وطلب memory_status مناسب قبل أي كتابة.',
+          body: 'استخرج الإصدار المنشور الحالي من Release operations، وافحص storage الموجود، واضبط MCP host متوافقًا بوضع read-only، ثم تحقّق من الأدوات الخمس وطلب memory_status مناسب قبل أي كتابة.',
         },
         {
           title: 'فعّل المساهمة بعد فهم الحدود',
@@ -907,7 +907,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
       ],
       promptLabel: 'رسالة جاهزة لوكيلك',
       promptTitle: 'انسخها ثم عدّلها على حسب سير عملك.',
-      promptBody: `هذا رابط FactLane الرسمي:\nhttps://github.com/Habib1001-m/factlane\n\nقبل أن تغيّر أي شيء على جهازي:\n1) اقرأ المشروع والوثائق الرسمية. اشرح لي ماذا يضيف FactLane بجانب أنظمة الذاكرة التي أستخدمها وهل يناسب سير عملي.\n2) اقترح حالات استخدام عملية، واشرح ببساطة Candidate وCurrent والحداثة والنطاق وحدود الصلاحيات.\n3) إذا كنت تملك صلاحيات Terminal والملفات وإعداد MCP host، افحص المتطلبات وثبّت الإصدار المدعوم v0.1.4 بالضبط، واضبط الاتصال read-only أولًا.\n4) تحقّق من أن الـhost يكتشف أدوات FactLane الخمس وأن طلب memory_status مناسبًا ينجح.\n5) قبل أي كتابة، اشرح delegated-candidate مقابل verifier authority واطلب موافقتي قبل تغيير write profile.\n\nإذا لم تكن تملك الصلاحيات اللازمة على الجهاز أو إعداد MCP host، لا تدّع أنك ثبّت أو هيّأت شيئًا؛ اشرح وارشدني فقط.`,
+      promptBody: `هذا رابط FactLane الرسمي:\nhttps://github.com/Habib1001-m/factlane\n\nقبل أن تغيّر أي شيء على جهازي:\n1) اقرأ المشروع والوثائق الرسمية. اشرح لي ماذا يضيف FactLane بجانب أنظمة الذاكرة التي أستخدمها وهل يناسب سير عملي. اشرح Candidate وCurrent والحداثة والنطاق وlifecycle history وحدود الصلاحيات.\n2) اقرأ دليل Release operations الرسمي واستخرج منه الإصدار المنشور الحالي. إذا أعطيتك tag منشورًا محددًا أو wheel أو source distribution فتحقّق منه مقابل هوية الإصدار غير القابلة للتغيير الخاصة به. إذا كانت release authority المنطبقة مفقودة أو قديمة أو ملتبسة أو متعارضة، فتوقف واذكر التعارض؛ لا تخمّن إصدارًا ولا تثبّت رقمًا ثابتًا ولا تبدأ التثبيت.\n3) إذا كنت تملك صلاحيات Terminal والملفات وإعداد MCP host، افحص المتطلبات وأي FactLane storage موجود قبل التشغيل. إذا كانت migration مطلوبة، أوقف التشغيل العادي، وأنشئ backup المطلوب وتحقق منه، ثم اتبع Release operations قبل المتابعة.\n4) اضبط اتصال MCP بوضع read-only أولًا. تحقّق من أن الـhost يكتشف أدوات FactLane الخمس بالضبط وأن طلب memory_status مناسبًا ينجح.\n5) إذا كان الـhost يدعم Skills، سجّل FactLane Skill المرفقة بآلية الـhost الموثقة، ثم تحقّق بصورة منفصلة من دليل registration ودليل loaded/active؛ لا تعتبر وجود الملف دليلًا على أن Skill محمّلة.\n6) إذا كانت وثائق الإصدار المختار تعرض OwnerControlService أو factlane-owner أو Owner WebUI المحلي عبر loopback، فاشرح فقط أسطح التشغيل وإجراءات lifecycle التي يدعمها ذلك الإصدار قبل استخدامها. لا تدّع قدرات Owner غير موجودة في الإصدار المختار. قبل أي كتابة، اشرح delegated-candidate مقابل verifier/Owner authority واطلب موافقتي قبل تغيير write profile.\n\nإذا لم تكن تملك الصلاحيات اللازمة على الجهاز أو إعداد MCP host، لا تدّع أنك ثبّت أو هيّأت أو سجّلت أو حمّلت شيئًا؛ اذكر ما استطعت التحقق منه وارشدني في الباقي.`,
       copyAction: 'انسخ الرسالة',
       copiedAction: 'تم نسخ الرسالة',
       copyFailedAction: 'تعذّر النسخ تلقائيًا — حدّد النص وانسخه يدويًا',
@@ -946,7 +946,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
       eyebrow: 'جودة يمكنك فحصها',
       title: 'مجاني ومفتوح المصدر. ومؤهل إنتاجيًا ضمن نطاق الدعم المعلن.',
       intro:
-        'FactLane v0.1.4 هو آخر إصدار إنتاج رسمي لملف محلي محدد عمدًا. خط المصدر 0.1.5 الحالي يظل RC محليًا حتى يَحسم قرار إصدار/نشر مستقل هويته.',
+        'يُنشر FactLane ضمن ملف تشغيل محلي محدد عمدًا. تملك Release operations هوية الإصدار المنشور الدقيقة، بينما يبقى النص الدائم مركزًا على السلوك المدعوم وحدود الصلاحيات.',
       cards: [
         {
           title: 'سطح عام صغير',
@@ -957,7 +957,7 @@ export const landingExperience: Record<'en' | 'ar', LandingExperience> = {
           body: 'الوضع الافتراضي read-only. حالات runtime/provider غير المدعومة والانتقالات غير المصرح بها تفشل مغلقة بدل توسيع الصلاحيات بصمت.',
         },
         {
-          title: 'تأهيل إنتاجي موثّق',
+          title: 'أدلة دعم محدودة',
           body: 'الملف الموثق اختُبر للتثبيت وbackup/restore وbounded concurrency وcrash/restart وconfigured host startup وproduction-derived retrieval وفشل سعة SQLite.',
         },
         {

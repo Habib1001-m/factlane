@@ -25,15 +25,21 @@ supported local deployment profile. That work covered package/install parity, au
 backup/restore compatibility, bounded concurrent operation, crash/restart behavior, configured
 stdio host integration, production-derived retrieval, and fail-closed SQLite capacity
 handling. The release remains local-first and keeps the five-tool public MCP contract at
-revision 2. The 0.1.4 line preserves that contract while adding the qualified embedding-compatibility migration, native Windows standard-runtime evidence, host/bootstrap hardening, and release/publication controls.
+revision 2. The 0.1.4 line preserved that contract while adding the qualified
+embedding-compatibility migration, native Windows x64 standard-runtime evidence, host/bootstrap
+hardening, and release/publication controls.
 
 The current 0.1.5 source/RC line advances the public contract to revision 3 and storage to contract
 v3 without expanding the five-tool MCP surface. It adds Owner `REVOKE`/`REJECT`, contradiction-group
 CAS, lifecycle event/operation records, manual `on_change` recheck, governed readmission,
 `OwnerControlService`, the `factlane-owner` CLI, and a loopback Owner WebUI. Storage-v2 data moves
-forward only through an explicit migration that creates and verifies a pre-v3 backup. The source
-line remains a local release candidate until a separate publication decision creates release
-identity and artifacts.
+forward only through an explicit POSIX maintenance migration that creates and verifies a pre-v3
+backup. The bounded native Windows x64 normal-runtime profile is retained, but no Windows migration,
+restore, sensitive-Recovery, or ARM64 support claim is added. The Python package and public site
+remain separate publication surfaces. The source line remains a local release candidate until a
+separate publication decision creates and verifies release identity and artifacts; site Production
+deployment is a separate crossing. See the [changelog](CHANGELOG.md) for the user-facing 0.1.5
+release-candidate notes and [Release operations](RELEASE_OPERATIONS.md) for the upgrade contract.
 
 Qualification does not turn FactLane into a universal retrieval or deployment platform.
 Language and semantic-ranking quality remain workload-specific, and operators remain

@@ -9,6 +9,10 @@
 تغييرات في الوثائق أو التطوير بعد الإصدار، ولذلك يجب ألا يُستخدم بديلًا عن هوية إصدار
 تاريخية.
 
+لملخص التغييرات الموجّه للمستخدم وتأثير الترقية في release candidate الحالي، راجع
+[سجل التغييرات](CHANGELOG.md). ويظل هذا الدليل المرجع المعتمد لهوية الإصدار الدقيقة وإجراءات
+الترحيل والتراجع والتثبيت وإعادة التحقق بعد التثبيت.
+
 ### هوية حزمة Development
 
 آخر إصدار إنتاج منشور هو `v0.1.4`. ويعلن خط المصدر/RC الحالي الآن `0.1.5` في `pyproject.toml`،
@@ -55,6 +59,7 @@ Development مغلقًا عمدًا أمام هوية الإصدار: فهو ي�
 | Linked SQLite | `>=3.42.0` |
 | Public Contract Revision | `2` |
 | Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
+| Portable Skill SHA-256 | `1c28bc370af0dd89499f8121fb7b611afb4c83773207ce546136abd8018f3e24` |
 
 أصول الإصدار منشورة في
 [GitHub Release for `v0.1.3`](https://github.com/Habib1001-m/factlane/releases/tag/v0.1.3).
@@ -110,14 +115,17 @@ Windows x64 القياسية، وإرشادات bootstrap للـSkill، وضوا
 | Linked SQLite | `>=3.42.0` |
 | Public Contract Revision | `2` |
 | Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
+| Portable Skill `SKILL.md` SHA-256 | `6255ddb8eeea074cd324d1f096d3e043f09a189b46cb3f64c724bb29ecd397a4` |
+| Portable Skill `references/host-bootstrap.md` SHA-256 | `05882a0d6716e32cd23ef452c1683a8aff1294abfcc7950fea771320cd211d4c` |
 
 هذه حقائق إصدار تاريخية. ولا تمنح أي هوية أو صلاحية نشر لخط المصدر/RC الحالي `0.1.5`.
 
-## ملاحظات FactLane 0.1.5 RC المحلي والانتقال من v0.1.4
+## FactLane 0.1.5 release candidate والانتقال من v0.1.4
 
 يعلن خط المصدر الحالي package `0.1.5` وPublic Contract Revision 3 وعقد التخزين v3. ويظل مادة RC
 محلية: لا توجد بعد علامة `v0.1.5` منشورة أو بصمة wheel/sdist أو deployment أو صلاحية
-Production/publication.
+Production/publication. تلخّص [فقرة 0.1.5 في سجل التغييرات](CHANGELOG.md) التغييرات الظاهرة
+للمستخدم؛ ويحدد هذا القسم آليات الانتقال.
 
 يحافظ الـRC على نقل MCP العام عبر **stdio فقط** وعلى سطح MCP العام عند الأدوات الخمس نفسها بالضبط.
 ويوسع Revision 3 أداة `memory_update` بوضعي `REVOKE`/`REJECT` بصلاحية Owner مباشرة، ويضيف سطح
@@ -128,7 +136,7 @@ Production/publication.
 الخدمة، وليس خادم MCP عبر HTTP ولا أداة MCP سادسة.
 
 يضيف storage v3 حالتي `REVOKED` و`REJECTED` المنطقيتين النهائيتين، وGroup CAS لمجموعة التناقض،
-وسجل lifecycle event/operation immutable، وإعادة فحص يدوية لحداثة `on_change`، وreadmission محكومًا.
+وسجلات دائمة لأحداث وعمليات lifecycle، وإعادة فحص يدوية لحداثة `on_change`، وreadmission محكومًا.
 دورة الحياة النهائية منطقية ولا تدعي المحو المادي. والـreadmission عملية دورة حياة متحققة لذاكرة
 مؤهلة في `REVOKED`، وليست استعادة backup ولا إحياءً بعد sensitive-Recovery.
 
@@ -139,7 +147,9 @@ unavailable أو indeterminate أو stale أو mismatched يفشل مغلقًا 
 ### ترحيل التخزين المطلوب من v2 إلى v3
 
 لا يرحّل بدء v0.1.5 العادي قاعدة v0.1.4/storage-v2 بصمت. يفشل الـRC مغلقًا مع
-`MIGRATION_REQUIRED` حتى يكمل مشغّل الترحيل الموثوق الانتقال. أوقف FactLane أو ضعه في quiescence،
+`MIGRATION_REQUIRED` حتى يكمل مشغّل الترحيل الموثوق الانتقال. تعامل مع ذلك باعتباره **ترحيل
+بيانات/schema** لا ترقية حزمة فقط. نجاح تثبيت الحزمة لا يصرّح بفتح بيانات storage-v2 بواسطة
+runtime 0.1.5 العادي. أوقف FactLane أو ضعه في quiescence،
 واختر مسار backup جديدًا داخل **مجلد private موجود مسبقًا ويملكه مشغّل الترحيل**. يجب ألا يمنح
 مجلد الـbackup أي صلاحيات للمجموعة أو للآخرين (`mode & 077 == 0`)؛ ولا تنشئ عملية الترحيل هذا
 المجلد أو توسّع صلاحياته نيابة عن المشغّل:
@@ -165,6 +175,10 @@ staging سري بصلاحية `0600` في المجلد نفسه، ثم يعيد 
 بعد الترحيل، احتفظ بمسار backup وSHA-256 المبلغ عنهما كدليل rollback، وأعد تشغيل فحوص وقت التشغيل
 العادية قبل تفعيل الكتابة.
 
+يغيّر الترحيل عقد التخزين الدائم الخاص بـPython runtime فقط. ولا ينشر Python package ولا ينشر
+الموقع العام ولا يمنح أيًا من السطحين صلاحية Production. يظل تأهيل/نشر الموقع مسار publication
+منفصلًا عن نشر wheel/source distribution.
+
 ### rollback للبيانات من v3 إلى v2
 
 إذا كان يجب التراجع عن الترحيل قبل قبول حالة v3 كمرجعية دائمة، فأوقف/جمّد وقت تشغيل v0.1.5
@@ -183,17 +197,30 @@ uv run factlane-migrate-storage-v3 restore \
 
 ## تثبيت إصدار دقيق
 
+انسخ الهوية الدقيقة من manifest الإصدار الذي اخترته إلى متغيرات shell قبل استخدام أي من
+مساري التثبيت. لا تستبدلها بقيم من `main` المتحرك أو قائمة package index أو الذاكرة:
+
+```bash
+RELEASE_TAG="<annotated tag>"
+RELEASE_COMMIT="<release commit>"
+RELEASE_TREE="<release tree>"
+WHEEL_NAME="<wheel filename>"
+WHEEL_SHA256="<wheel SHA-256>"
+SDIST_NAME="<source-distribution filename>"
+SDIST_SHA256="<source-distribution SHA-256>"
+```
+
 ### الخيار A: versioned source checkout
 
 استخدم وسم الإصدار ذي النسخة، وتحقق من commit/tree الخاصين به، بدل الاعتماد على
 فرع `main` المتحرك:
 
 ```bash
-git clone --branch v0.1.4 --depth 1 https://github.com/Habib1001-m/factlane.git
+git clone --branch "$RELEASE_TAG" --depth 1 https://github.com/Habib1001-m/factlane.git
 cd factlane
 
-test "$(git rev-parse HEAD)" = "4b2cf5b27d454799dd253c0306d83bd076c9369f"
-test "$(git rev-parse 'HEAD^{tree}')" = "d9a69de5e63419bfb6aade745e25137e07857cbb"
+test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+test "$(git rev-parse 'HEAD^{tree}')" = "$RELEASE_TREE"
 
 uv sync --frozen
 uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
@@ -206,13 +233,11 @@ uv run factlane --help-tools
 نزّل wheel الخاصة بالإصدار، وتحقق منها، ثم ثبّتها في بيئة جديدة:
 
 ```bash
-curl -fLO https://github.com/Habib1001-m/factlane/releases/download/v0.1.4/factlane-0.1.4-py3-none-any.whl
-printf '%s  %s\n' \
-  'b1a256d124d74ffd6b9dba4338c171e35b95fa901e232bb1ed59ebd4f0316307' \
-  'factlane-0.1.4-py3-none-any.whl' | sha256sum -c -
+curl -fLO "https://github.com/Habib1001-m/factlane/releases/download/${RELEASE_TAG}/${WHEEL_NAME}"
+printf '%s  %s\n' "$WHEEL_SHA256" "$WHEEL_NAME" | sha256sum -c -
 
 python3.11 -m venv .venv
-.venv/bin/python -m pip install ./factlane-0.1.4-py3-none-any.whl
+.venv/bin/python -m pip install "./${WHEEL_NAME}"
 .venv/bin/python -m pip check
 .venv/bin/factlane --help
 .venv/bin/factlane --help-tools
@@ -228,13 +253,11 @@ source checkout الموسوم مع `uv sync --frozen` وملف `uv.lock` الم
 يُعد source distribution أيضًا سطح clean-install مدعومًا بعد التحقق من SHA-256 الخاص به:
 
 ```bash
-curl -fLO https://github.com/Habib1001-m/factlane/releases/download/v0.1.4/factlane-0.1.4.tar.gz
-printf '%s  %s\n' \
-  '80c01dbf20dd5139350a9434c787c27a468f458397740fd0d85064394be1f5a3' \
-  'factlane-0.1.4.tar.gz' | sha256sum -c -
+curl -fLO "https://github.com/Habib1001-m/factlane/releases/download/${RELEASE_TAG}/${SDIST_NAME}"
+printf '%s  %s\n' "$SDIST_SHA256" "$SDIST_NAME" | sha256sum -c -
 
 python3.11 -m venv .venv
-.venv/bin/python -m pip install ./factlane-0.1.4.tar.gz
+.venv/bin/python -m pip install "./${SDIST_NAME}"
 ```
 
 تُشحن Skill المحمولة `using-factlane` مع الحزمة، لكن تثبيت الحزمة لا يسجل Skill
@@ -302,8 +325,9 @@ python3.11 -m venv .venv
    factlane --help-tools
    ```
 
-   بالنسبة إلى `v0.1.3`، يجب أن يبلغ هذا عن Public Contract Revision 2 وعن الأدوات
-   الخمس الواردة في manifest الإصدار أعلاه تحديدًا.
+   قارن Public Contract Revision المبلغ عنه مع manifest الإصدار المختار. ويبقى سطح MCP العام
+   المدعوم بالضبط `memory_search` و`memory_get` و`memory_store` و`memory_update` و`memory_status`؛
+   وظهور الأداة لا يمنح صلاحية كتابة.
 
 4. أكّد bytes الخاصة بـ Skill المحمولة لسطح التثبيت. بالنسبة إلى tagged source checkout،
    تحقق من النسخة المصدرية المتتبعة:
@@ -319,14 +343,12 @@ python3.11 -m venv .venv
    sha256sum .venv/share/factlane/skills/using-factlane/SKILL.md
    ```
 
-   بالنسبة إلى `v0.1.3`، يجب أن ينتج أي من المسارين المنطبقين hash بالقيمة
-   `1c28bc370af0dd89499f8121fb7b611afb4c83773207ce546136abd8018f3e24`.
-   ويحافظ source checkout المتزامن باستخدام `uv sync --frozen` على Skill الموثوقة في
-   شجرة المصدر ولا يحتاج إلى نسخ ملف البيانات ذلك تحت بادئة البيئة الافتراضية.
-   يجب أن تتعامل الإصدارات اللاحقة التي تضيف مراجع Skill مع Skill على أنها reference set
-   لا ملفًا واحدًا: سجّل وتحقق من المسار النسبي وSHA-256 لـ`SKILL.md` ولكل ملف ضمن
-   `references/*`، واطلب تكافؤ bytes بين المصدر وwheel وsdist للمجموعة كاملة. وجود الملفات
-   لا يثبت التسجيل في المضيف أو loaded state.
+   قارن bytes المنطبقة مع digests الخاصة بـSkill/reference-set والمسجلة للإصدار المختار.
+   ويحافظ source checkout المتزامن باستخدام `uv sync --frozen` على Skill الموثوقة في شجرة
+   المصدر ولا يحتاج إلى نسخ ملف البيانات ذلك تحت بادئة البيئة الافتراضية. ويجب أن تتعامل
+   الإصدارات التي تشحن مراجع Skill مع Skill على أنها reference set لا ملفًا واحدًا: سجّل وتحقق
+   من المسار النسبي وSHA-256 لـ`SKILL.md` ولكل ملف ضمن `references/*`، واطلب تكافؤ bytes بين
+   المصدر وwheel وsdist للمجموعة كاملة. وجود الملفات لا يثبت التسجيل في المضيف أو loaded state.
 5. شغّل مضيف stdio المهيأ في write profile المقصود وتأكد من أن اكتشاف الأدوات يطابق
    عقد الإصدار. ظهور الأداة لا يمنح سلطة كتابة.
 6. عند التحقق من مسار نشر جديد، فضّل قاعدة بيانات disposable لاختبارات smoke. وإذا كان

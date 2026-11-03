@@ -46,20 +46,10 @@ if (mode === 'public' && verifyBaseUrl.protocol !== 'https:' && !loopbackVerific
   throw new Error('Public production verification requires HTTPS; HTTP is allowed only for loopback rehearsal');
 }
 
-const docIds = [
-  'INTRO',
-  'USE_CASES',
-  'FAQ',
-  'CORE_CONCEPTS',
-  'QUICKSTART',
-  'TOOLS',
-  'USING_FACTLANE_SKILL',
-  'ARCHITECTURE',
-  'ENVIRONMENT',
-  'SECURITY',
-  'RELEASE_OPERATIONS',
-  'PROJECT_HISTORY',
-];
+const publicDocs = JSON.parse(
+  await readFile(path.join(siteRoot, 'public-docs.json'), 'utf8'),
+);
+const docIds = publicDocs.map((doc) => doc.id);
 
 const authority = JSON.parse(
   await readFile(path.join(siteRoot, 'src', 'content', 'answerAuthority.json'), 'utf8'),
@@ -620,7 +610,8 @@ if (mode === 'public') {
   assert(llms.contentType.includes('text/plain'), `Public llms.txt must be text/plain: ${llms.contentType}`);
   assert(llms.body.includes(`${expectedOrigin}/answers/`), 'llms.txt missing EN answer surface');
   assert(llms.body.includes(`${expectedOrigin}/ar/answers/`), 'llms.txt missing AR answer surface');
-  assert(llms.body.includes('v0.1.4'), 'llms.txt missing supported release boundary');
+  assert(llms.body.includes(`${expectedOrigin}/docs/RELEASE_OPERATIONS/`), 'llms.txt missing release operations');
+  assert(llms.body.includes(`${expectedOrigin}/docs/CHANGELOG/`), 'llms.txt missing changelog');
   assert(llms.body.includes('not a universal memory replacement'), 'llms.txt missing product-scope boundary');
   assert(arLlms.status === 404, `Public /ar/llms.txt must remain absent/404, got ${arLlms.status}`);
 

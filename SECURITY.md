@@ -25,13 +25,15 @@ release/commit and relevant runtime versions.
   accepts no project, worktree, workflow, or agent identity keys and does not implicitly
   copy records into another scope.
 - **Storage consistency:** Revision and lifecycle updates use transaction-local compare-and-swap.
-  The current `0.1.5` source/RC uses storage contract v3, which adds immutable lifecycle event and
-  operation records, contradiction-group CAS, and a connection-local
-  `factlane_contract_v3_writer` fence. A storage-v2 database is not opened for ordinary v0.1.5
-  service; it requires the explicit migration operator. The published v0.1.4 release remains a
-  storage-v2 release. SQLite capacity exhaustion reported as `SQLITE_FULL` is translated at the
-  FactLane boundary to retryable `BACKEND_UNAVAILABLE`; the failed mutation remains
-  transactional and does not leave a partial durable record.
+  Storage contract v3 keeps lifecycle-event history append-only and blocks ordinary mutation of
+  lifecycle-operation rows. Sensitive-memory Recovery has a separate trusted writer path that may
+  tombstone target-linked operation replay material while appending its own purge event. The storage
+  contract also enforces contradiction-group CAS and a connection-local `factlane_contract_v3_writer` fence. Exact
+  storage-v2 state is not opened for ordinary service; startup fails closed with
+  `MIGRATION_REQUIRED` until the explicit migration operator is used. SQLite capacity exhaustion
+  reported as `SQLITE_FULL` is translated at the FactLane boundary to retryable
+  `BACKEND_UNAVAILABLE`; the failed mutation remains transactional and does not leave a partial
+  durable record.
 - **Local providers:** The shipped embedding provider connects to Ollama on loopback;
   non-local embedding endpoints and automatic remote fallbacks are not supported. Embedding
   model identity, capabilities, dimensions, and input limits are checked against the
@@ -41,9 +43,11 @@ The public MCP surface is limited to `memory_search`, `memory_get`, `memory_stor
 `memory_update`, and `memory_status`. There is no normal-agent delete, recovery,
 administration, background harvesting, or autonomous consolidation tool.
 
-Public Contract Revision 3 adds Owner-only `REVOKE` and `REJECT` modes to `memory_update`; it does
-not add another MCP tool. Those operations require exact revision and contradiction-group CAS plus
-a bounded reason code. The local `OwnerControlService` is a separate trusted operator boundary.
+Direct Owner authority can use `REVOKE` and `REJECT` through `memory_update`; these modes do not add
+another MCP tool. They require exact revision and contradiction-group CAS plus a bounded reason
+code. The local `OwnerControlService` is a separate trusted operator boundary that also provides
+bounded inventory/detail, conflict review and resolution, health/retention inspection,
+reverification/replacement, manual freshness recheck, and readmission.
 The packaged `factlane-owner` CLI binds scope and direct Owner authority at launcher creation and
 accepts mutation proof as bounded JSON. The packaged `factlane-owner-webui` launcher delegates to
 the same service and binds exactly to `127.0.0.1`. Startup prints the bound origin plus a short-lived
@@ -53,6 +57,11 @@ rejected, and the UI does not store the bootstrap token in `localStorage`. Succe
 consumes the token, sets an `HttpOnly; SameSite=Strict` session cookie, and returns the CSRF token
 required by later mutation requests. It is an Owner control surface, not an HTTP MCP server and not
 remote administration.
+
+The WebUI surfaces **Overview**, **Current**, **Candidates**, **Conflicts**, **Needs Review**,
+**History**, and **System Health** over the same Owner service. Browser mutations remain bound to the
+trusted launcher scope, authenticated session, CSRF token, exact record revision, idempotency, and
+the displayed contradiction-group CAS token where required.
 
 `on_change` freshness does not create an autonomous monitor. The Owner manual-recheck operation
 accepts explicit bounded observation evidence and fails closed when evidence is stale, mismatched,
@@ -119,7 +128,7 @@ ineligible for ordinary Current use while preserving the audit/history contract.
 physical deletion. Use sensitive-memory recovery only for the separately authorized incident case
 where removal from the governed local store is required.
 
-## Upgrade and rollback security boundary
+## Storage migration and rollback security boundary
 
 Package rollback and durable-data rollback are different operations. Preserve an operator-owned
 backup before a version transition that may affect stored data. Do not run an older FactLane
@@ -128,30 +137,26 @@ unless the newer release explicitly documents that downgrade as safe. Otherwise,
 durable state requires a documented reverse migration or restoration of a verified compatible
 backup.
 
-The `0.1.5` source/RC transition is explicit: a storage-v2 database must be migrated by
+The current storage transition is explicit: a storage-v2 database must be migrated by
 `factlane-migrate-storage-v3 migrate --db ... --backup ...`. The operator creates and verifies an
 exact storage-v2 backup before contract version 3 is committed. Rollback of that migration uses
-`factlane-migrate-storage-v3 restore --db ... --backup ...` with that verified pre-v3 backup; running
-v0.1.4 directly against a storage-v3 database is not a supported rollback path.
-
-`v0.1.3` is the first official production release and has no earlier official production
-rollback target. Its public package can be replaced mechanically in an isolated environment,
-but that does not establish a production-database downgrade path. See
-[Release operations](docs/RELEASE_OPERATIONS.md) for versioned artifact verification and the
-operator transition checklist.
+`factlane-migrate-storage-v3 restore --db ... --backup ...` with that verified pre-v3 backup.
+Running an arbitrary older runtime directly against storage contract v3 is not a supported durable
+rollback path. See [Release operations](docs/RELEASE_OPERATIONS.md) for release-specific artifact
+verification and the operator transition checklist.
 
 ## Known limits
 
-FactLane is a local service, not a distributed consensus system. Version 0.1.4 remains the latest
-published production release and is production-qualified for the documented local deployment profile, including authoritative
-backup/restore compatibility, bounded concurrent operation, crash/restart rollback, configured
-stdio host integration, and production-derived retrieval checks. Operators still need their
-own backup retention, restore procedures, monitoring, and deployment-specific recovery plan.
+FactLane is a local service, not a distributed consensus system. Its supported local profile covers
+the documented stdio host integration, local SQLite/SQLite-vec storage, local Ollama embeddings,
+bounded concurrent operation, crash/restart behavior, backup/restore compatibility, and
+production-derived retrieval checks. Operators still need their own backup retention, restore
+procedures, monitoring, and deployment-specific recovery plan.
 
-The current `0.1.5` source/RC is not a published production release. Its normal runtime remains
-portable to the separately qualified Windows x64 path, while sensitive-memory recovery and the
-v2 → v3 migration/restore maintenance path depend on the POSIX maintenance-lock contract. Do not
-infer a Windows recovery or migration claim from normal Windows runtime support.
+Normal runtime support on native Windows x64/AMD64 is separate from sensitive maintenance.
+Sensitive-memory Recovery and storage-v2-to-v3 migration/restore depend on the POSIX
+`fcntl`/`flock` maintenance-lock contract. Do not infer a Windows Recovery or migration claim from
+normal Windows runtime support. No Windows ARM64 support claim is made.
 
 The qualification does not establish universal behavior for arbitrary network/FUSE
 filesystems, every MCP client, unlimited-duration load, or every language and ranking

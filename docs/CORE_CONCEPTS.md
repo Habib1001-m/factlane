@@ -1,157 +1,142 @@
 # Core concepts
 
-FactLane is easier to understand if you separate four questions:
+FactLane is easiest to understand as a **governed lane for reusable facts**, not as a transcript archive and not as a source of execution authority.
 
-1. **What is worth remembering?**
-2. **What is trusted as Current?**
-3. **Where is that fact allowed to apply?**
-4. **What outranks memory when the world changes?**
+A memory record can be useful because it survived a previous session while still being weaker than what the user, repository, product, or a verified live source says now.
 
-## The mental model in plain language
+## The mental model
 
-| Plain-language question | FactLane term |
-| --- | --- |
-| Is this worth keeping for later? | **Candidate** |
-| Has it been separately verified and is it eligible now? | **Current** |
-| Where is this fact allowed to apply? | **Scope** |
-| Could this fact have become stale? | **Freshness** |
-| Where did the fact come from? | **Provenance** |
+Think about four independent questions:
 
-You can understand the product with those five ideas. The sections near the end of this page add
-the exact integration mechanics for developers and operators.
+1. **Should this fact be retained?** — Candidate.
+2. **Is it trusted as current?** — Current eligibility.
+3. **Where is it allowed to apply?** — Scope and identity.
+4. **How long can it be trusted without new evidence?** — Freshness.
+
+Authority is a fifth boundary around those questions: who may contribute, verify, revoke, reject, recheck, or readmit is not determined by the fact itself.
 
 ## Memory supports decisions; it is not execution authority
 
-FactLane memory is supporting state.
+FactLane memory is supporting evidence.
 
-Current user instructions, current repository or product state, and verified live sources can
-outrank remembered information. A stored preference may be useful tomorrow, but it cannot force
-an assistant to ignore what you are asking for now.
+Higher-authority current context includes, depending on the task:
 
-This is the central product boundary.
+- the user's current instruction;
+- live repository or product state;
+- verified live external state;
+- active runtime permissions and policy.
+
+A remembered statement such as “production changes require approval” can inform behavior. It does not grant or remove the actual permission to change production.
 
 ## Candidate: worth remembering, not trusted yet
 
-A compatible host can allow an assistant to contribute a **Candidate**: a fact that looks useful
-enough to keep available for review.
+A **Candidate** is a bounded contribution retained for review.
 
-Think of Candidate as:
+It may come from:
 
-> “This may be useful later. Keep it available for review.”
+- an explicit user request to remember/store a fact; or
+- an agent proposal that the user explicitly authorizes.
 
-It does **not** mean:
+Content consent and runtime authority are separate. Consent to remember one fact does not change the launcher write profile or grant verifier authority.
 
-> “Treat this as verified current truth.”
+A delegated agent may store a Candidate only when its launcher profile permits Candidate contribution. It cannot turn that Candidate into Current by asserting a privileged identity.
 
-The assistant that contributed it cannot make it Current merely by claiming more authority.
+## Current: verified and eligible now
 
-## Current: verified and eligible to use now
+A record can participate in ordinary `CURRENT` retrieval only when the governed lifecycle, verification, scope, compatibility, and freshness conditions all admit it.
 
-An eligible Candidate becomes Current only after a separate trusted verification step. Normal
-current-state use excludes unverified Candidates.
+Current is not “true forever.” It means the record has passed the current FactLane eligibility rules for its intended use.
 
-Think of Current as:
-
-> “Verified, fresh enough, and eligible for this current-state lookup.”
-
-It still remains memory. It does not supersede a newer authoritative instruction or live source.
+When current reality changes, a trusted verifier or Owner may reverify, replace, revoke, or otherwise adjudicate the record through the governed operation that matches the change.
 
 ## Scope: where does this fact belong?
 
-FactLane defines five public scopes:
+The public scopes are:
 
-| Scope | Plain-language meaning |
+| Scope | Meaning |
 | --- | --- |
-| `GLOBAL_USER` | A fact that belongs to the user without project/workflow identity. |
-| `PROJECT` | A fact for one exact project. |
-| `WORKFLOW` | A fact for one exact project + workflow. |
-| `TOOL_ENVIRONMENT` | A fact tied to one exact agent/tool environment. |
-| `CROSS_PROJECT_WORKFLOW` | An identity-free workflow rule that applies across projects under its specific contract. |
+| `GLOBAL_USER` | User-level fact with no project/workflow identity. |
+| `PROJECT` | Fact for one exact `project_id`. |
+| `WORKFLOW` | Fact for one exact `project_id` + `workflow_id`. |
+| `TOOL_ENVIRONMENT` | Fact for one exact `agent_id`. |
+| `CROSS_PROJECT_WORKFLOW` | Deliberately cross-project workflow fact with project/worktree/workflow/agent identity keys absent. |
 
-`CROSS_PROJECT_WORKFLOW` does **not** mean “search all projects.”
+A trusted host may bind applicable identities. Conflicting caller-supplied identity fails closed.
+
+`CROSS_PROJECT_WORKFLOW` is not an implicit multi-project search. It is its own explicitly governed scope.
 
 ## Freshness: could the fact have expired?
 
-Some facts are long-lived:
+Freshness describes when a previously verified fact may stop being eligible.
 
-> “I prefer concise answers.”
+Depending on the policy, a record can be:
 
-Others become stale quickly:
+- still fresh;
+- approaching expiry;
+- stale by TTL;
+- waiting for an explicit recheck;
+- held for manual review.
 
-> “The latest published release is v0.1.4, while this source checkout is the 0.1.5 local RC.”
+For `on_change`, FactLane stores a recheck contract but does **not** run a background watcher. A trusted Owner supplies fresh bounded observation evidence through manual recheck.
 
-FactLane stores freshness policy with memory so current-state retrieval can exclude facts that
-are no longer eligible.
-
-Freshness is one reason a memory database should not be treated as an unquestionable truth
-source.
+Unchanged healthy evidence may renew eligibility. Changed, unavailable, indeterminate, stale, or mismatched evidence fails closed instead of silently refreshing the record.
 
 ## Provenance: where did this fact come from?
 
-A durable fact is more useful when an operator or agent can inspect its source. FactLane records
-source provenance rather than treating the text alone as sufficient context.
+Provenance records the source class and source identity/hash needed to understand where a fact came from.
 
-## For integrators: authority and revision mechanics
+Contribution and verification provenance are distinct. A verifier does not become the historical contributor merely because it verifies a Candidate.
 
-The rest of this page uses runtime terminology that matters when configuring or integrating a
-FactLane host. If you are evaluating the product as an end user, you can continue directly to the
-[Quick start](QUICKSTART.md) when someone is ready to perform the setup.
+Provenance is evidence. It is not permission.
 
-### Write profiles: seeing a tool is not the same as being allowed to use it
+## Lifecycle closure: revoke, reject, resolve, and readmit
 
-FactLane exposes the same five public MCP tools, but launcher configuration controls authority.
+Owner governance covers more than promotion:
 
-| Launcher profile | Practical meaning |
-| --- | --- |
-| omitted / `read-only` | Search, get and status only. |
-| `delegated-candidate` | Ordinary agent may contribute Candidate memory. |
-| trusted verifier/owner profiles | Restricted operator/verifier actions, including governed promotion. |
+- **`REVOKE`** applies to an eligible `VALIDATED_CURRENT` record that should no longer count as Current.
+- **`REJECT`** applies to a `CANDIDATE` that should not be admitted.
+- **resolve** chooses a governed outcome for a contradiction group under exact Group CAS.
+- **readmit** can create a governed successor for an eligible `REVOKED` logical memory after new verification.
 
-An agent does not become a verifier simply because `memory_update` appears in tool discovery.
+`REVOKED` and `REJECTED` are logical lifecycle states. They are not physical erasure.
 
-### Bound identity and current retrieval
+Readmission is not database restore and cannot recreate content that sensitive-memory Recovery removed from the governed local store.
 
-A trusted launcher can bind relevant project, workflow, or tool identity context. Conflicting
-caller-supplied bound identities are rejected rather than silently rewritten.
+## Authority: seeing a tool is not permission
 
-Normal `CURRENT` retrieval admits eligible `VALIDATED_CURRENT` facts, not unverified Candidates.
-Semantic or hybrid `CURRENT` retrieval can also preserve source diversity so one provenance source
-does not crowd every result slot merely because it contains several nearby matches.
+The public MCP surface always exposes the same five tool names, but runtime authorization is enforced independently.
 
-### REVERIFY vs REPLACE
+Typical launcher roles include:
 
-Trusted promotion uses `memory_update` with `REVERIFY`, the expected revision, and the exact
-expected record identity.
+- **read-only** — search/read/status only;
+- **delegated-candidate** — may contribute Candidates with explicit content consent;
+- **trusted verifier / direct Owner contexts** — separately configured privileged paths for governed verification or Owner operations.
 
-`REVERIFY` preserves the logical memory identity while refreshing verification of the same
-fact/scope/type/subject.
+A chat message cannot elevate launcher authority. An idempotency key is not an authorization token.
 
-`REPLACE` is used when the semantic identity itself changes.
+## REVERIFY vs REPLACE
 
-This distinction prevents a “verification” operation from quietly turning into an unrelated
-reclassification.
+Use `REVERIFY` when the logical fact identity remains the same and the record is being verified again.
 
-Public Contract Revision 3 adds two direct-Owner dispositions to the same `memory_update` tool:
-`REVOKE` for a `VALIDATED_CURRENT` logical memory and `REJECT` for a `CANDIDATE` that should not be
-admitted. Both use exact revision plus contradiction-group CAS. Their
-resulting `REVOKED` and `REJECTED` states are logical terminal states, not physical erasure.
+Use `REPLACE` when the semantic identity itself changes and a successor record is required.
 
-An Owner can later **readmit** an eligible `REVOKED` logical memory only after new verification and
-CAS checks. Readmission is different from restoring a database backup, and it cannot recreate data
-removed by sensitive-memory recovery.
+Candidate promotion uses `REVERIFY` with the exact expected Candidate record identity. Stale revision or identity checks fail closed.
 
-For `on_change` freshness, the policy names evidence that must be rechecked; FactLane does not run
-an automatic watcher. The Owner supplies a new bounded observation through the manual recheck path.
-Changed, unavailable, indeterminate, stale, or mismatched evidence fails closed for review.
+## Group CAS and contradiction handling
 
-### History is different from Current
+Operations that govern a contradiction group are bound to the exact group state the trusted operator reviewed.
 
-`REVIEW_HISTORY` can expose past revisions and Candidates for explicit inspection.
+Owner lifecycle mutations that require group protection use the displayed `observed_group_token` plus the current revision/record identity and an allowed reason code. If the group changed after review, the operation fails rather than acting on stale context.
 
-That history is useful evidence, but it is not automatically eligible for a `CURRENT` answer.
+## History is different from Current
+
+`REVIEW_HISTORY` exists for explicit inspection of Candidates and historical revisions. Historical retrieval can include records that are not eligible for Current use.
+
+For semantic/hybrid history, compaction can make vector coverage partial. FactLane reports that degradation instead of pretending the semantic history is complete.
 
 ## Next
 
-- [Quick start](QUICKSTART.md)
-- [Five MCP tools](TOOLS.md) — developer reference after the connection works.
-- [Architecture](ARCHITECTURE.md) — optional deeper system model.
+- [Quick Start](QUICKSTART.md) — establish a safe connection.
+- [Five MCP tools](TOOLS.md) — public MCP semantics.
+- [Architecture](ARCHITECTURE.md) — exact implementation boundaries.
+- [Security](../SECURITY.md) — trust, consent, and incident Recovery.

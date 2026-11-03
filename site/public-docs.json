@@ -1,0 +1,15 @@
+[
+  {"id":"INTRO","source":"docs/INTRO.md","group":"root","releaseBound":false},
+  {"id":"USE_CASES","source":"docs/USE_CASES.md","group":"start","releaseBound":false},
+  {"id":"FAQ","source":"docs/FAQ.md","group":"start","releaseBound":false},
+  {"id":"CORE_CONCEPTS","source":"docs/CORE_CONCEPTS.md","group":"start","releaseBound":false},
+  {"id":"QUICKSTART","source":"docs/QUICKSTART.md","group":"start","releaseBound":false},
+  {"id":"TOOLS","source":"docs/TOOLS.md","group":"developer","releaseBound":false},
+  {"id":"USING_FACTLANE_SKILL","source":"skills/using-factlane/SKILL.md","group":"developer","releaseBound":false},
+  {"id":"ARCHITECTURE","source":"docs/ARCHITECTURE.md","group":"operate","releaseBound":false},
+  {"id":"ENVIRONMENT","source":"docs/ENVIRONMENT.md","group":"operate","releaseBound":false},
+  {"id":"SECURITY","source":"SECURITY.md","group":"operate","releaseBound":false},
+  {"id":"RELEASE_OPERATIONS","source":"docs/RELEASE_OPERATIONS.md","group":"operate","releaseBound":true},
+  {"id":"CHANGELOG","source":"docs/CHANGELOG.md","group":"background","releaseBound":true},
+  {"id":"PROJECT_HISTORY","source":"docs/PROJECT_HISTORY.md","group":"background","releaseBound":true}
+]

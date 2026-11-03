@@ -1,108 +1,93 @@
 # Five MCP tools
 
-FactLane deliberately keeps its public MCP surface small:
+FactLane keeps its public MCP surface deliberately small:
 
-```text
-memory_search
-memory_get
-memory_store
-memory_update
-memory_status
-```
+1. `memory_search`
+2. `memory_get`
+3. `memory_store`
+4. `memory_update`
+5. `memory_status`
 
-The purpose of this page is to explain **when** each tool is useful. The live MCP schema and
-`factlane --help-tools` remain authoritative for exact request fields, enums, and signatures.
+The public transport is command-launched **stdio**. The local Owner CLI and loopback Owner WebUI are separate operator surfaces; they do not add MCP tools.
 
-This is a developer/integrator reference. If you have not connected FactLane yet, start with the
-[Quick start](QUICKSTART.md) and establish a safe read-only connection first.
+The live MCP schema and `factlane --help-tools` are authoritative for exact fields, enum values, and signatures.
 
 ## `memory_search`
 
-Use it to retrieve facts inside one exact scope.
+Search bounded facts inside one exact scope.
 
-Typical question:
+Key dimensions include:
 
-> “What verified project facts are relevant to the current release?”
+- exact public scope and required identity;
+- intent class from the live schema;
+- retrieval lifecycle (`CURRENT` or explicit `REVIEW_HISTORY`);
+- search kind (`EXACT`, `KEYWORD`, `SEMANTIC`, or `HYBRID` where allowed).
 
-Important boundaries:
+`CURRENT` retrieval admits only eligible Current records. For semantic search, eligibility is applied inside the vector candidate path before the final KNN result limit so closer unverified Candidates cannot crowd out eligible Current facts.
 
-- choose the intended scope;
-- `CURRENT` and `REVIEW_HISTORY` serve different purposes;
-- current-state retrieval does not make unverified Candidates eligible merely because they rank
-  highly;
-- bound identity supplied by a trusted host should not be redundantly overridden by the caller.
+`CROSS_PROJECT_WORKFLOW` follows its own search matrix and does not fan out across project scopes.
 
 ## `memory_get`
 
-Use it when you already know which logical memory you want to inspect.
+Read one logical memory by its governed identity and inspect its provenance, lifecycle, revision, freshness, and related metadata.
 
-It is useful for understanding provenance, lifecycle and revision details rather than performing a
-broad relevance search.
+Use it when you need the exact record rather than ranked search.
+
+A record can exist in history without being eligible for Current use.
 
 ## `memory_store`
 
-Use it to contribute one bounded fact when the launcher profile permits writing.
+Contribute one bounded fact.
 
-An ordinary `delegated-candidate` connection can contribute a **Candidate**. The tool does not
-let that agent mint `VALIDATED_CURRENT` by asserting a privileged verifier identity.
+A store request needs the exact fields defined by the live schema, including memory type, source provenance, freshness policy, scope, and idempotency key.
 
-Runtime permission is not content consent. Store only after an explicit user remember/store
-request or after the user explicitly authorizes a bounded fact proposed by the agent. Neither path
-elevates launcher or verifier authority.
+Two permissions are separate:
 
-A good contributed fact is:
+1. **content consent** — the user explicitly asked to remember/store the fact, or explicitly accepted an agent proposal;
+2. **launcher authority** — the active process profile permits Candidate contribution.
 
-- bounded;
-- attributable;
-- scoped;
-- accompanied by freshness policy;
-- idempotent under retry.
-
-It is not an arbitrary transcript or directory dump.
+A normal delegated agent stores a `CANDIDATE`; it does not mint `VALIDATED_CURRENT`.
 
 ## `memory_update`
 
-Use it for governed revision operations.
+Perform a governed update under exact revision/idempotency checks.
 
-Public Contract Revision 3 supports four modes:
+Core modes are:
 
-- **`REVERIFY`** — trusted verification of the same logical memory identity;
-- **`REPLACE`** — a governed successor when the semantic identity changes;
-- **`REVOKE`** — direct-Owner terminal disposition of a `VALIDATED_CURRENT` logical memory;
-- **`REJECT`** — direct-Owner terminal disposition of a `CANDIDATE` that should not be admitted.
+- `REVERIFY` — verify the same logical memory again; Candidate promotion uses exact `expected_record_id`;
+- `REPLACE` — create a successor when semantic identity changes;
+- `REVOKE` — direct Owner lifecycle disposition for an eligible `VALIDATED_CURRENT` record;
+- `REJECT` — direct Owner lifecycle disposition for a `CANDIDATE`.
 
-Promotion checks expected record identity and revision so a stale writer cannot silently replace a
-newer state. Owner `REVOKE`/`REJECT` additionally require the exact displayed
-`observed_group_token` and a bounded reason code, so an Owner decision is bound to the contradiction
-group that was actually reviewed.
+`REVOKE` and `REJECT` additionally require the exact displayed `observed_group_token` and an allowed bounded reason code. They are logical lifecycle states, not physical erasure.
 
-An ordinary delegated agent does not gain verifier authority simply because this tool is visible.
+A delegated agent does not gain verifier or Owner authority because `memory_update` is visible.
 
 ## `memory_status`
 
-Use it for bounded, read-only observations about a scope's storage and embedding-profile state.
+Return bounded read-only observations about a scope's storage and embedding-profile state.
 
-In published `v0.1.4`, the backend status also reports the persisted embedding
-compatibility state/binding and whether the observed runtime fingerprint still matches that binding.
-`memory_status` does not run a compatibility migration or silently requalify a changed runtime.
-When a legacy database is `UNPROVEN` or `INCOMPATIBLE`, safe non-semantic reads (`memory_get`,
-`EXACT`, `KEYWORD`) remain available while `SEMANTIC`, `HYBRID`, `memory_store`, and `memory_update`
-fail closed with `PROFILE_MISMATCH` until an explicit compatible migration/re-embedding path exists.
+The status surface can report compatibility/binding state, lifecycle counts, capacity/retention observations, and whether the current runtime fingerprint still matches persisted embedding expectations.
 
-It is not a full monitoring platform, backup facility, or maintenance daemon.
+It does not migrate storage, re-embed records, silently requalify a changed runtime, run background maintenance, or act as a general monitoring service.
 
-The current `0.1.5` source/RC adds a separate `OwnerControlService`, packaged `factlane-owner` CLI,
-and packaged `factlane-owner-webui` loopback launcher for inventory, conflict review,
-health/retention views, lifecycle actions, manual recheck, and readmission. The WebUI binds only to
-`127.0.0.1`; its one-use terminal bootstrap token is exchanged through the
-`X-FactLane-Bootstrap` header, never through a URL or `localStorage`. These Owner surfaces do not
-add MCP tools: the public MCP surface remains exactly the five names at the top of this page, over
-stdio only.
+When compatibility is unproven or mismatched, FactLane preserves safe read paths where the contract allows them and fails closed on semantic/vector-mutating operations that require the incompatible binding.
 
-An `on_change` freshness policy does not start a background monitor. Manual recheck requires fresh
-Owner-supplied observation evidence. `REVOKED`/`REJECTED` are logical terminal states; sensitive
-physical removal remains a separate recovery operation. Readmission applies only to eligible
-`REVOKED` logical memory and is not database restore.
+## Owner operations are separate
+
+`OwnerControlService` exposes trusted local governance beyond the ordinary MCP interaction model:
+
+- inventory and record detail;
+- Candidate, Current, history, conflicts, health, and retention views;
+- revoke/reject;
+- contradiction resolution;
+- trusted reverify/replace;
+- manual `on_change` freshness recheck;
+- readmission of eligible revoked memory.
+
+Use `factlane-owner --help` for the current CLI contract.
+
+Use `factlane-owner-webui --help` for the loopback Owner UI launcher. The WebUI binds to `127.0.0.1`, uses a one-use bootstrap exchange, authenticated session, and CSRF protection. It is not an HTTP MCP transport.
 
 ## Governed failures
 
@@ -114,20 +99,19 @@ Expected governed failures use the normal MCP result channel with:
 - empty results;
 - retry metadata where applicable.
 
-Callers should branch on `error_code`, not scrape exception prose.
+Branch on `error_code`, not exception prose.
 
-Unexpected internal exceptions remain transport errors rather than being relabeled as governed
-FactLane results.
+Unexpected internal exceptions remain transport errors rather than being relabeled as governed FactLane outcomes.
 
 ## Example: verify connectivity before writing
 
-For a global-user status check that does not require project identity:
+A simple global-user status request:
 
 ```json
 {"scope":"GLOBAL_USER"}
 ```
 
-For a project-scoped current keyword search, a request may look like:
+A project-scoped Current keyword search may look like:
 
 ```json
 {
@@ -140,10 +124,10 @@ For a project-scoped current keyword search, a request may look like:
 }
 ```
 
-When a trusted host has already bound a corresponding project/workflow/tool identity, follow the
-live schema and omit conflicting caller-supplied identity.
+When a trusted host already binds the applicable project/workflow/tool identity, follow the live schema and omit conflicting caller-supplied identity.
 
 ## Next
 
-- [Architecture](ARCHITECTURE.md) — exact request path, identity, storage and recovery boundaries.
-- [Environment](ENVIRONMENT.md) — runtime and embedding-profile compatibility.
+- [Core concepts](CORE_CONCEPTS.md) — lifecycle and authority model.
+- [Quick Start](QUICKSTART.md) — safe connection and first verification.
+- [Architecture](ARCHITECTURE.md) — request, storage, migration, and Owner-control internals.

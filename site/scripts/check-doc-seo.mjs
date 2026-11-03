@@ -8,6 +8,9 @@ const buildRoot = path.resolve(siteRoot, process.env.FACTLANE_BUILD_DIR ?? 'buil
 const mode = process.env.FACTLANE_SEO_MODE ?? 'public';
 const configuredSiteUrl = process.env.FACTLANE_SITE_URL ?? 'https://factlane.local';
 const origin = new URL(configuredSiteUrl).origin;
+const publicDocs = JSON.parse(
+  await readFile(path.join(siteRoot, 'public-docs.json'), 'utf8'),
+);
 const docSeo = JSON.parse(
   await readFile(path.join(siteRoot, 'src', 'content', 'docSeo.json'), 'utf8'),
 );
@@ -16,20 +19,7 @@ if (!['public', 'local'].includes(mode)) {
   throw new Error('FACTLANE_SEO_MODE must be exactly public or local');
 }
 
-const docIds = [
-  'INTRO',
-  'USE_CASES',
-  'FAQ',
-  'CORE_CONCEPTS',
-  'QUICKSTART',
-  'TOOLS',
-  'USING_FACTLANE_SKILL',
-  'ARCHITECTURE',
-  'ENVIRONMENT',
-  'SECURITY',
-  'RELEASE_OPERATIONS',
-  'PROJECT_HISTORY',
-];
+const docIds = publicDocs.map((doc) => doc.id);
 
 const locales = ['en', 'ar'];
 
@@ -123,7 +113,10 @@ for (const locale of locales) {
   }
 }
 
-assert(pages.length === 24, `Expected 24 documentation pages, found ${pages.length}`);
+assert(
+  pages.length === docIds.length * locales.length,
+  `Expected ${docIds.length * locales.length} documentation pages, found ${pages.length}`,
+);
 
 const expectedRoutes = new Set(pages.map((page) => page.route));
 const expectedIndexableRoutes = new Set([
@@ -285,5 +278,5 @@ if (mode === 'public') {
 }
 
 console.log(
-  `Documentation SEO audit passed: mode=${mode}; pages=24; titles=24 unique; descriptions=24 unique; canonicals=24 unique`,
+  `Documentation SEO audit passed: mode=${mode}; pages=${pages.length}; titles=${titles.size} unique; descriptions=${descriptions.size} unique; canonicals=${canonicals.size} unique`,
 );

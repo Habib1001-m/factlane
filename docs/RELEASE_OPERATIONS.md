@@ -9,6 +9,10 @@ Platform permissions can technically mutate those objects, so verify identities 
 trusting a name alone. The `main` branch may receive documentation or development changes after
 a release and must not be used as a substitute for a historical release identity.
 
+For the user-facing change summary and upgrade impact of the current release candidate, see the
+[changelog](CHANGELOG.md). This runbook remains authoritative for exact release identity,
+migration, rollback, installation, and post-install reverification procedures.
+
 ### Development package identity
 
 The latest published production release is `v0.1.4`. The current source/RC line now declares
@@ -56,6 +60,7 @@ compatibility, and database/schema compatibility are separate claims.
 | Linked SQLite | `>=3.42.0` |
 | Public Contract Revision | `2` |
 | Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
+| Portable Skill SHA-256 | `1c28bc370af0dd89499f8121fb7b611afb4c83773207ce546136abd8018f3e24` |
 
 The release assets are published at the
 [GitHub Release for `v0.1.3`](https://github.com/Habib1001-m/factlane/releases/tag/v0.1.3).
@@ -118,15 +123,18 @@ The published v0.1.4 identity is now sealed and recorded as:
 | Linked SQLite | `>=3.42.0` |
 | Public Contract Revision | `2` |
 | Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
+| Portable Skill `SKILL.md` SHA-256 | `6255ddb8eeea074cd324d1f096d3e043f09a189b46cb3f64c724bb29ecd397a4` |
+| Portable Skill `references/host-bootstrap.md` SHA-256 | `05882a0d6716e32cd23ef452c1683a8aff1294abfcc7950fea771320cd211d4c` |
 
 These are historical release facts. They do not provide any identity or publication authority to
 the current `0.1.5` source/RC.
 
-## FactLane 0.1.5 local RC notes and v0.1.4 transition
+## FactLane 0.1.5 release candidate and v0.1.4 transition
 
 The current source line declares package `0.1.5`, Public Contract Revision 3, and storage contract
 v3. It remains local RC material: there is no published `v0.1.5` tag, wheel/sdist digest, deployment,
-or Production/publication authority yet.
+or Production/publication authority yet. The [0.1.5 changelog entry](CHANGELOG.md) summarizes the
+user-visible changes; this section defines the transition mechanics.
 
 The RC keeps the public MCP transport at **stdio only** and the public MCP surface at exactly the same
 five tools. Revision 3 extends `memory_update` with direct-Owner `REVOKE`/`REJECT` modes and adds the
@@ -136,8 +144,8 @@ the bound origin and one-use bootstrap token; the token is exchanged only throug
 `X-FactLane-Bootstrap` header and never through a URL or `localStorage`. The WebUI is a local Owner
 presentation layer over that service, not an HTTP MCP server and not a sixth MCP tool.
 
-Storage v3 adds terminal logical states `REVOKED` and `REJECTED`, contradiction-group CAS, immutable
-lifecycle event/operation history, manual `on_change` freshness recheck, and governed readmission.
+Storage v3 adds terminal logical states `REVOKED` and `REJECTED`, contradiction-group CAS, durable
+lifecycle event and operation records, manual `on_change` freshness recheck, and governed readmission.
 Terminal lifecycle is logical; it does not claim physical erasure. Readmission is a verified
 lifecycle operation for an eligible `REVOKED` memory and is not backup restore or sensitive-Recovery
 resurrection.
@@ -151,6 +159,8 @@ closed for review.
 
 An existing v0.1.4 storage-v2 database is not silently upgraded by normal v0.1.5 startup. The RC
 fails closed with `MIGRATION_REQUIRED` until the trusted migration operator completes the transition.
+Treat this as a **data/schema migration**, not a package-only upgrade. A successful package install
+does not authorize opening storage-v2 data with the normal 0.1.5 runtime.
 Stop/quiesce FactLane and choose a new backup path inside an **existing private directory owned by
 the migration operator** before running. The backup parent must grant no group/other permissions
 (`mode & 077 == 0`); the migration does not create or relax that directory for you:
@@ -177,6 +187,11 @@ transactionally, advances the storage contract version last, then verifies the r
 After migration, preserve the reported backup path and SHA-256 as rollback evidence and re-run the
 normal runtime checks before enabling writes.
 
+The migration changes the Python runtime's durable storage contract only. It does not publish the
+Python package, deploy the public site, or grant either surface Production authority. Site
+qualification/deployment remains a separate publication workflow from wheel/source-distribution
+publication.
+
 ### v2 → v3 data rollback
 
 If the migration must be rolled back before the v3 state becomes the accepted durable authority,
@@ -196,17 +211,30 @@ v0.1.4 runtime. Installing v0.1.4 directly over a storage-v3 database is not a s
 
 ## Install an exact release
 
+Copy the selected release manifest's exact identity into shell variables before using either
+installation path. Do not substitute values from moving `main`, a package index listing, or memory:
+
+```bash
+RELEASE_TAG="<annotated tag>"
+RELEASE_COMMIT="<release commit>"
+RELEASE_TREE="<release tree>"
+WHEEL_NAME="<wheel filename>"
+WHEEL_SHA256="<wheel SHA-256>"
+SDIST_NAME="<source-distribution filename>"
+SDIST_SHA256="<source-distribution SHA-256>"
+```
+
 ### Option A: versioned source checkout
 
 Use the versioned release tag, and verify its commit/tree, rather than relying on the moving
 `main` branch:
 
 ```bash
-git clone --branch v0.1.4 --depth 1 https://github.com/Habib1001-m/factlane.git
+git clone --branch "$RELEASE_TAG" --depth 1 https://github.com/Habib1001-m/factlane.git
 cd factlane
 
-test "$(git rev-parse HEAD)" = "4b2cf5b27d454799dd253c0306d83bd076c9369f"
-test "$(git rev-parse 'HEAD^{tree}')" = "d9a69de5e63419bfb6aade745e25137e07857cbb"
+test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+test "$(git rev-parse 'HEAD^{tree}')" = "$RELEASE_TREE"
 
 uv sync --frozen
 uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
@@ -219,13 +247,11 @@ uv run factlane --help-tools
 Download the release wheel, verify it, then install it into a fresh environment:
 
 ```bash
-curl -fLO https://github.com/Habib1001-m/factlane/releases/download/v0.1.4/factlane-0.1.4-py3-none-any.whl
-printf '%s  %s\n' \
-  'b1a256d124d74ffd6b9dba4338c171e35b95fa901e232bb1ed59ebd4f0316307' \
-  'factlane-0.1.4-py3-none-any.whl' | sha256sum -c -
+curl -fLO "https://github.com/Habib1001-m/factlane/releases/download/${RELEASE_TAG}/${WHEEL_NAME}"
+printf '%s  %s\n' "$WHEEL_SHA256" "$WHEEL_NAME" | sha256sum -c -
 
 python3.11 -m venv .venv
-.venv/bin/python -m pip install ./factlane-0.1.4-py3-none-any.whl
+.venv/bin/python -m pip install "./${WHEEL_NAME}"
 .venv/bin/python -m pip check
 .venv/bin/factlane --help
 .venv/bin/factlane --help-tools
@@ -241,13 +267,11 @@ checkout with `uv sync --frozen` and its committed `uv.lock`.
 The source distribution is also a supported clean-install surface after verifying its SHA-256:
 
 ```bash
-curl -fLO https://github.com/Habib1001-m/factlane/releases/download/v0.1.4/factlane-0.1.4.tar.gz
-printf '%s  %s\n' \
-  '80c01dbf20dd5139350a9434c787c27a468f458397740fd0d85064394be1f5a3' \
-  'factlane-0.1.4.tar.gz' | sha256sum -c -
+curl -fLO "https://github.com/Habib1001-m/factlane/releases/download/${RELEASE_TAG}/${SDIST_NAME}"
+printf '%s  %s\n' "$SDIST_SHA256" "$SDIST_NAME" | sha256sum -c -
 
 python3.11 -m venv .venv
-.venv/bin/python -m pip install ./factlane-0.1.4.tar.gz
+.venv/bin/python -m pip install "./${SDIST_NAME}"
 ```
 
 The portable `using-factlane` Skill is shipped with the package, but package installation does
@@ -315,8 +339,9 @@ Before enabling writes, verify the release as installed:
    factlane --help-tools
    ```
 
-   For `v0.1.3`, this must report Public Contract Revision 2 and exactly the five tools listed
-   in the release manifest above.
+   Compare the reported Public Contract Revision with the selected release manifest. The supported
+   public MCP surface remains exactly `memory_search`, `memory_get`, `memory_store`, `memory_update`,
+   and `memory_status`; tool visibility does not grant write authority.
 
 4. Confirm the portable Skill bytes for the installation surface. For a tagged source checkout,
    verify the tracked source copy:
@@ -332,14 +357,13 @@ Before enabling writes, verify the release as installed:
    sha256sum .venv/share/factlane/skills/using-factlane/SKILL.md
    ```
 
-   For `v0.1.3`, either applicable path must hash to
-   `1c28bc370af0dd89499f8121fb7b611afb4c83773207ce546136abd8018f3e24`.
-   A source checkout synchronized with `uv sync --frozen` keeps the authoritative Skill in the
-   source tree and need not copy that data file under the virtual-environment prefix.
-   Later releases that add Skill references must treat the Skill as a reference set, not a single
-   file: record and verify the relative path plus SHA-256 for `SKILL.md` and every shipped
-   `references/*` file, and require source/wheel/sdist byte parity for that complete set. File
-   presence does not prove host registration or loaded state.
+   Compare the applicable bytes with the Skill/reference-set digests recorded by the selected
+   release. A source checkout synchronized with `uv sync --frozen` keeps the authoritative Skill in
+   the source tree and need not copy that data file under the virtual-environment prefix. Releases
+   that ship Skill references must treat the Skill as a reference set, not a single file: record and
+   verify the relative path plus SHA-256 for `SKILL.md` and every shipped `references/*` file, and
+   require source/wheel/sdist byte parity for that complete set. File presence does not prove host
+   registration or loaded state.
 5. Start the configured stdio host in the intended write profile and confirm tool discovery
    matches the release contract. Tool visibility does not grant write authority.
 6. When validating a new deployment path, prefer a disposable database for smoke tests. If a

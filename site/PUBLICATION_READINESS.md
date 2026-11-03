@@ -12,7 +12,8 @@ Pages, creates or promotes a release, or grants Production authority.
 The qualification path is intentionally split into four controls:
 
 1. Two independent clean checkouts of the exact source commit build the public site with the
-   committed lockfile, Node `22.22.3`, pinned Wrangler `4.149.0`, the approved HTTPS origin and
+   committed lockfile, the Node version pinned by the protected CI workflow, the Wrangler version
+   pinned by `site/package.json` and `site/package-lock.json`, the approved HTTPS origin and
    `FACTLANE_PUBLIC_BUILD=1`.
    Complete base manifests must be byte-identical. Source **commit and tree are both provenance**:
    source-aware sitemap `lastmod` uses Git history, so tree equality alone does not identify the

@@ -1,90 +1,97 @@
 # Frequently asked questions
 
-This page is for deciding whether FactLane fits your use case before you spend time on technical
-setup.
+Use this page to decide whether FactLane fits before investing in setup.
 
 ## Does FactLane replace my assistant?
 
-No. FactLane is a local memory layer behind a **compatible AI-agent host**. You keep using the
-assistant or coding agent; the host connects it to FactLane's memory tools.
+No. FactLane is a local memory layer behind a **compatible AI-agent host**. You keep using your assistant or coding agent; the host connects it to FactLane over MCP.
+
+## Does FactLane replace built-in memory or a knowledge base?
+
+No. Broad/native memory is useful for rich recall and continuity. Knowledge bases and graphs are useful for larger bodies of connected information.
+
+FactLane is narrower: it governs **small reusable facts** that need exact scope, provenance, freshness, Candidate → Current verification, and explicit authority boundaries. It is designed to coexist with broader memory systems.
 
 ## Do I need to be a developer?
 
-Not necessarily for normal use after FactLane is connected, but **setup is still technical**.
-Someone must install FactLane, provide a compatible command-launched stdio MCP host,
-and configure local storage and a supported local embedding model.
+Not for normal use after FactLane is connected, but setup is technical. Someone must install FactLane, verify its local runtime prerequisites, configure a compatible command-launched stdio MCP host, and choose the launcher authority profile.
 
-If nobody can perform that setup, FactLane is not currently a zero-configuration memory feature.
+An agent can guide that work only within the machine and host permissions it actually has. It should never claim installation or configuration that it could not verify.
 
 ## What is FactLane a good fit for?
 
-FactLane is designed for bounded durable facts such as:
+Examples include:
 
-- user preferences;
+- durable user preferences;
 - important project facts;
 - recurring workflow rules;
-- scoped tool or environment facts;
-- narrowly governed cross-project workflow rules.
+- scoped tool/environment facts;
+- deliberately governed cross-project workflow rules.
 
-It is useful when those facts should survive a session **without** allowing old memory to silently
-overrule current instructions or verified live state.
+It is especially useful when those facts should survive a session **without** allowing old memory to silently overrule current instructions or verified live state.
 
 ## What is it not trying to be?
 
 FactLane is not:
 
 - a transcript archive;
-- a bulk file or document crawler;
-- a general search/indexing system for arbitrary corpora;
+- a bulk file/document crawler;
+- a general search index for arbitrary corpora;
 - a backup service;
 - a managed remote memory cloud;
-- an HTTP/SSE/Streamable HTTP MCP server; the public MCP transport remains stdio-only in published
-  v0.1.4 and the current 0.1.5 source/RC;
-- an automatic permission system for an agent.
+- a public HTTP/SSE/Streamable HTTP MCP server;
+- an automatic permission system for an agent;
+- a general agent-safety framework.
 
-Facts are bounded to 2,000 UTF-8 bytes.
+Facts are bounded to **2,000 UTF-8 bytes**.
 
 ## Where does the data live?
 
-The qualified published v0.1.4 profile uses local SQLite/SQLite-vec storage and supported local Ollama
-embeddings. The shipped embedding path does not fall back to a remote provider automatically.
+The documented profile uses local SQLite/SQLite-vec storage and supported local Ollama embeddings. The shipped provider does not silently fall back to a remote embedding endpoint.
 
-The current 0.1.5 source/RC uses Public Contract Revision 3 and storage contract v3. A v0.1.4/v2
-database requires the explicit v2 → v3 migration with a verified pre-migration backup before the
-0.1.5 runtime can open it for normal service.
+Durable storage has an explicit contract. If an existing database needs migration before the installed runtime can use it, normal startup fails closed and the operator must follow the documented migration and verified backup/restore procedure.
 
-Read [Environment and compatibility](ENVIRONMENT.md) for the exact supported profile.
+See [Environment and compatibility](ENVIRONMENT.md) and [Release operations](RELEASE_OPERATIONS.md).
 
 ## Can an ordinary agent verify its own memory?
 
-No. A delegated agent may be allowed to contribute a **Candidate**, but Candidate promotion is a
-separate trusted verification operation. Seeing `memory_update` in tool discovery does not grant
-verifier authority.
+No. A delegated agent may be allowed to contribute a **Candidate**, but Candidate promotion is a separate trusted verification operation. Seeing `memory_update` does not grant verifier or Owner authority.
 
-Read [Core concepts](CORE_CONCEPTS.md) for the Candidate → Current model.
+Direct Owner authority may additionally revoke eligible Current records or reject Candidates after reviewing the exact current record/group state. Those lifecycle dispositions are logical states, not physical erasure.
 
-In Revision 3, direct Owner authority can also `REVOKE` or `REJECT` through `memory_update` after
-reviewing the exact contradiction group. These are logical terminal states, not physical erasure.
-The separate Owner service/CLI/WebUI also provides manual `on_change` recheck and governed
-readmission of eligible `REVOKED` memory.
+## What is the Owner control plane?
+
+`OwnerControlService` is the trusted local governance surface for inventory, record detail, conflicts, history, health/retention, lifecycle actions, manual freshness recheck, and readmission.
+
+It is exposed through:
+
+- the packaged `factlane-owner` CLI; and
+- the packaged `factlane-owner-webui` loopback launcher.
+
+The WebUI binds to `127.0.0.1`, uses a one-use bootstrap exchange plus an authenticated session and CSRF protection, and does **not** turn FactLane into an HTTP MCP server.
+
+## Does FactLane watch my sources in the background?
+
+No. An `on_change` freshness policy stores a recheck contract. A trusted Owner performs an explicit manual recheck with fresh observation evidence.
+
+Unchanged healthy evidence may renew eligibility. Changed, unavailable, indeterminate, stale, or mismatched evidence fails closed for review.
 
 ## What wins if memory conflicts with what I say now?
 
-Current authoritative context wins. A current user instruction, current repository/product state,
-or verified live source can outrank remembered information.
+Current authoritative context wins. A current user instruction, current repository/product state, or verified live source can outrank remembered information.
 
 Memory supports the decision; it does not own the decision.
 
 ## Can two assistants use the same facts?
 
-More than one compatible local agent host can use the same governed FactLane store when the
-operator configures them against that environment. That lets hosts reuse bounded facts instead of
-sharing entire transcripts.
+Yes, when the operator connects compatible local hosts to the same governed store.
 
-The hosts do not automatically gain identical write or verification authority merely because they
-can see the same public tools.
+That does not give the hosts identical authority. Launcher profiles, bound identity, current instructions, and runtime policy still govern what each connection can do.
+
+## How do I find the current supported release?
+
+Use [Release operations](RELEASE_OPERATIONS.md) for the authoritative published tag, commit/tree, artifact hashes, migration boundary, and rollback rules. Evergreen setup docs intentionally do not hard-code a release number.
 
 ## What should I read next?
 
-If the fit above matches what you need, continue with [Core concepts](CORE_CONCEPTS.md), then the
-[Quick start](QUICKSTART.md).
+Continue with [Core concepts](CORE_CONCEPTS.md), then the [Quick Start](QUICKSTART.md).

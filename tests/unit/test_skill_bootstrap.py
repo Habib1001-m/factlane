@@ -55,7 +55,7 @@ def test_skill_declares_consent_and_bootstrap_authority_boundaries() -> None:
     for marker in (
         "explicit content consent",
         "agent proposes",
-        "consent never elevates launcher/write authority",
+        "consent does not elevate launcher authority",
         "autonomous post-turn",
         "references/host-bootstrap.md",
         "read-only",
@@ -91,24 +91,27 @@ def test_readme_and_quickstart_remain_read_only_first() -> None:
     quickstart = Path("docs/QUICKSTART.md").read_text(encoding="utf-8")
     architecture = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8")
     tools = Path("docs/TOOLS.md").read_text(encoding="utf-8")
+    quickstart_normalized = " ".join(quickstart.split()).casefold()
 
-    readme_launch = readme.split("### Launch for a local stdio MCP host", 1)[1].split("## Five focused MCP tools", 1)[0]
+    readme_launch = readme.split("### Launch read-only first", 1)[1].split("## Five focused MCP tools", 1)[0]
     assert "--write-profile delegated-candidate" not in readme_launch
     assert "read-only" in readme_launch
     assert "explicit content" in readme
-    assert "does not grant or elevate launcher authority" in readme
+    assert "launcher authority and content consent" in readme
 
     first_launch = quickstart.split("For the first connection", 1)[1].split("### Codex", 1)[0]
     assert "--write-profile delegated-candidate" not in first_launch
     assert "read-only" in first_launch
     assert "references/host-bootstrap.md" in quickstart
-    assert "v0.1.4` release pinned in step 1 ships both `skill.md`" in quickstart.casefold()
-    assert "`references/host-bootstrap.md`" in quickstart.casefold()
-    assert "does not imply that a host registered or loaded the skill" in quickstart.casefold()
-    assert "content consent has two supported entry paths" in quickstart.casefold()
+    assert "file presence proves only that the skill bytes are present" in quickstart_normalized
+    assert "`references/host-bootstrap.md`" in quickstart_normalized
+    assert "does not prove that the host registered, discovered, or loaded the skill" in quickstart_normalized
+    assert "content consent has two supported entry paths" in quickstart_normalized
     assert "runtime grant is separate from content consent" in architecture.casefold()
     assert "content consent does not change the launcher profile" in architecture.casefold()
-    assert "runtime permission is not content consent" in tools.casefold()
+    assert "two permissions are separate" in tools.casefold()
+    assert "**content consent**" in tools.casefold()
+    assert "**launcher authority**" in tools.casefold()
 
 
 def test_wheel_and_sdist_preserve_complete_skill_reference_set(tmp_path: Path) -> None:

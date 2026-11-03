@@ -19,6 +19,10 @@
     "message": "الأسئلة الشائعة",
     "description": "The label of footer link with label=FAQ linking to /docs/FAQ"
   },
+  "link.item.label.Answers": {
+    "message": "الإجابات",
+    "description": "The label of footer link with label=Answers linking to /answers"
+  },
   "link.item.label.Core concepts": {
     "message": "المفاهيم الأساسية",
     "description": "The label of footer link with label=Core concepts linking to /docs/CORE_CONCEPTS"
@@ -56,7 +60,7 @@
     "description": "The label of footer link with label=Apache-2.0 linking to https://github.com/Habib1001-m/factlane/blob/main/LICENSE"
   },
   "copyright": {
-    "message": "FactLane v0.1.4 · ذاكرة Local-first بضوابط واضحة لمساعدات AI.",
+    "message": "FactLane · ذاكرة Local-first بضوابط واضحة لمساعدات AI.",
     "description": "The footer copyright"
   }
 }

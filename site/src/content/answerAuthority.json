@@ -1,8 +1,8 @@
 {
   "en": {
     "meta": {
-      "title": "FactLane answers: fit, trust, tools, and setup",
-      "description": "Direct, source-linked answers about what FactLane is, when it fits, Candidate to Current verification, authority limits, five MCP tools, supported environment, and read-only setup."
+      "title": "FactLane answers: fit, trust, Owner control, and setup",
+      "description": "Direct, source-linked answers about FactLane, Candidate to Current verification, Owner lifecycle control, five stdio MCP tools, the local profile, and read-only setup."
     },
     "eyebrow": "Canonical product answers",
     "title": "FactLane, answered from the product contract.",
@@ -10,11 +10,11 @@
     "sourceCue": "These summaries do not replace the docs. Follow the source links for the full contract; the live MCP schema and factlane --help-tools remain authoritative for exact tool fields and enums.",
     "factsLabel": "Verified product facts",
     "facts": [
-      {"strong": "v0.1.4", "rest": " latest published release"},
-      {"strong": "0.1.5", "rest": " current local RC source line"},
-      {"strong": "5", "rest": " public MCP tools"},
-      {"strong": "stdio", "rest": " command-launched transport"},
-      {"strong": "local", "rest": " SQLite + supported Ollama profile"}
+      {"strong": "5", "rest": " public stdio MCP tools"},
+      {"strong": "Owner", "rest": " CLI + loopback WebUI control plane"},
+      {"strong": "Lifecycle", "rest": " revoke, reject, resolve, recheck, readmit"},
+      {"strong": "local", "rest": " SQLite + supported Ollama profile"},
+      {"strong": "read-only", "rest": " first connection baseline"}
     ],
     "sourcesLabel": "Canonical sources",
     "answers": [
@@ -40,7 +40,7 @@
       {
         "id": "when-not-fit",
         "question": "When is FactLane not the right tool?",
-        "answer": "FactLane is not a transcript archive, arbitrary-corpus crawler or search index, backup service, managed remote memory cloud, or automatic permission system. Public MCP is stdio-only in published v0.1.4 and the current 0.1.5 source/RC; the RC Owner WebUI is a separate loopback-only control surface, not an HTTP MCP server.",
+        "answer": "FactLane is not a transcript archive, arbitrary-corpus crawler or search index, backup service, managed remote memory cloud, or automatic permission system. Public MCP is exactly five tools over stdio. The Owner WebUI is a separate loopback-only operator surface, not an HTTP MCP server.",
         "sources": [
           {"label": "FAQ", "to": "/docs/FAQ/"},
           {"label": "Environment and compatibility", "to": "/docs/ENVIRONMENT/"}
@@ -76,15 +76,15 @@
       {
         "id": "five-tools",
         "question": "What are the five public MCP tools?",
-        "answer": "The public MCP surface is exactly memory_search, memory_get, memory_store, memory_update, and memory_status. Public Contract Revision 3 in the 0.1.5 source/RC adds Owner-only REVOKE/REJECT modes to memory_update without adding a sixth tool. The live MCP schema and factlane --help-tools are authoritative for exact request fields, enums, and signatures.",
+        "answer": "The public MCP surface is exactly memory_search, memory_get, memory_store, memory_update, and memory_status over stdio. memory_update supports REVERIFY and REPLACE plus direct-Owner REVOKE for Current memory and REJECT for Candidate memory under governed CAS. Conflict resolution, manual recheck, readmission, inventory, and history remain Owner operations through the separate control plane. The live MCP schema and factlane --help-tools are authoritative for exact request fields, enums, and signatures.",
         "sources": [
           {"label": "Five MCP tools", "to": "/docs/TOOLS/"}
         ]
       },
       {
         "id": "supported-environment",
-        "question": "What environment does v0.1.4 support?",
-        "answer": "The qualified v0.1.4 profile uses Python 3.11+, linked SQLite 3.42.0+, command-launched local stdio MCP, local SQLite and SQLite-vec storage, supported local Ollama embeddings over loopback, and the documented local POSIX storage and recovery contract. The current 0.1.5 source/RC keeps that stdio/five-tool boundary while moving to Public Contract Revision 3 and storage v3 with explicit v2 migration; it has no published v0.1.5 release identity. There is no automatic remote embedding fallback.",
+        "question": "What local profile and Owner controls does FactLane support?",
+        "answer": "The qualified local profile uses Python 3.11+, linked SQLite 3.42.0+, command-launched stdio MCP, local SQLite/SQLite-vec storage, and supported local Ollama embeddings over loopback. OwnerControlService powers the factlane-owner CLI and loopback Owner WebUI for inventory, conflict review, lifecycle history, resolve, reverify, replace, revoke, reject, manual recheck, and governed readmission. Existing storage must be inspected before launch; when migration is required, normal startup stops until the operator makes a verified backup and follows Release operations. There is no automatic remote embedding fallback.",
         "sources": [
           {"label": "Environment and compatibility", "to": "/docs/ENVIRONMENT/"},
           {"label": "Architecture", "to": "/docs/ARCHITECTURE/"}
@@ -93,7 +93,7 @@
       {
         "id": "read-only-start",
         "question": "How should an agent start safely?",
-        "answer": "Connect a compatible MCP host in read-only mode first. The first safe success is: the host launches FactLane, exactly five tools are visible, and memory_status succeeds in an exact scope. Enable Candidate writes only after that connection works and only if they are needed.",
+        "answer": "Resolve the current published release from official Release operations, inspect existing storage before launch, and connect a compatible MCP host in read-only mode first. The first safe success is that exactly five FactLane tools are visible and memory_status succeeds in an exact scope. If migration is required, stop, make and verify the required backup, and follow Release operations before normal service. If the host supports Skills, verify registration and loaded/active state separately; file presence alone is not loaded evidence. An agent should not claim install, configuration, registration, or loaded state without direct evidence.",
         "sources": [
           {"label": "Quick Start", "to": "/docs/QUICKSTART/"},
           {"label": "Using FactLane safely", "to": "/docs/USING_FACTLANE_SKILL/"}
@@ -103,15 +103,15 @@
     "cta": {
       "eyebrow": "Next step",
       "title": "Start from a read-only connection.",
-      "body": "If the fit above matches your use case, give the project to your agent or follow the exact v0.1.4 Quick Start.",
+      "body": "If the fit above matches your use case, give the project to your agent or follow the Quick Start and resolve the current published release from Release operations.",
       "agent": "Start with your agent",
       "quickstart": "Open Quick Start"
     }
   },
   "ar": {
     "meta": {
-      "title": "إجابات FactLane: الملاءمة والثقة والأدوات والإعداد",
-      "description": "إجابات مباشرة وموثقة بالمصادر عن FactLane وملاءمته ودورة Candidate إلى Current وحدود الصلاحيات وأدوات MCP الخمس والبيئة المدعومة والبدء بوضع القراءة فقط."
+      "title": "إجابات FactLane: الملاءمة والثقة وتحكم Owner والإعداد",
+      "description": "إجابات مباشرة وموثقة بالمصادر عن FactLane ودورة Candidate إلى Current وتحكم Owner في دورة الحياة وأدوات MCP الخمس عبر stdio والملف المحلي والبدء بوضع القراءة فقط."
     },
     "eyebrow": "إجابات المنتج المرجعية",
     "title": "FactLane بإجابات مباشرة من عقد المنتج.",
@@ -119,11 +119,11 @@
     "sourceCue": "هذه الملخصات لا تستبدل الوثائق. ارجع إلى روابط المصادر للعقد الكامل؛ ويظل مخطط MCP الحي والأمر factlane --help-tools المرجع النهائي لحقول الأدوات وتعداداتها الدقيقة.",
     "factsLabel": "حقائق منتج مؤكدة",
     "facts": [
-      {"strong": "v0.1.4", "rest": " آخر إصدار منشور"},
-      {"strong": "0.1.5", "rest": " خط مصدر RC محلي حالي"},
-      {"strong": "5", "rest": " أدوات MCP عامة"},
-      {"strong": "stdio", "rest": " نقل يُشغَّل بأمر"},
-      {"strong": "محلي", "rest": " SQLite + ملف تعريف Ollama مدعوم"}
+      {"strong": "5", "rest": " أدوات MCP عامة عبر stdio"},
+      {"strong": "Owner", "rest": " CLI + WebUI محلي عبر loopback"},
+      {"strong": "Lifecycle", "rest": " revoke وreject وresolve وrecheck وreadmit"},
+      {"strong": "محلي", "rest": " SQLite + ملف تعريف Ollama مدعوم"},
+      {"strong": "read-only", "rest": " نقطة البدء للاتصال"}
     ],
     "sourcesLabel": "المصادر المرجعية",
     "answers": [
@@ -149,7 +149,7 @@
       {
         "id": "when-not-fit",
         "question": "متى لا يكون FactLane هو الأداة المناسبة؟",
-        "answer": "FactLane ليس أرشيفًا لنصوص المحادثات، ولا crawler أو فهرس بحث لمجموعات محتوى عشوائية، ولا خدمة نسخ احتياطي، ولا سحابة ذاكرة مُدارة عن بُعد، ولا نظامًا تلقائيًا لصلاحيات الوكيل. يبقى MCP العام عبر stdio فقط في v0.1.4 المنشور وخط المصدر 0.1.5 RC الحالي؛ وOwner WebUI في الـRC سطح تحكم منفصل عبر loopback فقط وليس خادم MCP عبر HTTP.",
+        "answer": "FactLane ليس أرشيفًا لنصوص المحادثات، ولا crawler أو فهرس بحث لمجموعات محتوى عشوائية، ولا خدمة نسخ احتياطي، ولا سحابة ذاكرة مُدارة عن بُعد، ولا نظامًا تلقائيًا لصلاحيات الوكيل. MCP العام هو خمس أدوات بالضبط عبر stdio. أما Owner WebUI فهو سطح Operator منفصل ومحلي عبر loopback وليس خادم MCP عبر HTTP.",
         "sources": [
           {"label": "الأسئلة الشائعة", "to": "/docs/FAQ/"},
           {"label": "البيئة والتوافق", "to": "/docs/ENVIRONMENT/"}
@@ -185,15 +185,15 @@
       {
         "id": "five-tools",
         "question": "ما أدوات MCP العامة الخمس؟",
-        "answer": "واجهة MCP العامة هي بالضبط memory_search وmemory_get وmemory_store وmemory_update وmemory_status. يضيف Public Contract Revision 3 في خط 0.1.5 RC وضعي REVOKE/REJECT بصلاحية Owner فقط داخل memory_update من دون إضافة أداة سادسة. ويظل مخطط MCP الحي والأمر factlane --help-tools المرجع النهائي لحقول الطلبات والتعدادات والتواقيع الدقيقة.",
+        "answer": "واجهة MCP العامة هي بالضبط memory_search وmemory_get وmemory_store وmemory_update وmemory_status عبر stdio. تدعم memory_update وضعي REVERIFY وREPLACE، ومع صلاحية Owner مباشرة تدعم REVOKE لذاكرة Current وREJECT لذاكرة Candidate وفق CAS محكوم. يظل resolve وإعادة الفحص اليدوي وreadmit والمخزون والتاريخ عمليات Owner عبر سطح التحكم المنفصل. ويظل مخطط MCP الحي والأمر factlane --help-tools المرجع النهائي لحقول الطلبات والتعدادات والتواقيع الدقيقة.",
         "sources": [
           {"label": "أدوات MCP الخمس", "to": "/docs/TOOLS/"}
         ]
       },
       {
         "id": "supported-environment",
-        "question": "ما البيئة التي يدعمها v0.1.4؟",
-        "answer": "يستخدم ملف التعريف المحلي الموثق والمؤهّل في v0.1.4 Python 3.11+ وSQLite 3.42.0+ المرتبط وMCP محليًا عبر stdio يُشغَّل بأمر وتخزين SQLite وSQLite-vec محليًا وتضمينات Ollama محلية مدعومة عبر loopback وعقد التخزين والاستعادة المحلي الموثق على POSIX. يحافظ خط المصدر 0.1.5 RC الحالي على حد stdio والأدوات الخمس مع Public Contract Revision 3 وتخزين v3 وترحيل v2 صريح، ولا يملك بعد هوية إصدار v0.1.5 منشورة. ولا يوجد fallback تلقائي إلى تضمينات بعيدة.",
+        "question": "ما الملف المحلي وتحكم Owner اللذان يدعمهما FactLane؟",
+        "answer": "يستخدم ملف التعريف المحلي المؤهّل Python 3.11+ وSQLite 3.42.0+ المرتبط وMCP عبر stdio يُشغَّل بأمر وتخزين SQLite/SQLite-vec محليًا وتضمينات Ollama محلية مدعومة عبر loopback. تشغّل OwnerControlService كلاً من factlane-owner CLI وOwner WebUI المحلي عبر loopback للمخزون ومراجعة التعارضات وتاريخ دورة الحياة وresolve وreverify وreplace وrevoke وreject وإعادة الفحص اليدوي وreadmit المحكوم. يجب فحص storage الموجود قبل التشغيل؛ وإذا كانت migration مطلوبة يتوقف التشغيل العادي حتى ينشئ المشغّل backup متحققًا منه ويتبع Release operations. ولا يوجد fallback تلقائي إلى تضمينات بعيدة.",
         "sources": [
           {"label": "البيئة والتوافق", "to": "/docs/ENVIRONMENT/"},
           {"label": "المعمارية", "to": "/docs/ARCHITECTURE/"}
@@ -202,7 +202,7 @@
       {
         "id": "read-only-start",
         "question": "كيف يبدأ الوكيل بصورة آمنة؟",
-        "answer": "اربط مضيف MCP متوافقًا في وضع القراءة فقط أولًا. أول نجاح آمن هو أن يشغّل المضيف FactLane، وتظهر الأدوات الخمس بالضبط، وينجح memory_status ضمن نطاق محدد. لا تفعّل كتابة Candidate إلا بعد نجاح الاتصال وعند الحاجة إليها.",
+        "answer": "استخرج الإصدار المنشور الحالي من Release operations الرسمية، وافحص storage الموجود قبل التشغيل، ثم اربط MCP host متوافقًا بوضع read-only أولًا. أول نجاح آمن هو ظهور أدوات FactLane الخمس بالضبط ونجاح memory_status ضمن نطاق محدد. إذا كانت migration مطلوبة فتوقف، وأنشئ backup المطلوب وتحقق منه، واتبع Release operations قبل الخدمة العادية. وإذا كان الـhost يدعم Skills فتحقق بصورة منفصلة من registration ومن loaded/active state؛ وجود الملف وحده ليس دليل تحميل. ولا ينبغي للوكيل ادعاء تثبيت أو تهيئة أو تسجيل أو تحميل من دون دليل مباشر.",
         "sources": [
           {"label": "البدء السريع", "to": "/docs/QUICKSTART/"},
           {"label": "استخدام FactLane بأمان", "to": "/docs/USING_FACTLANE_SKILL/"}
@@ -212,7 +212,7 @@
     "cta": {
       "eyebrow": "الخطوة التالية",
       "title": "ابدأ باتصال للقراءة فقط.",
-      "body": "إذا طابقت الملاءمة أعلاه احتياجك، أعطِ المشروع لوكيلك أو اتبع خطوات الإعداد الدقيقة للإصدار v0.1.4.",
+      "body": "إذا طابقت الملاءمة أعلاه احتياجك، أعطِ المشروع لوكيلك أو اتبع Quick Start واستخرج الإصدار المنشور الحالي من Release operations.",
       "agent": "ابدأ مع وكيلك",
       "quickstart": "افتح البدء السريع"
     }
