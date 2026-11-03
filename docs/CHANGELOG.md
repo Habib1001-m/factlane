@@ -4,13 +4,79 @@ This changelog records user-visible release changes and upgrade requirements. Fo
 migration, rollback, and release-identity procedures, use
 [Release operations](RELEASE_OPERATIONS.md).
 
-## 0.1.5 release candidate — pending publication
+## 0.1.6
 
-FactLane 0.1.5 is currently a release candidate. The source declares package version `0.1.5`,
-Public Contract Revision 3, and storage contract v3, but those source declarations do not create an
-official release. The final annotated tag, release commit/tree, wheel and source-distribution
-digests, PyPI state, and any site deployment remain pending their separately authorized publication
-steps.
+FactLane v0.1.6 is the current published Python-package release. It is a corrective patch release
+over the sealed v0.1.5 GitHub release: the package now declares the PyPI-compatible exact registry
+dependency `mcp-memory-service==11.10.0` instead of the direct VCS requirement that prevented the
+v0.1.5 wheel from being accepted by PyPI. Public Contract Revision 3, storage contract v3, the
+command-launched `stdio` transport, and the exact five-tool public MCP surface are unchanged.
+
+On Python 3.11 or newer, the normal PyPI installation path is:
+
+```bash
+pip install factlane==0.1.6
+```
+
+For an isolated Python 3.11 environment with an explicit post-install dependency check:
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/python -m pip install "factlane==0.1.6"
+.venv/bin/python -m pip check
+.venv/bin/factlane --help
+```
+
+This PyPI path resolves the exact direct backend requirement `mcp-memory-service==11.10.0` from the
+package index. It is the straightforward package-install path; it is not an exact replay of every
+transitive dependency captured by the repository lockfile. Use the tagged source checkout with
+`uv sync --frozen` when exact lockfile replay is required.
+
+### Corrective release scope
+
+- Replaces the PyPI-incompatible direct VCS dependency metadata with the exact registry pin
+  `mcp-memory-service==11.10.0`.
+- Preserves fail-closed backend identity by binding the reviewed registry runtime bytes and the
+  required backend class/signature contract.
+- Keeps Public Contract Revision 3, storage contract v3, `stdio`, and the five public tools exactly
+  unchanged.
+- Does not migrate durable data, change the v0.1.5 tag/assets, or advance the separately managed
+  public-site Production release.
+
+### Release identity
+
+| Item | v0.1.6 identity |
+| --- | --- |
+| Package version | `0.1.6` |
+| Annotated tag | `v0.1.6` |
+| Tag object | `75cf56de9cb693ca07f9d750fc08ff22e0f70e0d` |
+| Release commit | `e4a71aedaaf4f2e73aeaeaafbdeca60a846d21ad` |
+| Release tree | `4664d232810da749c2267fa56dc1568ab2af1f71` |
+| Wheel | `factlane-0.1.6-py3-none-any.whl` |
+| Wheel SHA-256 | `5cb74af31e6bfe96bc38e0048ea2e8abcde53c5a05470aebbe9ed8305dd46899` |
+| Source distribution | `factlane-0.1.6.tar.gz` |
+| Source distribution SHA-256 | `cb755605126cbc7f2fcc7c4335e020aa9f6da67f0812dcd7622d99e18c53b84b` |
+| Public Contract Revision | `3` |
+| Storage contract | `3` |
+| Public MCP transport | `stdio` |
+| Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
+| PyPI publication | Published as `factlane==0.1.6` |
+| Site Production deployment | Separate publication surface; not advanced by this package release |
+
+The trusted-publish workflow run that uploaded v0.1.6 is historically red because its **post-write**
+PyPI visibility check timed out after the upload step had succeeded. Independent readback then
+confirmed that PyPI serves exactly the qualified wheel and source-distribution bytes above. The run
+is therefore not evidence of a failed package upload, and it must not be retried to make the status
+green.
+
+## 0.1.5
+
+FactLane v0.1.5 is a sealed historical GitHub release with Public Contract Revision 3 and storage
+contract v3. Its recorded GitHub tag and release-asset identities remain the historical release
+evidence and must not be retargeted or replaced to rewrite that history. Its PyPI
+publication did **not** complete: PyPI rejected the wheel's direct VCS dependency metadata, and the
+v0.1.5 package version is not published on PyPI. That failed publication is terminal; v0.1.6 is the
+corrective PyPI-compatible successor rather than a mutation or retry of v0.1.5.
 
 ### Highlights
 
@@ -145,26 +211,24 @@ contract.
 - Semantic relevance, language quality, filesystem behavior outside the qualified profiles, and
   deployment scale remain workload- and environment-specific rather than universal guarantees.
 
-### Release identity pending publication
+### Release identity
 
-The following fields must be filled only from the separately authorized release crossing. Do not
-infer them from the moving `main` branch, local RC builds, workflow configuration, or candidate
-artifacts.
-
-| Item | 0.1.5 release candidate |
+| Item | v0.1.5 identity |
 | --- | --- |
 | Package version | `0.1.5` |
 | Public Contract Revision | `3` |
 | Storage contract | `3` |
 | Public MCP transport | `stdio` |
 | Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
-| Annotated tag | Pending publication |
-| Tag object | Pending publication |
-| Release commit | Pending publication |
-| Release tree | Pending publication |
-| Wheel name / SHA-256 | Pending publication |
-| Source distribution name / SHA-256 | Pending publication |
-| PyPI publication | Pending publication |
+| Annotated tag | `v0.1.5` |
+| Tag object | `e4275fb33147c3336797bb230312699571a0afe5` |
+| Release commit | `eaa75f8f17961cbaaf94d5d623e5a80083dad56f` |
+| Release tree | `6cc017b508571be0636f6f4b031aa4ca452893c4` |
+| Wheel | `factlane-0.1.5-py3-none-any.whl` |
+| Wheel SHA-256 | `9ff8039125cab109c169dacc62a88aae91cbbe2cd12abb0c2661e72db84c4a79` |
+| Source distribution | `factlane-0.1.5.tar.gz` |
+| Source distribution SHA-256 | `7f997ecb85a519e5c0b44d136a774182f1453d832dda02a795463602d627a0ac` |
+| PyPI publication | Not published; terminal direct-VCS metadata rejection |
 | Site Production deployment | Separate publication surface; not implied by this package release |
 
 ## 0.1.4
