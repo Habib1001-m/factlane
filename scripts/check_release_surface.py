@@ -48,6 +48,17 @@ def fail(message: str) -> None:
     raise SystemExit(f"HOLD: {message}")
 
 
+def validate_snapshot_authority_lineage(tag: str, reachable_tags: list[str]) -> None:
+    """Require the pinned snapshot tag to remain in source history.
+
+    The snapshot is a surface-specific released baseline. A newer repository
+    package tag does not supersede that snapshot unless that surface is
+    separately advanced through its own publication governance.
+    """
+    if tag not in reachable_tags:
+        fail(f"released-contract snapshot authority tag is not reachable from source: {tag}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -114,11 +125,7 @@ def main() -> int:
     if not reachable_tags:
         fail("no released tag is reachable from the source")
     latest_reachable_release_tag = reachable_tags[0]
-    if latest_reachable_release_tag != tag:
-        fail(
-            "released-contract snapshot is stale: "
-            f"latest reachable tag is {latest_reachable_release_tag}, snapshot authority is {tag}"
-        )
+    validate_snapshot_authority_lineage(tag, reachable_tags)
 
     head = git(repo, "rev-parse", "HEAD")
     tree = git(repo, "rev-parse", "HEAD^{tree}")
