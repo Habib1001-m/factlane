@@ -4,49 +4,13 @@ This changelog records user-visible release changes and upgrade requirements. Fo
 migration, rollback, and release-identity procedures, use
 [Release operations](RELEASE_OPERATIONS.md).
 
-## 0.1.6 corrective release candidate — PyPI-compliant dependency metadata
+## 0.1.5 release candidate — pending publication
 
-FactLane 0.1.6 is the corrective package successor to the immutable v0.1.5 GitHub release. The
-v0.1.5 trusted-publishing workflow reached PyPI with valid OIDC, but PyPI rejected the exact wheel
-because its Core Metadata declared `mcp-memory-service` as a direct VCS dependency. No FactLane
-project/version was created on PyPI.
-
-The v0.1.6 candidate preserves Public Contract Revision 3, storage contract v3, the exact five-tool
-stdio MCP surface, and the qualified v0.1.5 runtime/storage behavior. Its packaging correction is:
-
-- package version advances to `0.1.6`;
-- the backend requirement becomes the PyPI-compliant exact pin `mcp-memory-service==11.10.0`;
-- the reviewed PyPI backend wheel's complete 239-file runtime package is byte-identical to the
-  previously reviewed upstream commit `e5155b937051db4fa99a384018c5ebd621d8c5ef`;
-- runtime compatibility now binds the exact backend version plus reviewed backend runtime hashes
-  instead of requiring VCS `direct_url.json`;
-- no storage schema, public contract, MCP tool, Owner-control, migration, or site-publication
-  semantics are expanded by this corrective release.
-
-### 0.1.6 release identity pending publication
-
-| Item | 0.1.6 corrective release candidate |
-| --- | --- |
-| Package version | `0.1.6` |
-| Public Contract Revision | `3` |
-| Storage contract | `3` |
-| Public MCP transport | `stdio` |
-| Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
-| Annotated tag | Pending publication |
-| Tag object | Pending publication |
-| Release commit | Pending publication |
-| Release tree | Pending publication |
-| Wheel name / SHA-256 | Pending publication |
-| Source distribution name / SHA-256 | Pending publication |
-| PyPI publication | Pending publication |
-| Site Production deployment | Separate publication surface; not implied by this package release |
-
-## 0.1.5 GitHub release — PyPI publication failed
-
-FactLane v0.1.5 is an immutable GitHub release at Public Contract Revision 3 and storage contract
-v3. Its package artifacts were published to the GitHub Release, but PyPI rejected the wheel before
-creating the project/version because the wheel carried a direct VCS dependency. The v0.1.5 tag and
-assets remain historical evidence and are not rebuilt, replaced, or retargeted by v0.1.6.
+FactLane 0.1.5 is currently a release candidate. The source declares package version `0.1.5`,
+Public Contract Revision 3, and storage contract v3, but those source declarations do not create an
+official release. The final annotated tag, release commit/tree, wheel and source-distribution
+digests, PyPI state, and any site deployment remain pending their separately authorized publication
+steps.
 
 ### Highlights
 
@@ -181,22 +145,26 @@ contract.
 - Semantic relevance, language quality, filesystem behavior outside the qualified profiles, and
   deployment scale remain workload- and environment-specific rather than universal guarantees.
 
-### v0.1.5 immutable GitHub identity and PyPI outcome
+### Release identity pending publication
 
-| Item | v0.1.5 identity/outcome |
+The following fields must be filled only from the separately authorized release crossing. Do not
+infer them from the moving `main` branch, local RC builds, workflow configuration, or candidate
+artifacts.
+
+| Item | 0.1.5 release candidate |
 | --- | --- |
 | Package version | `0.1.5` |
 | Public Contract Revision | `3` |
 | Storage contract | `3` |
 | Public MCP transport | `stdio` |
 | Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
-| Annotated tag | `v0.1.5` |
-| Tag object | `e4275fb33147c3336797bb230312699571a0afe5` |
-| Release commit | `eaa75f8f17961cbaaf94d5d623e5a80083dad56f` |
-| Release tree | `6cc017b508571be0636f6f4b031aa4ca452893c4` |
-| Wheel | `factlane-0.1.5-py3-none-any.whl` / `9ff8039125cab109c169dacc62a88aae91cbbe2cd12abb0c2661e72db84c4a79` |
-| Source distribution | `factlane-0.1.5.tar.gz` / `7f997ecb85a519e5c0b44d136a774182f1453d832dda02a795463602d627a0ac` |
-| PyPI publication | Failed: HTTP 400 direct VCS dependency metadata rejection; project/version remained absent |
+| Annotated tag | Pending publication |
+| Tag object | Pending publication |
+| Release commit | Pending publication |
+| Release tree | Pending publication |
+| Wheel name / SHA-256 | Pending publication |
+| Source distribution name / SHA-256 | Pending publication |
+| PyPI publication | Pending publication |
 | Site Production deployment | Separate publication surface; not implied by this package release |
 
 ## 0.1.4

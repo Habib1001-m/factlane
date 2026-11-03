@@ -9,23 +9,21 @@ Platform permissions can technically mutate those objects, so verify identities 
 trusting a name alone. The `main` branch may receive documentation or development changes after
 a release and must not be used as a substitute for a historical release identity.
 
-For the user-facing change summary and upgrade impact of the current corrective release candidate, see the
+For the user-facing change summary and upgrade impact of the current release candidate, see the
 [changelog](CHANGELOG.md). This runbook remains authoritative for exact release identity,
 migration, rollback, installation, and post-install reverification procedures.
 
 ### Development package identity
 
-The latest immutable GitHub release is `v0.1.5`, but its PyPI publication attempt failed before any
-FactLane file became available from PyPI. The current source/RC line declares `0.1.6` in
-`pyproject.toml` as the corrective package release for that metadata defect. It remains a **local
-release-candidate identity** until a separate release crossing creates and seals the `v0.1.6` tag
-and published artifacts. A local wheel or source distribution built from this source must not be
-represented as an official `v0.1.6` release.
+The latest published production release is `v0.1.4`. The current source/RC line now declares
+`0.1.5` in `pyproject.toml`, but that package version is a **local release-candidate identity** until
+a separate release crossing creates and seals its tag and published artifacts. A local wheel or
+source distribution built from this source must not be represented as an official `v0.1.5` release.
 
 Repository CI classifies this boundary with `scripts/check_release_surface.py`. The Development
 classification is intentionally fail-closed for release identity: it records that the source differs
 from the released tag and does not assign publication or Production authority. The source-declared
-`0.1.6` version still does not create a `v0.1.6` tag, release asset identity, deployment, or public
+`0.1.5` version still does not create a `v0.1.5` tag, release asset identity, deployment, or public
 release authority. A later official release must receive its separately authorized tag and artifact
 digests before this boundary can be reconciled to released truth.
 
@@ -129,24 +127,14 @@ The published v0.1.4 identity is now sealed and recorded as:
 | Portable Skill `references/host-bootstrap.md` SHA-256 | `05882a0d6716e32cd23ef452c1683a8aff1294abfcc7950fea771320cd211d4c` |
 
 These are historical release facts. They do not provide any identity or publication authority to
-the current `0.1.6` source/RC.
+the current `0.1.5` source/RC.
 
-## FactLane v0.1.5 publication outcome and v0.1.6 corrective transition
+## FactLane 0.1.5 release candidate and v0.1.4 transition
 
-`v0.1.5` established Public Contract Revision 3 and storage contract v3 and is preserved as an
-immutable GitHub release. Its PyPI trusted-publishing attempt reached OIDC and immutable-release
-revalidation, then PyPI rejected the wheel because its Core Metadata declared a direct VCS
-dependency. PyPI therefore remained absent for both the FactLane project and version `0.1.5`.
-
-The current source line declares package `0.1.6` as the corrective successor. It preserves Public
-Contract Revision 3, storage contract v3, the exact five-tool stdio MCP surface, and the v0.1.5
-runtime/storage semantics. The package-only correction replaces the direct VCS requirement with
-the exact published `mcp-memory-service==11.10.0` distribution. The reviewed PyPI wheel's entire
-239-file `mcp_memory_service` runtime package is byte-identical to the reviewed upstream commit
-`e5155b937051db4fa99a384018c5ebd621d8c5ef`; FactLane additionally fail-closes on reviewed SHA-256
-digests for `storage/sqlite_vec.py`, `storage/mixins/base.py`, and `storage/mixins/embeddings.py` at
-runtime. The [changelog](CHANGELOG.md)
-summarizes the corrective release; this section defines the transition mechanics.
+The current source line declares package `0.1.5`, Public Contract Revision 3, and storage contract
+v3. It remains local RC material: there is no published `v0.1.5` tag, wheel/sdist digest, deployment,
+or Production/publication authority yet. The [0.1.5 changelog entry](CHANGELOG.md) summarizes the
+user-visible changes; this section defines the transition mechanics.
 
 The RC keeps the public MCP transport at **stdio only** and the public MCP surface at exactly the same
 five tools. Revision 3 extends `memory_update` with direct-Owner `REVOKE`/`REJECT` modes and adds the
@@ -162,17 +150,17 @@ Terminal lifecycle is logical; it does not claim physical erasure. Readmission i
 lifecycle operation for an eligible `REVOKED` memory and is not backup restore or sensitive-Recovery
 resurrection.
 
-`on_change` remains evidence-driven rather than automatically monitored. The release line does not run a
+`on_change` remains evidence-driven rather than automatically monitored. The RC does not run a
 background watcher that revalidates a source. An Owner supplies a fresh bounded observation to the
 manual recheck operation; changed, unavailable, indeterminate, stale, or mismatched evidence fails
 closed for review.
 
 ### Required v2 → v3 storage migration
 
-An existing v0.1.4 storage-v2 database is not silently upgraded by normal v0.1.6 startup. The runtime
+An existing v0.1.4 storage-v2 database is not silently upgraded by normal v0.1.5 startup. The RC
 fails closed with `MIGRATION_REQUIRED` until the trusted migration operator completes the transition.
 Treat this as a **data/schema migration**, not a package-only upgrade. A successful package install
-does not authorize opening storage-v2 data with the normal 0.1.6 runtime.
+does not authorize opening storage-v2 data with the normal 0.1.5 runtime.
 Stop/quiesce FactLane and choose a new backup path inside an **existing private directory owned by
 the migration operator** before running. The backup parent must grant no group/other permissions
 (`mode & 077 == 0`); the migration does not create or relax that directory for you:
@@ -207,7 +195,7 @@ publication.
 ### v2 → v3 data rollback
 
 If the migration must be rolled back before the v3 state becomes the accepted durable authority,
-stop/quiesce the v0.1.6 runtime and restore the exact verified pre-v3 backup through the migration
+stop/quiesce the v0.1.5 runtime and restore the exact verified pre-v3 backup through the migration
 operator:
 
 ```bash
@@ -269,9 +257,9 @@ python3.11 -m venv .venv
 .venv/bin/factlane --help-tools
 ```
 
-Corrective releases that replace a direct VCS requirement with an exact package-index pin record
-the selected dependency version and artifact digests in their release-specific notes and lockfile.
-The FactLane wheel records its direct requirements, but a
+The wheel has a pinned Git dependency on `mcp-memory-service`; a fresh online install therefore
+needs access to that pinned GitHub revision unless the dependency is already available through
+an operator-controlled cache or mirror. The wheel records FactLane's direct requirements, but a
 fresh installer may resolve newer compatible **transitive** dependencies than the environment
 captured by the repository lockfile. When exact dependency replay matters, use the tagged source
 checkout with `uv sync --frozen` and its committed `uv.lock`.
