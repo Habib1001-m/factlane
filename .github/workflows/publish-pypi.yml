@@ -21,9 +21,9 @@ jobs:
       PROJECT: factlane
       VERSION: 0.1.5
       WHEEL: factlane-0.1.5-py3-none-any.whl
-      WHEEL_SHA256: 1fe01c514d592c7be3d994ba09c2d3c9cdbf537e1a311a91e41b30c3a569e826
+      WHEEL_SHA256: 9ff8039125cab109c169dacc62a88aae91cbbe2cd12abb0c2661e72db84c4a79
       SDIST: factlane-0.1.5.tar.gz
-      SDIST_SHA256: 5c55aeb7aa74007a1db0015c38848120fefa4cd4550e7101dab94df15d99f9a6
+      SDIST_SHA256: 7f997ecb85a519e5c0b44d136a774182f1453d832dda02a795463602d627a0ac
       RELEASE_MANIFEST: factlane-v0.1.5-release-manifest.json
       SHA256SUMS: SHA256SUMS.txt
       UV_VERSION: 0.11.26
