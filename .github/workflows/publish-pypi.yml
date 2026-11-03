@@ -1,4 +1,4 @@
-name: Publish FactLane v0.1.5 to PyPI
+name: Publish FactLane v0.1.6 to PyPI
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: factlane-pypi-v0.1.5
+  group: factlane-pypi-v0.1.6
   cancel-in-progress: false
 
 jobs:
@@ -17,18 +17,24 @@ jobs:
       contents: read
       id-token: write
     env:
-      TAG: v0.1.5
+      TAG: v0.1.6
       PROJECT: factlane
-      VERSION: 0.1.5
-      WHEEL: factlane-0.1.5-py3-none-any.whl
-      WHEEL_SHA256: 9ff8039125cab109c169dacc62a88aae91cbbe2cd12abb0c2661e72db84c4a79
-      SDIST: factlane-0.1.5.tar.gz
-      SDIST_SHA256: 7f997ecb85a519e5c0b44d136a774182f1453d832dda02a795463602d627a0ac
-      RELEASE_MANIFEST: factlane-v0.1.5-release-manifest.json
+      VERSION: 0.1.6
+      WHEEL: factlane-0.1.6-py3-none-any.whl
+      WHEEL_SHA256: 5cb74af31e6bfe96bc38e0048ea2e8abcde53c5a05470aebbe9ed8305dd46899
+      WHEEL_SIZE: 171221
+      SDIST: factlane-0.1.6.tar.gz
+      SDIST_SHA256: cb755605126cbc7f2fcc7c4335e020aa9f6da67f0812dcd7622d99e18c53b84b
+      SDIST_SIZE: 167664
+      RELEASE_MANIFEST: factlane-v0.1.6-release-manifest.json
+      RELEASE_MANIFEST_SHA256: 85e08952eb305014637644f4e59bffd27c12b043fcf266c85d69186227279a56
+      RELEASE_MANIFEST_SIZE: 862
       SHA256SUMS: SHA256SUMS.txt
-      EXPECTED_TAG_OBJECT: e4275fb33147c3336797bb230312699571a0afe5
-      EXPECTED_RELEASE_COMMIT: eaa75f8f17961cbaaf94d5d623e5a80083dad56f
-      EXPECTED_RELEASE_TREE: 6cc017b508571be0636f6f4b031aa4ca452893c4
+      SHA256SUMS_SHA256: 292f1856c8ee8f56c721a1436ba054a155f951e07d126c1cee9a60974ef7a983
+      SHA256SUMS_SIZE: 186
+      EXPECTED_TAG_OBJECT: 75cf56de9cb693ca07f9d750fc08ff22e0f70e0d
+      EXPECTED_RELEASE_COMMIT: e4a71aedaaf4f2e73aeaeaafbdeca60a846d21ad
+      EXPECTED_RELEASE_TREE: 4664d232810da749c2267fa56dc1568ab2af1f71
       UV_VERSION: 0.11.26
       PYPI_UPLOAD_URL: https://upload.pypi.org/legacy/
       PYPI_CHECK_URL: https://pypi.org/simple/
@@ -89,7 +95,7 @@ jobs:
           gh api -H "Accept: application/vnd.github+json" \
             "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > state/release.json
           [[ "$(jq -er '.tag_name' state/release.json)" == "${TAG}" ]]
-          [[ "$(jq -er '.name' state/release.json)" == "FactLane v0.1.5" ]]
+          [[ "$(jq -er '.name' state/release.json)" == "FactLane v0.1.6" ]]
           [[ "$(jq -er '.draft' state/release.json)" == "false" ]]
           [[ "$(jq -er '.prerelease' state/release.json)" == "false" ]]
           [[ "$(jq -er '.assets | length' state/release.json)" == "4" ]]
@@ -145,9 +151,18 @@ jobs:
           expected_hashes = {
               os.environ["WHEEL"]: os.environ["WHEEL_SHA256"],
               os.environ["SDIST"]: os.environ["SDIST_SHA256"],
+              os.environ["RELEASE_MANIFEST"]: os.environ["RELEASE_MANIFEST_SHA256"],
+              os.environ["SHA256SUMS"]: os.environ["SHA256SUMS_SHA256"],
+          }
+          expected_sizes = {
+              os.environ["WHEEL"]: int(os.environ["WHEEL_SIZE"]),
+              os.environ["SDIST"]: int(os.environ["SDIST_SIZE"]),
+              os.environ["RELEASE_MANIFEST"]: int(os.environ["RELEASE_MANIFEST_SIZE"]),
+              os.environ["SHA256SUMS"]: int(os.environ["SHA256SUMS_SIZE"]),
           }
           for filename, expected in expected_hashes.items():
               assert sha256(root / filename) == expected
+              assert (root / filename).stat().st_size == expected_sizes[filename]
 
           release = json.loads(pathlib.Path("state/release.json").read_text())
           assets = {a["name"]: a for a in release["assets"]}
@@ -155,6 +170,7 @@ jobs:
           for filename in names:
               local_digest = sha256(root / filename)
               assert assets[filename].get("digest") == f"sha256:{local_digest}"
+              assert assets[filename]["size"] == expected_sizes[filename]
 
           expected_sums = (
               f'{os.environ["WHEEL_SHA256"]}  {os.environ["WHEEL"]}\n'
@@ -165,7 +181,7 @@ jobs:
           manifest = json.loads((root / os.environ["RELEASE_MANIFEST"]).read_text())
           expected_manifest = {
               "schemaVersion": 1,
-              "release": "FactLane v0.1.5",
+              "release": "FactLane v0.1.6",
               "tag": os.environ["TAG"],
               "tagObject": os.environ["TAG_OBJECT"],
               "commit": os.environ["RELEASE_COMMIT"],
@@ -301,7 +317,7 @@ jobs:
           now = json.loads(pathlib.Path("state/release-pre-publish.json").read_text())
           assert now["id"] == before["id"]
           assert now["tag_name"] == os.environ["TAG"]
-          assert now["name"] == "FactLane v0.1.5"
+          assert now["name"] == "FactLane v0.1.6"
           assert now["draft"] is False
           assert now["prerelease"] is False
 
