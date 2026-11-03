@@ -269,9 +269,9 @@ python3.11 -m venv .venv
 .venv/bin/factlane --help-tools
 ```
 
-The v0.1.6 wheel pins `mcp-memory-service==11.10.0` from the Python package index rather than using
-a direct VCS requirement. The repository lockfile records the exact PyPI wheel/sdist URLs and
-SHA-256 digests used for qualification. The FactLane wheel records its direct requirements, but a
+Corrective releases that replace a direct VCS requirement with an exact package-index pin record
+the selected dependency version and artifact digests in their release-specific notes and lockfile.
+The FactLane wheel records its direct requirements, but a
 fresh installer may resolve newer compatible **transitive** dependencies than the environment
 captured by the repository lockfile. When exact dependency replay matters, use the tagged source
 checkout with `uv sync --frozen` and its committed `uv.lock`.
