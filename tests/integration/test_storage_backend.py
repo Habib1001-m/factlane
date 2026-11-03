@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -14,8 +15,8 @@ import pytest
 import factlane.storage as storage_module
 from factlane import backend_compat
 from factlane.backend_compat import (
-    PINNED_BACKEND_COMMIT,
-    PINNED_BACKEND_URL,
+    PINNED_BACKEND_RUNTIME_HASHES,
+    PINNED_BACKEND_UPSTREAM_COMMIT,
     PINNED_BACKEND_VERSION,
     assert_backend_class_contract,
     assert_pinned_backend_identity,
@@ -81,78 +82,59 @@ def test_pinned_backend_exposes_required_sqlite_primitives(tmp_path) -> None:
 def test_declared_backend_pin_matches_runtime_contract() -> None:
     root = Path(__file__).resolve().parents[2]
     pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
-    lock = (root / "uv.lock").read_text(encoding="utf-8")
+    lock = tomllib.loads((root / "uv.lock").read_text(encoding="utf-8"))
 
     assert PINNED_BACKEND_VERSION == "11.10.0"
-    assert f"mcp-memory-service.git@{PINNED_BACKEND_COMMIT}" in pyproject
-    assert f"rev={PINNED_BACKEND_COMMIT}" in lock
-    assert f"#{PINNED_BACKEND_COMMIT}" in lock
+    assert '"mcp-memory-service==11.10.0"' in pyproject
+    assert "git+https://github.com/doobidoo/mcp-memory-service" not in pyproject
+    backend_packages = [package for package in lock["package"] if package["name"] == "mcp-memory-service"]
+    assert len(backend_packages) == 1
+    backend = backend_packages[0]
+    assert backend["version"] == PINNED_BACKEND_VERSION
+    assert backend["source"] == {"registry": "https://pypi.org/simple"}
+    wheel_hashes = {wheel["hash"] for wheel in backend.get("wheels", [])}
+    assert "sha256:40dea11f60d62a93b158eaf3a532010f7d06e55f9483fb79c14b5f0366f3f553" in wheel_hashes
 
 
 class FakeDistribution:
-    def __init__(self, *, version: str = PINNED_BACKEND_VERSION, direct_url: dict | None = None) -> None:
+    def __init__(self, *, version: str = PINNED_BACKEND_VERSION, runtime_path: Path | None = None) -> None:
         self.version = version
-        self.direct_url = direct_url or {
-            "url": PINNED_BACKEND_URL,
-            "vcs_info": {
-                "vcs": "git",
-                "commit_id": PINNED_BACKEND_COMMIT,
-                "requested_revision": PINNED_BACKEND_COMMIT,
-            },
-        }
+        self.runtime_path = runtime_path
 
-    def read_text(self, name: str) -> str | None:
-        if name != "direct_url.json":
-            return None
-        return json.dumps(self.direct_url)
+    def locate_file(self, path: str) -> Path:
+        assert path in PINNED_BACKEND_RUNTIME_HASHES
+        return self.runtime_path or Path("/definitely/missing/backend/runtime.py")
 
 
 @pytest.mark.parametrize(
-    ("version", "direct_url"),
+    ("version", "runtime_hash"),
     [
-        ("0.0.0", None),
-        (
-            PINNED_BACKEND_VERSION,
-            {
-                "url": "https://example.invalid/backend.git",
-                "vcs_info": {
-                    "vcs": "git",
-                    "commit_id": PINNED_BACKEND_COMMIT,
-                    "requested_revision": PINNED_BACKEND_COMMIT,
-                },
-            },
-        ),
-        (
-            PINNED_BACKEND_VERSION,
-            {
-                "url": PINNED_BACKEND_URL,
-                "vcs_info": {
-                    "vcs": "git",
-                    "commit_id": "0" * 40,
-                    "requested_revision": "0" * 40,
-                },
-            },
-        ),
+        ("0.0.0", next(iter(PINNED_BACKEND_RUNTIME_HASHES.values()))),
+        (PINNED_BACKEND_VERSION, "0" * 64),
     ],
 )
-def test_backend_identity_drift_fails_closed(monkeypatch, version: str, direct_url: dict | None) -> None:
-    monkeypatch.setattr(
-        backend_compat,
-        "distribution",
-        lambda _: FakeDistribution(version=version, direct_url=direct_url),
-    )
+def test_backend_identity_drift_fails_closed(monkeypatch, version: str, runtime_hash: str) -> None:
+    monkeypatch.setattr(backend_compat, "distribution", lambda _: FakeDistribution(version=version))
+    monkeypatch.setattr(backend_compat, "_backend_runtime_sha256", lambda *_: runtime_hash)
     with pytest.raises(AdapterError) as exc_info:
         assert_pinned_backend_identity()
     assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
 
 
-def test_backend_malformed_vcs_provenance_fails_closed(monkeypatch) -> None:
-    backend = FakeDistribution()
-    backend.read_text = lambda _: "[]"
-    monkeypatch.setattr(backend_compat, "distribution", lambda _: backend)
+def test_backend_missing_reviewed_runtime_file_fails_closed(monkeypatch) -> None:
+    monkeypatch.setattr(backend_compat, "distribution", lambda _: FakeDistribution())
     with pytest.raises(AdapterError) as exc_info:
         assert_pinned_backend_identity()
     assert exc_info.value.code == "BACKEND_COMPATIBILITY_MISMATCH"
+
+
+def test_reviewed_registry_runtime_provenance_is_documented() -> None:
+    assert PINNED_BACKEND_UPSTREAM_COMMIT == "e5155b937051db4fa99a384018c5ebd621d8c5ef"
+    assert PINNED_BACKEND_RUNTIME_HASHES == {
+        "mcp_memory_service/storage/sqlite_vec.py": "b61503bd416ddc702c43a542d467e3dea7c1549c50ac56c877d76fa1293929d9",
+        "mcp_memory_service/storage/mixins/base.py": "16f53c171cd14dd95efdba15618e185663c97c2cf1e900aec29e9fc647f81661",
+        "mcp_memory_service/storage/mixins/embeddings.py": "189a6d5cb7c831a1d2e0c8ce74a0a75055d744024f56296316f8c918c2f79c18",
+    }
 
 
 @pytest.mark.parametrize("backend", ["cloudflare", "hybrid"])

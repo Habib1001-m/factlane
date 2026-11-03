@@ -24,8 +24,17 @@
     "lockfile": "uv.lock",
     "backend": {
       "name": "mcp-memory-service",
-      "source": "https://github.com/doobidoo/mcp-memory-service",
-      "revision": "e5155b937051db4fa99a384018c5ebd621d8c5ef",
+      "source": "https://pypi.org/project/mcp-memory-service/11.10.0/",
+      "version": "11.10.0",
+      "wheel_sha256": "40dea11f60d62a93b158eaf3a532010f7d06e55f9483fb79c14b5f0366f3f553",
+      "sdist_sha256": "d6c9dc1d425671da34a48b9b8bd15a49974290eaeec8f26c557cd8ef1a27ae51",
+      "reviewed_upstream_commit": "e5155b937051db4fa99a384018c5ebd621d8c5ef",
+      "reviewed_runtime_files": {
+        "mcp_memory_service/storage/sqlite_vec.py": "b61503bd416ddc702c43a542d467e3dea7c1549c50ac56c877d76fa1293929d9",
+        "mcp_memory_service/storage/mixins/base.py": "16f53c171cd14dd95efdba15618e185663c97c2cf1e900aec29e9fc647f81661",
+        "mcp_memory_service/storage/mixins/embeddings.py": "189a6d5cb7c831a1d2e0c8ce74a0a75055d744024f56296316f8c918c2f79c18"
+      },
+      "reviewed_runtime_package_aggregate_sha256": "90041d6e35c2d0cde49a708b523f9d0e9e3b0abcf817f4ff2c3acec40b3066b4",
       "license": "Apache-2.0"
     },
     "sqlite_vec": {
