@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import inspect
-import json
+import hashlib
 from collections.abc import Awaitable, Callable
 from importlib.metadata import PackageNotFoundError, distribution
+from pathlib import Path
 from typing import Any
 
 from .contract import AdapterError
@@ -11,16 +12,29 @@ from .contract import AdapterError
 
 PINNED_BACKEND_DISTRIBUTION = "mcp-memory-service"
 PINNED_BACKEND_VERSION = "11.10.0"
-PINNED_BACKEND_URL = "https://github.com/doobidoo/mcp-memory-service.git"
-PINNED_BACKEND_COMMIT = "e5155b937051db4fa99a384018c5ebd621d8c5ef"
+PINNED_BACKEND_UPSTREAM_COMMIT = "e5155b937051db4fa99a384018c5ebd621d8c5ef"
+PINNED_BACKEND_RUNTIME_HASHES = {
+    "mcp_memory_service/storage/sqlite_vec.py": "b61503bd416ddc702c43a542d467e3dea7c1549c50ac56c877d76fa1293929d9",
+    "mcp_memory_service/storage/mixins/base.py": "16f53c171cd14dd95efdba15618e185663c97c2cf1e900aec29e9fc647f81661",
+    "mcp_memory_service/storage/mixins/embeddings.py": "189a6d5cb7c831a1d2e0c8ce74a0a75055d744024f56296316f8c918c2f79c18",
+}
 
 
 def _compatibility_error(message: str) -> AdapterError:
     return AdapterError("BACKEND_COMPATIBILITY_MISMATCH", message)
 
 
+def _backend_runtime_sha256(backend: Any, relative_path: str) -> str:
+    try:
+        runtime_path = Path(backend.locate_file(relative_path))
+        runtime_bytes = runtime_path.read_bytes()
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise _compatibility_error("pinned backend reviewed runtime file is unavailable") from exc
+    return hashlib.sha256(runtime_bytes).hexdigest()
+
+
 def assert_pinned_backend_identity() -> None:
-    """Fail closed unless the installed backend is the exact reviewed VCS pin."""
+    """Fail closed unless the installed backend matches the reviewed PyPI package runtime."""
     try:
         backend = distribution(PINNED_BACKEND_DISTRIBUTION)
     except PackageNotFoundError as exc:
@@ -28,28 +42,9 @@ def assert_pinned_backend_identity() -> None:
 
     if backend.version != PINNED_BACKEND_VERSION:
         raise _compatibility_error("pinned backend version does not match the reviewed contract")
-
-    raw_direct_url = backend.read_text("direct_url.json")
-    if not raw_direct_url:
-        raise _compatibility_error("pinned backend VCS provenance is unavailable")
-    try:
-        direct_url = json.loads(raw_direct_url)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise _compatibility_error("pinned backend VCS provenance is invalid") from exc
-    if not isinstance(direct_url, dict):
-        raise _compatibility_error("pinned backend VCS provenance is invalid")
-
-    vcs_info = direct_url.get("vcs_info")
-    if not isinstance(vcs_info, dict):
-        raise _compatibility_error("pinned backend VCS provenance is incomplete")
-    if direct_url.get("url") != PINNED_BACKEND_URL:
-        raise _compatibility_error("pinned backend repository identity changed")
-    if vcs_info.get("vcs") != "git":
-        raise _compatibility_error("pinned backend VCS kind changed")
-    if vcs_info.get("commit_id") != PINNED_BACKEND_COMMIT:
-        raise _compatibility_error("pinned backend commit identity changed")
-    if vcs_info.get("requested_revision") != PINNED_BACKEND_COMMIT:
-        raise _compatibility_error("pinned backend requested revision changed")
+    for relative_path, expected_sha256 in PINNED_BACKEND_RUNTIME_HASHES.items():
+        if _backend_runtime_sha256(backend, relative_path) != expected_sha256:
+            raise _compatibility_error("pinned backend reviewed runtime bytes changed")
 
 
 def assert_backend_class_contract(storage_class: type[Any]) -> None:

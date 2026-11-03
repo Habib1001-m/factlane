@@ -666,7 +666,7 @@ wheels = [
 
 [[package]]
 name = "factlane"
-version = "0.1.5"
+version = "0.1.6"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
@@ -685,7 +685,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "mcp", specifier = "==1.30.0" },
-    { name = "mcp-memory-service", git = "https://github.com/doobidoo/mcp-memory-service.git?rev=e5155b937051db4fa99a384018c5ebd621d8c5ef" },
+    { name = "mcp-memory-service", specifier = "==11.10.0" },
     { name = "pydantic", specifier = "==2.13.5" },
     { name = "sqlite-vec", specifier = "==0.1.9" },
     { name = "tokenizers", specifier = "==0.23.1" },
@@ -1018,7 +1018,7 @@ wheels = [
 [[package]]
 name = "mcp-memory-service"
 version = "11.10.0"
-source = { git = "https://github.com/doobidoo/mcp-memory-service.git?rev=e5155b937051db4fa99a384018c5ebd621d8c5ef#e5155b937051db4fa99a384018c5ebd621d8c5ef" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
     { name = "aiohttp" },
@@ -1045,6 +1045,10 @@ dependencies = [
     { name = "sse-starlette" },
     { name = "uvicorn" },
     { name = "zeroconf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f6/7a/7c632b8886ad8125b1bf6c53ee222561731f31e25127ee75b4cb8dcb1fb8/mcp_memory_service-11.10.0.tar.gz", hash = "sha256:d6c9dc1d425671da34a48b9b8bd15a49974290eaeec8f26c557cd8ef1a27ae51", size = 34195802, upload-time = "2026-08-27T23:06:13.245Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4d/84/7127a5a6d89a596612d84447670dee21283d6c506dcefa7542ee734e067f/mcp_memory_service-11.10.0-py3-none-any.whl", hash = "sha256:40dea11f60d62a93b158eaf3a532010f7d06e55f9483fb79c14b5f0366f3f553", size = 961554, upload-time = "2026-08-27T23:06:09.363Z" },
 ]
 
 [[package]]

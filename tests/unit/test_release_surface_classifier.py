@@ -15,7 +15,7 @@ validate_snapshot_authority_lineage = MODULE.validate_snapshot_authority_lineage
 
 
 def test_surface_snapshot_may_trail_newer_repository_package_tag() -> None:
-    validate_snapshot_authority_lineage("v0.1.4", ["v0.1.5", "v0.1.4", "v0.1.3"])
+    validate_snapshot_authority_lineage("v0.1.4", ["v0.1.6", "v0.1.5", "v0.1.4", "v0.1.3"])
 
 
 def test_surface_snapshot_tag_must_remain_reachable() -> None:
@@ -23,4 +23,4 @@ def test_surface_snapshot_tag_must_remain_reachable() -> None:
         SystemExit,
         match=r"^HOLD: released-contract snapshot authority tag is not reachable from source: v0\.1\.4$",
     ):
-        validate_snapshot_authority_lineage("v0.1.4", ["v0.1.5", "v0.1.3"])
+        validate_snapshot_authority_lineage("v0.1.4", ["v0.1.6", "v0.1.5", "v0.1.3"])

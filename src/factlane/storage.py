@@ -399,7 +399,7 @@ def _validate_existing_v3_schema(conn: sqlite3.Connection) -> None:
 def inspect_storage_contract_version(db_path: str) -> int | None:
     """Read FactLane contract metadata from a disposable byte copy, never the live DB.
 
-    Copying the main/WAL/SHM trio before SQLite inspection keeps ordinary v0.1.5
+    Copying the main/WAL/SHM trio before SQLite inspection keeps ordinary v0.1.6
     launch from creating/checkpointing sidecars or otherwise mutating a v2 database.
     """
     canonical = os.path.realpath(os.path.abspath(db_path))
@@ -838,10 +838,10 @@ class SQLiteVecEngine:
         if existing_contract == 2:
             raise AdapterError(
                 "MIGRATION_REQUIRED",
-                "storage contract v2 requires the explicit migrate-storage-v3 operator before v0.1.5 runtime can open it",
+                "storage contract v2 requires the explicit migrate-storage-v3 operator before v0.1.6 runtime can open it",
             )
         if existing_contract is not None and existing_contract != STORAGE_CONTRACT_VERSION:
-            raise AdapterError("SCHEMA_MISMATCH", "storage contract version is unsupported by v0.1.5")
+            raise AdapterError("SCHEMA_MISMATCH", "storage contract version is unsupported by v0.1.6")
         if self._maintenance_capability is None:
             self._maintenance_lease_handle = _acquire_runtime_maintenance_lease(self.db_path)
         else:
