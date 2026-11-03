@@ -35,14 +35,35 @@ jobs:
           uv run python scripts/build_qualified_package.py
           --out-dir "${{ runner.temp }}/factlane-python-dist"
           --receipt "${{ runner.temp }}/factlane-python-package.json"
-      - uses: actions/setup-node@v4
+      - name: Detect public-site surface changes
+        id: site_surface
         if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          protected_base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          git cat-file -e "${protected_base}^{commit}"
+          if git diff --quiet "$protected_base" HEAD -- \
+            site/ \
+            docs/ \
+            README.md \
+            SECURITY.md \
+            skills/using-factlane/; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: >-
+          (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') &&
+          steps.site_surface.outputs.changed == 'true'
         with:
           node-version: "22.22.3"
           cache: npm
           cache-dependency-path: site/package-lock.json
       - name: Qualify public site artifact
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+        if: >-
+          (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') &&
+          steps.site_surface.outputs.changed == 'true'
         env:
           FACTLANE_SITE_URL: https://factlane.pages.dev
           FACTLANE_PUBLIC_BUILD: "1"
@@ -50,7 +71,9 @@ jobs:
           FACTLANE_PROTECTED_BASE_COMMIT: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: bash site/scripts/qualify-publication-ci.sh
       - name: Record publication qualification
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+        if: >-
+          (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') &&
+          steps.site_surface.outputs.changed == 'true'
         run: |
           {
             echo '### FactLane public-site qualification'
@@ -60,7 +83,9 @@ jobs:
             echo 'This artifact is qualification evidence only; CI never deploys Production.'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload qualified publication package
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+        if: >-
+          (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') &&
+          steps.site_surface.outputs.changed == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: factlane-site-publication-${{ github.event.pull_request.head.sha || github.sha }}
