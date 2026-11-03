@@ -4,12 +4,48 @@
 والترحيل والتراجع وهوية الإصدار الدقيقة، استخدم
 [عمليات الإصدار](RELEASE_OPERATIONS.md).
 
-## 0.1.5 release candidate — بانتظار النشر
+## 0.1.6 corrective release candidate — dependency metadata متوافقة مع PyPI
 
-FactLane 0.1.5 هو حاليًا release candidate. يعلن المصدر package version `0.1.5` وPublic Contract
-Revision 3 وstorage contract v3، لكن هذه التصريحات في المصدر لا تنشئ إصدارًا رسميًا. ويظل
-annotated tag النهائي وrelease commit/tree وdigests الخاصة بالـwheel وsource distribution وحالة
-PyPI وأي نشر للموقع بانتظار خطوات نشر منفصلة ومصرح بها.
+FactLane 0.1.6 هو package successor تصحيحي لـv0.1.5 GitHub release الثابت. وصلت عملية trusted
+publishing الخاصة بـv0.1.5 إلى PyPI عبر OIDC صالح، لكن PyPI رفض الـwheel الدقيقة لأن Core Metadata
+أعلنت `mcp-memory-service` كـdirect VCS dependency. ولم يُنشأ مشروع FactLane أو version على PyPI.
+
+يحافظ candidate الخاص بـv0.1.6 على Public Contract Revision 3 وعقد التخزين v3 وسطح MCP نفسه ذي
+الأدوات الخمس عبر stdio وعلى سلوك runtime/storage المؤهل من v0.1.5. ويقتصر تصحيح packaging على:
+
+- تقدم package version إلى `0.1.6`؛
+- يصبح اعتماد backend هو PyPI pin الدقيق `mcp-memory-service==11.10.0`؛
+- تتطابق حزمة runtime الكاملة ذات 239 ملفًا داخل wheel المراجعة على PyPI بايتًا ببايت مع commit
+  upstream المراجع `e5155b937051db4fa99a384018c5ebd621d8c5ef`؛
+- يربط runtime compatibility إصدار backend الدقيق مع runtime hashes مراجعة بدل اشتراط VCS
+  `direct_url.json`؛
+- لا يوسع هذا الإصدار التصحيحي storage schema أو public contract أو MCP tools أو Owner-control
+  أو migration أو site-publication semantics.
+
+### هوية إصدار 0.1.6 بانتظار النشر
+
+| العنصر | 0.1.6 corrective release candidate |
+| --- | --- |
+| Package version | `0.1.6` |
+| Public Contract Revision | `3` |
+| Storage contract | `3` |
+| Public MCP transport | `stdio` |
+| Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
+| Annotated tag | بانتظار النشر |
+| Tag object | بانتظار النشر |
+| Release commit | بانتظار النشر |
+| Release tree | بانتظار النشر |
+| Wheel name / SHA-256 | بانتظار النشر |
+| Source distribution name / SHA-256 | بانتظار النشر |
+| PyPI publication | بانتظار النشر |
+| Site Production deployment | سطح publication منفصل؛ لا تتضمنه هذه package release ضمنيًا |
+
+## GitHub release v0.1.5 — فشل نشر PyPI
+
+FactLane v0.1.5 هو GitHub release ثابت عند Public Contract Revision 3 وعقد التخزين v3. نُشرت
+package artifacts في GitHub Release، لكن PyPI رفض الـwheel قبل إنشاء project/version لأن metadata
+احتوت direct VCS dependency. وتظل tag وassets الخاصة بـv0.1.5 دليلًا تاريخيًا لا يعاد بناؤه أو
+استبداله أو إعادة توجيهه بواسطة v0.1.6.
 
 ### أبرز التغييرات
 
@@ -133,25 +169,22 @@ uv run factlane-migrate-storage-v3 restore \
 - تظل semantic relevance وجودة اللغة وسلوك filesystem خارج الملفات المؤهلة وحجم deployment
   خاصة بعبء العمل والبيئة بدل أن تكون ضمانات عامة.
 
-### هوية الإصدار بانتظار النشر
+### هوية GitHub الثابتة لـv0.1.5 ونتيجة PyPI
 
-لا تُملأ الحقول التالية إلا من عبور الإصدار المصرح به بصورة منفصلة. لا تستنتجها من فرع `main`
-المتحرك أو local RC builds أو workflow configuration أو candidate artifacts.
-
-| العنصر | 0.1.5 release candidate |
+| العنصر | هوية/نتيجة v0.1.5 |
 | --- | --- |
 | Package version | `0.1.5` |
 | Public Contract Revision | `3` |
 | Storage contract | `3` |
 | Public MCP transport | `stdio` |
 | Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
-| Annotated tag | بانتظار النشر |
-| Tag object | بانتظار النشر |
-| Release commit | بانتظار النشر |
-| Release tree | بانتظار النشر |
-| Wheel name / SHA-256 | بانتظار النشر |
-| Source distribution name / SHA-256 | بانتظار النشر |
-| PyPI publication | بانتظار النشر |
+| Annotated tag | `v0.1.5` |
+| Tag object | `e4275fb33147c3336797bb230312699571a0afe5` |
+| Release commit | `eaa75f8f17961cbaaf94d5d623e5a80083dad56f` |
+| Release tree | `6cc017b508571be0636f6f4b031aa4ca452893c4` |
+| Wheel | `factlane-0.1.5-py3-none-any.whl` / `9ff8039125cab109c169dacc62a88aae91cbbe2cd12abb0c2661e72db84c4a79` |
+| Source distribution | `factlane-0.1.5.tar.gz` / `7f997ecb85a519e5c0b44d136a774182f1453d832dda02a795463602d627a0ac` |
+| PyPI publication | فشل: HTTP 400 بسبب direct VCS dependency metadata؛ ظل project/version غائبًا |
 | Site Production deployment | سطح publication منفصل؛ لا تتضمنه هذه package release ضمنيًا |
 
 ## 0.1.4
