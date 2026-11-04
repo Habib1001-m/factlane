@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "releaseAuthority": {
+    "tag": "v0.1.6",
+    "tagObject": "75cf56de9cb693ca07f9d750fc08ff22e0f70e0d",
+    "commit": "e4a71aedaaf4f2e73aeaeaafbdeca60a846d21ad",
+    "tree": "4664d232810da749c2267fa56dc1568ab2af1f71",
+    "packageVersion": "0.1.6",
+    "pythonRequires": ">=3.11",
+    "linkedSqliteMinimum": "3.42.0",
+    "publicContractRevision": 3,
+    "transport": "stdio",
+    "embeddingProvider": "Ollama",
+    "tools": [
+      "memory_search",
+      "memory_get",
+      "memory_store",
+      "memory_update",
+      "memory_status"
+    ]
+  },
+  "releasedArtifacts": {
+    "wheel": {
+      "name": "factlane-0.1.6-py3-none-any.whl",
+      "sha256": "5cb74af31e6bfe96bc38e0048ea2e8abcde53c5a05470aebbe9ed8305dd46899"
+    },
+    "sdist": {
+      "name": "factlane-0.1.6.tar.gz",
+      "sha256": "cb755605126cbc7f2fcc7c4335e020aa9f6da67f0812dcd7622d99e18c53b84b"
+    },
+    "releaseManifestSha256": "85e08952eb305014637644f4e59bffd27c12b043fcf266c85d69186227279a56",
+    "sha256SumsSha256": "292f1856c8ee8f56c721a1436ba054a155f951e07d126c1cee9a60974ef7a983"
+  },
+  "releasedSiteBaseline": {
+    "sourceCommit": "233486f944abdec8571f35fbc78c5c2f53277815",
+    "sourceTree": "8e02dbb37d4a29355b29f2155b4778de0ea78210"
+  },
+  "releasedPublicationBaseline": {
+    "productionSourceCommit": "c6a150a10f8dc27fbf60cca855a2a19fbef3de38",
+    "productionSourceTree": "87322293123a370a29ce546412f87ec31550c0ec",
+    "productionDeploymentId": "5178c346-129e-48b6-956d-2f108076adff",
+    "productionArtifactManifestSha256": "b95be86de93af9c0b61e298bebce5fcde7bc5588919334a6c2d2310a6dba79f0"
+  }
+}

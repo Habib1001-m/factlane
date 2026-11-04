@@ -19,17 +19,23 @@ The qualification path is intentionally split into four controls:
    source-aware sitemap `lastmod` uses Git history, so tree equality alone does not identify the
    publication bytes after a squash or history rewrite.
 2. `scripts/check-publication-eligibility.mjs` derives the current RELEASED product authority from
-   the exact annotated release tag. The publication baseline is **not selected by the candidate
-   snapshot**: it is derived from the parent of the historical commit that first introduced the
-   release-control file, and bootstrap qualification requires that parent to equal the externally
-   supplied protected/base SHA. Later qualifications require that historical introduction to
-   already belong to the protected/base history. CI then compares a generated public-claim
+   the exact annotated release tag. A release snapshot may bind a later accepted site-source
+   baseline when the public site is advanced after the package release. That explicit baseline must
+   be an exact commit/tree descendant of the released product authority, must retain the same
+   package version, and on first introduction must equal the externally supplied protected/base
+   SHA. Later qualifications require the snapshot introduction to already belong to the protected
+   base history, require the snapshot Git blob to be byte-identical to the protected-base copy, and
+   require the accepted site baseline to remain an ancestor of the candidate. A released-contract
+   snapshot is therefore immutable after its first merge; a later authority transition uses a new
+   snapshot rather than rebinding an existing one. CI
+   then compares a generated public-claim
    projection for **all canonical routes** against a clean build of that derived baseline. The
    projection includes title, description, all rendered page text (including global chrome/footer),
    JSON-LD, normalized external anchor targets and root `llms.txt`, so release/support claims or
    their authoritative external targets cannot evade classification by moving between sections,
-   out of `<main>`, or changing only an `href`. The baseline hashes are derived at qualification time from
-   immutable Git history; they are not editable snapshot values. A recognized release-bound
+   out of `<main>`, or changing only an `href`. The baseline hashes are derived at qualification time
+   from the exact Git commit/tree binding; the snapshot records identity, not precomputed projection
+   hashes. A recognized release-bound
    Development change may keep the required `test` context green while the receipt records
    `HOLD_UNRELEASED_CONTRACT`; unknown/stale release authority is also publication HOLD. When the
    released-site snapshot is stale because a newer package tag exists without a corresponding site
