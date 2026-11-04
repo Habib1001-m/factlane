@@ -94,7 +94,7 @@ echo "PUBLICATION_CI_SOURCE_TREE=$source_tree"
 echo "PUBLICATION_CI_ORIGIN=$public_origin"
 echo "PUBLICATION_CI_PROTECTED_BASE_COMMIT=$protected_base_commit"
 
-released_snapshot="$site_root/publication/released-contract-v0.1.4.json"
+released_snapshot="$site_root/publication/released-contract-v0.1.6.json"
 released_snapshot_relative=${released_snapshot#"$repo_root/"}
 released_package_version=$(node -p "const x=require('$released_snapshot'); x.releaseAuthority?.packageVersion || ''")
 [[ "$released_package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
@@ -112,6 +112,10 @@ released_baseline_commit=${released_site_baseline_commit:-$legacy_released_basel
 if git -C "$repo_root" cat-file -e "$protected_base_commit:$released_snapshot_relative" 2>/dev/null; then
   [[ $(git -C "$repo_root" merge-base "$control_introduction_commit" "$protected_base_commit") == "$control_introduction_commit" ]] || {
     echo 'HOLD: publication-control introduction is not part of the externally supplied protected/base history' >&2
+    exit 1
+  }
+  [[ $(git -C "$repo_root" hash-object "$released_snapshot") == $(git -C "$repo_root" rev-parse "$protected_base_commit:$released_snapshot_relative") ]] || {
+    echo 'HOLD: released-contract snapshot drifted after first introduction; create a new snapshot instead of rebinding it' >&2
     exit 1
   }
 else

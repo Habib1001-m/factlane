@@ -21,7 +21,7 @@ const baselineBuildRoot = path.resolve(args['baseline-build'] ?? '');
 const protectedBaseCommit = args['protected-base-commit'] ?? '';
 const receiptPath = path.resolve(args.receipt ?? path.join(buildRoot, '..', 'PUBLICATION_ELIGIBILITY.json'));
 const snapshotPath = path.resolve(
-  args.snapshot ?? path.join(siteRoot, 'publication', 'released-contract-v0.1.4.json'),
+  args.snapshot ?? path.join(siteRoot, 'publication', 'released-contract-v0.1.6.json'),
 );
 
 assert(args.build, '--build is required');
@@ -53,16 +53,12 @@ if (releasedSiteBaseline) {
   assert(/^[0-9a-f]{40}$/.test(releasedSiteBaseline.sourceCommit ?? ''), 'Released-site baseline commit is invalid');
   assert(/^[0-9a-f]{40}$/.test(releasedSiteBaseline.sourceTree ?? ''), 'Released-site baseline tree is invalid');
   assert(
-    releasedSiteBaseline.sourceCommit === authority.commit,
-    'Released-site baseline commit must equal released product authority commit',
-  );
-  assert(
-    releasedSiteBaseline.sourceTree === authority.tree,
-    'Released-site baseline tree must equal released product authority tree',
-  );
-  assert(
     git(repoRoot, ['rev-parse', `${releasedSiteBaseline.sourceCommit}^{tree}`]) === releasedSiteBaseline.sourceTree,
     'Released-site baseline commit/tree binding is invalid',
+  );
+  assert(
+    git(repoRoot, ['merge-base', authority.commit, releasedSiteBaseline.sourceCommit]) === authority.commit,
+    'Released-site baseline must descend from the released product authority',
   );
 }
 assert(
@@ -90,6 +86,10 @@ if (!snapshotExistedAtProtectedBase) {
     git(repoRoot, ['merge-base', controlIntroductionCommit, protectedBaseCommit]) === controlIntroductionCommit,
     'Historical publication-control introduction is not part of the protected/base authority',
   );
+  assert(
+    git(repoRoot, ['hash-object', snapshotPath]) === git(repoRoot, ['rev-parse', `${protectedBaseCommit}:${snapshotRepoRelative}`]),
+    'Released-contract snapshot is immutable after first introduction; create a new snapshot instead of rebinding it',
+  );
 }
 
 const tagRef = `refs/tags/${authority.tag}`;
@@ -113,18 +113,24 @@ assert(
 );
 
 const releasedPyproject = git(repoRoot, ['show', `${authority.tag}:pyproject.toml`]);
+const releasedSitePyproject = git(repoRoot, ['show', `${derivedAcceptedMainCommit}:pyproject.toml`]);
 const releasedContract = git(repoRoot, ['show', `${authority.tag}:src/factlane/contract.py`]);
 const releasedServer = git(repoRoot, ['show', `${authority.tag}:src/factlane/server.py`]);
 const releasedEnvironment = git(repoRoot, ['show', `${authority.tag}:docs/ENVIRONMENT.md`]);
 const currentPyproject = await readFile(path.join(repoRoot, 'pyproject.toml'), 'utf8');
 
 const releasedVersion = releasedPyproject.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+const releasedSiteVersion = releasedSitePyproject.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 const currentPackageVersion = currentPyproject.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 const releasedPython = releasedPyproject.match(/^requires-python\s*=\s*"([^"]+)"/m)?.[1];
 const releasedRevision = Number(releasedContract.match(/^PUBLIC_CONTRACT_REVISION\s*=\s*(\d+)/m)?.[1]);
 const releasedTools = [...releasedServer.matchAll(/@server\.tool\(name="([^"]+)"/g)].map((match) => match[1]);
 
 assert(releasedVersion === authority.packageVersion, 'Released package version does not match snapshot');
+assert(
+  releasedSiteVersion === authority.packageVersion,
+  'Released-site baseline package version must match released product authority',
+);
 assert(releasedPython === authority.pythonRequires, 'Released Python boundary does not match snapshot');
 assert(releasedRevision === authority.publicContractRevision, 'Released public-contract revision does not match snapshot');
 assert(JSON.stringify(releasedTools) === JSON.stringify(authority.tools), 'Released five-tool surface does not match snapshot');
