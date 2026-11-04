@@ -26,7 +26,11 @@ const expectedDigest = args['expected-package-contents-sha256'];
 const expectedEligibility = args['expected-publication-eligibility'] ?? 'ELIGIBLE_PENDING_OTHER_GATES';
 assert(/^[0-9a-f]{64}$/.test(expectedDigest), 'Expected package digest must be lowercase SHA-256');
 assert(
-  ['ELIGIBLE_PENDING_OTHER_GATES', 'HOLD_UNRELEASED_CONTRACT'].includes(expectedEligibility),
+  [
+    'ELIGIBLE_PENDING_OTHER_GATES',
+    'HOLD_UNRELEASED_CONTRACT',
+    'HOLD_RELEASE_SNAPSHOT_STALE',
+  ].includes(expectedEligibility),
   `Unsupported expected publication eligibility: ${expectedEligibility}`,
 );
 
@@ -79,10 +83,19 @@ if (expectedEligibility === 'ELIGIBLE_PENDING_OTHER_GATES') {
     eligibility.publicationClass === 'RELEASE_NEUTRAL',
     `Deploy-eligible package must be RELEASE_NEUTRAL, got ${eligibility.publicationClass}`,
   );
-} else {
+} else if (expectedEligibility === 'HOLD_UNRELEASED_CONTRACT') {
   assert(
     eligibility.publicationClass === 'RELEASE_BOUND',
     `Unreleased-contract HOLD must be RELEASE_BOUND, got ${eligibility.publicationClass}`,
+  );
+} else {
+  assert(
+    eligibility.publicationClass === 'UNCLASSIFIED',
+    `Stale-release-snapshot HOLD must be UNCLASSIFIED, got ${eligibility.publicationClass}`,
+  );
+  assert(
+    eligibility.releaseSnapshotStale === true,
+    'Stale-release-snapshot HOLD must bind releaseSnapshotStale=true',
   );
 }
 
@@ -108,7 +121,9 @@ console.log(JSON.stringify({
   status: 'PASS',
   gate: expectedEligibility === 'ELIGIBLE_PENDING_OTHER_GATES'
     ? 'EXACT_PACKAGE_INTEGRITY_AND_ELIGIBILITY_PASS'
-    : 'EXACT_PACKAGE_INTEGRITY_AND_EXPECTED_UNRELEASED_HOLD_PASS',
+    : expectedEligibility === 'HOLD_UNRELEASED_CONTRACT'
+      ? 'EXACT_PACKAGE_INTEGRITY_AND_EXPECTED_UNRELEASED_HOLD_PASS'
+      : 'EXACT_PACKAGE_INTEGRITY_AND_EXPECTED_STALE_AUTHORITY_HOLD_PASS',
   expectedPublicationEligibility: expectedEligibility,
   publicationClass: eligibility.publicationClass,
   productionCrossingEligible: expectedEligibility === 'ELIGIBLE_PENDING_OTHER_GATES',

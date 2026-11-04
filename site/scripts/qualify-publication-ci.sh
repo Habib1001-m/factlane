@@ -229,14 +229,33 @@ negative_eligibility="$tmp_root/NEGATIVE_PUBLICATION_ELIGIBILITY.json"
     --protected-base-commit "$protected_base_commit" \
     --receipt "$negative_eligibility" >/dev/null
 )
-[[ $(node -p "require('$negative_eligibility').publicationClass") == RELEASE_BOUND ]] || {
-  echo 'HOLD: release-bound negative control was not classified RELEASE_BOUND' >&2
-  exit 1
+
+assert_release_bound_negative_control() {
+  local receipt=$1
+  local label=$2
+  local expected_class=RELEASE_BOUND
+  local expected_eligibility=HOLD_UNRELEASED_CONTRACT
+
+  if [[ $(node -p "require('$eligibility').releaseSnapshotStale ? 'YES' : 'NO'") == YES ]]; then
+    expected_class=UNCLASSIFIED
+    expected_eligibility=HOLD_RELEASE_SNAPSHOT_STALE
+  fi
+
+  [[ $(node -p "require('$receipt').publicationClass") == "$expected_class" ]] || {
+    echo "HOLD: $label negative control publication class mismatch" >&2
+    exit 1
+  }
+  [[ $(node -p "require('$receipt').publicationEligibility") == "$expected_eligibility" ]] || {
+    echo "HOLD: $label negative control did not preserve the expected fail-closed publication state" >&2
+    exit 1
+  }
+  [[ $(node -p "require('$receipt').currentProjectionSha256") != $(node -p "require('$eligibility').currentProjectionSha256") ]] || {
+    echo "HOLD: $label negative control did not perturb the public-claim projection" >&2
+    exit 1
+  }
 }
-[[ $(node -p "require('$negative_eligibility').publicationEligibility") == HOLD_UNRELEASED_CONTRACT ]] || {
-  echo 'HOLD: release-bound negative control did not fail closed for publication' >&2
-  exit 1
-}
+
+assert_release_bound_negative_control "$negative_eligibility" 'tested-host release-bound'
 
 cp -a "$build_a" "$negative_llms_build"
 printf '\nFactLane v9.9.9 is now universally supported.\n' >> "$negative_llms_build/llms.txt"
@@ -249,14 +268,7 @@ negative_llms_eligibility="$tmp_root/NEGATIVE_LLMS_PUBLICATION_ELIGIBILITY.json"
     --protected-base-commit "$protected_base_commit" \
     --receipt "$negative_llms_eligibility" >/dev/null
 )
-[[ $(node -p "require('$negative_llms_eligibility').publicationClass") == RELEASE_BOUND ]] || {
-  echo 'HOLD: llms.txt release-bound negative control was not classified RELEASE_BOUND' >&2
-  exit 1
-}
-[[ $(node -p "require('$negative_llms_eligibility').publicationEligibility") == HOLD_UNRELEASED_CONTRACT ]] || {
-  echo 'HOLD: llms.txt release-bound negative control did not fail closed for publication' >&2
-  exit 1
-}
+assert_release_bound_negative_control "$negative_llms_eligibility" 'llms.txt release-bound'
 
 cp -a "$build_a" "$negative_footer_build"
 python - "$negative_footer_build/ar/index.html" <<'PY'
@@ -280,14 +292,7 @@ negative_footer_eligibility="$tmp_root/NEGATIVE_FOOTER_PUBLICATION_ELIGIBILITY.j
     --protected-base-commit "$protected_base_commit" \
     --receipt "$negative_footer_eligibility" >/dev/null
 )
-[[ $(node -p "require('$negative_footer_eligibility').publicationClass") == RELEASE_BOUND ]] || {
-  echo 'HOLD: footer release-bound negative control was not classified RELEASE_BOUND' >&2
-  exit 1
-}
-[[ $(node -p "require('$negative_footer_eligibility').publicationEligibility") == HOLD_UNRELEASED_CONTRACT ]] || {
-  echo 'HOLD: footer release-bound negative control did not fail closed for publication' >&2
-  exit 1
-}
+assert_release_bound_negative_control "$negative_footer_eligibility" 'footer release-bound'
 
 cp -a "$build_a" "$negative_external_href_build"
 python - "$negative_external_href_build/docs/RELEASE_OPERATIONS/index.html" <<'PY'
@@ -311,14 +316,7 @@ negative_external_href_eligibility="$tmp_root/NEGATIVE_EXTERNAL_HREF_PUBLICATION
     --protected-base-commit "$protected_base_commit" \
     --receipt "$negative_external_href_eligibility" >/dev/null
 )
-[[ $(node -p "require('$negative_external_href_eligibility').publicationClass") == RELEASE_BOUND ]] || {
-  echo 'HOLD: external-href release-bound negative control was not classified RELEASE_BOUND' >&2
-  exit 1
-}
-[[ $(node -p "require('$negative_external_href_eligibility').publicationEligibility") == HOLD_UNRELEASED_CONTRACT ]] || {
-  echo 'HOLD: external-href release-bound negative control did not fail closed for publication' >&2
-  exit 1
-}
+assert_release_bound_negative_control "$negative_external_href_eligibility" 'external-href release-bound'
 
 cp -a "$build_a" "$negative_collision_base"
 cp "$clone_a/site/publication/overlays/discovery/1d226189096d15c62deace5c0bb3ade7.txt" "$negative_collision_base/"
@@ -424,6 +422,20 @@ elif [[ "$publication_eligibility" == HOLD_UNRELEASED_CONTRACT ]]; then
   )
   node -e 'const x=require(process.argv[1]); if (x.status!=="PASS" || x.expectedPublicationEligibility!=="HOLD_UNRELEASED_CONTRACT" || x.publicationClass!=="RELEASE_BOUND" || x.productionCrossingEligible!==false || x.productionDeploymentPerformed!==false) process.exit(1)' "$crossing_result" || {
     echo 'HOLD: unreleased-contract crossing receipt did not prove the expected fail-closed state' >&2
+    exit 1
+  }
+elif [[ "$publication_eligibility" == HOLD_RELEASE_SNAPSHOT_STALE ]]; then
+  (
+    cd "$clone_a/site"
+    node scripts/check-publication-crossing.mjs \
+      --package "$package_dir" \
+      --expected-package-contents-sha256 "$expected_package_digest" \
+      --expected-origin "$public_origin" \
+      --expected-project factlane \
+      --expected-publication-eligibility HOLD_RELEASE_SNAPSHOT_STALE > "$crossing_result"
+  )
+  node -e 'const x=require(process.argv[1]); if (x.status!=="PASS" || x.expectedPublicationEligibility!=="HOLD_RELEASE_SNAPSHOT_STALE" || x.publicationClass!=="UNCLASSIFIED" || x.productionCrossingEligible!==false || x.productionDeploymentPerformed!==false) process.exit(1)' "$crossing_result" || {
+    echo 'HOLD: stale-release-snapshot crossing receipt did not prove the expected fail-closed state' >&2
     exit 1
   }
 else

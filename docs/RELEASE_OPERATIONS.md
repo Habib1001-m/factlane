@@ -9,23 +9,23 @@ Platform permissions can technically mutate those objects, so verify identities 
 trusting a name alone. The `main` branch may receive documentation or development changes after
 a release and must not be used as a substitute for a historical release identity.
 
-For the user-facing change summary and upgrade impact of the current release candidate, see the
+For the user-facing change summary and upgrade impact of the current release, see the
 [changelog](CHANGELOG.md). This runbook remains authoritative for exact release identity,
 migration, rollback, installation, and post-install reverification procedures.
 
 ### Development package identity
 
-The latest published production release is `v0.1.4`. The current source/RC line now declares
-`0.1.5` in `pyproject.toml`, but that package version is a **local release-candidate identity** until
-a separate release crossing creates and seals its tag and published artifacts. A local wheel or
-source distribution built from this source must not be represented as an official `v0.1.5` release.
+The latest published Python-package release is `v0.1.6`. The moving `main` branch currently declares
+`0.1.6` in `pyproject.toml`, but a local build from `main` is not automatically the official release
+artifact. The official identity remains the annotated tag, its exact commit/tree, the published
+GitHub Release assets, and the corresponding PyPI bytes recorded below.
 
 Repository CI classifies this boundary with `scripts/check_release_surface.py`. The Development
 classification is intentionally fail-closed for release identity: it records that the source differs
-from the released tag and does not assign publication or Production authority. The source-declared
-`0.1.5` version still does not create a `v0.1.5` tag, release asset identity, deployment, or public
-release authority. A later official release must receive its separately authorized tag and artifact
-digests before this boundary can be reconciled to released truth.
+from the released tag and does not assign publication or Production authority. Reusing a published
+version string on a later `main` commit does not make that later tree part of the historical release.
+A future release must receive its own separately authorized tag and artifact digests before it can be
+treated as released truth.
 
 ## Release identity contract
 
@@ -126,17 +126,20 @@ The published v0.1.4 identity is now sealed and recorded as:
 | Portable Skill `SKILL.md` SHA-256 | `6255ddb8eeea074cd324d1f096d3e043f09a189b46cb3f64c724bb29ecd397a4` |
 | Portable Skill `references/host-bootstrap.md` SHA-256 | `05882a0d6716e32cd23ef452c1683a8aff1294abfcc7950fea771320cd211d4c` |
 
-These are historical release facts. They do not provide any identity or publication authority to
-the current `0.1.5` source/RC.
+These are historical release facts. They do not provide identity or publication authority to any
+later release.
 
-## FactLane 0.1.5 release candidate and v0.1.4 transition
+## FactLane v0.1.5 release and v0.1.4 transition
 
-The current source line declares package `0.1.5`, Public Contract Revision 3, and storage contract
-v3. It remains local RC material: there is no published `v0.1.5` tag, wheel/sdist digest, deployment,
-or Production/publication authority yet. The [0.1.5 changelog entry](CHANGELOG.md) summarizes the
-user-visible changes; this section defines the transition mechanics.
+FactLane v0.1.5 is a sealed historical GitHub release with package version `0.1.5`, Public Contract
+Revision 3, and storage contract v3. Its recorded tag and GitHub Release asset identities are the
+historical evidence and must not be retargeted or replaced to rewrite that history. PyPI publication
+did not complete because PyPI rejected the wheel's direct VCS dependency
+metadata; v0.1.5 is therefore not available as `factlane==0.1.5` from PyPI. The corrective successor
+v0.1.6 fixes only that package-distribution metadata problem. The [0.1.5 changelog entry](CHANGELOG.md)
+summarizes the user-visible feature changes; this section defines the transition mechanics.
 
-The RC keeps the public MCP transport at **stdio only** and the public MCP surface at exactly the same
+The release keeps the public MCP transport at **stdio only** and the public MCP surface at exactly the same
 five tools. Revision 3 extends `memory_update` with direct-Owner `REVOKE`/`REJECT` modes and adds the
 governed Owner control plane around the same stored lifecycle: `OwnerControlService`, the packaged
 `factlane-owner` CLI, and the packaged `factlane-owner-webui` loopback launcher. The launcher prints
@@ -150,14 +153,33 @@ Terminal lifecycle is logical; it does not claim physical erasure. Readmission i
 lifecycle operation for an eligible `REVOKED` memory and is not backup restore or sensitive-Recovery
 resurrection.
 
-`on_change` remains evidence-driven rather than automatically monitored. The RC does not run a
+`on_change` remains evidence-driven rather than automatically monitored. The release does not run a
 background watcher that revalidates a source. An Owner supplies a fresh bounded observation to the
 manual recheck operation; changed, unavailable, indeterminate, stale, or mismatched evidence fails
 closed for review.
 
+The sealed v0.1.5 identity is:
+
+| Item | v0.1.5 identity |
+| --- | --- |
+| Annotated tag | `v0.1.5` |
+| Tag object | `e4275fb33147c3336797bb230312699571a0afe5` |
+| Release commit | `eaa75f8f17961cbaaf94d5d623e5a80083dad56f` |
+| Release tree | `6cc017b508571be0636f6f4b031aa4ca452893c4` |
+| Wheel | `factlane-0.1.5-py3-none-any.whl` |
+| Wheel SHA-256 | `9ff8039125cab109c169dacc62a88aae91cbbe2cd12abb0c2661e72db84c4a79` |
+| Source distribution | `factlane-0.1.5.tar.gz` |
+| Source distribution SHA-256 | `7f997ecb85a519e5c0b44d136a774182f1453d832dda02a795463602d627a0ac` |
+| Python | `>=3.11` |
+| Linked SQLite | `>=3.42.0` |
+| Public Contract Revision | `3` |
+| Storage contract | `3` |
+| Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
+| PyPI | Not published; terminal direct-VCS metadata rejection |
+
 ### Required v2 → v3 storage migration
 
-An existing v0.1.4 storage-v2 database is not silently upgraded by normal v0.1.5 startup. The RC
+An existing v0.1.4 storage-v2 database is not silently upgraded by normal v0.1.5 startup. The runtime
 fails closed with `MIGRATION_REQUIRED` until the trusted migration operator completes the transition.
 Treat this as a **data/schema migration**, not a package-only upgrade. A successful package install
 does not authorize opening storage-v2 data with the normal 0.1.5 runtime.
@@ -209,6 +231,63 @@ promotes it under the maintenance lease, removes stale WAL/SHM sidecars, and ver
 database as v2. Only after that data rollback is proven should an operator consider restarting a
 v0.1.4 runtime. Installing v0.1.4 directly over a storage-v3 database is not a supported downgrade.
 
+## FactLane v0.1.6 corrective package release
+
+FactLane v0.1.6 preserves the v0.1.5 product behavior and storage/public contracts while correcting
+the package dependency metadata that blocked PyPI publication. The direct backend dependency is now
+the exact registry requirement `mcp-memory-service==11.10.0`; the reviewed backend runtime bytes and
+required class/signature compatibility remain fail-closed.
+
+The sealed v0.1.6 identity is:
+
+| Item | v0.1.6 identity |
+| --- | --- |
+| Annotated tag | `v0.1.6` |
+| Tag object | `75cf56de9cb693ca07f9d750fc08ff22e0f70e0d` |
+| Release commit | `e4a71aedaaf4f2e73aeaeaafbdeca60a846d21ad` |
+| Release tree | `4664d232810da749c2267fa56dc1568ab2af1f71` |
+| Wheel | `factlane-0.1.6-py3-none-any.whl` |
+| Wheel SHA-256 | `5cb74af31e6bfe96bc38e0048ea2e8abcde53c5a05470aebbe9ed8305dd46899` |
+| Source distribution | `factlane-0.1.6.tar.gz` |
+| Source distribution SHA-256 | `cb755605126cbc7f2fcc7c4335e020aa9f6da67f0812dcd7622d99e18c53b84b` |
+| Python | `>=3.11` |
+| Linked SQLite | `>=3.42.0` |
+| Public Contract Revision | `3` |
+| Storage contract | `3` |
+| Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
+| PyPI | Published as `factlane==0.1.6` |
+
+### Install v0.1.6 from PyPI
+
+On Python 3.11 or newer, the supported public-index package path is direct and does not require a
+Git dependency checkout:
+
+```bash
+pip install factlane==0.1.6
+```
+
+For an isolated Python 3.11 environment and a dependency/CLI smoke check:
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/python -m pip install "factlane==0.1.6"
+.venv/bin/python -m pip check
+.venv/bin/factlane --help
+```
+
+This path was reverified from the public PyPI index after release: it installs FactLane `0.1.6`,
+resolves `mcp-memory-service==11.10.0`, passes `pip check`, and exposes the packaged CLI. It is a
+package install, not an exact replay of all transitive versions in the repository lockfile. For an
+exact dependency replay, use the v0.1.6 tagged source checkout with `uv sync --frozen` and verify the
+tag/commit/tree above.
+
+The v0.1.6 transition from an already accepted storage-v3/v0.1.5 state is package/runtime-only; it
+does not add a new schema migration. A deployment still on v0.1.4/storage-v2 must complete the v2 →
+v3 migration contract above before using the normal v0.1.6 runtime against that durable database.
+
+The public website is a separate release surface. Publishing v0.1.6 to PyPI did not advance the
+site's Production release identity or authorize a site deployment.
+
 ## Install an exact release
 
 Copy the selected release manifest's exact identity into shell variables before using either
@@ -257,12 +336,12 @@ python3.11 -m venv .venv
 .venv/bin/factlane --help-tools
 ```
 
-The wheel has a pinned Git dependency on `mcp-memory-service`; a fresh online install therefore
-needs access to that pinned GitHub revision unless the dependency is already available through
-an operator-controlled cache or mirror. The wheel records FactLane's direct requirements, but a
-fresh installer may resolve newer compatible **transitive** dependencies than the environment
-captured by the repository lockfile. When exact dependency replay matters, use the tagged source
-checkout with `uv sync --frozen` and its committed `uv.lock`.
+The wheel records FactLane's direct requirements, but the dependency origin is release-specific:
+do not assume that a selected release uses a Git source or a package-index source without checking
+that release's metadata and notes. A fresh installer may also resolve newer compatible
+**transitive** dependencies than the environment captured by the repository lockfile. When exact
+dependency replay matters, use the tagged source checkout with `uv sync --frozen` and its committed
+`uv.lock`.
 
 The source distribution is also a supported clean-install surface after verifying its SHA-256:
 

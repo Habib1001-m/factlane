@@ -31,7 +31,12 @@ The qualification path is intentionally split into four controls:
    out of `<main>`, or changing only an `href`. The baseline hashes are derived at qualification time from
    immutable Git history; they are not editable snapshot values. A recognized release-bound
    Development change may keep the required `test` context green while the receipt records
-   `HOLD_UNRELEASED_CONTRACT`; unknown/stale release authority is also publication HOLD.
+   `HOLD_UNRELEASED_CONTRACT`; unknown/stale release authority is also publication HOLD. When the
+   released-site snapshot is stale because a newer package tag exists without a corresponding site
+   release, CI preserves the stronger `UNCLASSIFIED` / `HOLD_RELEASE_SNAPSHOT_STALE` state instead of
+   relabeling the candidate `RELEASE_BOUND`. Release-bound negative controls must still perturb the
+   public-claim projection, but they inherit that stronger stale-authority HOLD until the site
+   authority is separately reconciled.
 3. `scripts/compose-publication-artifact.mjs` overlays only the manifest-bound hosting/discovery
    inputs under `site/publication/`. Stable host redirects are separated from GSC/Bing/IndexNow
    ownership files. Path collisions, missing files, digest drift, redirect collisions, origin drift,
@@ -62,12 +67,14 @@ consume the frozen archive bytes without rebuilding them.
 It authenticates the exact candidate against the expected package digest supplied by the caller,
 verifies every package member plus the frozen archive and consumer verifier, and requires the exact
 eligibility state named by the caller. The default requires `ELIGIBLE_PENDING_OTHER_GATES`; CI may
-instead require `HOLD_UNRELEASED_CONTRACT` to prove that a release-bound Development artifact is
-intact **and still not Production-crossing eligible**. That expected-HOLD mode reports
-`productionCrossingEligible=false`; it does not turn the HOLD into authorization. The script **does
-not authenticate owner authorization** and never labels its own PASS as authorization. A Production
-crossing still requires a separately authenticated owner approval bound externally to the exact
-accepted package digest, followed by fresh live Cloudflare
+instead require `HOLD_UNRELEASED_CONTRACT` for a release-bound Development artifact or
+`HOLD_RELEASE_SNAPSHOT_STALE` when the released-site authority is stale. Both expected-HOLD modes
+report `productionCrossingEligible=false`; a stale-snapshot HOLD additionally requires
+`publicationClass=UNCLASSIFIED` and `releaseSnapshotStale=true`. Integrity verification of a HOLD
+package does not turn that HOLD into authorization. The script **does not authenticate owner
+authorization** and never labels its own PASS as authorization. A Production crossing still requires
+a separately authenticated owner approval bound externally to the exact accepted package digest,
+followed by fresh live Cloudflare
 project/deployment-state checks before Direct Upload. Production rollback is likewise never
 automatic and requires explicit or pre-approved incident/runbook authority.
 

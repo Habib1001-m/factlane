@@ -9,22 +9,22 @@
 تغييرات في الوثائق أو التطوير بعد الإصدار، ولذلك يجب ألا يُستخدم بديلًا عن هوية إصدار
 تاريخية.
 
-لملخص التغييرات الموجّه للمستخدم وتأثير الترقية في release candidate الحالي، راجع
+لملخص التغييرات الموجّه للمستخدم وتأثير الترقية في الإصدار الحالي، راجع
 [سجل التغييرات](CHANGELOG.md). ويظل هذا الدليل المرجع المعتمد لهوية الإصدار الدقيقة وإجراءات
 الترحيل والتراجع والتثبيت وإعادة التحقق بعد التثبيت.
 
 ### هوية حزمة Development
 
-آخر إصدار إنتاج منشور هو `v0.1.4`. ويعلن خط المصدر/RC الحالي الآن `0.1.5` في `pyproject.toml`،
-لكن رقم الحزمة هذا يمثل **هوية Release Candidate محلية** إلى أن ينشئ عبور إصدار منفصل الـtag
-والartifacts المنشورة ويختمها. ولا يجوز تمثيل wheel أو source distribution محلي مبني من هذا
-المصدر على أنه إصدار `v0.1.5` رسمي.
+آخر Python-package release منشور هو `v0.1.6`. ويعلن فرع `main` المتحرك حاليًا `0.1.6` في
+`pyproject.toml`، لكن build محليًا من `main` ليس تلقائيًا artifact الإصدار الرسمي. تظل الهوية
+الرسمية هي annotated tag وcommit/tree الدقيقان وGitHub Release assets المنشورة وbytes المقابلة
+على PyPI والمسجلة أدناه.
 
 يصنّف CI الخاص بالمستودع هذا الحد بواسطة `scripts/check_release_surface.py`. ويكون تصنيف
 Development مغلقًا عمدًا أمام هوية الإصدار: فهو يسجل أن المصدر يختلف عن الوسم المنشور، ولا
-يعيّن صلاحية نشر أو صلاحية Production. وحتى رقم `0.1.5` المعلن في المصدر لا ينشئ tag باسم
-`v0.1.5` أو هوية release asset أو deployment أو صلاحية إصدار عامة. ويجب أن يحصل أي إصدار رسمي
-لاحق على tag وartifact digests مخولة بصورة منفصلة قبل مواءمة هذا الحد مع الحقيقة المنشورة.
+يعيّن صلاحية نشر أو صلاحية Production. ولا يؤدي إعادة استخدام version string منشور في commit
+لاحق على `main` إلى ضم ذلك الـtree إلى الإصدار التاريخي. ويجب أن يحصل أي إصدار مستقبلي على tag
+وartifact digests مخولة بصورة منفصلة قبل اعتباره حقيقة إصدار منشورة.
 
 ## عقد هوية الإصدار
 
@@ -118,16 +118,18 @@ Windows x64 القياسية، وإرشادات bootstrap للـSkill، وضوا
 | Portable Skill `SKILL.md` SHA-256 | `6255ddb8eeea074cd324d1f096d3e043f09a189b46cb3f64c724bb29ecd397a4` |
 | Portable Skill `references/host-bootstrap.md` SHA-256 | `05882a0d6716e32cd23ef452c1683a8aff1294abfcc7950fea771320cd211d4c` |
 
-هذه حقائق إصدار تاريخية. ولا تمنح أي هوية أو صلاحية نشر لخط المصدر/RC الحالي `0.1.5`.
+هذه حقائق إصدار تاريخية. ولا تمنح أي هوية أو صلاحية نشر لأي إصدار لاحق.
 
-## FactLane 0.1.5 release candidate والانتقال من v0.1.4
+## إصدار FactLane v0.1.5 والانتقال من v0.1.4
 
-يعلن خط المصدر الحالي package `0.1.5` وPublic Contract Revision 3 وعقد التخزين v3. ويظل مادة RC
-محلية: لا توجد بعد علامة `v0.1.5` منشورة أو بصمة wheel/sdist أو deployment أو صلاحية
-Production/publication. تلخّص [فقرة 0.1.5 في سجل التغييرات](CHANGELOG.md) التغييرات الظاهرة
-للمستخدم؛ ويحدد هذا القسم آليات الانتقال.
+FactLane v0.1.5 هو GitHub release تاريخي مختوم مع package version `0.1.5` وPublic Contract
+Revision 3 وstorage contract v3. وتظل هويات tag وGitHub Release assets المسجلة الخاصة به دليلًا
+تاريخيًا، ولا يجوز retarget أو استبدالها لإعادة كتابة ذلك التاريخ. لكن نشر PyPI لم يكتمل لأن PyPI رفض direct VCS dependency metadata في wheel؛ ولذلك لا يتوفر
+v0.1.5 باسم `factlane==0.1.5` من PyPI. يصلح successor v0.1.6 مشكلة package-distribution metadata
+فقط. تلخص [فقرة 0.1.5 في سجل التغييرات](CHANGELOG.md) التغييرات الظاهرة للمستخدم، ويحدد هذا القسم
+آليات الانتقال.
 
-يحافظ الـRC على نقل MCP العام عبر **stdio فقط** وعلى سطح MCP العام عند الأدوات الخمس نفسها بالضبط.
+يحافظ الإصدار على نقل MCP العام عبر **stdio فقط** وعلى سطح MCP العام عند الأدوات الخمس نفسها بالضبط.
 ويوسع Revision 3 أداة `memory_update` بوضعي `REVOKE`/`REJECT` بصلاحية Owner مباشرة، ويضيف سطح
 تحكم Owner المحكوم حول دورة الحياة المخزنة نفسها: `OwnerControlService` وCLI المرفق
 `factlane-owner` وlauncher المرفق `factlane-owner-webui` عبر loopback. يطبع launcher الـorigin
@@ -140,13 +142,32 @@ Production/publication. تلخّص [فقرة 0.1.5 في سجل التغييرا�
 دورة الحياة النهائية منطقية ولا تدعي المحو المادي. والـreadmission عملية دورة حياة متحققة لذاكرة
 مؤهلة في `REVOKED`، وليست استعادة backup ولا إحياءً بعد sensitive-Recovery.
 
-ويظل `on_change` معتمدًا على الدليل بدل المراقبة الآلية. لا يشغّل الـRC watcher في الخلفية يعيد
+ويظل `on_change` معتمدًا على الدليل بدل المراقبة الآلية. لا يشغّل الإصدار watcher في الخلفية يعيد
 التحقق من المصدر. يقدم Owner ملاحظة حديثة ومحدودة لعملية إعادة الفحص اليدوية؛ والدليل changed أو
 unavailable أو indeterminate أو stale أو mismatched يفشل مغلقًا للمراجعة.
 
+هوية v0.1.5 المختومة هي:
+
+| العنصر | هوية v0.1.5 |
+| --- | --- |
+| Annotated tag | `v0.1.5` |
+| Tag object | `e4275fb33147c3336797bb230312699571a0afe5` |
+| Release commit | `eaa75f8f17961cbaaf94d5d623e5a80083dad56f` |
+| Release tree | `6cc017b508571be0636f6f4b031aa4ca452893c4` |
+| Wheel | `factlane-0.1.5-py3-none-any.whl` |
+| Wheel SHA-256 | `9ff8039125cab109c169dacc62a88aae91cbbe2cd12abb0c2661e72db84c4a79` |
+| Source distribution | `factlane-0.1.5.tar.gz` |
+| Source distribution SHA-256 | `7f997ecb85a519e5c0b44d136a774182f1453d832dda02a795463602d627a0ac` |
+| Python | `>=3.11` |
+| Linked SQLite | `>=3.42.0` |
+| Public Contract Revision | `3` |
+| Storage contract | `3` |
+| Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
+| PyPI | غير منشور؛ رفض terminal لـdirect-VCS metadata |
+
 ### ترحيل التخزين المطلوب من v2 إلى v3
 
-لا يرحّل بدء v0.1.5 العادي قاعدة v0.1.4/storage-v2 بصمت. يفشل الـRC مغلقًا مع
+لا يرحّل بدء v0.1.5 العادي قاعدة v0.1.4/storage-v2 بصمت. يفشل runtime مغلقًا مع
 `MIGRATION_REQUIRED` حتى يكمل مشغّل الترحيل الموثوق الانتقال. تعامل مع ذلك باعتباره **ترحيل
 بيانات/schema** لا ترقية حزمة فقط. نجاح تثبيت الحزمة لا يصرّح بفتح بيانات storage-v2 بواسطة
 runtime 0.1.5 العادي. أوقف FactLane أو ضعه في quiescence،
@@ -194,6 +215,60 @@ uv run factlane-migrate-storage-v3 restore \
 تحت maintenance lease، ويزيل WAL/SHM sidecars القديمة، ثم يتحقق من قاعدة البيانات المستعادة كـv2.
 ولا ينبغي للمشغّل التفكير في إعادة تشغيل v0.1.4 إلا بعد إثبات rollback للبيانات. تثبيت v0.1.4
 مباشرة فوق قاعدة storage-v3 ليس downgrade مدعومًا.
+
+## إصدار FactLane v0.1.6 التصحيحي للحزمة
+
+يحافظ FactLane v0.1.6 على سلوك المنتج وعقود storage/public في v0.1.5، مع تصحيح package dependency
+metadata التي منعت نشر PyPI. أصبح اعتماد backend المباشر هو registry requirement الدقيق
+`mcp-memory-service==11.10.0`؛ وتظل bytes الخاصة بوقت التشغيل التي تمت مراجعتها وتوافق
+class/signature المطلوب مربوطين بسياسة fail-closed.
+
+هوية v0.1.6 المختومة هي:
+
+| العنصر | هوية v0.1.6 |
+| --- | --- |
+| Annotated tag | `v0.1.6` |
+| Tag object | `75cf56de9cb693ca07f9d750fc08ff22e0f70e0d` |
+| Release commit | `e4a71aedaaf4f2e73aeaeaafbdeca60a846d21ad` |
+| Release tree | `4664d232810da749c2267fa56dc1568ab2af1f71` |
+| Wheel | `factlane-0.1.6-py3-none-any.whl` |
+| Wheel SHA-256 | `5cb74af31e6bfe96bc38e0048ea2e8abcde53c5a05470aebbe9ed8305dd46899` |
+| Source distribution | `factlane-0.1.6.tar.gz` |
+| Source distribution SHA-256 | `cb755605126cbc7f2fcc7c4335e020aa9f6da67f0812dcd7622d99e18c53b84b` |
+| Python | `>=3.11` |
+| Linked SQLite | `>=3.42.0` |
+| Public Contract Revision | `3` |
+| Storage contract | `3` |
+| Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
+| PyPI | منشور باسم `factlane==0.1.6` |
+
+### تثبيت v0.1.6 من PyPI
+
+على Python 3.11 أو أحدث، مسار package index العام المدعوم مباشر ولا يحتاج Git dependency checkout:
+
+```bash
+pip install factlane==0.1.6
+```
+
+ولبيئة Python 3.11 معزولة وفحص للاعتمادات والـCLI:
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/python -m pip install "factlane==0.1.6"
+.venv/bin/python -m pip check
+.venv/bin/factlane --help
+```
+
+أُعيد التحقق من هذا المسار من public PyPI index بعد الإصدار: يثبت FactLane `0.1.6` ويحل
+`mcp-memory-service==11.10.0` ويمرر `pip check` ويكشف CLI المرفق. وهو package install وليس إعادة
+تشغيل دقيقة لكل transitive version في repository lockfile. لإعادة تشغيل الاعتمادات بدقة، استخدم
+tagged source checkout لـv0.1.6 مع `uv sync --frozen` وتحقق من tag/commit/tree أعلاه.
+
+الانتقال إلى v0.1.6 من حالة storage-v3/v0.1.5 المقبولة هو package/runtime-only؛ ولا يضيف schema
+migration جديدة. أما deployment الذي ما زال على v0.1.4/storage-v2 فيجب أن يكمل عقد الترحيل v2 →
+v3 أعلاه قبل استخدام runtime v0.1.6 العادي مع قاعدة البيانات الدائمة تلك.
+
+الموقع العام سطح إصدار منفصل. نشر v0.1.6 إلى PyPI لم يرفع هوية Production للموقع ولم يصرح بنشره.
 
 ## تثبيت إصدار دقيق
 
@@ -243,12 +318,11 @@ python3.11 -m venv .venv
 .venv/bin/factlane --help-tools
 ```
 
-تحتوي wheel على اعتماد Git مثبت على `mcp-memory-service`؛ ولذلك يحتاج التثبيت الجديد
-عبر الإنترنت إلى الوصول إلى مراجعة GitHub المثبتة تلك ما لم يكن الاعتماد متاحًا بالفعل
-عبر cache أو mirror يتحكم فيه المشغّل. تسجل wheel متطلبات FactLane المباشرة، لكن قد
-يحل مثبت جديد إصدارات أحدث متوافقة من الاعتمادات **transitive** مقارنة بالبيئة التي
-يلتقطها lockfile في المستودع. عندما تكون إعادة تشغيل الاعتمادات بدقة مهمة، استخدم
-source checkout الموسوم مع `uv sync --frozen` وملف `uv.lock` المحفوظ معه.
+تسجل wheel متطلبات FactLane المباشرة، لكن مصدر الاعتماد خاص بكل release: لا تفترض أن الإصدار
+المحدد يستخدم Git source أو package-index source من دون مراجعة metadata وملاحظات ذلك الإصدار.
+وقد يحل مثبت جديد إصدارات أحدث متوافقة من الاعتمادات **transitive** مقارنة بالبيئة التي يلتقطها
+lockfile في المستودع. عندما تكون إعادة تشغيل الاعتمادات بدقة مهمة، استخدم source checkout الموسوم
+مع `uv sync --frozen` وملف `uv.lock` المحفوظ معه.
 
 يُعد source distribution أيضًا سطح clean-install مدعومًا بعد التحقق من SHA-256 الخاص به:
 
