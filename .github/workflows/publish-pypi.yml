@@ -38,8 +38,20 @@ jobs:
       UV_VERSION: 0.11.26
       PYPI_UPLOAD_URL: https://upload.pypi.org/legacy/
       PYPI_CHECK_URL: https://pypi.org/simple/
+      PYPI_VERIFY_TIMEOUT_SECONDS: 600
+      PYPI_VERIFY_POLL_SECONDS: 10
+      PYPI_VERIFY_REQUEST_TIMEOUT_SECONDS: 15
 
     steps:
+      - name: Checkout exact workflow source for post-write verifier
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/verify_pypi_publication.py
+          sparse-checkout-cone-mode: false
+
       - name: Guard dispatch context and forbid credential fallback
         shell: bash
         run: |
@@ -344,6 +356,7 @@ jobs:
           [[ "${version_status}" == "404" ]]
 
       - name: Publish exact wheel and sdist to real PyPI with trusted publishing only
+        id: pypi_publish
         shell: bash
         run: |
           set -euo pipefail
@@ -357,41 +370,43 @@ jobs:
             "release-assets/${WHEEL}" \
             "release-assets/${SDIST}"
 
-      - name: Verify exact PyPI filenames and SHA-256 digests
+      - name: Verify exact PyPI metadata and published bytes
+        id: pypi_verify
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          import time
-          import urllib.error
-          import urllib.request
+          if ! python3 scripts/verify_pypi_publication.py \
+            --project "${PROJECT}" \
+            --version "${VERSION}" \
+            --wheel-name "${WHEEL}" \
+            --wheel-sha256 "${WHEEL_SHA256}" \
+            --wheel-size "${WHEEL_SIZE}" \
+            --sdist-name "${SDIST}" \
+            --sdist-sha256 "${SDIST_SHA256}" \
+            --sdist-size "${SDIST_SIZE}" \
+            --timeout-seconds "${PYPI_VERIFY_TIMEOUT_SECONDS}" \
+            --poll-interval-seconds "${PYPI_VERIFY_POLL_SECONDS}" \
+            --request-timeout-seconds "${PYPI_VERIFY_REQUEST_TIMEOUT_SECONDS}" \
+            --receipt state/pypi-post-write-verification.json; then
+            echo '::error::PUBLICATION_OUTCOME_REQUIRES_EXTERNAL_RECONCILIATION — DO NOT AUTO-RETRY'
+            exit 1
+          fi
 
-          url = f'https://pypi.org/pypi/{os.environ["PROJECT"]}/{os.environ["VERSION"]}/json'
-          data = None
-          for _ in range(12):
-              try:
-                  with urllib.request.urlopen(url, timeout=15) as response:
-                      if response.status == 200:
-                          data = json.load(response)
-                          break
-              except urllib.error.HTTPError as exc:
-                  if exc.code != 404:
-                      raise
-              time.sleep(5)
-
-          assert data is not None, "PyPI version did not become readable"
-          assert data["info"]["name"].lower() == os.environ["PROJECT"]
-          assert data["info"]["version"] == os.environ["VERSION"]
-
-          expected = {
-              os.environ["WHEEL"]: (os.environ["WHEEL_SHA256"], "bdist_wheel"),
-              os.environ["SDIST"]: (os.environ["SDIST_SHA256"], "sdist"),
-          }
-          actual = {entry["filename"]: entry for entry in data["urls"]}
-          assert set(actual) == set(expected)
-          for filename, (digest, package_type) in expected.items():
-              assert actual[filename]["digests"]["sha256"] == digest
-              assert actual[filename]["packagetype"] == package_type
-          PY
+      - name: Record post-write publication verification outcome
+        if: ${{ always() && steps.pypi_publish.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '### FactLane PyPI post-write verification'
+            echo '```json'
+            if [[ -f state/pypi-post-write-verification.json ]]; then
+              cat state/pypi-post-write-verification.json
+            else
+              printf '%s\n' '{"status":"HOLD","classification":"PUBLICATION_OUTCOME_REQUIRES_EXTERNAL_RECONCILIATION","doNotAutoRetry":true,"reason":"post-write verification receipt missing"}'
+            fi
+            echo '```'
+            if [[ "${{ steps.pypi_verify.outcome }}" != 'success' ]]; then
+              echo '**PUBLICATION_OUTCOME_REQUIRES_EXTERNAL_RECONCILIATION — DO NOT AUTO-RETRY**'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
