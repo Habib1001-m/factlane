@@ -8,6 +8,7 @@ import os
 import socket
 import stat
 import struct
+import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
@@ -15,6 +16,19 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
+
+from .windows_security import (
+    WindowsSecurityError,
+    current_user_sid,
+    ensure_owner_private_directory as ensure_windows_owner_private_directory,
+    owner_only_security_attributes,
+    process_identity as windows_process_identity,
+    protect_owner_private_path,
+    require_process_identity,
+    validate_local_named_pipe_name,
+    validate_owner_only_kernel_object,
+    validate_owner_private_path,
+)
 
 
 PROTOCOL_VERSION = 1
@@ -52,6 +66,7 @@ _IDENTITY_KEYS = frozenset(
         "lifecycle_state",
     }
 )
+_WINDOWS_RUNTIME_PIPE_PREFIX = "factlane-runtime-"
 
 
 class RuntimeControlError(RuntimeError):
@@ -98,6 +113,12 @@ def _positive_int(value: object, field: str) -> int:
 
 
 def _ensure_owner_private_directory(path: Path) -> None:
+    if os.name == "nt":
+        try:
+            ensure_windows_owner_private_directory(path, owner_sid=current_user_sid())
+        except WindowsSecurityError as exc:
+            raise RuntimeControlError("PRIVATE_STATE_UNAVAILABLE", exc.safe_message) from exc
+        return
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         os.chmod(path, 0o700)
@@ -116,8 +137,13 @@ def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if os.name == "nt":
+                protect_owner_private_path(temporary, owner_sid=current_user_sid(), directory=False)
             os.replace(temporary, path)
-            os.chmod(path, 0o600)
+            if os.name == "nt":
+                protect_owner_private_path(path, owner_sid=current_user_sid(), directory=False)
+            else:
+                os.chmod(path, 0o600)
         finally:
             if temporary.exists():
                 temporary.unlink()
@@ -147,6 +173,31 @@ def process_start_ticks(pid: int) -> int | None:
         return int(fields[19])
     except (IndexError, ValueError) as exc:
         raise RuntimeControlError("PROCESS_IDENTITY_UNAVAILABLE", "process start identity is malformed") from exc
+
+
+def windows_runtime_pipe_name(instance_id: str) -> str:
+    canonical = _canonical_uuid(instance_id, "instance_id")
+    return rf"\\.\pipe\{_WINDOWS_RUNTIME_PIPE_PREFIX}{uuid.UUID(canonical).hex}"
+
+
+def _is_windows_runtime_pipe(value: str) -> bool:
+    return isinstance(value, str) and value.casefold().startswith(r"\\.\pipe\factlane-runtime-".casefold())
+
+
+def _canonical_control_endpoint(value: object, instance_id: str) -> str:
+    endpoint = _bounded_text(value, "control_socket_path", maximum=4096)
+    if os.name == "nt" and _is_windows_runtime_pipe(endpoint):
+        expected = windows_runtime_pipe_name(instance_id)
+        if endpoint.casefold() != expected.casefold():
+            raise RuntimeControlError(
+                "PATH_IDENTITY_MISMATCH",
+                "runtime-control Named Pipe does not match the registered instance identity",
+            )
+        try:
+            return validate_local_named_pipe_name(endpoint, prefix=_WINDOWS_RUNTIME_PIPE_PREFIX)
+        except WindowsSecurityError as exc:
+            raise RuntimeControlError("PATH_IDENTITY_MISMATCH", exc.safe_message) from exc
+    return os.path.abspath(endpoint)
 
 
 @dataclass(frozen=True)
@@ -230,7 +281,7 @@ class RuntimeIdentity:
     def __post_init__(self) -> None:
         if self.protocol_version != PROTOCOL_VERSION:
             raise RuntimeControlError("UNSUPPORTED_PROTOCOL", "runtime registration protocol version is unsupported")
-        _canonical_uuid(self.instance_id, "instance_id")
+        instance_id = _canonical_uuid(self.instance_id, "instance_id")
         _nonnegative_int(self.owner_uid, "owner_uid")
         _positive_int(self.pid, "pid")
         _nonnegative_int(self.process_start_ticks, "process_start_ticks")
@@ -242,16 +293,17 @@ class RuntimeIdentity:
             raise RuntimeControlError("INVALID_RUNTIME_STATE", "runtime lifecycle state is unsupported")
         if self.database_path != os.path.realpath(os.path.abspath(self.database_path)):
             raise RuntimeControlError("PATH_IDENTITY_MISMATCH", "database path must be canonical")
-        if self.control_socket_path != os.path.abspath(self.control_socket_path):
-            raise RuntimeControlError("PATH_IDENTITY_MISMATCH", "control socket path must be absolute")
+        if _canonical_control_endpoint(self.control_socket_path, instance_id) != self.control_socket_path:
+            raise RuntimeControlError("PATH_IDENTITY_MISMATCH", "control endpoint must use canonical identity")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "RuntimeIdentity":
         if set(value) != _IDENTITY_KEYS:
             raise RuntimeControlError("INVALID_REGISTRATION", "runtime registration has unexpected fields")
+        instance_id = _canonical_uuid(value["instance_id"], "instance_id")
         return cls(
             protocol_version=_positive_int(value["protocol_version"], "protocol_version"),
-            instance_id=_canonical_uuid(value["instance_id"], "instance_id"),
+            instance_id=instance_id,
             owner_uid=_nonnegative_int(value["owner_uid"], "owner_uid"),
             pid=_positive_int(value["pid"], "pid"),
             process_start_ticks=_nonnegative_int(value["process_start_ticks"], "process_start_ticks"),
@@ -260,7 +312,7 @@ class RuntimeIdentity:
             device=_nonnegative_int(value["device"], "device"),
             inode=_nonnegative_int(value["inode"], "inode"),
             generation=_nonnegative_int(value["generation"], "generation"),
-            control_socket_path=os.path.abspath(_bounded_text(value["control_socket_path"], "control_socket_path", maximum=4096)),
+            control_socket_path=_canonical_control_endpoint(value["control_socket_path"], instance_id),
             lifecycle_state=_bounded_text(value["lifecycle_state"], "lifecycle_state", maximum=64),
         )
 
@@ -308,12 +360,14 @@ class RuntimeRegistry:
         owner_uid: int | None = None,
         boot_id_provider: Callable[[], str] = current_boot_id,
         process_start_provider: Callable[[int], int | None] = process_start_ticks,
+        endpoint_validator: Callable[[RuntimeIdentity], None] | None = None,
     ) -> None:
         self.runtime_root = Path(runtime_root).absolute()
         self.registry_root = self.runtime_root / "registry"
         self.owner_uid = os.getuid() if owner_uid is None else owner_uid
         self._boot_id_provider = boot_id_provider
         self._process_start_provider = process_start_provider
+        self._endpoint_validator = endpoint_validator
         _ensure_owner_private_directory(self.runtime_root)
         _ensure_owner_private_directory(self.registry_root)
 
@@ -322,6 +376,14 @@ class RuntimeRegistry:
         return self.registry_root / f"{canonical}.json"
 
     def _validate_socket_location(self, identity: RuntimeIdentity) -> None:
+        if os.name == "nt" and _is_windows_runtime_pipe(identity.control_socket_path):
+            expected = windows_runtime_pipe_name(identity.instance_id)
+            if identity.control_socket_path.casefold() != expected.casefold():
+                raise RuntimeControlError(
+                    "PATH_IDENTITY_MISMATCH",
+                    "runtime-control Named Pipe does not match the registered instance identity",
+                )
+            return
         root = os.path.realpath(str(self.runtime_root))
         socket_parent = os.path.realpath(os.path.dirname(identity.control_socket_path))
         try:
@@ -331,10 +393,16 @@ class RuntimeRegistry:
         if common != root:
             raise RuntimeControlError("PATH_IDENTITY_MISMATCH", "control socket is outside the private runtime directory")
 
+    def _validate_control_endpoint(self, identity: RuntimeIdentity) -> None:
+        if self._endpoint_validator is not None:
+            self._endpoint_validator(identity)
+            return
+        self._validate_socket_location(identity)
+
     def register(self, identity: RuntimeIdentity) -> RuntimeIdentity:
         if identity.owner_uid != self.owner_uid:
             raise RuntimeControlError("OWNER_UID_MISMATCH", "runtime registration Owner UID does not match this registry")
-        self._validate_socket_location(identity)
+        self._validate_control_endpoint(identity)
         _atomic_json(self._path(identity.instance_id), identity.to_mapping())
         return identity
 
@@ -343,6 +411,8 @@ class RuntimeRegistry:
     def load(self, instance_id: str) -> RuntimeIdentity:
         path = self._path(instance_id)
         try:
+            if os.name == "nt" and path.exists():
+                validate_owner_private_path(path, owner_sid=current_user_sid(), directory=False)
             raw = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
             raise RuntimeControlError("REGISTRATION_NOT_FOUND", "runtime registration was not found") from exc
@@ -382,7 +452,7 @@ class RuntimeRegistry:
         observed_start = self._process_start_provider(identity.pid)
         if observed_start is None or observed_start != identity.process_start_ticks:
             raise RuntimeControlError("STALE_PROCESS_IDENTITY", "runtime registration PID/start identity is stale")
-        self._validate_socket_location(identity)
+        self._validate_control_endpoint(identity)
         return identity
 
     def remove_stale(self, instance_id: str, *, exclusion_released: bool) -> None:
@@ -981,3 +1051,351 @@ class RuntimeControlClient:
                 await writer.wait_closed()
             except OSError:
                 pass
+
+
+def _windows_pipe_modules() -> tuple[Any, Any, Any]:
+    if os.name != "nt":
+        raise RuntimeControlError("CONTROL_SOCKET_UNAVAILABLE", "Windows Named Pipes are unavailable on this platform")
+    try:
+        import pywintypes
+        import win32file
+        import win32pipe
+    except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+        raise RuntimeControlError(
+            "CONTROL_SOCKET_UNAVAILABLE",
+            "pywin32 Named Pipe primitives are unavailable",
+        ) from exc
+    return pywintypes, win32file, win32pipe
+
+
+def _windows_close_handle(handle: Any) -> None:
+    close = getattr(handle, "Close", None)
+    if callable(close):
+        close()
+
+
+def _windows_read_line(handle: Any, *, deadline: float) -> bytes:
+    pywintypes, win32file, _win32pipe = _windows_pipe_modules()
+    data = bytearray()
+    while len(data) <= MAX_CONTROL_MESSAGE_BYTES:
+        try:
+            _result, chunk = win32file.ReadFile(handle, min(1024, MAX_CONTROL_MESSAGE_BYTES + 1 - len(data)))
+        except pywintypes.error as exc:
+            if getattr(exc, "winerror", None) in {232, 536}:
+                if time.monotonic() >= deadline:
+                    raise RuntimeControlError(
+                        "CONTROL_SOCKET_UNAVAILABLE",
+                        "runtime-control Named Pipe response timed out",
+                    ) from exc
+                time.sleep(0.01)
+                continue
+            raise RuntimeControlError("CONTROL_RESPONSE_MISSING", "runtime-control peer closed without a response") from exc
+        except Exception as exc:
+            raise RuntimeControlError("CONTROL_RESPONSE_MISSING", "runtime-control peer closed without a response") from exc
+        if not chunk:
+            break
+        data.extend(chunk)
+        newline = data.find(b"\n")
+        if newline >= 0:
+            return bytes(data[: newline + 1])
+    if len(data) > MAX_CONTROL_MESSAGE_BYTES:
+        raise RuntimeControlError("CONTROL_MESSAGE_TOO_LARGE", "runtime-control message exceeds 8 KiB")
+    if not data:
+        raise RuntimeControlError("CONTROL_RESPONSE_MISSING", "runtime-control peer closed without a response")
+    return bytes(data)
+
+
+class WindowsRuntimeControlServer:
+    """Owner-only Windows Named Pipe runtime-control server using the existing NDJSON protocol."""
+
+    def __init__(
+        self,
+        *,
+        identity: RuntimeIdentity,
+        registry: RuntimeRegistry,
+        controller: RuntimeLifecycleController,
+        owner_sid: str | None = None,
+    ) -> None:
+        if not _is_windows_runtime_pipe(identity.control_socket_path):
+            raise RuntimeControlError(
+                "PATH_IDENTITY_MISMATCH",
+                "Windows runtime-control requires an exact local Named Pipe endpoint",
+            )
+        self.identity = identity
+        self.registry = registry
+        self.controller = controller
+        self.owner_sid = current_user_sid() if owner_sid is None else owner_sid
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._shutdown = threading.Event()
+        self._ready = threading.Event()
+        self._startup_error: BaseException | None = None
+
+    def _validate_server_process(self) -> None:
+        try:
+            current = windows_process_identity(os.getpid())
+        except WindowsSecurityError as exc:
+            raise RuntimeControlError("PEER_IDENTITY_UNAVAILABLE", exc.safe_message) from exc
+        if current.sid.casefold() != self.owner_sid.casefold():
+            raise RuntimeControlError("OWNER_UID_MISMATCH", "runtime-control server process is not owned by the Windows Owner")
+        if current.pid != self.identity.pid or current.creation_time_us != self.identity.process_start_ticks:
+            raise RuntimeControlError(
+                "STALE_PROCESS_IDENTITY",
+                "runtime-control server process identity does not match the registration",
+            )
+
+    def _create_pipe(self) -> Any:
+        _pywintypes, win32file, win32pipe = _windows_pipe_modules()
+        security = owner_only_security_attributes(self.owner_sid)
+        open_mode = win32pipe.PIPE_ACCESS_DUPLEX | getattr(win32file, "FILE_FLAG_FIRST_PIPE_INSTANCE", 0x00080000)
+        pipe_mode = (
+            win32pipe.PIPE_TYPE_BYTE
+            | win32pipe.PIPE_READMODE_BYTE
+            | win32pipe.PIPE_WAIT
+            | getattr(win32pipe, "PIPE_REJECT_REMOTE_CLIENTS", 0x00000008)
+        )
+        try:
+            handle = win32pipe.CreateNamedPipe(
+                self.identity.control_socket_path,
+                open_mode,
+                pipe_mode,
+                1,
+                MAX_CONTROL_MESSAGE_BYTES + 1,
+                MAX_CONTROL_MESSAGE_BYTES + 1,
+                10_000,
+                security,
+            )
+            validate_owner_only_kernel_object(handle, self.owner_sid)
+            return handle
+        except WindowsSecurityError as exc:
+            raise RuntimeControlError("CONTROL_SOCKET_UNAVAILABLE", exc.safe_message) from exc
+        except Exception as exc:
+            raise RuntimeControlError(
+                "CONTROL_SOCKET_UNAVAILABLE",
+                "runtime-control Named Pipe could not be created exclusively",
+            ) from exc
+
+    async def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._validate_server_process()
+        self._loop = asyncio.get_running_loop()
+        self._shutdown.clear()
+        self._ready.clear()
+        self._startup_error = None
+        thread = threading.Thread(
+            target=self._serve,
+            name="factlane-runtime-control-pipe",
+            daemon=False,
+        )
+        self._thread = thread
+        thread.start()
+        ready = await asyncio.to_thread(self._ready.wait, 5.0)
+        if not ready:
+            await self.close()
+            raise RuntimeControlError("CONTROL_SOCKET_UNAVAILABLE", "runtime-control Named Pipe did not become ready")
+        if self._startup_error is not None:
+            error = self._startup_error
+            await self.close()
+            if isinstance(error, RuntimeControlError):
+                raise error
+            raise RuntimeControlError("CONTROL_SOCKET_UNAVAILABLE", "runtime-control Named Pipe failed to start") from error
+
+    def _serve(self) -> None:
+        pywintypes, _win32file, win32pipe = _windows_pipe_modules()
+        error_pipe_connected = getattr(pywintypes, "ERROR_PIPE_CONNECTED", 535)
+        handle: Any | None = None
+        try:
+            handle = self._create_pipe()
+            self._ready.set()
+            while not self._shutdown.is_set():
+                try:
+                    win32pipe.SetNamedPipeHandleState(
+                        handle,
+                        win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
+                        None,
+                        None,
+                    )
+                    try:
+                        win32pipe.ConnectNamedPipe(handle, None)
+                    except pywintypes.error as exc:
+                        if getattr(exc, "winerror", None) != error_pipe_connected:
+                            if self._shutdown.is_set():
+                                return
+                            raise
+                    if self._shutdown.is_set():
+                        return
+                    win32pipe.SetNamedPipeHandleState(
+                        handle,
+                        win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_NOWAIT,
+                        None,
+                        None,
+                    )
+                    self._handle_pipe(handle, win32pipe)
+                finally:
+                    try:
+                        win32pipe.DisconnectNamedPipe(handle)
+                    except Exception:
+                        pass
+        except BaseException as exc:
+            if not self._ready.is_set():
+                self._startup_error = exc
+                self._ready.set()
+            elif not self._shutdown.is_set():
+                self._startup_error = exc
+        finally:
+            if handle is not None:
+                try:
+                    win32pipe.DisconnectNamedPipe(handle)
+                except Exception:
+                    pass
+                _windows_close_handle(handle)
+
+    def _handle_pipe(self, handle: Any, win32pipe: Any) -> None:
+        try:
+            validate_owner_only_kernel_object(handle, self.owner_sid)
+            peer_pid = int(win32pipe.GetNamedPipeClientProcessId(handle))
+            require_process_identity(peer_pid, owner_sid=self.owner_sid)
+            raw = _windows_read_line(handle, deadline=time.monotonic() + 10.0)
+            request = decode_request(raw)
+            loop = self._loop
+            if loop is None:
+                raise RuntimeControlError("CONTROL_SOCKET_UNAVAILABLE", "runtime-control event loop is unavailable")
+            future = asyncio.run_coroutine_threadsafe(self.controller.handle(request), loop)
+            response = future.result()
+            _pywintypes, win32file, _win32pipe = _windows_pipe_modules()
+            try:
+                win32file.WriteFile(handle, _encode_mapping(response))
+                win32file.FlushFileBuffers(handle)
+            except Exception:
+                # A peer can disappear after an authenticated request but before
+                # consuming the response.  That is a per-connection failure;
+                # it must not tear down the persistent first pipe instance.
+                return
+        except (RuntimeControlError, WindowsSecurityError):
+            # Invalid unauthenticated/unparseable requests have no trustworthy
+            # correlation identifiers; fail closed without reflecting payloads.
+            return
+
+    async def close(self) -> None:
+        thread = self._thread
+        self._thread = None
+        self._shutdown.set()
+        if thread is None:
+            return
+        await asyncio.to_thread(self._wake)
+        await asyncio.to_thread(thread.join, 5.0)
+        if thread.is_alive():
+            raise RuntimeControlError("CONTROL_SOCKET_UNAVAILABLE", "runtime-control Named Pipe did not stop")
+
+    def _wake(self) -> None:
+        try:
+            _pywintypes, win32file, win32pipe = _windows_pipe_modules()
+            win32pipe.WaitNamedPipe(self.identity.control_socket_path, 200)
+            handle = win32file.CreateFile(
+                self.identity.control_socket_path,
+                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                0,
+                None,
+                win32file.OPEN_EXISTING,
+                0,
+                None,
+            )
+        except Exception:
+            return
+        _windows_close_handle(handle)
+
+
+class WindowsRuntimeControlClient:
+    """Coordinator-side Windows Named Pipe client authenticating the registered runtime process."""
+
+    def __init__(self, registry: RuntimeRegistry, *, owner_sid: str | None = None, timeout_seconds: float = 10.0) -> None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+            or timeout_seconds > 10.0
+        ):
+            raise ValueError("timeout_seconds must be greater than zero and at most 10 seconds")
+        self.registry = registry
+        self.owner_sid = current_user_sid() if owner_sid is None else owner_sid
+        self.timeout_seconds = float(timeout_seconds)
+
+    async def call(self, identity: RuntimeIdentity, request: RuntimeControlRequest) -> dict[str, object]:
+        self.registry.validate_live(identity)
+        if request.instance_id != identity.instance_id:
+            raise RuntimeControlError("INSTANCE_MISMATCH", "runtime-control request targets another instance")
+        return await asyncio.to_thread(self._call_blocking, identity, request)
+
+    def _open_pipe(self, pywintypes: Any, win32file: Any, win32pipe: Any, pipe_name: str) -> Any:
+        deadline = time.monotonic() + self.timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeControlError(
+                    "CONTROL_SOCKET_UNAVAILABLE",
+                    "registered runtime-control Named Pipe did not become available before timeout",
+                )
+            try:
+                win32pipe.WaitNamedPipe(pipe_name, max(1, int(remaining * 1000)))
+                return win32file.CreateFile(
+                    pipe_name,
+                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                    0,
+                    None,
+                    win32file.OPEN_EXISTING,
+                    0,
+                    None,
+                )
+            except pywintypes.error as exc:
+                if getattr(exc, "winerror", None) not in {2, 231}:
+                    raise
+                time.sleep(min(0.01, max(0.0, remaining)))
+
+    def _call_blocking(self, identity: RuntimeIdentity, request: RuntimeControlRequest) -> dict[str, object]:
+        if not _is_windows_runtime_pipe(identity.control_socket_path):
+            raise RuntimeControlError(
+                "PATH_IDENTITY_MISMATCH",
+                "Windows runtime-control requires an exact local Named Pipe endpoint",
+            )
+        pywintypes, win32file, win32pipe = _windows_pipe_modules()
+        handle: Any | None = None
+        try:
+            handle = self._open_pipe(pywintypes, win32file, win32pipe, identity.control_socket_path)
+            try:
+                validate_owner_only_kernel_object(handle, self.owner_sid)
+                server_pid = int(win32pipe.GetNamedPipeServerProcessId(handle))
+                if server_pid != identity.pid:
+                    raise RuntimeControlError(
+                        "PEER_PROCESS_MISMATCH",
+                        "runtime-control Named Pipe is owned by another process",
+                    )
+                require_process_identity(
+                    server_pid,
+                    owner_sid=self.owner_sid,
+                    creation_time_us=identity.process_start_ticks,
+                )
+            except WindowsSecurityError as exc:
+                code = "PEER_UID_MISMATCH" if exc.code == "WINDOWS_PROCESS_SID_MISMATCH" else "PEER_IDENTITY_UNAVAILABLE"
+                if exc.code == "WINDOWS_PROCESS_IDENTITY_MISMATCH":
+                    code = "STALE_PROCESS_IDENTITY"
+                raise RuntimeControlError(code, exc.safe_message) from exc
+            win32pipe.SetNamedPipeHandleState(
+                handle,
+                win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_NOWAIT,
+                None,
+                None,
+            )
+            win32file.WriteFile(handle, request.to_bytes())
+            raw = _windows_read_line(handle, deadline=time.monotonic() + self.timeout_seconds)
+            return decode_response(raw, request)
+        except RuntimeControlError:
+            raise
+        except Exception as exc:
+            raise RuntimeControlError(
+                "CONTROL_SOCKET_UNAVAILABLE",
+                "registered runtime-control Named Pipe is unavailable",
+            ) from exc
+        finally:
+            if handle is not None:
+                _windows_close_handle(handle)

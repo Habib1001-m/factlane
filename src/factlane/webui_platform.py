@@ -19,6 +19,14 @@ from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import quote, urlsplit
 
 from .owner_auth import PendingEnrollment
+from .windows_security import (
+    WindowsProcessIdentity,
+    WindowsSecurityError,
+    current_user_sid,
+    require_process_identity,
+    validate_local_named_pipe_name,
+    validate_owner_only_kernel_object,
+)
 from .webui_install import (
     EndpointState,
     InstallEnvironment,
@@ -768,6 +776,213 @@ class NativeLauncherClient:
             chunks.append(chunk)
             remaining -= len(chunk)
         return b"".join(chunks)
+
+
+class WindowsNativeLauncherClient(NativeLauncherClient):
+    """Owner launcher/control client over an authenticated local Windows Named Pipe."""
+
+    def __init__(
+        self,
+        pipe_name: str,
+        *,
+        expected_server: WindowsProcessIdentity,
+        owner_sid: str | None = None,
+        timeout_seconds: float = _CONTROL_TIMEOUT_SECONDS,
+    ) -> None:
+        if not isinstance(expected_server, WindowsProcessIdentity):
+            raise TypeError("expected_server must be a WindowsProcessIdentity")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+            or timeout_seconds > _CONTROL_TIMEOUT_SECONDS
+        ):
+            raise ValueError("timeout_seconds must be greater than zero and at most 10 seconds")
+        self.pipe_name = validate_local_named_pipe_name(pipe_name, prefix="factlane-owner-")
+        self.owner_sid = current_user_sid() if owner_sid is None else owner_sid
+        self.expected_server = expected_server
+        self.timeout_seconds = float(timeout_seconds)
+        if self.expected_server.sid.casefold() != self.owner_sid.casefold():
+            raise WebUIPlatformError(
+                "CONTROL_PEER_IDENTITY_DENIED",
+                "expected native-control server belongs to a different Windows user",
+            )
+        if current_user_sid().casefold() != self.owner_sid.casefold():
+            raise WebUIPlatformError(
+                "CONTROL_OWNER_IDENTITY_DENIED",
+                "native-control client is not running as the configured Windows Owner",
+            )
+
+    @staticmethod
+    def _windows_pipe_modules() -> tuple[Any, Any, Any]:
+        if os.name != "nt":
+            raise WebUIPlatformError(
+                "CONTROL_UNAVAILABLE",
+                "Windows native-control Named Pipes are unavailable on this platform",
+            )
+        try:
+            import pywintypes
+            import win32file
+            import win32pipe
+        except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+            raise WebUIPlatformError(
+                "CONTROL_UNAVAILABLE",
+                "pywin32 Named Pipe primitives are unavailable",
+            ) from exc
+        return pywintypes, win32file, win32pipe
+
+    @classmethod
+    def _read_pipe_exact(cls, handle: Any, length: int, *, deadline: float) -> bytes:
+        pywintypes, win32file, _win32pipe = cls._windows_pipe_modules()
+        chunks: list[bytes] = []
+        remaining = length
+        while remaining:
+            try:
+                _result, chunk = win32file.ReadFile(handle, remaining)
+            except pywintypes.error as exc:
+                if getattr(exc, "winerror", None) in {232, 536}:
+                    if time.monotonic() >= deadline:
+                        raise WebUIPlatformError(
+                            "CONTROL_UNAVAILABLE",
+                            "native control response timed out",
+                        ) from exc
+                    time.sleep(0.01)
+                    continue
+                raise WebUIPlatformError(
+                    "CONTROL_RESPONSE_INCOMPLETE",
+                    "native control response ended early",
+                ) from exc
+            except Exception as exc:
+                raise WebUIPlatformError(
+                    "CONTROL_RESPONSE_INCOMPLETE",
+                    "native control response ended early",
+                ) from exc
+            if not chunk:
+                raise WebUIPlatformError(
+                    "CONTROL_RESPONSE_INCOMPLETE",
+                    "native control response ended early",
+                )
+            chunks.append(bytes(chunk))
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _validate_connected_server(self, handle: Any, win32pipe: Any) -> None:
+        try:
+            validate_owner_only_kernel_object(handle, self.owner_sid)
+        except WindowsSecurityError as exc:
+            raise WebUIPlatformError(
+                "CONTROL_SOCKET_UNSAFE",
+                "native WebUI Named Pipe is not owner-private",
+            ) from exc
+        try:
+            server_pid = int(win32pipe.GetNamedPipeServerProcessId(handle))
+            if server_pid != self.expected_server.pid:
+                raise WebUIPlatformError(
+                    "CONTROL_ENDPOINT_REPLACED",
+                    "native WebUI control endpoint is owned by an unexpected process",
+                )
+            require_process_identity(
+                server_pid,
+                owner_sid=self.owner_sid,
+                creation_time_us=self.expected_server.creation_time_us,
+            )
+        except WebUIPlatformError:
+            raise
+        except WindowsSecurityError as exc:
+            code = (
+                "CONTROL_PEER_IDENTITY_DENIED"
+                if exc.code == "WINDOWS_PROCESS_SID_MISMATCH"
+                else "CONTROL_ENDPOINT_REPLACED"
+                if exc.code == "WINDOWS_PROCESS_IDENTITY_MISMATCH"
+                else "CONTROL_PEER_IDENTITY_UNAVAILABLE"
+            )
+            raise WebUIPlatformError(code, "native WebUI control peer identity could not be verified") from exc
+        except Exception as exc:
+            raise WebUIPlatformError(
+                "CONTROL_PEER_IDENTITY_UNAVAILABLE",
+                "native WebUI control peer identity could not be verified",
+            ) from exc
+
+    def _open_pipe(self, pywintypes: Any, win32file: Any, win32pipe: Any) -> Any:
+        deadline = time.monotonic() + self.timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WebUIPlatformError(
+                    "CONTROL_UNAVAILABLE",
+                    "native WebUI control Named Pipe did not become available before timeout",
+                )
+            try:
+                win32pipe.WaitNamedPipe(self.pipe_name, max(1, int(remaining * 1000)))
+                return win32file.CreateFile(
+                    self.pipe_name,
+                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                    0,
+                    None,
+                    win32file.OPEN_EXISTING,
+                    0,
+                    None,
+                )
+            except pywintypes.error as exc:
+                if getattr(exc, "winerror", None) not in {2, 231}:
+                    raise
+                time.sleep(min(0.01, max(0.0, remaining)))
+
+    def _exchange(
+        self,
+        request: dict[str, Any],
+        *,
+        response_timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        raw = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if not raw or len(raw) > _CONTROL_MAX_FRAME_BYTES:
+            raise WebUIPlatformError("CONTROL_REQUEST_INVALID", "native control request is too large")
+        _pywintypes, win32file, win32pipe = self._windows_pipe_modules()
+        handle: Any | None = None
+        try:
+            handle = self._open_pipe(_pywintypes, win32file, win32pipe)
+            self._validate_connected_server(handle, win32pipe)
+            win32pipe.SetNamedPipeHandleState(
+                handle,
+                win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_NOWAIT,
+                None,
+                None,
+            )
+            win32file.WriteFile(handle, struct.pack("!I", len(raw)) + raw)
+            response_timeout = self.timeout_seconds if response_timeout_seconds is None else float(response_timeout_seconds)
+            deadline = time.monotonic() + response_timeout
+            length = struct.unpack("!I", self._read_pipe_exact(handle, 4, deadline=deadline))[0]
+            if length == 0 or length > _CONTROL_MAX_FRAME_BYTES:
+                raise WebUIPlatformError(
+                    "CONTROL_RESPONSE_INVALID",
+                    "native control response frame is invalid",
+                )
+            payload = self._read_pipe_exact(handle, length, deadline=deadline)
+        except WebUIPlatformError:
+            raise
+        except Exception as exc:
+            raise WebUIPlatformError(
+                "CONTROL_UNAVAILABLE",
+                "native WebUI control Named Pipe is unavailable",
+            ) from exc
+        finally:
+            if handle is not None:
+                close = getattr(handle, "Close", None)
+                if callable(close):
+                    close()
+        try:
+            decoded = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WebUIPlatformError(
+                "CONTROL_RESPONSE_INVALID",
+                "native control response is not valid JSON",
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise WebUIPlatformError(
+                "CONTROL_RESPONSE_INVALID",
+                "native control response must be a JSON object",
+            )
+        return decoded
 
 
 class ProductionWebUIController:
