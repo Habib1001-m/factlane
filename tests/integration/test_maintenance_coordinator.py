@@ -9,6 +9,12 @@ from pathlib import Path
 
 import pytest
 
+if os.name == "nt":
+    pytest.skip(
+        "maintenance coordinator qualification requires POSIX fcntl/flock",
+        allow_module_level=True,
+    )
+
 import factlane.maintenance_coordinator as maintenance_coordinator_module
 from factlane.maintenance_coordinator import (
     MaintenanceBarrierStore,

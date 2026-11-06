@@ -3,12 +3,20 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import stat
+import sys
 import time
 import uuid
 from pathlib import Path
 
 import pytest
+
+if sys.platform != "linux" or not hasattr(socket, "SO_PEERCRED"):
+    pytest.skip(
+        "runtime-control maintenance transport qualification requires Linux AF_UNIX peer credentials",
+        allow_module_level=True,
+    )
 
 from factlane.maintenance_coordinator import MaintenanceBarrierStore, MaintenanceCoordinatorError
 from factlane.runtime_control import (

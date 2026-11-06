@@ -8,9 +8,16 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import sys
 import uuid
 
 import pytest
+
+if sys.platform != "linux":
+    pytest.skip(
+        "managed Owner WebUI database-service qualification is Linux-only",
+        allow_module_level=True,
+    )
 
 from factlane.contract import AdapterError
 from factlane.owner_database import LOGICAL_IMPORT_MAX_BYTES, ArtifactRegistry, create_consistent_backup

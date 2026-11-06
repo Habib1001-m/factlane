@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+if os.name == "nt":
+    pytest.skip(
+        "full Owner restore qualification requires POSIX maintenance and recovery locking",
+        allow_module_level=True,
+    )
 
 import factlane.owner_restore as owner_restore_module
 from factlane.contract import AdapterError

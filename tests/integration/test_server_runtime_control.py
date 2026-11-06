@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -12,6 +13,12 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 import pytest
+
+if sys.platform != "linux":
+    pytest.skip(
+        "managed server runtime-control integration qualification is Linux-only",
+        allow_module_level=True,
+    )
 
 from factlane.adapter import trusted_write_context_for_profile
 from factlane.contract import AdapterError

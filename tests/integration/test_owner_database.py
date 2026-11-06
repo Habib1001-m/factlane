@@ -10,6 +10,11 @@ import uuid
 
 import pytest
 
+_POSIX_OWNER_ARTIFACTS = pytest.mark.skipif(
+    os.name == "nt",
+    reason="Owner artifact registry/backup qualification requires POSIX owner/private-file semantics",
+)
+
 import factlane.owner_database as owner_database_module
 from factlane.contract import AdapterError
 from factlane.owner_database import (
@@ -79,6 +84,7 @@ def _logical_bytes(records: list[dict[str, object]]) -> bytes:
     )
 
 
+@_POSIX_OWNER_ARTIFACTS
 def test_consistent_backup_captures_committed_wal_and_registers_private_receipt(tmp_path: Path) -> None:
     source = tmp_path / "active.db"
     artifacts = tmp_path / "artifacts"
@@ -125,6 +131,7 @@ def test_consistent_backup_captures_committed_wal_and_registers_private_receipt(
         conn.close()
 
 
+@_POSIX_OWNER_ARTIFACTS
 def test_registered_artifact_listing_metadata_and_exact_preview_delete_are_path_free(tmp_path: Path) -> None:
     registry = ArtifactRegistry(tmp_path / "artifacts")
     first = registry.managed_path("one.sqlite3")
@@ -165,6 +172,7 @@ def test_registered_artifact_listing_metadata_and_exact_preview_delete_are_path_
     assert [item["artifact_id"] for item in registry.list_metadata()] == ["two"]
 
 
+@_POSIX_OWNER_ARTIFACTS
 def test_registered_artifact_delete_preview_detects_file_or_receipt_drift(tmp_path: Path) -> None:
     registry = ArtifactRegistry(tmp_path / "artifacts")
     artifact = registry.managed_path("one.sqlite3")
@@ -179,6 +187,7 @@ def test_registered_artifact_delete_preview_detects_file_or_receipt_drift(tmp_pa
     assert artifact.exists()
 
 
+@_POSIX_OWNER_ARTIFACTS
 def test_registered_logical_export_is_owner_private_and_scope_validated(tmp_path: Path) -> None:
     registry = ArtifactRegistry(tmp_path / "artifacts")
     records = [
@@ -226,6 +235,7 @@ def test_registered_logical_export_is_owner_private_and_scope_validated(tmp_path
     assert not registry.managed_path("export-logical-invalid.json").exists()
 
 
+@_POSIX_OWNER_ARTIFACTS
 def test_verify_registered_backup_reopens_read_only_and_reports_current_integrity(tmp_path: Path) -> None:
     source = tmp_path / "active.db"
     conn = sqlite3.connect(source)
@@ -257,6 +267,7 @@ def test_verify_registered_backup_reopens_read_only_and_reports_current_integrit
         verify_registered_backup(registry, "not-backup")
 
 
+@_POSIX_OWNER_ARTIFACTS
 def test_restore_upload_promotion_preserves_identity_reverifies_and_is_idempotent(tmp_path: Path) -> None:
     registry = ArtifactRegistry(tmp_path / "artifacts")
     artifact = registry.managed_path("restore-upload.sqlite3")
@@ -294,6 +305,7 @@ def test_restore_upload_promotion_preserves_identity_reverifies_and_is_idempoten
     assert registry.promote_restore_upload("restore-one") == promoted
 
 
+@_POSIX_OWNER_ARTIFACTS
 def test_restore_upload_promotion_revalidates_exact_current_receipt_after_fresh_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -323,6 +335,7 @@ def test_restore_upload_promotion_revalidates_exact_current_receipt_after_fresh_
     assert registry._load()["restore-race"]["kind"] == "RESTORE_UPLOAD"
 
 
+@_POSIX_OWNER_ARTIFACTS
 def test_shared_registry_serializes_concurrent_restore_promotion(tmp_path: Path) -> None:
     registry = ArtifactRegistry(tmp_path / "artifacts")
     artifact = registry.managed_path("restore-upload.sqlite3")
@@ -343,6 +356,7 @@ def test_shared_registry_serializes_concurrent_restore_promotion(tmp_path: Path)
     assert results[0]["sha256"] == uploaded["sha256"]
 
 
+@_POSIX_OWNER_ARTIFACTS
 def test_artifact_deletion_accepts_registered_identity_only_and_never_browser_paths(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     root.mkdir(mode=0o700)
@@ -364,6 +378,7 @@ def test_artifact_deletion_accepts_registered_identity_only_and_never_browser_pa
     assert sentinel.read_bytes() == b"keep"
 
 
+@_POSIX_OWNER_ARTIFACTS
 def test_registered_artifact_symlink_replacement_is_rejected_without_following_target(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     root.mkdir(mode=0o700)
@@ -381,6 +396,7 @@ def test_registered_artifact_symlink_replacement_is_rejected_without_following_t
     assert sentinel.read_bytes() == b"keep"
 
 
+@_POSIX_OWNER_ARTIFACTS
 def test_failed_backup_never_publishes_or_leaves_a_staged_artifact(tmp_path: Path) -> None:
     source = tmp_path / "broken.db"
     source.write_bytes(b"not-a-sqlite-database")

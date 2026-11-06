@@ -12,6 +12,12 @@ from typing import Any
 
 import pytest
 
+if os.name == "nt":
+    pytest.skip(
+        "permanent Owner purge qualification requires POSIX sensitive-recovery maintenance",
+        allow_module_level=True,
+    )
+
 from factlane.adapter import MemoryAdapter, _establish_embedding_compatibility, trusted_write_context_for_profile
 from factlane.contract import ScopeContext
 from factlane.embeddings import EmbeddingProfile

@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import json
 import socket
+import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+
+_LINUX_OWNER_PRIVATE_WRITE = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="production managed-WebUI owner-private file writes are Linux-only",
+)
 
 from factlane.webui_service import ServiceSnapshot, ServiceStatus
 
@@ -684,6 +690,7 @@ def test_apply_propagates_typed_privileged_and_browser_trust_incomplete_results(
     assert all(op.kind != "WRITE_SERVICE_CONFIG" for op, _plan in incomplete.operations)
 
 
+@_LINUX_OWNER_PRIVATE_WRITE
 def test_production_backend_owner_private_write_is_atomic_regular_0600_under_0700_parent(
     tmp_path: Path,
 ) -> None:
@@ -755,6 +762,7 @@ def test_production_backend_rejects_symlink_directory_component(tmp_path: Path) 
     assert not (real_parent / "webui.json").exists()
 
 
+@_LINUX_OWNER_PRIVATE_WRITE
 def test_user_unit_write_preserves_unrelated_sibling_units(tmp_path: Path) -> None:
     backend = ProductionLinuxInstallerBackend(
         systemctl_path="/usr/bin/systemctl",

@@ -3,8 +3,15 @@ from __future__ import annotations
 import json
 import stat
 from pathlib import Path
+import sys
 
 import pytest
+
+if sys.platform != "linux":
+    pytest.skip(
+        "managed Owner WebUI service-state qualification is Linux-only",
+        allow_module_level=True,
+    )
 
 from factlane.webui_service import (
     EndpointUnavailable,

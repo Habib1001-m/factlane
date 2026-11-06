@@ -3,8 +3,15 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
 
 import pytest
+
+if sys.platform != "linux":
+    pytest.skip(
+        "managed Owner WebUI runtime qualification is Linux-only",
+        allow_module_level=True,
+    )
 
 from factlane.webui_runtime import (
     BackendMode,
