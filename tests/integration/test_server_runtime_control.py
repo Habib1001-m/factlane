@@ -7,9 +7,11 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+import pytest
 
 from factlane.adapter import trusted_write_context_for_profile
 from factlane.contract import AdapterError
@@ -20,6 +22,7 @@ from factlane.server import (
     _AdapterLaunchConfig,
     _BoundFastMCP,
     _build_runtime_session,
+    _default_lease_probe,
     build_mcp_server,
 )
 
@@ -43,6 +46,20 @@ class _FakeAdapter:
 
     async def close(self) -> None:
         self.closed = True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX runtime lease safety regression")
+def test_default_lease_probe_requires_runtime_maintenance_lease_on_posix() -> None:
+    adapter = SimpleNamespace(
+        engine=SimpleNamespace(
+            _closed=False,
+            _maintenance_lease_handle=None,
+            conn=object(),
+            storage=object(),
+        )
+    )
+
+    assert _default_lease_probe(adapter) is False
 
 
 def _request(identity, *, command: str, operation_id: str, generation: int, drain_deadline: float | None = None):

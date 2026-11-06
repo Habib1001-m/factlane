@@ -66,7 +66,11 @@ def _default_lease_probe(adapter: Any) -> bool:
     if bool(getattr(engine, "_closed", False)):
         return False
     if hasattr(engine, "_maintenance_lease_handle"):
-        return getattr(engine, "_maintenance_lease_handle") is not None
+        if getattr(engine, "_maintenance_lease_handle") is not None:
+            return True
+        if os.name != "nt":
+            return False
+        return getattr(engine, "conn", None) is not None and getattr(engine, "storage", None) is not None
     return getattr(engine, "conn", None) is not None or getattr(engine, "storage", None) is not None
 
 
