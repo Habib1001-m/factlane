@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Callable, Mapping, Protocol, TextIO
 
@@ -23,9 +24,16 @@ from .webui_platform import (
 )
 
 
-_WEBUI_ACTIONS = frozenset(
-    {"setup", "serve", "open", "start", "stop", "status", "restart"}
+_WEBUI_ACTION_HELP = (
+    ("setup", "Plan and apply the managed local WebUI installation."),
+    ("serve", "Run the configured managed WebUI runtime."),
+    ("open", "Open the managed WebUI through the trusted local platform flow."),
+    ("start", "Start the managed WebUI service."),
+    ("stop", "Stop the managed WebUI service."),
+    ("status", "Report the managed WebUI service status."),
+    ("restart", "Restart the managed WebUI service."),
 )
+_WEBUI_ACTIONS = frozenset(action for action, _description in _WEBUI_ACTION_HELP)
 _SERVICE_ACTIONS = frozenset({"serve", "open", "start", "stop", "status", "restart"})
 
 
@@ -71,11 +79,21 @@ def main(
     """Dispatch the bounded WebUI CLI surface and preserve every legacy MCP argv."""
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    stream = sys.stdout if output is None else output
+    if raw_argv == ["--help"]:
+        _write_webui_discovery(stream)
+        with redirect_stdout(stream):
+            return server.main(raw_argv)
+
+    help_action = _webui_help_action(raw_argv)
+    if help_action is not None:
+        _write_webui_command_help(stream, help_action)
+        return 0
+
     command = parse_webui_command(raw_argv)
     if command is None:
         return server.main(raw_argv)
 
-    stream = sys.stdout if output is None else output
     if command.action == "setup":
         return _dispatch_setup(
             setup_config_provider=setup_config_provider,
@@ -87,6 +105,36 @@ def main(
         service_controller=service_controller,
         output=stream,
     )
+
+
+def _webui_help_action(argv: list[str]) -> str | None:
+    if (
+        len(argv) == 3
+        and argv[1] == "webui"
+        and argv[2] == "--help"
+        and argv[0] in _WEBUI_ACTIONS
+    ):
+        return argv[0]
+    return None
+
+
+def _write_webui_discovery(output: TextIO) -> None:
+    output.write("Managed WebUI commands:\n")
+    for action, description in _WEBUI_ACTION_HELP:
+        output.write(f"  factlane {action} webui  {description}\n")
+    output.write(
+        "  Run `factlane <action> webui --help` for managed command help.\n\n"
+        "Legacy stdio MCP server options:\n"
+    )
+    output.flush()
+
+
+def _write_webui_command_help(output: TextIO, action: str) -> None:
+    descriptions = dict(_WEBUI_ACTION_HELP)
+    output.write(f"usage: factlane {action} webui\n\n")
+    output.write(f"Managed WebUI command: {descriptions[action]}\n")
+    output.write("Execution form accepts no additional command-line options.\n")
+    output.flush()
 
 
 def _dispatch_setup(

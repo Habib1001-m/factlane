@@ -71,8 +71,10 @@ def _setup_configuration() -> cli.SetupConfiguration:
         ["--help-tools"],
         ["setup"],
         ["setup", "webui", "--apply"],
+        ["setup", "webui", "-h"],
         ["setup", "other"],
         ["serve", "webui", "--config", "/tmp/webui.json"],
+        ["status", "webui", "--verbose"],
         ["unknown", "webui"],
         ["webui", "status"],
     ],
@@ -108,6 +110,66 @@ def test_only_exact_supported_webui_pairs_are_recognized(action: str) -> None:
     assert cli.parse_webui_command([action, "webui", "extra"]) is None
     assert cli.parse_webui_command([action.upper(), "webui"]) is None
     assert cli.parse_webui_command([action, "WEBUI"]) is None
+
+
+def test_top_level_help_exposes_managed_webui_and_preserves_legacy_help(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def legacy(received: list[str] | None = None) -> int:
+        assert received is not None
+        calls.append(received)
+        print("legacy stdio help: --db DB --host-id HOST_ID --help-tools")
+        return 0
+
+    monkeypatch.setattr(cli.server, "main", legacy)
+    output = io.StringIO()
+
+    result = cli.main(["--help"], output=output)
+
+    rendered = output.getvalue()
+    assert result == 0
+    assert calls == [["--help"]]
+    for action in ("setup", "serve", "open", "start", "stop", "status", "restart"):
+        assert f"factlane {action} webui" in rendered
+    assert "--db DB" in rendered
+    assert "--host-id HOST_ID" in rendered
+    assert "--help-tools" in rendered
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["setup", "serve", "open", "start", "stop", "status", "restart"],
+)
+def test_managed_webui_help_is_exact_and_has_no_execution_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    def legacy(_received: list[str] | None = None) -> int:
+        pytest.fail("managed WebUI --help must not enter the legacy parser")
+
+    def setup_provider() -> cli.SetupConfiguration | None:
+        pytest.fail("managed WebUI --help must not compose setup configuration")
+
+    class Controller:
+        def dispatch(self, _requested: str) -> dict[str, object]:
+            pytest.fail("managed WebUI --help must not dispatch service control")
+
+    monkeypatch.setattr(cli.server, "main", legacy)
+    output = io.StringIO()
+
+    result = cli.main(
+        [action, "webui", "--help"],
+        setup_config_provider=setup_provider,
+        service_controller=Controller(),
+        output=output,
+    )
+
+    rendered = output.getvalue()
+    assert result == 0
+    assert f"usage: factlane {action} webui" in rendered
+    assert "Managed WebUI command" in rendered
 
 
 def test_setup_webui_calls_pure_planner_and_emits_structured_plan(
