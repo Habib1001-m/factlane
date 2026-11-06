@@ -7,6 +7,7 @@ import inspect
 import json
 import socket
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -14,6 +15,12 @@ from dataclasses import dataclass
 from http.cookies import SimpleCookie
 
 import pytest
+
+if sys.platform != "linux":
+    pytest.skip(
+        "managed Owner WebUI HTTP transport qualification is Linux-only",
+        allow_module_level=True,
+    )
 
 import factlane.owner_http as owner_http_module
 from factlane.owner_auth import NativeConfirmationRequest, OwnerAuthState

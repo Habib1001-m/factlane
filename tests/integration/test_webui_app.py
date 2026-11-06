@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import hashlib
 import http.client
 import json
@@ -9,6 +8,7 @@ import os
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -17,6 +17,14 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import pytest
+
+if sys.platform != "linux" or not hasattr(socket, "SO_PEERCRED"):
+    pytest.skip(
+        "managed Owner WebUI backend qualification requires Linux/POSIX service primitives",
+        allow_module_level=True,
+    )
+
+import fcntl
 
 from factlane.adapter import MemoryAdapter
 from factlane.contract import AdapterError, ScopeContext

@@ -4,12 +4,19 @@ import json
 import os
 import socket
 import struct
+import sys
 import threading
 from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
+
+if sys.platform != "linux":
+    pytest.skip(
+        "managed Owner WebUI production-platform qualification is Linux-only",
+        allow_module_level=True,
+    )
 
 import factlane.webui_app as webui_app
 from factlane.owner_auth import NativeConfirmationRequest, OwnerAuthState, PendingEnrollment

@@ -5,10 +5,17 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 
 import pytest
+
+if sys.platform != "linux" or not hasattr(socket, "SO_PEERCRED"):
+    pytest.skip(
+        "managed Owner native-control qualification requires Linux AF_UNIX peer credentials",
+        allow_module_level=True,
+    )
 
 from factlane.owner_auth import NativeConfirmationRequest, OwnerAuthState, PendingEnrollment
 from factlane.owner_native_control import (

@@ -23,6 +23,12 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 import pytest
 
+if sys.platform != "linux" or not hasattr(socket, "SO_PEERCRED"):
+    pytest.skip(
+        "real runtime-control maintenance qualification requires Linux AF_UNIX peer credentials",
+        allow_module_level=True,
+    )
+
 from factlane.adapter import MemoryAdapter
 from factlane.maintenance_coordinator import (
     MaintenanceBarrierStore,
@@ -37,11 +43,6 @@ from factlane.webui_app import create_owner_runtime_backend
 from factlane.webui_runtime import BackendLaunchSpec, BackendMode
 from factlane.webui_service import WebUIServiceState
 
-
-pytestmark = pytest.mark.skipif(
-    sys.platform != "linux" or not hasattr(socket, "SO_PEERCRED"),
-    reason="real runtime-control maintenance qualification requires Linux AF_UNIX peer credentials",
-)
 
 _MODEL_DIGEST = "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f"
 _TIMEOUT = 20.0
