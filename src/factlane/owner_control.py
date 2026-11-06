@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import os
 import shutil
@@ -92,10 +94,126 @@ _EVENT_SELECT = (
 )
 
 
+class OwnerAdapterMaintenanceGate:
+    """Same-loop request gate for the reopenable Owner adapter.
+
+    New Owner-service requests fail closed once maintenance begins. Requests that
+    were already admitted are allowed to finish, including re-entrant calls made by
+    the same asyncio task through another Owner service. The maintenance participant
+    waits for that admitted set to drain before closing the adapter.
+    """
+
+    RUNNING = "RUNNING"
+    DRAINING = "DRAINING"
+    CLOSED = "CLOSED"
+    REOPENING = "REOPENING"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+
+    def __init__(self) -> None:
+        self._state = self.RUNNING
+        self._active: dict[asyncio.Task[Any], int] = {}
+        self._condition = asyncio.Condition()
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    async def enter(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Owner adapter requests require an asyncio task")
+        async with self._condition:
+            depth = self._active.get(task)
+            if depth is not None:
+                self._active[task] = depth + 1
+                return
+            if self._state != self.RUNNING:
+                raise AdapterError(
+                    "BACKEND_UNAVAILABLE",
+                    "Owner adapter is unavailable while governed maintenance is active",
+                )
+            self._active[task] = 1
+
+    async def exit(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Owner adapter requests require an asyncio task")
+        async with self._condition:
+            depth = self._active.get(task)
+            if depth is None:
+                raise RuntimeError("Owner adapter request gate exit without entry")
+            if depth > 1:
+                self._active[task] = depth - 1
+                return
+            del self._active[task]
+            self._condition.notify_all()
+
+    async def begin_maintenance(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Owner adapter maintenance requires an asyncio task")
+        async with self._condition:
+            if task in self._active:
+                raise AdapterError(
+                    "BACKEND_UNAVAILABLE",
+                    "Owner adapter maintenance cannot begin from an admitted Owner adapter request",
+                )
+            if self._state != self.RUNNING:
+                raise AdapterError(
+                    "BACKEND_UNAVAILABLE",
+                    "Owner adapter maintenance is already active",
+                )
+            self._state = self.DRAINING
+            await self._condition.wait_for(lambda: not self._active)
+
+    def mark_closed(self) -> None:
+        if self._state != self.DRAINING:
+            raise RuntimeError("Owner adapter can close only after request drain")
+        self._state = self.CLOSED
+
+    def cancel_drain(self) -> None:
+        if self._state != self.DRAINING:
+            raise RuntimeError("Owner adapter drain can be cancelled only while draining")
+        self._state = self.RUNNING
+
+    def mark_reopening(self) -> None:
+        if self._state not in {self.CLOSED, self.RECOVERY_REQUIRED}:
+            raise RuntimeError("Owner adapter can reopen only from a closed maintenance state")
+        self._state = self.REOPENING
+
+    def mark_running(self) -> None:
+        if self._state != self.REOPENING:
+            raise RuntimeError("Owner adapter can return to RUNNING only after reopen")
+        self._state = self.RUNNING
+
+    def mark_recovery_required(self) -> None:
+        self._state = self.RECOVERY_REQUIRED
+
+
+def owner_adapter_request(method):
+    """Guard one public Owner-service coroutine with the shared maintenance gate."""
+
+    @functools.wraps(method)
+    async def guarded(self, *args, **kwargs):
+        gate = self._maintenance_gate
+        await gate.enter()
+        try:
+            return await method(self, *args, **kwargs)
+        finally:
+            await gate.exit()
+
+    return guarded
+
+
 class OwnerControlService:
     """Owner-local semantic surface over the governed FactLane core."""
 
-    def __init__(self, adapter: MemoryAdapter) -> None:
+    def __init__(
+        self,
+        adapter: MemoryAdapter,
+        *,
+        maintenance_gate: OwnerAdapterMaintenanceGate | None = None,
+    ) -> None:
         if not isinstance(adapter, MemoryAdapter):
             raise AdapterError("WRITE_AUTHORIZATION_DENIED", "OwnerControlService requires a governed MemoryAdapter")
         context = getattr(adapter, "_trusted_write_context", None)
@@ -111,6 +229,24 @@ class OwnerControlService:
         self._adapter = adapter
         self._engine = adapter.engine
         self._owner_context = context
+        self._maintenance_gate = maintenance_gate or OwnerAdapterMaintenanceGate()
+
+    def _rebind_adapter(self, adapter: MemoryAdapter) -> None:
+        if not isinstance(adapter, MemoryAdapter):
+            raise AdapterError("WRITE_AUTHORIZATION_DENIED", "OwnerControlService requires a governed MemoryAdapter")
+        context = getattr(adapter, "_trusted_write_context", None)
+        if context is not self._owner_context:
+            raise AdapterError(
+                "WRITE_AUTHORIZATION_DENIED",
+                "reopened Owner adapter must preserve the exact trusted Owner context",
+            )
+        if self._maintenance_gate.state != OwnerAdapterMaintenanceGate.REOPENING:
+            raise AdapterError(
+                "BACKEND_UNAVAILABLE",
+                "Owner adapter rebinding is allowed only during governed reopen",
+            )
+        self._adapter = adapter
+        self._engine = adapter.engine
 
     @staticmethod
     def _scope(
@@ -214,6 +350,7 @@ class OwnerControlService:
             }
         return seeds
 
+    @owner_adapter_request
     async def inventory(
         self,
         *,
@@ -298,6 +435,7 @@ class OwnerControlService:
             "next_cursor": next_cursor,
         }
 
+    @owner_adapter_request
     async def detail(
         self,
         *,
@@ -419,6 +557,7 @@ class OwnerControlService:
             "events_next_cursor": events_next_cursor,
         }
 
+    @owner_adapter_request
     async def conflicts(
         self,
         *,
@@ -496,6 +635,7 @@ class OwnerControlService:
             "next_cursor": next_cursor,
         }
 
+    @owner_adapter_request
     async def health(
         self,
         *,
@@ -514,6 +654,295 @@ class OwnerControlService:
             "backend_status": await self._engine.status(scope_context),
         }
 
+    @owner_adapter_request
+    async def create_candidate(
+        self,
+        *,
+        fact: str,
+        scope: str,
+        memory_type: str,
+        source_provenance: dict[str, Any],
+        freshness_policy: dict[str, Any],
+        idempotency_key: str,
+        project_id: str | None = None,
+        worktree_id: str | None = None,
+        workflow_id: str | None = None,
+        agent_id: str | None = None,
+        source_timestamp: str | None = None,
+        confidence: float = 0.5,
+        tags: list[str] | None = None,
+        subject: str | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create one explicitly requested unverified Candidate in an exact scope."""
+
+        scope_context = self._scope(scope, project_id, worktree_id, workflow_id, agent_id)
+        request_id_value = self._request_id(request_id)
+        return await self._adapter.store(
+            fact=fact,
+            memory_type=memory_type,
+            source_provenance=source_provenance,
+            freshness_policy=freshness_policy,
+            idempotency_key=idempotency_key,
+            source_timestamp=source_timestamp,
+            confidence=confidence,
+            tags=tags,
+            subject=subject,
+            request_id=request_id_value,
+            verified_by="UNVERIFIED",
+            requested_lifecycle_state="CANDIDATE",
+            **scope_context.to_dict(),
+        )
+
+    def _normalize_candidate_verification(self, verification: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(verification, dict):
+            raise AdapterError("VERIFICATION_REQUIRED", "Candidate approval verification must be an object")
+        unknown = set(verification) - _RESOLVE_VERIFICATION_FIELDS
+        if unknown:
+            raise AdapterError(
+                "INVALID_ENVELOPE",
+                "Candidate approval verification contains unsupported fields: " + ", ".join(sorted(unknown)),
+            )
+        required = {"source_provenance", "freshness_policy", "source_timestamp", "verified_by"}
+        missing = sorted(required - set(verification))
+        if missing:
+            raise AdapterError(
+                "VERIFICATION_REQUIRED",
+                "Candidate approval requires verification fields: " + ", ".join(missing),
+            )
+        if verification.get("verified_by") != "OWNER":
+            raise AdapterError("VERIFICATION_REQUIRED", "Candidate approval verification must be verified_by OWNER")
+        provenance = validate_provenance(verification["source_provenance"])
+        freshness = validate_freshness(verification["freshness_policy"])
+        source_timestamp = self._adapter._normalize_timestamp(verification.get("source_timestamp"), required=True)
+        committed_at = iso_now()
+        last_verified_at = self._adapter._normalize_timestamp(
+            verification.get("last_verified_at", committed_at), required=True
+        )
+        committed_time = parse_iso(committed_at, required=True)
+        verified_time = parse_iso(last_verified_at, required=True)
+        if verified_time > committed_time:
+            raise AdapterError("VERIFICATION_REQUIRED", "Candidate approval verification time cannot be in the future")
+        self._adapter._validate_on_change_freshness(provenance, freshness)
+        if not is_fresh(freshness, last_verified_at, provenance, now=committed_time):
+            raise AdapterError("VERIFICATION_REQUIRED", "Candidate approval verification is not fresh enough")
+        normalized = dict(verification)
+        normalized["source_provenance"] = provenance
+        normalized["freshness_policy"] = freshness
+        normalized["source_timestamp"] = source_timestamp
+        # Preserve omission in the request payload so the governed adapter's
+        # idempotency fingerprint remains stable across exact retries. The adapter
+        # persists its own commit-time default when the caller did not supply one.
+        if "last_verified_at" in verification:
+            normalized["last_verified_at"] = last_verified_at
+        return normalized
+
+    @owner_adapter_request
+    async def batch_review(
+        self,
+        *,
+        scope: str,
+        items: list[dict[str, Any]],
+        project_id: str | None = None,
+        worktree_id: str | None = None,
+        workflow_id: str | None = None,
+        agent_id: str | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply a bounded explicit review selection within one exact scope."""
+
+        scope_context = self._scope(scope, project_id, worktree_id, workflow_id, agent_id)
+        if not isinstance(items, list):
+            raise AdapterError("INVALID_ENVELOPE", "batch review items must be an array")
+        if len(items) > 50:
+            raise AdapterError("LIMIT_EXCEEDED", "batch review accepts at most 50 explicitly selected records")
+
+        identity_keys = {"scope", "project_id", "worktree_id", "workflow_id", "agent_id"}
+        common_keys = {
+            "action",
+            "memory_id",
+            "expected_record_id",
+            "expected_revision",
+            "observed_group_token",
+            "idempotency_key",
+        }
+        prepared: list[dict[str, Any]] = []
+        for index, raw in enumerate(items):
+            if not isinstance(raw, dict):
+                raise AdapterError("INVALID_ENVELOPE", f"batch review item {index + 1} must be an object")
+            if identity_keys.intersection(raw):
+                raise AdapterError("CROSS_SCOPE_DENIED", "batch items cannot override the exact batch scope")
+            action = raw.get("action")
+            allowed = set(common_keys)
+            if action == "APPROVE":
+                allowed.add("verification")
+            elif action == "REJECT":
+                allowed.add("reason_code")
+            else:
+                raise AdapterError("INVALID_ENUM", "batch review action must be APPROVE or REJECT")
+            unknown = set(raw) - allowed
+            if unknown:
+                raise AdapterError(
+                    "INVALID_ENVELOPE",
+                    "batch review item contains unsupported fields: " + ", ".join(sorted(unknown)),
+                )
+            missing = sorted(common_keys - {"action"} - set(raw))
+            if missing:
+                raise AdapterError(
+                    "INVALID_ENVELOPE",
+                    "batch review item requires fields: " + ", ".join(missing),
+                )
+            memory_id = self._uuid(raw["memory_id"], "memory_id")
+            expected_record_id = self._uuid(raw["expected_record_id"], "expected_record_id")
+            expected_revision = self._positive_revision(raw["expected_revision"])
+            observed_group_token = validate_group_token(raw["observed_group_token"])
+            idempotency_key = validate_identifier(raw["idempotency_key"], "idempotency_key", required=True)
+            assert idempotency_key is not None
+            item = {
+                "action": action,
+                "memory_id": memory_id,
+                "expected_record_id": expected_record_id,
+                "expected_revision": expected_revision,
+                "observed_group_token": observed_group_token,
+                "idempotency_key": idempotency_key,
+            }
+            if action == "APPROVE":
+                item["verification"] = self._normalize_candidate_verification(raw.get("verification"))
+            else:
+                reason_code = raw.get("reason_code")
+                validate_owner_reason("REJECT", reason_code)
+                item["reason_code"] = reason_code
+            prepared.append(item)
+
+        # Resolve every selected target inside the one exact batch scope before the
+        # first mutation. Cross-scope membership is an invalid selection and aborts
+        # the whole batch. Pre-existing record/group drift is retained as a per-item
+        # conflict so other valid selections may still be attempted.
+        for item in prepared:
+            # Scope membership is always resolved before idempotency reconciliation.
+            # A reserved key must never turn a foreign-scope selection into a
+            # per-item error after an earlier batch item has already mutated.
+            history = await self._engine.get_record(item["memory_id"], scope_context, history=True)
+            if not history:
+                if await self._engine.memory_exists_outside_scope(item["memory_id"], scope_context):
+                    raise AdapterError("CROSS_SCOPE_DENIED", "batch selection contains a memory outside the exact batch scope")
+                item["preflight_error"] = AdapterError("NOT_FOUND", "batch review target was not found")
+                continue
+
+            # Once exact-scope membership is proven, an already-reserved global
+            # idempotency key can safely reconcile before lifecycle/CAS preflight.
+            # The governed operation proves exact replay or raises a conflict without
+            # producing a second effect.
+            owner = await self._engine.idempotency_owner(item["idempotency_key"])
+            if owner is not None:
+                try:
+                    if item["action"] == "APPROVE":
+                        replay = await self.reverify(
+                            memory_id=item["memory_id"],
+                            expected_record_id=item["expected_record_id"],
+                            expected_revision=item["expected_revision"],
+                            observed_group_token=item["observed_group_token"],
+                            idempotency_key=item["idempotency_key"],
+                            verification=item["verification"],
+                            **scope_context.to_dict(),
+                        )
+                    else:
+                        replay = await self.reject(
+                            memory_id=item["memory_id"],
+                            expected_record_id=item["expected_record_id"],
+                            expected_revision=item["expected_revision"],
+                            observed_group_token=item["observed_group_token"],
+                            idempotency_key=item["idempotency_key"],
+                            reason_code=item["reason_code"],
+                            **scope_context.to_dict(),
+                        )
+                except AdapterError as exc:
+                    item["preflight_error"] = exc
+                else:
+                    item["preflight_replay"] = replay
+                continue
+            target = next((row for row in history if row["record_id"] == item["expected_record_id"]), None)
+            if target is None or int(target["revision"]) != item["expected_revision"]:
+                item["preflight_error"] = AdapterError(
+                    "VERSION_CONFLICT", "batch review target changed since preview"
+                )
+                continue
+            if target["lifecycle_state"] != "CANDIDATE":
+                item["preflight_error"] = AdapterError(
+                    "VERSION_CONFLICT", "batch review target is no longer a Candidate"
+                )
+                continue
+            observation = await self._engine.group_observation(scope_context, target["contradiction_key"])
+            current_group_token = observation["public"]["observed_group_token"]
+            if current_group_token != item["observed_group_token"]:
+                item["preflight_error"] = AdapterError(
+                    "GROUP_VERSION_CONFLICT", "batch review contradiction group changed since preview"
+                )
+
+        outcomes: list[dict[str, Any]] = []
+        counts = {"applied": 0, "conflicted": 0, "failed": 0}
+        for item in prepared:
+            try:
+                preflight_error = item.get("preflight_error")
+                if isinstance(preflight_error, AdapterError):
+                    raise preflight_error
+                preflight_replay = item.get("preflight_replay")
+                if isinstance(preflight_replay, dict):
+                    result = preflight_replay
+                elif item["action"] == "APPROVE":
+                    result = await self.reverify(
+                        memory_id=item["memory_id"],
+                        expected_record_id=item["expected_record_id"],
+                        expected_revision=item["expected_revision"],
+                        observed_group_token=item["observed_group_token"],
+                        idempotency_key=item["idempotency_key"],
+                        verification=item["verification"],
+                        **scope_context.to_dict(),
+                    )
+                else:
+                    result = await self.reject(
+                        memory_id=item["memory_id"],
+                        expected_record_id=item["expected_record_id"],
+                        expected_revision=item["expected_revision"],
+                        observed_group_token=item["observed_group_token"],
+                        idempotency_key=item["idempotency_key"],
+                        reason_code=item["reason_code"],
+                        **scope_context.to_dict(),
+                    )
+            except AdapterError as exc:
+                conflict = exc.code in {"VERSION_CONFLICT", "GROUP_VERSION_CONFLICT", "IDEMPOTENCY_CONFLICT"}
+                bucket = "conflicted" if conflict else "failed"
+                counts[bucket] += 1
+                outcomes.append(
+                    {
+                        "status": "CONFLICTED" if conflict else "FAILED",
+                        "memory_id": item["memory_id"],
+                        "expected_record_id": item["expected_record_id"],
+                        "error_code": exc.code,
+                        "message": exc.safe_message,
+                    }
+                )
+            else:
+                counts["applied"] += 1
+                outcomes.append(
+                    {
+                        "status": "APPLIED",
+                        "memory_id": item["memory_id"],
+                        "expected_record_id": item["expected_record_id"],
+                        "result": result,
+                    }
+                )
+
+        status = "OK" if counts["conflicted"] == 0 and counts["failed"] == 0 else "PARTIAL"
+        return {
+            "status": status,
+            "request_id": self._request_id(request_id),
+            "scope": scope_context.to_dict(),
+            "counts": counts,
+            "outcomes": outcomes,
+        }
+
+    @owner_adapter_request
     async def revoke(
         self,
         *,
@@ -546,6 +975,7 @@ class OwnerControlService:
             request_id=request_id,
         )
 
+    @owner_adapter_request
     async def reject(
         self,
         *,
@@ -617,6 +1047,9 @@ class OwnerControlService:
         if target is None or int(target["revision"]) != expected_revision:
             raise AdapterError("VERSION_CONFLICT", "expected record/revision no longer matches the inspected target")
 
+        if action == "REVERIFY" and target["lifecycle_state"] == "CANDIDATE":
+            payload = self._normalize_candidate_verification(payload)
+
         update_kwargs: dict[str, Any] = {
             "memory_id": memory_id,
             "expected_record_id": expected_record_id,
@@ -633,6 +1066,7 @@ class OwnerControlService:
             update_kwargs["replacement"] = payload
         return await self._adapter.update(**update_kwargs)
 
+    @owner_adapter_request
     async def reverify(
         self,
         *,
@@ -665,6 +1099,7 @@ class OwnerControlService:
             request_id=request_id,
         )
 
+    @owner_adapter_request
     async def replace(
         self,
         *,
@@ -842,6 +1277,7 @@ class OwnerControlService:
         )
         return successor
 
+    @owner_adapter_request
     async def resolve(
         self,
         *,
@@ -980,6 +1416,7 @@ class OwnerControlService:
             raise AdapterError("RAW_OR_SENSITIVE_CONTENT", f"{field} contains unsafe material")
         return normalized
 
+    @owner_adapter_request
     async def manual_recheck(
         self,
         *,
@@ -1281,6 +1718,7 @@ class OwnerControlService:
             raise AdapterError("VERIFICATION_REQUIRED", "readmit verification is not fresh enough for Current admission")
         return successor
 
+    @owner_adapter_request
     async def readmit(
         self,
         *,
@@ -1787,6 +2225,7 @@ class OwnerControlService:
         except OSError:
             return None
 
+    @owner_adapter_request
     async def retention_status(
         self,
         *,

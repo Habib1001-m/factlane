@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import os
+import socket
 import sys
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -10,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 from .adapter import PROFILE_DEFINITIONS, MemoryAdapter, trusted_write_context_for_profile
 from .contract import AdapterError, validate_identifier
 from .gateway import HostBinding, MemoryGateway, TrustedContextBinding
+from .maintenance_coordinator import MaintenanceBarrierStore
 from .public_contract import (
     MemoryGetRequest,
     MemorySearchRequest,
@@ -19,8 +27,310 @@ from .public_contract import (
     TOOL_DESCRIPTIONS,
     render_tool_help,
 )
+from .runtime_control import (
+    PROTOCOL_VERSION,
+    RuntimeControlError,
+    RuntimeControlServer,
+    RuntimeIdentity,
+    RuntimeLifecycleController,
+    RuntimeRegistry,
+    current_boot_id,
+    process_start_ticks,
+)
 
 STDIO_TRANSPORT = "stdio"
+
+
+@dataclass(frozen=True, slots=True)
+class _AdapterLaunchConfig:
+    """Immutable inputs required to construct the same governed adapter after maintenance."""
+
+    db_path: str
+    profile_name: str
+    ollama_url: str
+    tokenizer_path: str | None
+    trusted_write_context: Any
+
+
+AdapterFactory = Callable[..., Awaitable[Any]]
+LeaseProbe = Callable[[Any], bool]
+
+
+def _default_lease_probe(adapter: Any) -> bool:
+    """Verify that a production adapter still owns an open engine lease."""
+    engine = getattr(adapter, "engine", None)
+    if engine is None:
+        # Narrow injected-adapter seam used by existing server tests. Production
+        # MemoryAdapter always exposes its SQLiteVecEngine as ``engine``.
+        return True
+    if bool(getattr(engine, "_closed", False)):
+        return False
+    if hasattr(engine, "_maintenance_lease_handle"):
+        return getattr(engine, "_maintenance_lease_handle") is not None
+    return getattr(engine, "conn", None) is not None or getattr(engine, "storage", None) is not None
+
+
+class _ReopenableAdapterHolder:
+    """Keep FastMCP alive while the real adapter is closed for maintenance."""
+
+    def __init__(
+        self,
+        config: _AdapterLaunchConfig,
+        *,
+        adapter_factory: AdapterFactory,
+        lease_probe: LeaseProbe = _default_lease_probe,
+    ) -> None:
+        self._config = config
+        self._adapter_factory = adapter_factory
+        self._lease_probe = lease_probe
+        self._adapter: Any | None = None
+        self._controller: RuntimeLifecycleController | None = None
+        self._condition = asyncio.Condition()
+        self._inflight = 0
+        self._closing = False
+
+    def bind_controller(self, controller: RuntimeLifecycleController) -> None:
+        if self._controller is not None and self._controller is not controller:
+            raise RuntimeError("runtime lifecycle controller is already bound")
+        self._controller = controller
+
+    def _accepting(self) -> bool:
+        if self._closing or self._adapter is None:
+            return False
+        controller = self._controller
+        return controller is None or controller.admits_normal_requests
+
+    async def dispatch(self, operation: str, request: dict[str, Any]) -> dict[str, Any]:
+        async with self._condition:
+            if not self._accepting():
+                raise AdapterError(
+                    "MAINTENANCE_IN_PROGRESS",
+                    "memory is temporarily unavailable while local maintenance is in progress",
+                    retry_action="retry after maintenance completes",
+                )
+            adapter = self._adapter
+            assert adapter is not None
+            self._inflight += 1
+        try:
+            result = await adapter.dispatch(operation, request)
+            if not isinstance(result, dict):
+                raise AdapterError("INVALID_ADAPTER_RESPONSE", "adapter returned an invalid response")
+            return result
+        finally:
+            async with self._condition:
+                self._inflight -= 1
+                if self._inflight == 0:
+                    self._condition.notify_all()
+
+    async def open_adapter(self, generation: int) -> None:
+        del generation  # generation binding is enforced by RuntimeLifecycleController/barrier.
+        async with self._condition:
+            if self._adapter is not None:
+                if self._lease_probe(self._adapter):
+                    return
+                raise AdapterError("BACKEND_UNAVAILABLE", "existing adapter state is not safely reopenable")
+            self._closing = True
+        try:
+            adapter = await self._adapter_factory(
+                self._config.db_path,
+                self._config.profile_name,
+                ollama_url=self._config.ollama_url,
+                tokenizer_path=self._config.tokenizer_path,
+                trusted_write_context=self._config.trusted_write_context,
+            )
+            if not self._lease_probe(adapter):
+                close = getattr(adapter, "close", None)
+                if callable(close):
+                    await close()
+                raise AdapterError("BACKEND_UNAVAILABLE", "adapter opened without a verified database lease")
+        except BaseException:
+            async with self._condition:
+                self._closing = False
+                self._condition.notify_all()
+            raise
+        async with self._condition:
+            self._adapter = adapter
+            self._closing = False
+            self._condition.notify_all()
+
+    async def close_adapter(self) -> None:
+        async with self._condition:
+            self._closing = True
+            while self._inflight:
+                await self._condition.wait()
+            adapter = self._adapter
+        if adapter is None:
+            async with self._condition:
+                self._closing = False
+                self._condition.notify_all()
+            return
+        try:
+            await adapter.close()
+        except BaseException:
+            async with self._condition:
+                self._closing = False
+                self._condition.notify_all()
+            raise
+        async with self._condition:
+            if self._adapter is adapter:
+                self._adapter = None
+            self._closing = False
+            self._condition.notify_all()
+
+    def lease_is_open(self) -> bool:
+        adapter = self._adapter
+        return adapter is not None and self._lease_probe(adapter)
+
+
+class _RuntimeSession:
+    def __init__(
+        self,
+        *,
+        holder: _ReopenableAdapterHolder,
+        registry: RuntimeRegistry,
+        barrier: MaintenanceBarrierStore,
+        controller: RuntimeLifecycleController,
+        control_server: RuntimeControlServer,
+    ) -> None:
+        self.holder = holder
+        self.registry = registry
+        self.barrier = barrier
+        self.controller = controller
+        self.control_server = control_server
+        self._started = False
+
+    @property
+    def identity(self) -> RuntimeIdentity:
+        return self.controller.identity
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        await self.control_server.start()
+        try:
+            loop = asyncio.get_running_loop()
+            retry_deadline = loop.time() + 5.0
+            while True:
+                try:
+                    await self.controller.startup_open()
+                    break
+                except RuntimeControlError as exc:
+                    if exc.code != "BARRIER_BUSY" or loop.time() >= retry_deadline:
+                        raise
+                    await asyncio.sleep(0.01)
+        except BaseException:
+            await self.control_server.close()
+            await self.holder.close_adapter()
+            self._remove_registration()
+            raise
+        self._started = True
+
+    async def close(self) -> None:
+        await self.control_server.close()
+        try:
+            await self.holder.close_adapter()
+        finally:
+            self._remove_registration()
+            self._started = False
+
+    def _remove_registration(self) -> None:
+        path = self.registry.registry_root / f"{self.identity.instance_id}.json"
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            # A stale private registration remains fail-closed and is validated by
+            # PID/start/boot identity before any coordinator can rely on it.
+            pass
+
+
+def _build_runtime_session(
+    config: _AdapterLaunchConfig,
+    *,
+    runtime_root: str | os.PathLike[str],
+    barrier_root: str | os.PathLike[str] | None = None,
+    adapter_factory: AdapterFactory = MemoryAdapter.create,
+    lease_probe: LeaseProbe = _default_lease_probe,
+    holder: _ReopenableAdapterHolder | None = None,
+) -> _RuntimeSession:
+    db_path = os.path.realpath(os.path.abspath(config.db_path))
+    info = os.stat(db_path)
+    root = Path(runtime_root).absolute()
+    registry = RuntimeRegistry(root, owner_uid=os.getuid())
+    durable_root = Path(barrier_root).absolute() if barrier_root is not None else root / "maintenance"
+    barrier = MaintenanceBarrierStore(durable_root, db_path)
+    snapshot = barrier.initialize(generation=1)
+    if (snapshot.device, snapshot.inode) != (info.st_dev, info.st_ino):
+        raise AdapterError(
+            "DATABASE_IDENTITY_MISMATCH",
+            "database inode changed outside the governed maintenance barrier",
+        )
+    instance_id = str(uuid.uuid4())
+    start_ticks = process_start_ticks(os.getpid())
+    if start_ticks is None:
+        raise RuntimeError("current process start identity is unavailable")
+    identity = RuntimeIdentity(
+        protocol_version=PROTOCOL_VERSION,
+        instance_id=instance_id,
+        owner_uid=os.getuid(),
+        pid=os.getpid(),
+        process_start_ticks=start_ticks,
+        boot_id=current_boot_id(),
+        database_path=db_path,
+        device=snapshot.device if snapshot.device else info.st_dev,
+        inode=snapshot.inode if snapshot.inode else info.st_ino,
+        generation=snapshot.generation,
+        control_socket_path=str(root / f"{uuid.UUID(instance_id).hex[:16]}.sock"),
+        lifecycle_state="PARKED",
+    )
+    adapter_holder = holder or _ReopenableAdapterHolder(
+        config,
+        adapter_factory=adapter_factory,
+        lease_probe=lease_probe,
+    )
+    controller = RuntimeLifecycleController(
+        identity,
+        barrier=barrier,
+        registry=registry,
+        open_adapter=adapter_holder.open_adapter,
+        close_adapter=adapter_holder.close_adapter,
+        lease_is_open=adapter_holder.lease_is_open,
+    )
+    adapter_holder.bind_controller(controller)
+    control_server = RuntimeControlServer(identity=identity, registry=registry, controller=controller)
+    return _RuntimeSession(
+        holder=adapter_holder,
+        registry=registry,
+        barrier=barrier,
+        controller=controller,
+        control_server=control_server,
+    )
+
+
+def _default_runtime_root(db_path: str) -> Path | None:
+    """Return the private per-database runtime root when this Linux session supports it."""
+    if os.name != "posix" or not hasattr(socket, "SO_PEERCRED") or not os.path.isfile(db_path):
+        return None
+    uid = os.getuid()
+    configured = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(configured) if configured else Path(f"/run/user/{uid}")
+    try:
+        info = base.stat()
+    except OSError:
+        return None
+    if not base.is_dir() or info.st_uid != uid:
+        return None
+    canonical = os.path.realpath(os.path.abspath(db_path))
+    database_key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return base / "factlane" / database_key
+
+
+def _default_barrier_root(db_path: str) -> Path:
+    """Derive durable per-user maintenance state independently of the ephemeral runtime directory."""
+    configured = os.environ.get("XDG_STATE_HOME")
+    base = Path(configured).expanduser() if configured else Path.home() / ".local" / "state"
+    canonical = os.path.realpath(os.path.abspath(db_path))
+    database_key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+    return base / "factlane" / "maintenance" / database_key
 
 
 def _safe_error_request_id(request: object) -> str | None:
@@ -65,10 +375,26 @@ async def _dispatch_public_tool(
 class _BoundFastMCP(FastMCP):
     """FastMCP server restricted to the transport bound at construction."""
 
+    def configure_runtime_session(self, session: _RuntimeSession) -> None:
+        if hasattr(self, "_runtime_session"):
+            raise RuntimeError("runtime session is already configured")
+        self._runtime_session = session
+
     def run(self, transport: str = STDIO_TRANSPORT, mount_path: str | None = None) -> None:
         if transport != STDIO_TRANSPORT:
             raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "selected transport does not match its binding")
         super().run(transport, mount_path)
+
+    async def run_stdio_async(self) -> None:
+        session = getattr(self, "_runtime_session", None)
+        if session is None:
+            await super().run_stdio_async()
+            return
+        await session.start()
+        try:
+            await super().run_stdio_async()
+        finally:
+            await session.close()
 
     async def run_sse_async(self, mount_path: str | None = None) -> None:
         raise AdapterError("HOST_TRANSPORT_IDENTITY_MISMATCH", "SSE is not supported")
@@ -168,29 +494,49 @@ def main(argv: list[str] | None = None) -> None:
             )
     except AdapterError as exc:
         parser.error(exc.safe_message)
-    adapter = asyncio.run(
-        MemoryAdapter.create(
-            args.db,
-            args.profile,
-            ollama_url=args.ollama_url,
-            tokenizer_path=args.tokenizer_path,
-            trusted_write_context=trusted_write_context_for_profile(
-                args.write_profile,
-                contributor_ref=args.host_id,
-                grant_ref=f"launcher:{args.write_profile}:{args.host_id}",
-            ),
-        )
+    launch_config = _AdapterLaunchConfig(
+        db_path=args.db,
+        profile_name=args.profile,
+        ollama_url=args.ollama_url,
+        tokenizer_path=args.tokenizer_path,
+        trusted_write_context=trusted_write_context_for_profile(
+            args.write_profile,
+            contributor_ref=args.host_id,
+            grant_ref=f"launcher:{args.write_profile}:{args.host_id}",
+        ),
     )
-    try:
-        gateway = MemoryGateway(
-            adapter,
-            binding,
-            transport_kind=STDIO_TRANSPORT,
-            context_binding=context_binding,
+    holder = _ReopenableAdapterHolder(
+        launch_config,
+        adapter_factory=MemoryAdapter.create,
+    )
+    gateway = MemoryGateway(
+        holder,
+        binding,
+        transport_kind=STDIO_TRANSPORT,
+        context_binding=context_binding,
+    )
+    server = build_mcp_server(gateway)
+    runtime_root = _default_runtime_root(args.db) if isinstance(server, _BoundFastMCP) else None
+    if runtime_root is not None:
+        session = _build_runtime_session(
+            launch_config,
+            runtime_root=runtime_root,
+            barrier_root=_default_barrier_root(args.db),
+            adapter_factory=MemoryAdapter.create,
+            holder=holder,
         )
-        build_mcp_server(gateway).run(STDIO_TRANSPORT)
+        server.configure_runtime_session(session)
+        server.run(STDIO_TRANSPORT)
+        return
+
+    # Unsupported/new-database topology retains the previous compatible stdio
+    # behavior. It is intentionally unregistered, so autonomous maintenance must
+    # treat this live connection as an exclusion blocker until a later relaunch.
+    asyncio.run(holder.open_adapter(0))
+    try:
+        server.run(STDIO_TRANSPORT)
     finally:
-        asyncio.run(adapter.close())
+        asyncio.run(holder.close_adapter())
 
 
 if __name__ == "__main__":
