@@ -154,7 +154,7 @@ FactLane keeps operator governance separate from ordinary agent memory use.
 
 The packaged `factlane-owner` CLI exposes that service for trusted local operators.
 
-FactLane v0.1.7 also exposes the managed local WebUI workflow through the main `factlane` CLI:
+FactLane also exposes the managed local WebUI workflow through the main `factlane` CLI:
 
 ```text
 factlane setup webui
