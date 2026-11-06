@@ -154,7 +154,21 @@ FactLane keeps operator governance separate from ordinary agent memory use.
 
 The packaged `factlane-owner` CLI exposes that service for trusted local operators.
 
-The packaged `factlane-owner-webui` launcher exposes the same Owner boundary through a loopback-only WebUI. It binds exactly to `127.0.0.1`, uses a short-lived one-use bootstrap token exchanged through `X-FactLane-Bootstrap`, establishes an `HttpOnly; SameSite=Strict` session, and requires CSRF protection for later mutations. It is **not** an HTTP MCP transport and does not add a sixth public tool.
+FactLane also exposes the managed local WebUI workflow through the main `factlane` CLI:
+
+```text
+factlane setup webui
+factlane serve webui
+factlane open webui
+factlane start webui
+factlane stop webui
+factlane status webui
+factlane restart webui
+```
+
+Run `factlane --help` to discover the managed surface or `factlane <action> webui --help` for command-specific help. Setup and service lifecycle stay inside the managed platform boundary; unsupported extra arguments continue to use the existing stdio MCP CLI contract.
+
+The packaged `factlane-owner-webui` launcher remains a direct loopback Owner WebUI entrypoint and alternate path rather than the managed install/service lifecycle. It binds exactly to `127.0.0.1`, uses a short-lived one-use bootstrap token exchanged through `X-FactLane-Bootstrap`, establishes an `HttpOnly; SameSite=Strict` session, and requires CSRF protection for later mutations. It is **not** an HTTP MCP transport and does not add a sixth public tool.
 
 For `on_change` freshness, FactLane records a recheck contract but does not run a background source watcher. A trusted Owner supplies fresh bounded observation evidence. Healthy unchanged evidence may renew eligibility; changed, unavailable, indeterminate, stale, or mismatched evidence fails closed for review.
 

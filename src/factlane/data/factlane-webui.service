@@ -1,0 +1,12 @@
+[Unit]
+Description=FactLane Owner WebUI
+
+[Service]
+Type=simple
+ExecStart=@FACTLANE_EXECUTABLE@ serve webui
+Restart=no
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

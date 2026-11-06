@@ -1909,7 +1909,7 @@ def test_candidate_reverify_rechecks_group_arrival_inside_storage_transaction(tm
                     expected_revision=1,
                     observed_group_token=token,
                     idempotency_key="owner-candidate-race-reverify",
-                    verification={"source_timestamp": "2026-10-31T20:02:00Z", "verified_by": "OWNER"},
+                    verification={"source_provenance": row["source_provenance"], "freshness_policy": row["freshness_policy"], "source_timestamp": "2026-10-31T20:02:00Z", "verified_by": "OWNER"},
                     scope="PROJECT",
                     project_id="project-a",
                 )
