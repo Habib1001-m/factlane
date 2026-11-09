@@ -1,18 +1,18 @@
 # Environment and compatibility
 
-FactLane is a local Python application with a command-launched MCP server. A compatible
-Python interpreter is necessary but not sufficient: the version of **SQLite linked into that
+FactLane is a local CPython application with a command-launched MCP server. A compatible
+CPython interpreter is necessary but not sufficient: the version of **SQLite linked into that
 interpreter** determines whether the storage contract can run safely.
 
 ## Required runtime
 
 | Component | Requirement |
 | --- | --- |
-| Python | 3.11 or newer. |
+| CPython | 3.11 or newer. |
 | Linked SQLite | **3.42.0 or newer**. |
-| Dependencies | Project `uv.lock`, installed into a project-owned environment. |
+| Source-checkout dependencies | Project `uv.lock`, installed into a project-owned environment. Published-wheel installation follows the selected release's package metadata. |
 | MCP host | Local command-based `stdio` client. |
-| Embeddings | Local Ollama reachable on loopback with a matching installed model. |
+| Embeddings | Local Ollama reached through an exact HTTP loopback-literal base URL with a matching installed model. |
 
 A CPU-only setup is supported. A GPU, Docker, cloud LLM, remote embedding API, and always-on
 FactLane daemon are not prerequisites.
@@ -24,9 +24,16 @@ The current supported operating boundary is:
 | Public MCP surface | Exactly five tools: search, get, store, governed update, and status. |
 | MCP transport | Command-launched stdio only. |
 | Durable storage | Storage contract v3; exact storage-v2 state requires explicit migration. |
-| Owner control | Local `OwnerControlService`, packaged `factlane-owner`, and loopback-only `factlane-owner-webui`. |
-| Normal Windows runtime | Native Windows x64/AMD64 for ordinary package/runtime behavior. |
-| Sensitive Recovery / storage migration maintenance | POSIX maintenance-lock contract; no Windows maintenance claim. |
+| Owner control | Local `OwnerControlService`, packaged `factlane-owner`, direct loopback `factlane-owner-webui`, and the separately managed Owner Panel lifecycle. |
+| Native Windows x64/AMD64 | Current development runtime, managed Owner Panel, panel restore/purge paths, and storage-v2→v3 migration with exact pre-v3 rollback. |
+| Sensitive-memory incident Recovery | Separate POSIX maintenance-lock contract; this general Recovery operator is not a Windows capability. |
+
+The managed Owner Panel has additional receiving-host requirements beyond the ordinary stdio MCP
+server. On Linux, setup must run as a non-root user on a running `systemd` host and must discover
+absolute executable paths for `systemctl`, Caddy, Zenity, Mozilla Firefox or Firefox ESR, and NSS
+`certutil`. `loginctl` is additionally required when the setup plan needs to enable user lingering.
+Missing tooling is a setup prerequisite failure; FactLane does not silently substitute another
+browser, weaken local HTTPS verification, or install those host packages on the operator's behalf.
 
 After installing the project, inspect the SQLite version through the **same Python
 environment used by FactLane**:
@@ -73,10 +80,13 @@ supported by the same Unicode handling as other text, while semantic relevance r
 workload-specific and must be validated against the intended corpus. Source-diverse selection
 reduces one document-crowding mechanism but is not a universal ranking guarantee.
 
-The only shipped embedding-provider implementation communicates with Ollama on a **loopback
-URL** (by default `http://127.0.0.1:11434`). The provider interface permits future
-implementations, but a remote endpoint, automatic cloud fallback, or hosted embedding
-service is **not** a supported current configuration.
+The only shipped embedding-provider implementation accepts an exact HTTP loopback-literal Ollama
+base URL (by default `http://127.0.0.1:11434`; bracketed `::1` is also supported). Its provider-owned
+HTTP path disables ambient proxy inheritance and rejects redirects, so FactLane's own Ollama request
+destinations stay on the configured loopback endpoint. This does not claim that a separately
+controlled local Ollama daemon or privileged local routing layer can never forward traffic after it
+receives a request. The provider interface permits future implementations, but a remote endpoint,
+automatic cloud fallback, or hosted embedding service is **not** a supported current configuration.
 
 The compatibility binding records semantic identity separately from runtime provenance. Semantic
 identity includes the base model/family, source/output dimensions,
@@ -137,8 +147,12 @@ release explicitly documents that downgrade as safe.
 Ordinary service expects storage contract v3. Exact storage-v2 state is inspected without silent
 migration and returns `MIGRATION_REQUIRED`. The operator must run
 `factlane-migrate-storage-v3 migrate` with a separate backup destination. Migration verifies the v2
-database and lineage, creates and integrity-checks an exact v2 backup, applies the v3 schema and
-writer fences transactionally, advances the contract version last, and verifies v3 after commit.
+database and lineage, creates and integrity-checks an exact v2 backup, and verifies the resulting v3
+image before releasing maintenance custody. On the documented POSIX release path, the v3 schema and
+writer fences are applied transactionally and the contract version advances last. The current Native
+Windows development path instead uses a native Windows exclusive-custody/recovery path and
+establishes verified rollback state before changing the active database; it must not be described as
+the POSIX transactional maintenance path.
 
 Rollback of that data transition means `factlane-migrate-storage-v3 restore` from the verified
 pre-v3 backup. Package rollback alone is not sufficient once durable data has reached contract v3.
@@ -152,19 +166,19 @@ crawler, transcript repository, or bulk document index. Very large source collec
 separate ingestion/extraction stage, which may have different throughput and provider
 requirements; no terabyte-scale ingestion rate is claimed here.
 
-The normal runtime is supported on native Windows x64/AMD64 with Python 3.11+, linked SQLite
+The normal runtime is supported on native Windows x64/AMD64 with CPython 3.11+, linked SQLite
 3.42.0+, the pinned sqlite-vec Windows AMD64 artifact, command-launched stdio MCP, and the same
 five-tool authority model. This boundary covers normal package import/startup, read-only and
 Candidate workflows, verifier and Owner control logic, WAL/busy behavior, cross-process
 CAS/concurrency, fresh-process durability, and valid Windows paths. No Windows ARM64 support claim
 is made.
 
-Sensitive-memory Recovery and storage-v2-to-v3 migration/restore are separate maintenance paths.
-They rely on the POSIX `fcntl`/`flock` maintenance-lock contract and therefore do not inherit the
-normal Windows runtime claim. Where that locking capability is unavailable, maintenance fails
-closed before mutation without making the ordinary storage module unimportable. The Owner WebUI is
-loopback-only and is a local operator surface, not an MCP transport or remotely supported admin
-service.
+The current development source also has a Native Windows x64/AMD64 storage-v2→v3 migration and
+exact pre-v3 rollback path with Windows-specific custody/exclusion semantics. That does **not** make
+the general sensitive-memory `SensitiveMemoryRecoveryOperator` a Windows capability: incident
+Recovery continues to rely on the POSIX `fcntl`/`flock` maintenance-lock contract. The direct
+`factlane-owner-webui` launcher is loopback-only; the managed Owner Panel is a separate local
+platform lifecycle. Neither is an MCP transport or a remotely supported admin service.
 
 This is a bounded support statement, not a universal deployment claim. Validate your own
 language/ranking workload and operational scale, and keep production data, backup retention,

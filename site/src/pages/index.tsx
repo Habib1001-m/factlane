@@ -512,10 +512,12 @@ function Authority({copy}: {copy: HomeCopy}) {
 
 function QuickStart({copy}: {copy: HomeCopy}) {
   const command = [
-    'git clone https://github.com/Habib1001-m/factlane.git',
+    "FACTLANE_TAG='<released-tag-from-release-operations>'",
+    'git clone --branch "$FACTLANE_TAG" --depth 1 https://github.com/Habib1001-m/factlane.git',
     'cd factlane',
-    '# Resolve the current published release from docs/RELEASE_OPERATIONS.md,',
-    '# then check out that exact published identity before installing.',
+    'git rev-parse HEAD',
+    'git rev-parse HEAD^{tree}',
+    '# Compare both identities with docs/RELEASE_OPERATIONS.md before installing.',
     'uv sync --frozen',
     "uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'",
     'ollama pull embeddinggemma:300m',
@@ -533,7 +535,7 @@ function QuickStart({copy}: {copy: HomeCopy}) {
         <div className={styles.codePanel}>
           <div className={styles.codeHeader}>
             <span>terminal</span>
-            <span>current published release</span>
+            <span>recorded released baseline</span>
           </div>
           <pre><code>{command}</code></pre>
         </div>

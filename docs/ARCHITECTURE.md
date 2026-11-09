@@ -96,20 +96,29 @@ context. Scope and launcher identity come from CLI arguments; mutation JSON cann
 Every mutation is revision/idempotency protected, and operations that can affect a contradiction
 group require the exact observed Group CAS token.
 
-The packaged `factlane-owner-webui` launcher is another presentation layer over the same service.
-Its server binds exactly to `127.0.0.1` and one immutable scope. Startup prints the bound origin and
+The packaged `factlane-owner-webui` launcher is the direct loopback presentation layer over the same
+service. Its server binds exactly to `127.0.0.1` and one immutable scope. Startup prints the bound origin and
 a short-lived one-use bootstrap token. That token is accepted only through the
 `X-FactLane-Bootstrap` header on `/owner/bootstrap`; URL credentials are rejected and the UI does
 not persist the bootstrap token in `localStorage`. A successful exchange consumes the token,
 establishes an `HttpOnly; SameSite=Strict` authenticated session, and returns the CSRF token used by
 later mutations. The WebUI is not an HTTP MCP transport and does not add a sixth MCP tool.
 
-The WebUI exposes operator views for **Overview**, **Current**, **Candidates**, **Conflicts**,
-**Needs Review**, **History**, and **System Health**. Record and conflict views expose only the
-governed actions valid for the observed state, including `REVERIFY`, `REPLACE`, `REVOKE`, `REJECT`,
-manual recheck, readmission, and conflict resolution. Mutations remain bound to the trusted launcher
-scope, exact record revision, idempotency key, and the displayed contradiction-group CAS token where
-required.
+The managed Owner Panel is a separate platform lifecycle driven through the main `factlane` CLI.
+Its current top-level views are **Overview**, **Memories**, **Review**, **Conflicts**, **Database**,
+**Agents**, **Activity**, and **Session & settings**. **Memories** can use authenticated Owner-wide read-only
+discovery across the selected database, and **Review** uses the same bounded discovery surface for an
+Owner-wide Candidate queue. Every returned item retains its exact scope identity; selecting an item
+returns to exact-scope record detail before any mutation. Owner-wide discovery does not broaden the
+public MCP scope contract or authorize cross-scope mutation. The same Owner service supplies memory governance, while
+the managed backend also composes capability-gated database operations such as artifacts, explicit
+backup/export/import, full restore/jobs, and platform-specific permanent purge. Record and conflict
+views expose only the governed actions valid for the observed state, including `REVERIFY`, `REPLACE`,
+`REVOKE`, `REJECT`, manual recheck, readmission, and conflict resolution. Mutations remain bound to
+the trusted launcher/platform scope, exact record revision, idempotency key, and the current
+contradiction-group CAS token where required. The managed panel keeps record/revision/CAS identities
+internal to its normal decision flow while presenting human-readable conflict content to the Owner.
+Destructive database actions add their own exact-preview and sensitive-approval gates.
 
 For `on_change` freshness, FactLane stores a recheck contract but does not run a source watcher.
 An Owner manual recheck supplies fresh observation evidence; changed, unavailable, indeterminate,
@@ -122,7 +131,7 @@ cannot recreate content removed by sensitive-memory Recovery.
 
 `CURRENT` retrieval admits only eligible `VALIDATED_CURRENT` facts within the exact scope.
 For keyword search, the lifecycle filter precedes SQL limits. For semantic search,
-sqlite-vec KNN constrains eligible row IDs **inside the vector query before `k` **.
+sqlite-vec KNN constrains eligible row IDs **inside the vector query before `k`**.
 Otherwise, many closer unverified Candidates could fill the top results and conceal a
 farther validated fact.
 
@@ -210,15 +219,15 @@ service. Process exit releases those descriptors; the sealing-incomplete state s
 operator reconciliation.
 
 The exclusion guarantee is bounded to supported local POSIX filesystems with reliable `flock`
-semantics; sensitive-memory recovery maintenance remains unsupported on Windows and on unvalidated
-network/FUSE locking behavior. Native Windows x64/AMD64 is supported for normal import/startup,
-stdio MCP, SQLite WAL/busy/CAS, process concurrency, durability, and valid Windows paths. That
-normal-runtime support does not add a Windows sensitive-Recovery implementation or a Windows
-storage-migration maintenance claim: maintenance that depends on the POSIX `fcntl`/`flock`
-exclusion contract fails closed before mutation when that capability is unavailable. The recovery
-exclusion boundary is cooperative, not a defense against arbitrary raw filesystem replacement by a
-privileged external process, so the independent quiescence inventory/full-stop procedure is still
-part of recovery. No Windows ARM64 support claim is made.
+semantics; general sensitive-memory recovery maintenance remains unsupported on Windows and on
+unvalidated network/FUSE locking behavior. Native Windows x64/AMD64 is supported for normal
+import/startup, stdio MCP, SQLite WAL/busy/CAS, process concurrency, durability, valid Windows paths,
+the managed Owner Panel, its qualified full-restore/permanent-purge paths, and the current
+development storage-v2→v3 migration/rollback implementation. These Windows-specific maintenance
+paths use their own custody/exclusion primitives; they do not turn the POSIX
+`SensitiveMemoryRecoveryOperator` into a Windows capability. The incident-Recovery exclusion
+boundary is cooperative, not a defense against arbitrary privileged raw filesystem replacement, so
+its independent quiescence/full-stop procedure remains required. No Windows ARM64 support claim is made.
 
 ## Storage migration boundary
 
@@ -231,19 +240,22 @@ migration contract, post-migration verification, and any supported rollback/rest
 Ordinary service opens storage contract v3. An exact storage-v2 database is detected but not
 silently upgraded; normal startup fails closed with `MIGRATION_REQUIRED`. The explicit
 `factlane-migrate-storage-v3 migrate` operator requires an exact v2 database and lineage,
-creates and integrity-checks a pre-v3 backup, applies v3 schema/fences transactionally, then verifies
-the result as v3. Rollback of that migration is restoration of the verified pre-v3 backup through
+creates and integrity-checks a pre-v3 backup, applies v3 schema/fences, then verifies the result as
+v3. On supported POSIX release paths the schema change is transactional; the current Native Windows
+development path uses Windows-specific staged/exclusive custody and fail-closed crash recovery.
+Rollback of that migration is restoration of the verified pre-v3 backup through
 `factlane-migrate-storage-v3 restore`; package rollback alone is not a durable-data rollback path.
 Exact release identity and release-specific transition procedures live in
 [Release operations](RELEASE_OPERATIONS.md).
 
 ## Qualification boundary
 
-The supported local runtime boundary is Python 3.11+, linked SQLite 3.42.0+, SQLite/SQLite-vec,
+The supported local runtime boundary is CPython 3.11+, linked SQLite 3.42.0+, SQLite/SQLite-vec,
 command-launched stdio MCP with exactly five public tools, and supported local Ollama embeddings.
-The normal runtime is qualified on native Windows x64/AMD64 as described above; sensitive-memory
-Recovery and storage-v2-to-v3 migration/restore remain POSIX-maintenance capabilities because they
-depend on the documented `fcntl`/`flock` exclusion contract.
+Native Windows x64/AMD64 support is described above. General sensitive-memory Recovery remains a
+POSIX-maintenance capability because it depends on the documented `fcntl`/`flock` exclusion
+contract; the separately qualified Windows migration/rollback and panel destructive paths do not
+inherit that implementation.
 
 Qualification covers default read-only authority, Candidate-only delegated contribution, verifier
 promotion, governed Owner lifecycle operations, WAL/busy handling, cross-process CAS/concurrency,

@@ -33,7 +33,7 @@ The design is intentionally narrow:
 > [!IMPORTANT]
 > Memory is **supporting evidence**, not execution authority. Tool visibility, remembered policy, or a prior approval does not grant new runtime permissions.
 
-For the current published release identity, artifact hashes, release status, and exact upgrade/rollback boundary, use [Release operations](docs/RELEASE_OPERATIONS.md). For user-facing changes between releases, use the [Changelog](docs/CHANGELOG.md).
+For the released baseline recorded by this repository, artifact hashes, release status, and exact upgrade/rollback boundary, use [Release operations](docs/RELEASE_OPERATIONS.md). For user-facing release and development changes, use the [Changelog](docs/CHANGELOG.md).
 
 ## How FactLane works
 
@@ -61,8 +61,8 @@ A normal memory lifecycle separates contribution from verification:
 
 The documented local profile requires:
 
-- Python **3.11+**;
-- a Python-linked SQLite runtime **3.42.0+**;
+- CPython **3.11+**;
+- a CPython-linked SQLite runtime **3.42.0+**;
 - [`uv`](https://docs.astral.sh/uv/);
 - local [Ollama](https://ollama.com/) with a supported embedding model;
 - a compatible MCP host that can launch a local stdio command.
@@ -71,7 +71,7 @@ Docker, a GPU, a hosted memory service, and an external embedding API are not re
 
 ### Install a supported release without hard-coding it here
 
-Read [Release operations](docs/RELEASE_OPERATIONS.md) first and copy the current published tag from the release manifest. Then pin the checkout to that tag instead of following moving `main`:
+Read [Release operations](docs/RELEASE_OPERATIONS.md) first and copy the recorded released tag from the release manifest. Then pin the checkout to that tag instead of following moving `main`. This source-checkout example uses a POSIX shell; native Windows users can pass the same exact tag to `git clone --branch` from PowerShell and use Windows paths afterward:
 
 ```bash
 RELEASE_TAG="<published tag from Release operations>"
@@ -83,7 +83,7 @@ uv run factlane --help
 uv run factlane --help-tools
 ```
 
-The SQLite check intentionally runs through the same interpreter that launches FactLane. A compatible Python version alone does not prove a compatible linked SQLite runtime.
+The SQLite check intentionally runs through the same interpreter that launches FactLane. A compatible CPython version alone does not prove a compatible linked SQLite runtime.
 
 Install the embedding model required by the profile you intend to use. For the built-in `embeddinggemma-300m-768` profile:
 
@@ -101,6 +101,10 @@ uv run factlane \
   --profile embeddinggemma-300m-768 \
   --host-id local-dev
 ```
+
+On native Windows, use the installed Windows executable and a native drive path for the database;
+do not pass WSL or UNC database paths to the Windows runtime. See the full
+[Quick Start](docs/QUICKSTART.md) for platform-specific examples.
 
 The first connection should stay read-only. Verify that the host launches FactLane, discovers exactly five tools, and completes an appropriate read-only `memory_status` request before enabling any write profile.
 
@@ -144,7 +148,7 @@ FactLane keeps operator governance separate from ordinary agent memory use.
 `OwnerControlService` provides bounded local operations for:
 
 - inventory and record detail;
-- Candidate, Current, history, conflict, health, and retention views;
+- memory browsing, Candidate review, history, conflict, health, and retention views;
 - `REVOKE` of eligible Current records;
 - `REJECT` of Candidates;
 - contradiction resolution;
@@ -158,6 +162,8 @@ FactLane also exposes the managed local WebUI workflow through the main `factlan
 
 ```text
 factlane setup webui
+factlane doctor webui
+factlane launch webui
 factlane serve webui
 factlane open webui
 factlane start webui
@@ -166,9 +172,13 @@ factlane status webui
 factlane restart webui
 ```
 
-Run `factlane --help` to discover the managed surface or `factlane <action> webui --help` for command-specific help. Setup and service lifecycle stay inside the managed platform boundary; unsupported extra arguments continue to use the existing stdio MCP CLI contract.
+Run `factlane --help` to discover the managed surface or `factlane <action> webui --help` for command-specific help. `factlane doctor webui` is read-only onboarding discovery: it reports the resolved runtime/interpreter, managed memory binding, packaged Skill path, launcher presence, service observation, and a host-neutral read-only MCP launch recipe without editing the host, registering the Skill, changing storage, or starting the service. For normal opening after setup, `factlane launch webui` checks service state, starts the managed service when needed, then uses the trusted open flow. Successful setup also installs a non-terminal Linux application launcher or a current-user Windows Start Menu shortcut that reuses that same launch flow. Setup and service lifecycle stay inside the managed platform boundary; unsupported extra arguments continue to use the existing stdio MCP CLI contract.
 
-The packaged `factlane-owner-webui` launcher remains a direct loopback Owner WebUI entrypoint and alternate path rather than the managed install/service lifecycle. It binds exactly to `127.0.0.1`, uses a short-lived one-use bootstrap token exchanged through `X-FactLane-Bootstrap`, establishes an `HttpOnly; SameSite=Strict` session, and requires CSRF protection for later mutations. It is **not** an HTTP MCP transport and does not add a sixth public tool.
+When a fresh managed panel has no memory binding yet, its authenticated setup flow presents supported profiles and a suggested owner-local database/host identity instead of requiring the user to reconstruct runtime topology. On Linux, binding validates the selected existing database/storage/profile, never performs an implicit migration, publishes only the managed memory binding with owner-private atomic verification, and then requests a managed user-service restart. MCP-host identity and per-request scope remain separate explicit host choices.
+
+The packaged `factlane-owner-webui` launcher remains a direct loopback Owner WebUI entrypoint and alternate path rather than the managed install/service lifecycle. It binds exactly to `127.0.0.1`, uses a short-lived one-use bootstrap token exchanged through `X-FactLane-Bootstrap`, establishes an authenticated session, and requires CSRF protection for later mutations. The managed WebUI is a separate platform-owned lifecycle. Neither surface is an HTTP MCP transport and neither adds a sixth public tool.
+
+In the current **unreleased development source**, the managed Owner Panel opens **Memories** in an Owner-wide read-only discovery view and **Review** as an Owner-wide Candidate queue, while every mutation still binds back to the selected record's exact scope and current proof. Candidate approval uses local date/time input with the browser timezone shown; record IDs, revisions, and Group-CAS proof remain internal to the normal review flow. The panel also exposes database operations such as explicit backup artifacts, logical export/import, full-restore jobs, and capability-gated permanent purge. Native Windows x64/AMD64 has its own qualified managed lifecycle, HTTPS/browser path, storage-v2→v3 migration/rollback path, full-restore path, and panel purge path. Those capabilities do not turn general sensitive-memory incident Recovery into a Windows feature; that operator remains a separate POSIX-only boundary. See the [Quick Start](docs/QUICKSTART.md), [Environment](docs/ENVIRONMENT.md), and [Security](SECURITY.md) for the exact distinctions.
 
 For `on_change` freshness, FactLane records a recheck contract but does not run a background source watcher. A trusted Owner supplies fresh bounded observation evidence. Healthy unchanged evidence may renew eligibility; changed, unavailable, indeterminate, stale, or mismatched evidence fails closed for review.
 
@@ -197,7 +207,8 @@ Trusted local Owner
         │
         └──────────────► OwnerControlService
                            ├─ factlane-owner CLI
-                           └─ loopback Owner WebUI
+                           ├─ direct loopback Owner WebUI
+                           └─ managed Owner Panel lifecycle
 ```
 
 The gateway enforces public request boundaries. The adapter owns FactLane validation, authority, freshness, contradiction handling, revision/transaction semantics, and retrieval budgets. The pinned backend supplies SQLite/SQLite-vec mechanics; it does not decide FactLane authorization.
@@ -206,14 +217,14 @@ Read [Architecture](docs/ARCHITECTURE.md) for storage, migration, recovery, retr
 
 ## Supported profile and limits
 
-FactLane makes a deliberately bounded support claim. The documented profile covers Python 3.11+, linked SQLite 3.42.0+, command-launched stdio MCP, supported local Ollama embeddings, local SQLite/SQLite-vec storage, and the documented local POSIX storage/recovery contract. Normal runtime behavior is also qualified on native Windows x64/AMD64; sensitive-memory Recovery remains a separate POSIX-only boundary.
+FactLane makes a deliberately bounded support claim. The documented profile covers CPython 3.11+, linked SQLite 3.42.0+, command-launched stdio MCP, supported local Ollama embeddings, and local SQLite/SQLite-vec storage. The shipped provider accepts only exact HTTP loopback-literal Ollama base URLs and uses a provider-owned HTTP path with ambient proxies and redirects disabled; it does not configure an automatic remote/cloud fallback. Native Windows x64/AMD64 is also qualified for the current development runtime and managed Owner Panel. General sensitive-memory Recovery remains a separate POSIX-only incident-recovery boundary.
 
 Current product limits include:
 
 - no public HTTP, SSE, or Streamable HTTP MCP transport;
-- no remote embedding endpoint fallback;
+- no remote embedding provider or automatic cloud fallback;
 - no automatic background freshness watcher;
-- no transcript archive, bulk file crawler, general document index, or backup service;
+- no transcript archive, bulk file crawler, general document index, or continuous managed backup service;
 - facts are bounded to **2,000 UTF-8 bytes**;
 - language and semantic-ranking quality remain workload-specific;
 - arbitrary filesystem, scale, and deployment environments are not implied by the documented qualification.
@@ -253,6 +264,7 @@ Read [Security](SECURITY.md) for the trust model and recovery boundary.
 | [Five MCP tools](docs/TOOLS.md) | Public tool semantics and governed failures. |
 | [Architecture](docs/ARCHITECTURE.md) | Request path, storage, lifecycle, Owner control, migration, and recovery. |
 | [Environment](docs/ENVIRONMENT.md) | Runtime requirements, supported profiles, and compatibility limits. |
+| [FAQ](docs/FAQ.md) | Product fit, Owner surfaces, data location, and common boundaries. |
 | [Security](SECURITY.md) | Trust boundaries, write authority, and sensitive-memory Recovery. |
 | [Changelog](docs/CHANGELOG.md) | User-facing release changes. |
 | [Release operations](docs/RELEASE_OPERATIONS.md) | Exact release identity, artifact hashes, installation, migration, and rollback. |

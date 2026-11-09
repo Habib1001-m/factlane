@@ -37,7 +37,7 @@ FactLane is not:
 - a transcript archive;
 - a bulk file/document crawler;
 - a general search index for arbitrary corpora;
-- a backup service;
+- a continuous managed backup service;
 - a managed remote memory cloud;
 - a public HTTP/SSE/Streamable HTTP MCP server;
 - an automatic permission system for an agent;
@@ -47,7 +47,11 @@ Facts are bounded to **2,000 UTF-8 bytes**.
 
 ## Where does the data live?
 
-The documented profile uses local SQLite/SQLite-vec storage and supported local Ollama embeddings. The shipped provider does not silently fall back to a remote embedding endpoint.
+The documented profile uses local SQLite/SQLite-vec storage and supported local Ollama embeddings.
+The current development provider accepts only an exact HTTP loopback-literal Ollama base URL,
+does not inherit ambient proxies or follow redirects, and does not silently fall back to a remote
+embedding provider. The managed Owner Panel can create explicit local backup artifacts; operators
+still own retention and external backup policy.
 
 Durable storage has an explicit contract. If an existing database needs migration before the installed runtime can use it, normal startup fails closed and the operator must follow the documented migration and verified backup/restore procedure.
 
@@ -65,10 +69,32 @@ Direct Owner authority may additionally revoke eligible Current records or rejec
 
 It is exposed through:
 
-- the packaged `factlane-owner` CLI; and
-- the packaged `factlane-owner-webui` loopback launcher.
+- the packaged `factlane-owner` CLI;
+- the direct `factlane-owner-webui` loopback launcher; and
+- where the selected development/release surface provides it, the separately managed Owner Panel
+  lifecycle driven through the main `factlane` CLI.
 
-The WebUI binds to `127.0.0.1`, uses a one-use bootstrap exchange plus an authenticated session and CSRF protection, and does **not** turn FactLane into an HTTP MCP server.
+The direct WebUI binds to `127.0.0.1` and uses a one-use bootstrap exchange plus an authenticated
+session and CSRF protection. The managed panel has a platform-owned local connection/authentication
+flow. Neither surface turns FactLane into an HTTP MCP server.
+
+In the current unreleased development source, the managed panel includes Database, Agents,
+**Activity**, and **Session & settings** alongside memory/review/conflict views. Memories opens Owner-wide by default,
+and Review is an Owner-wide Candidate queue; those are read-only discovery conveniences, while
+mutations remain exact-scope operations on the selected record. Activity provides filterable local
+operation/lifecycle history; local redacted Diagnostics are available under Session & settings. Database operations are explicit
+and capability-gated; full restore and permanent purge require additional preview/approval steps.
+
+After managed setup, `factlane launch webui` is the normal command to open the panel: it checks the
+service, starts it if needed, then uses the trusted open flow. Successful setup also installs a
+non-terminal Linux application launcher or current-user Windows Start Menu shortcut using that flow.
+
+For onboarding diagnostics, `factlane doctor webui` reports the local executable/interpreter,
+managed database/profile binding, packaged Skill path, launcher presence, service observation, and a
+read-only MCP launch recipe without modifying the host or service. It deliberately leaves MCP
+`host_id` and request scope explicit. On Linux first run, an unbound managed panel can complete its
+memory binding in the authenticated setup flow; existing storage v2 still requires the explicit
+migration operator rather than being migrated during setup.
 
 ## Does FactLane watch my sources in the background?
 
@@ -90,7 +116,10 @@ That does not give the hosts identical authority. Launcher profiles, bound ident
 
 ## How do I find the current supported release?
 
-Use [Release operations](RELEASE_OPERATIONS.md) for the authoritative published tag, commit/tree, artifact hashes, migration boundary, and rollback rules. Evergreen setup docs intentionally do not hard-code a release number.
+Use [Release operations](RELEASE_OPERATIONS.md) for the recorded released tag, commit/tree, artifact
+hashes, migration boundary, and rollback rules. A newer version in a development checkout is not by
+itself evidence that the version has been published. Evergreen setup docs intentionally avoid
+treating a moving source version as release authority.
 
 ## What should I read next?
 

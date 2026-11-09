@@ -4,9 +4,32 @@
 والترحيل والتراجع وهوية الإصدار الدقيقة، استخدم
 [عمليات الإصدار](RELEASE_OPERATIONS.md).
 
+## 0.1.7 (Unreleased)
+
+FactLane v0.1.7 هو هوية حزمة التطوير الحالية في شجرة المصدر هذه. وهو **ليس إصدارًا منشورًا** في حالة التوثيق هذه؛ فلا تستنتج tag أو GitHub Release أو نشرًا على PyPI أو انتقالًا لموقع Production من رقم الإصدار وحده. يظل خط أساس الحزمة المنشور المسجل أدناه v0.1.6 إلى أن يسجل إصدار مستقل ومصرح به هوية ثابتة جديدة.
+
+### أبرز تغييرات التطوير
+
+- يوسّع دعم Windows x64/AMD64 الأصلي من تكافؤ وقت التشغيل العادي إلى دورة حياة Owner Panel المُدارة، بما يشمل التحكم في الخدمة للمستخدم الحالي، وHTTPS المحلي، وتكامل Firefox المعزول، وإدارة قاعدة البيانات، والاستعادة الكاملة المؤهلة، والمحو الدائم المقيد بالإمكانات المتاحة.
+- يضيف تنفيذ ترحيل storage-v2→v3 وتراجع دقيق إلى ما قبل v3 على Windows x64/AMD64 الأصلي. وهو منفصل عن مشغّل Recovery العام لحوادث الذاكرة الحساسة، الذي يبقى عقدًا مقصورًا على POSIX.
+- تبدأ Owner Panel المُدارة الآن Memories باكتشاف Owner-wide للقراءة فقط وReview بقائمة Candidates على مستوى Owner، مع بقاء إثبات التعديل مربوطًا بالنطاق الدقيق. يستخدم اعتماد Candidate تحكم تاريخ/وقت محليًا مع إظهار منطقة المتصفح الزمنية، بينما تبقى تفاصيل record/revision/Group-CAS داخل المسار العادي. تعرض **Activity** سجل العمليات ودورة الحياة المحلي القابل للتصفية؛ وتوجد Diagnostics المحلية والمنقحة داخل الجلسة والإعدادات.
+- يضيف `factlane launch webui` كتركيب طبيعي لـstatus/start/open بعد الإعداد. يثبت الإعداد الناجح مشغّل Linux `.desktop` بلا Terminal أو اختصار Start Menu للمستخدم الحالي على Windows يعيد استخدام مسار الفتح الموثوق نفسه.
+- يضيف `factlane doctor webui` للقراءة فقط لاكتشاف runtime/interpreter وربط قاعدة البيانات/profile المُدار والـSkill المضمّن وحالة launcher/service ووصفة MCP محايدة للمضيف بوضع read-only، مع بقاء هوية MCP host والنطاق صريحين. ويمكن لإعداد Linux المُدار في التشغيل الأول الآن إكمال ربط ذاكرة غائب عبر setup shell الموثق، مع تحقق دقيق من التخزين/profile، ومن دون ترحيل ضمني، ومع نشر متحقق منه للإعداد الخاص بالمالك وإعادة تشغيل مُدارة.
+- تظل الاستعادة الكاملة والمحو الدائم تتطلبان معاينة دقيقة وموافقة منفصلة عبر آلية المنصة الأصلية على الإجراء الحساس قبل التنفيذ.
+- يمكن استئناف جلسة Owner مُدارة صالحة بعد إعادة تحميل الصفحة مع تدوير CSRF من دون إعادة ضبط مهلة الخمول أو العمر المطلق.
+- يقتصر تشغيل المتصفح المُدار على Windows على Firefox، باستخدام ملف FactLane مخصص والتحقق من الجاهزية ضمن حدود محددة قبل تسليم محدد اتصال لمرة واحدة. تجاوز شهادات المتصفح وإعادة استخدام ملف شخصي وإعادة تسليم المحدد ليست وسائل استعادة مدعومة.
+- يشدّد مزوّد Ollama المرفق بحيث تظل وجهات طلبات HTTP الخاصة بـFactLane عند نقطة نهاية بـloopback literal دقيق: تُعطّل وراثة إعدادات proxy المحيطة وتُرفض إعادة التوجيه.
+- يصحح صياغة مساعدة/مخطط `memory_update` الحي بحيث توثق عمليتا Owner `REVOKE`/`REJECT` متطلب `expected_record_id` الدقيق، إضافة إلى إثبات Group CAS والسبب.
+
+### الترقية وحالة الإصدار
+
+يظل عقد التخزين v3. لا تتطلب قاعدة رُحلت بالفعل إلى v3 ترحيل مخطط جديدًا لمجرد الانتقال من وقت تشغيل v0.1.6 إلى شجرة تطوير v0.1.7 الحالية. يجب على تثبيت ما زال يستخدم storage v2 تشغيل مشغّل الترحيل/التراجع الصريح المدعوم على المنصة المستهدفة قبل الخدمة العادية. راجع [عمليات الإصدار](RELEASE_OPERATIONS.md).
+
+لا يعيّن هذا القسم غير المنشور هوية إصدار عامة.
+
 ## 0.1.6
 
-FactLane v0.1.6 هو إصدار Python package المنشور الحالي. وهو corrective patch release فوق GitHub
+FactLane v0.1.6 هو خط أساس حزمة Python المنشور المسجل في هذا المستودع. وهو corrective patch release فوق GitHub
 release المختوم v0.1.5: تستخدم الحزمة الآن اعتماد registry دقيقًا ومتوافقًا مع PyPI
 `mcp-memory-service==11.10.0` بدل direct VCS requirement الذي منع قبول wheel الخاصة بـv0.1.5 على
 PyPI. ويظل Public Contract Revision 3 وstorage contract v3 ونقل `stdio` المشغّل بالأمر وسطح MCP
@@ -72,7 +95,7 @@ PyPI انتهت مهلته بعد نجاح خطوة الرفع. وأثبتت rea
 FactLane v0.1.5 هو GitHub release تاريخي مختوم مع Public Contract Revision 3 وstorage contract v3.
 وتظل هويات tag وrelease assets المسجلة الخاصة به دليل الإصدار التاريخي، ولا يجوز retarget أو
 استبدالها لإعادة كتابة ذلك التاريخ. لكن نشره على PyPI لم يكتمل: رفض PyPI direct
-VCS dependency metadata الموجودة في wheel، ولا يوجد package version `0.1.5` منشور على PyPI.
+VCS dependency metadata الموجودة في wheel، ولا يوجد package version 0.1.5 منشور على PyPI.
 ويُعد ذلك الفشل terminal؛ فـv0.1.6 هو successor تصحيحي متوافق مع PyPI، وليس mutation أو retry
 للإصدار v0.1.5.
 
@@ -109,7 +132,7 @@ VCS dependency metadata الموجودة في wheel، ولا يوجد package ve
 - يتقدم Public Contract Revision من 2 إلى 3. وتبقى مجموعة أدوات MCP العامة بالضبط:
   `memory_search` و`memory_get` و`memory_store` و`memory_update` و`memory_status`.
 - تدعم `memory_update` الآن `REVOKE` و`REJECT` بصلاحية Owner مباشرة إلى جانب `REVERIFY`
-  و`REPLACE`. تتطلب dispositions الخاصة بالـOwner revision الحالي الدقيق وملاحظة مجموعة التناقض
+  و`REPLACE`. تتطلب dispositions الخاصة بالـOwner رقم revision الحالي الدقيق وملاحظة مجموعة التناقض
   وحماية idempotency وreason code محدودًا.
 - يتقدم storage contract من v2 إلى v3. ويضيف storage v3 حواجز writer محكومة وGroup CAS لمجموعة
   التناقض وlifecycle history وحماية idempotency عامة عبر adapter writes العادية وعمليات Owner lifecycle.

@@ -44,24 +44,56 @@ The public MCP surface is limited to `memory_search`, `memory_get`, `memory_stor
 administration, background harvesting, or autonomous consolidation tool.
 
 Direct Owner authority can use `REVOKE` and `REJECT` through `memory_update`; these modes do not add
-another MCP tool. They require exact revision and contradiction-group CAS plus a bounded reason
-code. The local `OwnerControlService` is a separate trusted operator boundary that also provides
+another MCP tool. They require exact revision, exact current `expected_record_id`, contradiction-group
+CAS, and a bounded reason code. The local `OwnerControlService` is a separate trusted operator boundary that also provides
 bounded inventory/detail, conflict review and resolution, health/retention inspection,
 reverification/replacement, manual freshness recheck, and readmission.
 The packaged `factlane-owner` CLI binds scope and direct Owner authority at launcher creation and
-accepts mutation proof as bounded JSON. The packaged `factlane-owner-webui` launcher delegates to
-the same service and binds exactly to `127.0.0.1`. Startup prints the bound origin plus a short-lived
-one-use bootstrap token. The client exchanges that secret only through the
+accepts mutation proof as bounded JSON. The packaged `factlane-owner-webui` launcher is the direct
+loopback WebUI path: it delegates to the same service and binds exactly to `127.0.0.1`. Startup
+prints the bound origin plus a short-lived one-use bootstrap token. The client exchanges that secret only through the
 `X-FactLane-Bootstrap` header on `POST /owner/bootstrap`; bootstrap credentials in the URL are
 rejected, and the UI does not store the bootstrap token in `localStorage`. Successful exchange
 consumes the token, sets an `HttpOnly; SameSite=Strict` session cookie, and returns the CSRF token
 required by later mutation requests. It is an Owner control surface, not an HTTP MCP server and not
 remote administration.
 
-The WebUI surfaces **Overview**, **Current**, **Candidates**, **Conflicts**, **Needs Review**,
-**History**, and **System Health** over the same Owner service. Browser mutations remain bound to the
-trusted launcher scope, authenticated session, CSRF token, exact record revision, idempotency, and
-the displayed contradiction-group CAS token where required.
+The managed Owner Panel is a separate platform-owned lifecycle driven by the main `factlane` CLI.
+Its current primary navigation is **Overview**, **Memories**, **Review**, **Conflicts**, **Database**,
+**Agents**, **Activity**, and **Session & settings**. Owner-wide Memories/Review discovery is authenticated,
+read-only, and bounded to the selected local database; each result carries exact scope identity and
+mutation still refreshes exact record/revision/Group-CAS proof. **Activity** exposes the governed,
+filterable local operation/lifecycle history; local redacted Diagnostics live under **Session & settings**.
+Neither surface is an external telemetry/upload channel. On Native Windows x64/AMD64, the managed path uses a
+dedicated Firefox profile and local HTTPS with owner-private trust material rather than the direct
+loopback bootstrap URL. It does not fall back to Edge/Chrome, install a system trust root, modify the
+hosts file, or require certificate-bypass flags.
+
+Managed enrollment uses one short-lived local request, pre-authentication binding, and a
+fragment-only connection locator that is scrubbed from the page location after use. Reusing or
+redelivering one locator to multiple browser documents is not a supported recovery mechanism; a
+pre-authentication mismatch fails closed as `PENDING_CLAIM_CONFLICT` (HTTP 409) and can invalidate
+the contested enrollment. Discard that enrollment and start a fresh `factlane open webui`; do not
+retry or reuse its locator. A successful managed session uses a host-only
+`Secure; HttpOnly; SameSite=Strict` cookie plus a separate CSRF
+token. A valid session can resume across a page reload with CSRF rotation; resume does not reset the
+30-minute inactivity limit or the 8-hour absolute session lifetime. Background polling is not user
+activity.
+
+Ordinary native control responses keep the 10-second control bound. Enrollment approval and
+sensitive-action approval are explicit human-confirmation operations and allow up to 125 seconds for
+the response. If that confirmation window expires, the surfaced control failure is
+`CONTROL_UNAVAILABLE`; do not recover by replaying an old enrollment locator.
+
+Browser mutations remain bound to the trusted launcher/platform scope, authenticated session, CSRF
+token, exact record revision, idempotency, and the current contradiction-group CAS token where
+required. The managed panel keeps record/revision/CAS identities internal to its ordinary decision
+flow while it presents human-readable memory content to the Owner. Full database restore and permanent purge add a second gate: a fresh exact preview plus
+native sensitive-action approval and a short-lived matching grant before commit. Restore also
+requires explicit acknowledgement that active database state will be replaced; purge requires the
+exact typed confirmation displayed by the preview. A recovery-required retry retains the exact
+operation/preview identity but requires fresh sensitive approval rather than reusing a consumed
+grant. Ordinary session access is not sufficient destructive-action authorization.
 
 `on_change` freshness does not create an autonomous monitor. The Owner manual-recheck operation
 accepts explicit bounded observation evidence and fails closed when evidence is stale, mismatched,
@@ -145,6 +177,12 @@ Running an arbitrary older runtime directly against storage contract v3 is not a
 rollback path. See [Release operations](docs/RELEASE_OPERATIONS.md) for release-specific artifact
 verification and the operator transition checklist.
 
+Historical released migration instructions restrict that implementation to the POSIX maintenance
+path shipped in the corresponding release. The current **unreleased development source**
+additionally contains a qualified Native Windows x64/AMD64 migration and exact pre-v3
+rollback path using Windows-specific custody/exclusion primitives. This storage transition is still
+different from full Owner Panel database restore and from sensitive-memory incident Recovery.
+
 ## Known limits
 
 FactLane is a local service, not a distributed consensus system. Its supported local profile covers
@@ -153,10 +191,11 @@ bounded concurrent operation, crash/restart behavior, backup/restore compatibili
 production-derived retrieval checks. Operators still need their own backup retention, restore
 procedures, monitoring, and deployment-specific recovery plan.
 
-Normal runtime support on native Windows x64/AMD64 is separate from sensitive maintenance.
-Sensitive-memory Recovery and storage-v2-to-v3 migration/restore depend on the POSIX
-`fcntl`/`flock` maintenance-lock contract. Do not infer a Windows Recovery or migration claim from
-normal Windows runtime support. No Windows ARM64 support claim is made.
+Native Windows x64/AMD64 support in the current development source includes the managed Owner
+Panel, its qualified full-restore/permanent-purge paths, and storage-v2→v3 migration with exact
+pre-v3 rollback. General sensitive-memory incident Recovery remains separate and continues to depend
+on the POSIX `fcntl`/`flock` contract. Do not infer Windows parity for that general Recovery operator.
+No Windows ARM64 support claim is made.
 
 The qualification does not establish universal behavior for arbitrary network/FUSE
 filesystems, every MCP client, unlimited-duration load, or every language and ranking

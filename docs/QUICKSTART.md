@@ -14,7 +14,7 @@ For a first setup, keep the goal narrow. You are done when:
 
 Start read-only. Enable Candidate writes only after basic connectivity works.
 
-## 1. Select an exact published release and check the runtime
+## 1. Select an exact recorded release and check the runtime
 
 Before changing the machine, distinguish **inspection** from **mutation**. Reading the existing
 host configuration, installed runtime identity, storage paths, and release documentation is
@@ -23,13 +23,15 @@ a Skill, creating or migrating storage, or changing a launcher profile mutates t
 requires the applicable operator/user authority. An agent that lacks that authority should stop at
 guidance and must not claim that installation or configuration occurred.
 
-Use [Release operations](RELEASE_OPERATIONS.md) to identify the current published FactLane release.
-Record its exact tag plus the commit/tree or artifact digests documented there. Do not install from
-the moving `main` branch and do not infer a release identity from the package version in an arbitrary
-checkout.
+Use [Release operations](RELEASE_OPERATIONS.md) to identify the released baseline recorded by the
+repository authority you are using. Record its exact tag plus the commit/tree or artifact digests
+documented there. Do not install from the moving `main` branch and do not infer a release identity
+from the package version in an arbitrary checkout. A development checkout can declare a newer
+package version without that version being published.
 
-For a versioned source installation, set `FACTLANE_TAG` to the published tag named by Release
-operations, then clone that exact tag:
+For a versioned source installation, set `FACTLANE_TAG` to the released tag named by Release
+operations, then clone that exact tag. The example below uses a POSIX shell; PowerShell users can
+set `$env:FACTLANE_TAG` and pass that exact tag to `git clone --branch`.
 
 ```bash
 FACTLANE_TAG='<published-tag-from-release-operations>'
@@ -41,8 +43,9 @@ Verify the checkout commit/tree against the values recorded for that tag in Rele
 before continuing. If you prefer a published wheel or source distribution, follow the digest-checked
 installation procedure there instead of translating this source-checkout example by guesswork.
 
-Install the Python, [`uv`](https://docs.astral.sh/uv/), and [Ollama](https://ollama.com/) prerequisites
-declared by the selected release and [Environment and compatibility](ENVIRONMENT.md). Verify the
+Install the CPython and [Ollama](https://ollama.com/) prerequisites declared by the selected release
+and [Environment and compatibility](ENVIRONMENT.md). The repository/lockfile workflow below also
+uses [`uv`](https://docs.astral.sh/uv/); a published-wheel install does not require `uv`. Verify the
 SQLite library linked into the same Python environment that will run FactLane:
 
 The current supported product profile requires a linked SQLite runtime **3.42.0+**. Still verify the
@@ -59,7 +62,7 @@ uv run factlane --help-tools
 The SQLite check above uses the project interpreter. A system-wide `python` or `sqlite3`
 executable may report a *different* version. If the linked runtime is below the selected release's
 required floor, FactLane returns
-`BACKEND_COMPATIBILITY_MISMATCH` before creating or opening its database. Python version
+`BACKEND_COMPATIBILITY_MISMATCH` before creating or opening its database. CPython version
 alone does not satisfy the storage contract.
 
 ### Inspect existing storage before launch
@@ -81,12 +84,15 @@ improvise a storage migration.
 
 Choose a supported embedding profile from [Environment and compatibility](ENVIRONMENT.md), install
 the exact model that profile requires, and start the local Ollama service using your installation's
-normal procedure. Do not guess a profile/model pair from an older example. Model identity, digest,
-dimensions, and input capacity must match the selected profile; FactLane does not download or
-replace a model automatically.
+normal procedure. Do not guess a profile/model pair from an older example. Model family/identity,
+native/output dimensions, context capability, and input policy must satisfy the selected profile;
+the observed model digest is runtime provenance rather than, by itself, a profile-acceptance key.
+FactLane does not download or replace a model automatically.
 
-Use the endpoint and provider boundary documented for the selected release. Do not introduce a
-remote embedding endpoint or fallback unless that release explicitly supports it.
+Use the endpoint and provider boundary documented for the selected release. In the current
+development source, the configured Ollama base URL must be an exact HTTP loopback literal and
+FactLane's own request path disables ambient proxy inheritance and redirects. Do not introduce a
+remote embedding endpoint or fallback unless a future release explicitly supports it.
 
 ## 3. Choose the launch profile
 
@@ -95,7 +101,9 @@ SQLite file), `--host-id` (a stable non-secret label for the launcher), and an e
 `--profile`. Select the profile from the current Environment documentation rather than relying on
 an implicit or historical default.
 
-For the first connection, keep the launcher read-only by omitting `--write-profile`:
+For the first connection, keep the launcher read-only by omitting `--write-profile`. The multiline
+form below uses POSIX-shell continuation; PowerShell users can put the same arguments on one line or
+use PowerShell's continuation syntax:
 
 ```bash
 FACTLANE_PROFILE='<supported-profile-from-environment>'
@@ -127,6 +135,10 @@ args = [
 enabled = true
 ```
 
+On native Windows, use the actual Windows executable and database paths instead of POSIX paths, for
+example `C:\path\to\venv\Scripts\factlane.exe` and
+`C:\path\to\state\factlane.sqlite3`.
+
 Reload your installed Codex version's MCP configuration and confirm that the five FactLane tools
 appear. An agent's use of those tools should follow the portable
 [using-factlane Skill](../skills/using-factlane/SKILL.md), installed through your host's
@@ -152,6 +164,9 @@ mcp_servers:
       - "--host-id"
       - "hermes"
 ```
+
+On native Windows, use the corresponding Windows executable and database paths. Do not pass a WSL
+path to the native Windows runtime.
 
 Reload Hermes's MCP configuration and check tool discovery. The portable Skill is included in
 FactLane's source and package artifacts but is **not automatically registered** with either
@@ -182,7 +197,7 @@ profile still controls writes. Ask the client to call `memory_status` with an ex
 For a global-user check that does not require a project ID:
 
 ```json
-{"scope":"GLOBAL_USER"}
+{"request":{"scope":"GLOBAL_USER"}}
 ```
 
 If that request succeeds, the safe first-run objective is complete: the host can launch FactLane,
@@ -196,18 +211,21 @@ For an **unbound** project-scoped search, a request can look like this:
 
 ```json
 {
-  "scope": "PROJECT",
-  "project_id": "example-project",
-  "intent_class": "CURRENT_PROJECT_STATE",
-  "query": "What release constraints are recorded?",
-  "retrieval_mode": "CURRENT",
-  "retrieval_mode_kind": "KEYWORD"
+  "request": {
+    "scope": "PROJECT",
+    "project_id": "example-project",
+    "intent_class": "CURRENT_PROJECT_STATE",
+    "query": "What release constraints are recorded?",
+    "retrieval_mode": "CURRENT",
+    "retrieval_mode_kind": "KEYWORD"
+  }
 }
 ```
 
-When your trusted host has already bound a project or workflow identity, **omit the
-corresponding bound ID from the request**. FactLane supplies it at the gateway and rejects a
-conflicting explicit ID with `BOUND_CONTEXT_IDENTITY_MISMATCH`. `CROSS_PROJECT_WORKFLOW` is
+When your trusted host has already bound a project, workflow, or tool-environment identity,
+**omit the corresponding bound ID from the request**. FactLane supplies it at the gateway; an
+explicit bound `project_id`, `workflow_id`, or `agent_id` must match or the request fails closed
+with `BOUND_CONTEXT_IDENTITY_MISMATCH`. `CROSS_PROJECT_WORKFLOW` is
 different: it forbids the presence of *all* project, worktree, workflow, and agent identity
 keys and does not query all projects automatically.
 
@@ -260,9 +278,10 @@ autonomous post-turn storage.
 A trusted verifier reviewing a Candidate uses `REVIEW_HISTORY` to inspect it and
 `memory_update` with `mode=REVERIFY`, `expected_revision`, and the Candidate's
 `expected_record_id` to promote it. A delegated agent has no verifier grant, even with user
-approval in chat. `REVERIFY` refreshes verification without changing the memory's
-contradiction identity; use `REPLACE` rather than changing `memory_type` or subject when a
-semantic reclassification is intended.
+approval in chat. `REVERIFY` cannot change the Candidate's contradiction identity. `REPLACE`
+applies to an eligible current logical memory; it is not a Candidate-edit path. If a Candidate is
+materially wrong or misclassified, leave it unpromoted; a direct Owner can `REJECT` it, after which
+the corrected bounded Candidate can be submitted and reviewed.
 
 ### Optional trusted Owner control path
 
@@ -271,8 +290,9 @@ may additionally ship local Owner control surfaces such as `factlane-owner` or
 `factlane-owner-webui`. Treat those as **optional trusted-operator interfaces** only when the
 selected release documents and installs them; do not assume they exist from this Quick Start.
 
-Owner control does not create a sixth MCP tool and does not turn the loopback WebUI into an HTTP MCP
-transport. Bind Owner operations to the exact trusted scope and use current inventory/detail or
+Owner control does not create a sixth MCP tool. The direct `factlane-owner-webui` launcher is a
+loopback UI, while the managed `factlane ... webui` lifecycle is a separate platform-owned surface;
+neither is an HTTP MCP transport. Bind Owner operations to the exact trusted scope and use current inventory/detail or
 conflict observations for revision and Group-CAS proof. Do not attempt Owner lifecycle operations
 from a delegated-agent session, and do not treat content approval in chat as Owner or machine-level
 authority.
@@ -282,10 +302,124 @@ Manual recheck and readmission are explicit Owner operations, not background sou
 database restore, or recovery resurrection. Follow the selected release's Owner and security
 documentation for exact commands and mutation envelopes.
 
+### Current development: managed Owner Panel workflow
+
+This section describes the current **unreleased development surface**. A development package version
+does not become a published release or replace the recorded released authority in
+[Release operations](RELEASE_OPERATIONS.md).
+
+On Linux, managed Owner Panel setup requires a non-root user session on a running `systemd` host,
+with `systemctl`, Caddy, Zenity, Mozilla Firefox or Firefox ESR, and NSS `certutil` available through
+absolute executable paths. `loginctl` is also required when setup needs to enable user lingering.
+These are managed-panel prerequisites; they are not additional requirements for the ordinary stdio
+MCP server.
+
+The managed Owner Panel uses the main `factlane` CLI:
+
+```text
+factlane setup webui
+factlane doctor webui
+factlane launch webui
+factlane start webui
+factlane status webui
+factlane open webui
+factlane stop webui
+factlane restart webui
+```
+
+Before reconstructing local paths by hand, use `factlane doctor webui`. It is a read-only inspection
+surface: it reports the resolved FactLane executable/interpreter, configured managed database/profile
+or the supported profiles when unconfigured, packaged Skill location, Owner Panel launcher presence,
+managed service observation, and a host-neutral read-only MCP argv recipe. It does **not** edit an MCP
+host, register a Skill, start the panel service, change a write profile, install a model/package, or
+migrate storage. The MCP host identity remains `EXPLICIT_REQUIRED` and scope remains
+`EXPLICIT_PER_REQUEST`.
+
+For normal opening after setup, use `factlane launch webui`. It checks status, starts the managed
+service when needed, then performs the same trusted open flow. The lower-level `status`, `start`, and
+`open` commands remain available for explicit service control. Setup is a separate, explicitly
+confirmed action.
+
+Successful setup also installs an Owner Panel launcher for the current user. Linux receives a
+non-terminal `.desktop` application entry; Windows receives a current-user **FactLane Owner Panel**
+Start Menu shortcut. Both reuse the trusted `launch webui` flow rather than bypassing managed
+service/authentication controls.
+
+On Linux, if first-run managed setup has not selected memory yet, the authenticated setup shell
+offers the supported profiles plus a suggested owner-local database path and non-secret Owner host
+identity. Binding validates the exact database path, current storage contract, and any existing
+embedding-profile binding before publication. Storage v2 remains an explicit migration boundary:
+setup returns migration-required rather than migrating it. A successful bind changes only
+`db`/`profile`/`host_id` in the owner-private managed config, verifies the atomic publication, then
+requests the existing user service to restart. It does not configure the separate MCP host identity
+or its request scopes.
+
+On native Windows x64/AMD64, managed setup stores owner-private state under
+`%LOCALAPPDATA%\FactLane`, registers a current-user Task Scheduler entry and Start Menu shortcut, and requires Mozilla
+Firefox for the managed browser. There is no Edge/Chrome fallback. FactLane uses a dedicated managed
+Firefox profile and local HTTPS material; do not disable certificate validation, reuse a personal
+Firefox profile, add browser bypass flags, or substitute WSL/UNC database paths.
+
+After connection, the primary navigation is **Overview**, **Memories**, **Review**, **Conflicts**,
+**Database**, **Agents**, **Activity**, and **Session & settings**. **Activity** exposes filterable local
+operation/lifecycle history. Local redacted Diagnostics are available from **Session & settings**;
+neither surface implies external upload.
+
+**Memories** defaults to Owner-wide read-only discovery across the scopes owned by the selected local
+database, so you do not need to know a scope ID before you can find a record. **Review** likewise opens
+as an Owner-wide Candidate queue. This aggregation is an Owner read/discovery convenience only: it
+does not change the five-tool MCP scope contract and it cannot be replayed as a cross-scope mutation.
+When you select a record or Candidate, mutation flows bind to that record's exact scope and refresh
+the current record/revision/Group-CAS proof before commit.
+
+For Candidate approval, the normal form uses a local date/time control and shows the browser timezone.
+FactLane converts that value back to the backend's timezone-bearing timestamp contract. The ordinary
+review form does not ask you to type record IDs, revisions, or Group-CAS tokens; those concurrency
+identities stay derived from the selected current record. Advanced provenance fields remain available
+when the evidence actually needs correction.
+
+**Conflicts** follows the same rule: it presents the competing memory content and evidence in human
+terms, while the exact memory/record/revision/Group-CAS identities remain internal and are refreshed
+again before resolution. If that exact group changes, the panel requires a fresh review instead of
+silently retargeting the Owner's selection.
+
+The Database view exposes capability-gated
+database operations including explicit backup artifacts, logical export/import, restore preview and
+jobs, plus destructive operations where the current platform advertises them. Imported facts remain
+Candidates until governed review.
+
+Full database restore and permanent purge require a fresh exact preview plus separate native
+sensitive-action approval before commit. For restore, acknowledge that the active database state
+will be replaced before requesting/using that approval. For purge, type the exact confirmation shown
+by the preview. If either operation enters a recovery-required state, keep the exact operation and
+preview identity and obtain fresh sensitive approval for the retry; do not reuse the consumed grant.
+Restore invalidates existing Owner sessions after activation, so reconnect through the managed flow
+before continuing. Permanent purge is distinct from normal `REVOKE`/`REJECT` and from the general
+sensitive-memory incident-Recovery operator.
+
+Storage-v2 → v3 migration is also separate from panel restore. Stop normal service and use
+`factlane-migrate-storage-v3` with the verified pre-v3 backup/rollback procedure in
+[Release operations](RELEASE_OPERATIONS.md). Current development bytes include a Native Windows
+x64/AMD64 migration and exact pre-v3 rollback path; historical released instructions for the earlier
+implementation remain POSIX-only because that implementation did not contain the Windows maintenance path.
+
+A valid Owner session can survive a page reload: the panel resumes the existing session and rotates
+its CSRF token without resetting the session's idle or absolute lifetime. If the session is invalid
+or expired, return to the managed connection flow. Do not copy or redeliver an old connection
+locator. A contested pre-authentication claim surfaces as `PENDING_CLAIM_CONFLICT`; discard that
+enrollment and start a fresh `factlane open webui` operation. Ordinary native control responses use
+the 10-second control bound, while explicit human enrollment/sensitive confirmations allow up to
+125 seconds for their response. A confirmation timeout surfaces as `CONTROL_UNAVAILABLE`, not as
+permission to reuse the old locator.
+
+For platform limits and browser requirements, see [Environment](ENVIRONMENT.md). For authentication,
+destructive-action approval, and sensitive-Recovery boundaries, see [Security](../SECURITY.md).
+
 ## 6. Limits and next references
 
-Facts are limited to 2,000 UTF-8 bytes. FactLane is not a raw-corpus indexer, backup
-service, or remote embedding gateway. Reproduction on this example profile does not
+Facts are limited to 2,000 UTF-8 bytes. FactLane is not a raw-corpus indexer, continuous managed
+backup system, or remote embedding gateway. The Owner Panel can create explicit local backup
+artifacts, but operators remain responsible for retention and external backup policy. Reproduction on this example profile does not
 establish language quality or production-scale throughput for your data. Sensitive-memory
 recovery is a separate, operator-authorized procedure, **not** a public MCP tool; use
 [Security](../SECURITY.md) for the recovery trust boundary.

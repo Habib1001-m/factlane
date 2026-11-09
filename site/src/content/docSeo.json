@@ -18,7 +18,7 @@
     },
     "QUICKSTART": {
       "title": "Quick Start: local MCP server setup",
-      "description": "Resolve the current published release from Release operations, inspect storage, start read-only, verify five stdio MCP tools and memory_status, then enable only governed writes."
+      "description": "Resolve the released baseline recorded by Release operations, inspect storage, start read-only, verify five stdio MCP tools and memory_status, then enable only governed writes."
     },
     "TOOLS": {
       "title": "Five MCP tools",
@@ -30,11 +30,11 @@
     },
     "ARCHITECTURE": {
       "title": "Architecture: MCP gateway, scope, and storage",
-      "description": "Explore FactLane’s local stdio MCP architecture, OwnerControlService, CLI and loopback WebUI, exact scopes, lifecycle closure, SQLite-vec storage, and recovery."
+      "description": "Explore FactLane’s local stdio MCP architecture, OwnerControlService, direct and managed Owner interfaces, exact scopes, lifecycle closure, SQLite-vec storage, and recovery."
     },
     "ENVIRONMENT": {
       "title": "Environment and compatibility requirements",
-      "description": "Review the qualified local profile, Python and SQLite requirements, five-tool stdio MCP boundary, local Ollama storage dependencies, migration stops, and support limits."
+      "description": "Review the qualified local profile, CPython and SQLite requirements, five-tool stdio MCP boundary, loopback Ollama dependencies, Native Windows support, migration stops, and support limits."
     },
     "SECURITY": {
       "title": "Security policy",
@@ -42,7 +42,7 @@
     },
     "RELEASE_OPERATIONS": {
       "title": "Release operations: install, upgrade, rollback",
-      "description": "Resolve the exact current published identity, inspect storage, require a verified backup before migration, and follow documented install, upgrade, rollback, and reverification steps."
+      "description": "Resolve the recorded released baseline, inspect storage, require a verified backup before migration, and follow documented install, upgrade, rollback, and reverification steps."
     },
     "CHANGELOG": {
       "title": "Changelog: release-by-release FactLane changes",
@@ -64,7 +64,7 @@
     },
     "FAQ": {
       "title": "الأسئلة الشائعة: الملاءمة والإعداد والبيانات وحدود الثقة",
-      "description": "تحقق من ملاءمة FactLane لسير عملك: متطلبات الإعداد، ومكان البيانات، وما لا يهدف إليه المنتج، والتحقق من Candidate، وحدود صلاحية الوكلاء."
+      "description": "تحقق من ملاءمة FactLane لسير عملك: متطلبات الإعداد، ومكان البيانات، وما لا يهدف إليه المنتج، والتحقق من Candidate، واستخدام المخزن عبر مضيفين متوافقين، وأولوية الحقيقة الحالية."
     },
     "CORE_CONCEPTS": {
       "title": "المفاهيم الأساسية: Candidate وCurrent والنطاق والحداثة",
@@ -72,7 +72,7 @@
     },
     "QUICKSTART": {
       "title": "البدء السريع: إعداد خادم MCP محلي",
-      "description": "استخرج الإصدار المنشور الحالي من Release operations، وافحص storage، وابدأ بوضع read-only، وتحقق من أدوات MCP الخمس عبر stdio وmemory_status قبل تفعيل الكتابة المحكومة."
+      "description": "استخرج baseline الإصدار المسجّل من Release operations، وافحص storage، وابدأ بوضع read-only، وتحقق من أدوات MCP الخمس عبر stdio وmemory_status قبل تفعيل الكتابة المحكومة."
     },
     "TOOLS": {
       "title": "أدوات MCP الخمس",
@@ -84,11 +84,11 @@
     },
     "ARCHITECTURE": {
       "title": "المعمارية: بوابة MCP والنطاق والتخزين",
-      "description": "استعرض معمارية FactLane عبر stdio MCP وOwnerControlService وCLI وOwner WebUI المحلي، مع النطاقات الدقيقة وإغلاق دورة الحياة وSQLite-vec والاستعادة."
+      "description": "استعرض معمارية FactLane عبر stdio MCP وOwnerControlService وواجهات Owner المباشرة والمُدارة، مع النطاقات الدقيقة وإغلاق دورة الحياة وSQLite-vec والاستعادة."
     },
     "ENVIRONMENT": {
       "title": "البيئة ومتطلبات التوافق",
-      "description": "راجع ملف التشغيل المحلي المؤهّل ومتطلبات Python وSQLite وحد أدوات MCP الخمس عبر stdio واعتماد Ollama المحلي ونقاط توقف migration وحدود الدعم."
+      "description": "راجع ملف التشغيل المحلي المؤهّل ومتطلبات CPython وSQLite وحد أدوات MCP الخمس عبر stdio واعتماد Ollama عبر loopback ودعم Native Windows ونقاط توقف migration وحدود الدعم."
     },
     "SECURITY": {
       "title": "سياسة الأمان",
@@ -96,7 +96,7 @@
     },
     "RELEASE_OPERATIONS": {
       "title": "عمليات الإصدار: التثبيت والترقية والتراجع",
-      "description": "استخرج هوية الإصدار المنشور الحالية بدقة، وافحص storage الموجود، ولا تنفذ migration مطلوبة إلا مع backup متحقق منه، ثم اتبع خطوات الترقية والتراجع وإعادة التحقق الموثقة."
+      "description": "استخرج baseline الإصدار المسجّل بدقة، وافحص storage الموجود، ولا تنفذ migration مطلوبة إلا مع backup متحقق منه، ثم اتبع خطوات الترقية والتراجع وإعادة التحقق الموثقة."
     },
     "CHANGELOG": {
       "title": "سجل التغييرات: تغييرات FactLane حسب كل إصدار",

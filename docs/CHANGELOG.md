@@ -4,9 +4,58 @@ This changelog records user-visible release changes and upgrade requirements. Fo
 migration, rollback, and release-identity procedures, use
 [Release operations](RELEASE_OPERATIONS.md).
 
+## 0.1.7 (Unreleased)
+
+FactLane v0.1.7 is the current development package identity in this source tree. It is **not** a
+published release in this documentation state; do not infer a tag, GitHub Release, PyPI publication,
+or Production-site transition from the version string alone. The recorded released package baseline
+below remains v0.1.6 until a separately authorized release records a new immutable identity.
+
+### Development highlights
+
+- Expands Native Windows x64/AMD64 from normal-runtime parity to the managed Owner Panel lifecycle,
+  including current-user service control, local HTTPS, isolated Firefox integration, database
+  management, qualified full restore, and capability-gated permanent purge.
+- Adds a Native Windows x64/AMD64 storage-v2→v3 migration and exact pre-v3 rollback implementation.
+  This is separate from the general sensitive-memory incident-Recovery operator, which remains a
+  POSIX-only contract.
+- The managed Owner Panel now defaults Memories to Owner-wide read-only discovery and Review to an
+  Owner-wide Candidate queue while preserving exact-scope mutation proof. Candidate approval uses a
+  local date/time control with explicit browser timezone; record/revision/Group-CAS details remain
+  internal to the normal review flow. Activity provides filterable local operation/lifecycle history;
+  local redacted Diagnostics live under Session & settings.
+- Adds `factlane launch webui` as the normal status/start/open composition after setup. Successful
+  setup installs a non-terminal Linux `.desktop` launcher or current-user Windows Start Menu shortcut
+  that reuses the same trusted launch flow.
+- Adds read-only `factlane doctor webui` onboarding discovery for runtime/interpreter, managed
+  database/profile binding, packaged Skill, launcher/service state, and a host-neutral read-only MCP
+  recipe while keeping MCP host identity and scope explicit. Linux first-run managed setup can now
+  complete an absent memory binding through the authenticated setup shell, with exact storage/profile
+  validation, no implicit migration, verified owner-private config publication, and managed restart.
+- Full restore and permanent purge still require an exact preview plus separate native
+  sensitive-action approval before commit.
+- A valid managed Owner session can resume across page reload with CSRF rotation without resetting
+  its inactivity or absolute lifetime.
+- Windows managed-browser launch is Firefox-only, uses a dedicated FactLane profile, and verifies
+  bounded readiness before delivering a one-time connection locator. Browser-certificate bypasses,
+  personal-profile reuse, and locator redelivery are not supported recovery techniques.
+- Hardens the shipped Ollama provider so FactLane's own HTTP request destinations remain on an exact
+  loopback-literal endpoint: ambient proxy inheritance is disabled and redirects are rejected.
+- Corrects live `memory_update` help/schema wording so Owner `REVOKE`/`REJECT` document their exact
+  `expected_record_id` requirement in addition to Group CAS/reason proof.
+
+### Upgrade and release status
+
+Storage remains contract v3. A database already migrated to v3 does not require a new schema
+migration merely because the runtime moves from v0.1.6 to the current v0.1.7 development tree. A
+deployment still on storage v2 must use the explicit migration/rollback operator supported by the
+target platform before normal service. See [Release operations](RELEASE_OPERATIONS.md).
+
+No public release identity is assigned by this unreleased section.
+
 ## 0.1.6
 
-FactLane v0.1.6 is the current published Python-package release. It is a corrective patch release
+FactLane v0.1.6 is the recorded released Python-package baseline in this repository. It is a corrective patch release
 over the sealed v0.1.5 GitHub release: the package now declares the PyPI-compatible exact registry
 dependency `mcp-memory-service==11.10.0` instead of the direct VCS requirement that prevented the
 v0.1.5 wheel from being accepted by PyPI. Public Contract Revision 3, storage contract v3, the

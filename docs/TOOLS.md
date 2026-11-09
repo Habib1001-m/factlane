@@ -8,7 +8,7 @@ FactLane keeps its public MCP surface deliberately small:
 4. `memory_update`
 5. `memory_status`
 
-The public transport is command-launched **stdio**. The local Owner CLI and loopback Owner WebUI are separate operator surfaces; they do not add MCP tools.
+The public transport is command-launched **stdio**. Owner CLI/WebUI surfaces are separate operator interfaces; they do not add MCP tools.
 
 The live MCP schema and `factlane --help-tools` are authoritative for exact fields, enum values, and signatures.
 
@@ -55,11 +55,11 @@ Perform a governed update under exact revision/idempotency checks.
 Core modes are:
 
 - `REVERIFY` — verify the same logical memory again; Candidate promotion uses exact `expected_record_id`;
-- `REPLACE` — create a successor when semantic identity changes;
+- `REPLACE` — create a governed successor for an eligible current logical memory; it is not a Candidate-edit path;
 - `REVOKE` — direct Owner lifecycle disposition for an eligible `VALIDATED_CURRENT` record;
 - `REJECT` — direct Owner lifecycle disposition for a `CANDIDATE`.
 
-`REVOKE` and `REJECT` additionally require the exact displayed `observed_group_token` and an allowed bounded reason code. They are logical lifecycle states, not physical erasure.
+`REVOKE` and `REJECT` additionally require the exact current `expected_record_id`, the displayed `observed_group_token`, and an allowed bounded reason code. They are logical lifecycle states, not physical erasure.
 
 A delegated agent does not gain verifier or Owner authority because `memory_update` is visible.
 
@@ -87,7 +87,9 @@ When compatibility is unproven or mismatched, FactLane preserves safe read paths
 
 Use `factlane-owner --help` for the current CLI contract.
 
-Use `factlane-owner-webui --help` for the loopback Owner UI launcher. The WebUI binds to `127.0.0.1`, uses a one-use bootstrap exchange, authenticated session, and CSRF protection. It is not an HTTP MCP transport.
+Use `factlane-owner-webui --help` for the direct loopback Owner UI launcher. It is distinct from the managed `factlane setup|serve|open|start|stop|status|restart webui` lifecycle. Neither Owner UI surface is an HTTP MCP transport.
+
+In current development, the managed Owner Panel can also expose capability-gated database workflows such as explicit backup artifacts, import/export, full restore, and platform-specific permanent purge. These are Owner/operator workflows rather than MCP tools; see the [Quick Start](QUICKSTART.md) for the user-facing boundary.
 
 ## Governed failures
 
@@ -108,19 +110,21 @@ Unexpected internal exceptions remain transport errors rather than being relabel
 A simple global-user status request:
 
 ```json
-{"scope":"GLOBAL_USER"}
+{"request":{"scope":"GLOBAL_USER"}}
 ```
 
 A project-scoped Current keyword search may look like:
 
 ```json
 {
-  "scope": "PROJECT",
-  "project_id": "example-project",
-  "intent_class": "CURRENT_PROJECT_STATE",
-  "query": "What release constraints are recorded?",
-  "retrieval_mode": "CURRENT",
-  "retrieval_mode_kind": "KEYWORD"
+  "request": {
+    "scope": "PROJECT",
+    "project_id": "example-project",
+    "intent_class": "CURRENT_PROJECT_STATE",
+    "query": "What release constraints are recorded?",
+    "retrieval_mode": "CURRENT",
+    "retrieval_mode_kind": "KEYWORD"
+  }
 }
 ```
 

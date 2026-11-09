@@ -9,16 +9,18 @@ Platform permissions can technically mutate those objects, so verify identities 
 trusting a name alone. The `main` branch may receive documentation or development changes after
 a release and must not be used as a substitute for a historical release identity.
 
-For the user-facing change summary and upgrade impact of the current release, see the
-[changelog](CHANGELOG.md). This runbook remains authoritative for exact release identity,
+For user-facing release/development changes and upgrade impact, see the
+[changelog](CHANGELOG.md). This runbook remains authoritative for exact recorded release identity,
 migration, rollback, installation, and post-install reverification procedures.
 
 ### Development package identity
 
-The latest published Python-package release is `v0.1.6`. The moving `main` branch currently declares
-`0.1.6` in `pyproject.toml`, but a local build from `main` is not automatically the official release
-artifact. The official identity remains the annotated tag, its exact commit/tree, the published
-GitHub Release assets, and the corresponding PyPI bytes recorded below.
+The recorded released Python-package baseline in this repository is `v0.1.6`. The current
+development source declares `0.1.7` in `pyproject.toml`, but a local build from a development branch
+is not automatically an official release artifact. A recorded release identity is the annotated
+tag, its exact commit/tree, the published GitHub Release assets, and the corresponding package bytes
+recorded below. If you need to know whether a newer release exists externally, verify that separately
+before changing an installation; do not infer it from this moving source tree.
 
 Repository CI classifies this boundary with `scripts/check_release_surface.py`. The Development
 classification is intentionally fail-closed for release identity: it records that the source differs
@@ -56,7 +58,7 @@ compatibility, and database/schema compatibility are separate claims.
 | Wheel SHA-256 | `daf145cd7754b7c46a0f18ad49cc8872291094c8ac84621fce3cec091f90072a` |
 | Source distribution | `factlane-0.1.3.tar.gz` |
 | Source distribution SHA-256 | `81de371ec23d17109f9267750fed80cd6492cee245681d72630da6868f3cd16b` |
-| Python | `>=3.11` |
+| CPython | `>=3.11` |
 | Linked SQLite | `>=3.42.0` |
 | Public Contract Revision | `2` |
 | Public MCP tools | `memory_search`, `memory_get`, `memory_store`, `memory_update`, `memory_status` |
@@ -259,7 +261,7 @@ The sealed v0.1.6 identity is:
 
 ### Install v0.1.6 from PyPI
 
-On Python 3.11 or newer, the supported public-index package path is direct and does not require a
+On CPython 3.11 or newer, the supported public-index package path is direct and does not require a
 Git dependency checkout:
 
 ```bash
@@ -275,6 +277,15 @@ python3.11 -m venv .venv
 .venv/bin/factlane --help
 ```
 
+Native Windows PowerShell uses the same package identity with Windows environment paths:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install "factlane==0.1.6"
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\factlane.exe --help
+```
+
 This path was reverified from the public PyPI index after release: it installs FactLane `0.1.6`,
 resolves `mcp-memory-service==11.10.0`, passes `pip check`, and exposes the packaged CLI. It is a
 package install, not an exact replay of all transitive versions in the repository lockfile. For an
@@ -287,6 +298,70 @@ v3 migration contract above before using the normal v0.1.6 runtime against that 
 
 The public website is a separate release surface. Publishing v0.1.6 to PyPI did not advance the
 site's Production release identity or authorize a site deployment.
+
+## FactLane v0.1.7 development transition (unreleased)
+
+The current source tree declares `0.1.7`, but no immutable v0.1.7 tag/artifact/PyPI/site identity is
+assigned by this documentation. Treat this section as development/operator guidance, not as a
+published-release manifest.
+
+Storage remains contract v3. An already accepted v0.1.5/v0.1.6 storage-v3 database does not require
+a new schema transition merely because the runtime moves to the current v0.1.7 development bytes.
+A deployment still on exact storage v2 must complete the explicit v2→v3 migration before ordinary
+v0.1.7 service.
+
+### Native Windows x64/AMD64 v2 → v3 migration
+
+Unlike the historical v0.1.5 migration implementation above, the current 0.1.7 development tree has
+a separate Native Windows x64/AMD64 migration/rollback implementation. Stop the managed service and
+use native Windows drive paths for both the database and backup. Do not use WSL or UNC paths.
+
+If FactLane or another process still holds the active database or its WAL/SHM files incompatibly,
+the operator fails closed before modifying active storage. Close or quiesce the holder and rerun the
+command; do not delete or replace the database or sidecars to bypass the hold.
+
+PowerShell example from an installed/current development environment:
+
+```powershell
+factlane-migrate-storage-v3 migrate `
+  --db "C:\path\to\state\factlane.sqlite3" `
+  --backup "C:\path\to\backup\factlane-pre-v3.sqlite3"
+```
+
+The Windows operator verifies exact storage v2 and target custody, maintains continuous exclusion
+over the active database/WAL/SHM mutation window, creates and verifies a private pre-v3 backup plus
+its verification manifest before active storage is changed, establishes verified rollback state
+before the active database is changed, and verifies the resulting v3 image before releasing
+maintenance custody. Existing backup or manifest destinations are not silently replaced.
+
+Rollback uses the exact verified pre-v3 backup and its bound verification state:
+
+```powershell
+factlane-migrate-storage-v3 restore `
+  --db "C:\path\to\state\factlane.sqlite3" `
+  --backup "C:\path\to\backup\factlane-pre-v3.sqlite3"
+```
+
+The restore path returns the active database to the verified pre-v3 image and verifies the result
+before maintenance custody is released. Exact rollback is supported only while the target is still
+the immediate migrated-v3 result bound to that backup. Later accepted v3 logical/lifecycle/trust-clock
+changes or a backup/target binding mismatch fail closed with `ROLLBACK_HOLD` and do not change data.
+Package rollback alone is not durable-data rollback.
+
+If migrate or restore is interrupted, leave the database, backup, and verification files intact and
+rerun the same operation with the same paths. Do not manually replace or delete those files; the
+operator resumes from verified state when possible or fails closed when it cannot prove a safe resume.
+
+This Windows migration/rollback contract is distinct from both the managed Owner Panel's full
+database restore workflow and general sensitive-memory incident Recovery. The latter remains the
+separate POSIX-only `SensitiveMemoryRecoveryOperator` contract.
+
+### Managed Owner Panel
+
+The current 0.1.7 development tree also provides the managed `factlane ... webui` lifecycle on
+Native Windows x64/AMD64. See [Quick Start](QUICKSTART.md) for the status/start/open workflow and
+[Security](../SECURITY.md) for session, sensitive-approval, permanent-purge, and full-restore trust
+boundaries. These local capabilities do not assign a public v0.1.7 release identity.
 
 ## Install an exact release
 
