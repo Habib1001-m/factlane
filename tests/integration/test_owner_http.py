@@ -725,7 +725,14 @@ def request(
     if cookies:
         request_headers["Cookie"] = "; ".join(f"{key}={value}" for key, value in cookies.items())
     conn = UnixHTTPConnection(str(server.socket_path))
-    conn.request(method, path, body=raw_body, headers=request_headers)
+    try:
+        conn.request(method, path, body=raw_body, headers=request_headers)
+    except BrokenPipeError:
+        # Host/origin/body-size policy can reject from headers and close before
+        # http.client finishes its separate body send. The queued HTTP response
+        # is still authoritative; getresponse() below must succeed or the test
+        # continues to fail normally.
+        pass
     response = conn.getresponse()
     payload = response.read()
     conn.close()

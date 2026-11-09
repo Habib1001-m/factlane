@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
+
+if sys.platform != "linux":
+    pytest.skip("managed Linux setup qualification is Linux-only", allow_module_level=True)
 
 from factlane.webui_install import (
     BrowserInstall,

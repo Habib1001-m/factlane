@@ -2217,9 +2217,18 @@ class WindowsStagedMigrationLease:
                 "MIGRATION_RECOVERY_SNAPSHOT_FAILED",
                 "migration recovery semantic snapshot already exists",
             )
-        root = Path(tempfile.mkdtemp(prefix="factlane-recovery-guard-"))
+        raw_root = Path(tempfile.mkdtemp(prefix="factlane-recovery-guard-"))
+        root = raw_root
         owner_sid = current_user_sid()
         try:
+            _reject_reparse_components(str(raw_root), label="migration recovery scratch")
+            root = Path(
+                _canonical_native_path(
+                    os.path.realpath(raw_root, strict=True),
+                    label="migration recovery scratch",
+                )
+            )
+            _reject_reparse_components(str(root), label="migration recovery scratch")
             ensure_owner_private_directory(root, owner_sid=owner_sid)
             scratch_db = root / Path(self.db_path).name
             self._copy_retained_handle_bytes(self._db_handle, scratch_db)
@@ -2238,7 +2247,7 @@ class WindowsStagedMigrationLease:
             self._stage_db_path = str(scratch_db)
             return str(scratch_db)
         except BaseException:
-            shutil.rmtree(root, ignore_errors=True)
+            shutil.rmtree(raw_root, ignore_errors=True)
             raise
 
     def _cleanup_recovery_semantic_snapshot(self) -> None:

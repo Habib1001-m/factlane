@@ -880,6 +880,11 @@ class SQLiteVecEngine:
             )
         if existing_contract is not None and existing_contract != STORAGE_CONTRACT_VERSION:
             raise AdapterError("SCHEMA_MISMATCH", "storage contract version is unsupported by v0.1.7")
+        # Native Windows runtime custody requires the database parent to exist
+        # before it can retain a safe directory/file handle. Match the existing
+        # first-open semantics on POSIX by creating only the parent directory
+        # before acquiring the platform maintenance lease.
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         if self._maintenance_capability is None:
             self._maintenance_lease_handle = _acquire_runtime_maintenance_lease(self.db_path)
         else:
@@ -890,7 +895,6 @@ class SQLiteVecEngine:
             # Do not write MCP_* process environment here. The pinned backend
             # caches environment-backed config at import time; FactLane binds
             # the storage class and the behavior it uses explicitly below.
-            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             SqliteVecMemoryStorage = load_pinned_sqlite_vec_storage()
             storage = SqliteVecMemoryStorage(
                 self.db_path,

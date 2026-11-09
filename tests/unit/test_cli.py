@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tomllib
 from pathlib import Path
 from typing import Any, Mapping
@@ -764,6 +765,7 @@ def test_doctor_webui_emits_machine_readable_read_only_report_without_service_di
     assert payload["next_actions"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="this unit test exercises the Linux registration branch")
 def test_register_database_validates_local_source_and_returns_only_custody_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

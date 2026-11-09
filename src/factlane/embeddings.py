@@ -52,6 +52,13 @@ def _validated_loopback_base_url(base_url: str) -> str:
         raise AdapterError("INVALID_ENVELOPE", "embedding provider must use local HTTP only")
     if username is not None or password is not None:
         raise AdapterError("INVALID_ENVELOPE", "embedding provider URL is invalid")
+    expected_authority = (
+        f"[{hostname}]" if hostname == "::1" else hostname
+    )
+    if port is not None:
+        expected_authority = f"{expected_authority}:{port}"
+    if parsed.netloc != expected_authority:
+        raise AdapterError("INVALID_ENVELOPE", "embedding provider URL is invalid")
     if parsed.params or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise AdapterError("INVALID_ENVELOPE", "embedding provider URL is invalid")
     if parsed.netloc.endswith(":") or parsed.netloc.endswith("]:") or port == 0:

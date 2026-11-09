@@ -2850,6 +2850,8 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
             raise TypeError("tls_context must be an SSLContext")
         if tls_context.protocol == ssl.PROTOCOL_TLS_CLIENT:
             raise ValueError("tls_context must support server-side TLS")
+        if tls_context.minimum_version < ssl.TLSVersion.TLSv1_2:
+            tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
 
         self.origin, self.host, self.hostname, self.origin_port = self._validate_windows_origin(origin)
         self.public_origins, self._origin_by_host = self._validate_origin_allowlist(
@@ -3023,6 +3025,8 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
             raise TypeError("trust_context must be an SSLContext")
         if trust_context.verify_mode != ssl.CERT_REQUIRED or not trust_context.check_hostname:
             raise ValueError("trust_context must require certificate and hostname verification")
+        if trust_context.minimum_version < ssl.TLSVersion.TLSv1_2:
+            trust_context.minimum_version = ssl.TLSVersion.TLSv1_2
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))

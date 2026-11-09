@@ -52,12 +52,14 @@ def _loopback_port() -> int:
 
 def _server_context() -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(str(TEST_IDENTITY), password=TEST_IDENTITY_PASSWORD)
     return context
 
 
 def _trust_context() -> ssl.SSLContext:
     context = ssl.create_default_context(cafile=str(TEST_IDENTITY))
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.check_hostname is True
     return context
@@ -137,6 +139,7 @@ def _response_cookies(response: http.client.HTTPResponse) -> dict[str, str]:
 
 def _unverified_client_context() -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     return context

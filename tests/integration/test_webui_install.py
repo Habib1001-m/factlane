@@ -189,7 +189,7 @@ def test_detects_linux_systemd_caddy_zenity_and_supported_browser() -> None:
 
 def test_non_linux_detection_returns_unsupported_facts_without_posix_uid_support() -> None:
     environment = detect_install_environment(
-        system_name=lambda: "Windows",
+        system_name=lambda: "Darwin",
         path_exists=lambda _path: False,
         which=lambda _name: None,
         geteuid=lambda: -1,
@@ -844,6 +844,7 @@ def test_production_backend_owner_private_write_is_atomic_regular_0600_under_070
     assert calls == []
 
 
+@_LINUX_OWNER_PRIVATE_WRITE
 def test_production_backend_rejects_symlink_target_without_touching_referent(
     tmp_path: Path,
 ) -> None:
@@ -870,6 +871,7 @@ def test_production_backend_rejects_symlink_target_without_touching_referent(
     assert target.is_symlink()
 
 
+@_LINUX_OWNER_PRIVATE_WRITE
 def test_production_backend_rejects_symlink_directory_component(tmp_path: Path) -> None:
     backend = ProductionLinuxInstallerBackend(
         systemctl_path="/usr/bin/systemctl",
@@ -926,6 +928,7 @@ def test_production_backend_registers_only_exact_user_service_with_argv_no_shell
     calls: list[tuple[str, ...]] = []
     backend = ProductionLinuxInstallerBackend(
         systemctl_path="/opt/systemd/bin/systemctl",
+        owner_uid=1000,
         command_runner=lambda argv: calls.append(argv) or 0,
     )
     receipt = plan_webui_setup(_request(), _environment(), _consent())
@@ -978,6 +981,7 @@ def test_production_backend_managed_activation_uses_exact_start_stop_argv_and_se
 
     backend = ProductionLinuxInstallerBackend(
         systemctl_path="/opt/systemd/bin/systemctl",
+        owner_uid=1000,
         command_runner=lambda argv: calls.append(argv) or 0,
         service_state_reader=state_reader,
         activation_probe=probe,
@@ -1007,6 +1011,7 @@ def test_production_backend_port_conflict_comes_only_from_typed_probe_not_stderr
     assert receipt.plan is not None
     backend = ProductionLinuxInstallerBackend(
         systemctl_path="/opt/systemd/bin/systemctl",
+        owner_uid=1000,
         command_runner=lambda argv: calls.append(argv) or 1,
         activation_probe=lambda origin: ManagedServiceActivationResult(
             status=ManagedServiceActivationStatus.PORT_CONFLICT,
