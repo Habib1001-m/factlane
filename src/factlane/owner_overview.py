@@ -29,6 +29,8 @@ from .storage import _RECORD_COLUMNS
 _SCOPE_FIELDS = ("scope", "project_id", "worktree_id", "workflow_id", "agent_id")
 _GOVERNANCE_ACTIVE_STATES = ("CANDIDATE", "QUARANTINED", "STALE", "VALIDATED_CURRENT")
 _SEARCH_MODES = frozenset({"TEXT", "SEMANTIC"})
+_CHRONOLOGICAL_SORT_ORDERS = frozenset({"NEWEST", "OLDEST"})
+_SEMANTIC_SORT_ORDER = "RELEVANCE"
 _SEMANTIC_DEGRADATION_CODES = frozenset({"EMBEDDING_UNAVAILABLE", "PROFILE_MISMATCH", "SCHEMA_MISMATCH"})
 _SEMANTIC_CANDIDATE_LIMIT = 400
 _MAX_CURSOR_BYTES = 2048
@@ -131,6 +133,28 @@ class OwnerOverviewService:
         return value
 
     @staticmethod
+    def _validate_chronological_sort(value: str | None) -> str:
+        if value is None:
+            return "NEWEST"
+        if not isinstance(value, str) or value not in _CHRONOLOGICAL_SORT_ORDERS:
+            raise AdapterError("INVALID_ENUM", "sort_order must be NEWEST or OLDEST")
+        return value
+
+    @staticmethod
+    def _chronological_page(
+        sort_order: str,
+        after: tuple[str, str] | None,
+    ) -> tuple[str, list[str], str]:
+        if sort_order == "NEWEST":
+            page_where = "WHERE created_at < ? OR (created_at = ? AND record_id > ?) " if after else ""
+            order_by = "created_at DESC,record_id ASC"
+        else:
+            page_where = "WHERE created_at > ? OR (created_at = ? AND record_id > ?) " if after else ""
+            order_by = "created_at ASC,record_id ASC"
+        page_values = [after[0], after[0], after[1]] if after else []
+        return page_where, page_values, order_by
+
+    @staticmethod
     def _scope_dict(values: tuple[Any, ...] | list[Any]) -> dict[str, Any]:
         return dict(zip(_SCOPE_FIELDS, values, strict=True))
 
@@ -219,6 +243,16 @@ class OwnerOverviewService:
                 "COUNT(DISTINCT CASE WHEN lifecycle_state='CANDIDATE' THEN memory_id END) "
                 "FROM adapter_records"
             ).fetchone()
+            lifecycle_rows = conn.execute(
+                "WITH ranked AS ("
+                "SELECT lifecycle_state,ROW_NUMBER() OVER (PARTITION BY memory_id "
+                "ORDER BY revision DESC,created_at DESC,record_id DESC) AS owner_row_rank "
+                "FROM adapter_records) "
+                "SELECT lifecycle_state,COUNT(*) FROM ranked WHERE owner_row_rank=1 GROUP BY lifecycle_state"
+            ).fetchall()
+            lifecycle_counts = {state: 0 for state in sorted(LIFECYCLE_STATES)}
+            for lifecycle_state, count in lifecycle_rows:
+                lifecycle_counts[str(lifecycle_state)] = int(count)
             conflict_total = int(
                 conn.execute(
                     f"SELECT COUNT(*) FROM ({self._conflict_count_sql()})",
@@ -285,6 +319,7 @@ class OwnerOverviewService:
                 "revisions": int(total_row[1]),
                 "candidates": int(total_row[2]),
                 "conflicts": conflict_total,
+                "lifecycle": lifecycle_counts,
                 "scopes": scopes,
                 "projects": projects,
             }
@@ -328,6 +363,9 @@ class OwnerOverviewService:
                 "candidates": _metric(snapshot["candidates"], "EXACT"),
                 "conflicts": _metric(snapshot["conflicts"], "EXACT"),
             },
+            "lifecycle_breakdown": {
+                state: _metric(count, "EXACT") for state, count in snapshot["lifecycle"].items()
+            },
             "scope_index": {
                 "total": _metric(len(snapshot["scopes"]), "EXACT"),
                 "page_count": len(visible),
@@ -362,6 +400,152 @@ class OwnerOverviewService:
             values.append(created_before)
         return clauses, values
 
+    def _discovery_sync(
+        self,
+        *,
+        scope: ScopeContext | None,
+        lifecycle_state: str | None,
+        source_ref: str | None,
+        created_after: str | None,
+        created_before: str | None,
+        sort_order: str,
+        page_size: int,
+        after: tuple[str, str] | None,
+    ) -> tuple[int, int, list[dict[str, Any]]]:
+        conn = self._engine.conn
+        if conn is None:
+            raise AdapterError("BACKEND_UNAVAILABLE", "Owner overview database is not open")
+        if scope is None:
+            scope_where, scope_values = "1=1", []
+        else:
+            scope_where, scope_values = self._engine._scope_where(scope)
+        filter_clauses, filter_values = self._filter_sql(
+            lifecycle_state=lifecycle_state,
+            source_ref=source_ref,
+            created_after=created_after,
+            created_before=created_before,
+            alias="r",
+        )
+        filtered_where = "r.owner_row_rank=1"
+        if filter_clauses:
+            filtered_where += " AND " + " AND ".join(filter_clauses)
+        ranked = (
+            "WITH ranked AS ("
+            "SELECT a.*,ROW_NUMBER() OVER (PARTITION BY a.memory_id "
+            "ORDER BY a.revision DESC,a.created_at DESC,a.record_id DESC) AS owner_row_rank "
+            f"FROM adapter_records a WHERE {scope_where}),"
+            f"filtered AS (SELECT * FROM ranked r WHERE {filtered_where}) "
+        )
+        base_values = [*scope_values, *filter_values]
+
+        conn.execute("BEGIN")
+        try:
+            count_row = conn.execute(
+                ranked
+                + "SELECT (SELECT COUNT(*) FROM filtered),"
+                "(SELECT COUNT(*) FROM ranked all_rows "
+                "WHERE all_rows.memory_id IN (SELECT memory_id FROM filtered))",
+                base_values,
+            ).fetchone()
+            page_where, page_values, order_by = self._chronological_page(sort_order, after)
+            rows = conn.execute(
+                ranked
+                + f"SELECT * FROM filtered {page_where}"
+                + f"ORDER BY {order_by} LIMIT ?",
+                [*base_values, *page_values, page_size + 1],
+            ).fetchall()
+            records = [self._engine._row_to_dict(row[:-1]) for row in rows]
+            return int(count_row[0]), int(count_row[1]), records
+        finally:
+            conn.rollback()
+
+    @owner_adapter_request
+    async def discover(
+        self,
+        *,
+        scope: str | None = None,
+        project_id: str | None = None,
+        worktree_id: str | None = None,
+        workflow_id: str | None = None,
+        agent_id: str | None = None,
+        lifecycle_state: str | None = None,
+        source_ref: str | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
+        sort_order: str | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        scope_context = self._exact_scope(scope, project_id, worktree_id, workflow_id, agent_id)
+        if lifecycle_state is not None and lifecycle_state not in LIFECYCLE_STATES:
+            raise AdapterError("INVALID_ENUM", "lifecycle_state filter is invalid")
+        source_ref_value = self._validate_source_ref(source_ref)
+        after_value = self._validate_date(created_after, "created_after")
+        before_value = self._validate_date(created_before, "created_before")
+        sort_value = self._validate_chronological_sort(sort_order)
+        if after_value is not None and before_value is not None:
+            after_dt = parse_iso(after_value, required=True)
+            before_dt = parse_iso(before_value, required=True)
+            assert after_dt is not None and before_dt is not None
+            if after_dt > before_dt:
+                raise AdapterError("INVALID_ENVELOPE", "created_after must not be later than created_before")
+        page_size = validate_owner_page_size(limit)
+        filters = {
+            "kind": "overview_discovery",
+            "scope": scope_context.to_dict() if scope_context else None,
+            "lifecycle_state": lifecycle_state,
+            "source_ref": source_ref_value,
+            "created_after": after_value,
+            "created_before": before_value,
+            "sort_order": sort_value,
+        }
+        position = self._decode_cursor(cursor, filters)
+        after: tuple[str, str] | None = None
+        if position is not None:
+            if len(position) != 2 or not all(isinstance(value, str) and value for value in position):
+                raise AdapterError("INVALID_CURSOR", "Owner overview pagination cursor is invalid")
+            after = (position[0], position[1])
+
+        filtered_total, revision_total, rows = await self._engine._run(
+            lambda: self._discovery_sync(
+                scope=scope_context,
+                lifecycle_state=lifecycle_state,
+                source_ref=source_ref_value,
+                created_after=after_value,
+                created_before=before_value,
+                sort_order=sort_value,
+                page_size=page_size,
+                after=after,
+            )
+        )
+        visible = rows[:page_size]
+        has_more = len(rows) > page_size
+        next_cursor = None
+        if has_more and visible:
+            last = visible[-1]
+            next_cursor = self._encode_cursor(filters, [last["created_at"], last["record_id"]])
+        items = [self._public_item(row, rank=index) for index, row in enumerate(visible, start=1)]
+        return {
+            "status": "OK",
+            "request_id": self._request_id(request_id),
+            "scope": scope_context.to_dict() if scope_context else None,
+            "filters": {
+                "lifecycle_state": lifecycle_state,
+                "source_ref": source_ref_value,
+                "created_after": after_value,
+                "created_before": before_value,
+                "sort_order": sort_value,
+            },
+            "counts": {
+                "filtered_logical": _metric(filtered_total, "EXACT"),
+                "filtered_revisions": _metric(revision_total, "EXACT"),
+                "page_rows": _metric(len(items), "EXACT"),
+            },
+            "items": items,
+            "next_cursor": next_cursor,
+        }
+
     def _text_search_sync(
         self,
         *,
@@ -371,6 +555,7 @@ class OwnerOverviewService:
         source_ref: str | None,
         created_after: str | None,
         created_before: str | None,
+        sort_order: str,
         page_size: int,
         after: tuple[str, str] | None,
     ) -> tuple[int, int, list[dict[str, Any]]]:
@@ -410,15 +595,11 @@ class OwnerOverviewService:
                 "WHERE all_rows.memory_id IN (SELECT memory_id FROM filtered))",
                 base_values,
             ).fetchone()
-            page_where = ""
-            page_values: list[Any] = []
-            if after is not None:
-                page_where = "WHERE created_at < ? OR (created_at = ? AND record_id > ?) "
-                page_values.extend([after[0], after[0], after[1]])
+            page_where, page_values, order_by = self._chronological_page(sort_order, after)
             rows = conn.execute(
                 ranked
                 + f"SELECT * FROM filtered {page_where}"
-                "ORDER BY created_at DESC,record_id ASC LIMIT ?",
+                + f"ORDER BY {order_by} LIMIT ?",
                 [*base_values, *page_values, page_size + 1],
             ).fetchall()
             records = [self._engine._row_to_dict(row[:-1]) for row in rows]
@@ -526,6 +707,7 @@ class OwnerOverviewService:
         source_ref: str | None,
         created_after: str | None,
         created_before: str | None,
+        sort_order: str,
         page_size: int,
         cursor: str | None,
         request_id: str | None,
@@ -540,7 +722,7 @@ class OwnerOverviewService:
             "source_ref": source_ref,
             "created_after": created_after,
             "created_before": created_before,
-            "sort": "created_at_desc_record_id_asc",
+            "sort_order": sort_order,
         }
         position = self._decode_cursor(cursor, filters)
         after: tuple[str, str] | None = None
@@ -556,6 +738,7 @@ class OwnerOverviewService:
                 source_ref=source_ref,
                 created_after=created_after,
                 created_before=created_before,
+                sort_order=sort_order,
                 page_size=page_size,
                 after=after,
             )
@@ -577,6 +760,7 @@ class OwnerOverviewService:
                 "source_ref": source_ref,
                 "created_after": created_after,
                 "created_before": created_before,
+                "sort_order": sort_order,
             },
             "search": {
                 "requested_mode": requested_mode,
@@ -632,6 +816,7 @@ class OwnerOverviewService:
                 source_ref=source_ref,
                 created_after=created_after,
                 created_before=created_before,
+                sort_order="NEWEST",
                 page_size=page_size,
                 cursor=cursor,
                 request_id=request_id,
@@ -647,7 +832,7 @@ class OwnerOverviewService:
             "source_ref": source_ref,
             "created_after": created_after,
             "created_before": created_before,
-            "sort": "distance_asc_record_id_asc",
+            "sort_order": _SEMANTIC_SORT_ORDER,
         }
         position = self._decode_cursor(cursor, filters)
         after: tuple[float, str] | None = None
@@ -688,6 +873,7 @@ class OwnerOverviewService:
                 "source_ref": source_ref,
                 "created_after": created_after,
                 "created_before": created_before,
+                "sort_order": _SEMANTIC_SORT_ORDER,
             },
             "search": {
                 "requested_mode": "SEMANTIC",
@@ -719,6 +905,7 @@ class OwnerOverviewService:
         source_ref: str | None = None,
         created_after: str | None = None,
         created_before: str | None = None,
+        sort_order: str | None = None,
         limit: int = 100,
         cursor: str | None = None,
         request_id: str | None = None,
@@ -727,6 +914,12 @@ class OwnerOverviewService:
         if not isinstance(search_mode, str) or search_mode.upper() not in _SEARCH_MODES:
             raise AdapterError("INVALID_ENUM", "search_mode must be TEXT or SEMANTIC")
         mode = search_mode.upper()
+        if mode == "SEMANTIC":
+            if sort_order is not None and sort_order != _SEMANTIC_SORT_ORDER:
+                raise AdapterError("INVALID_ENUM", "semantic sort_order must be RELEVANCE")
+            sort_value = _SEMANTIC_SORT_ORDER
+        else:
+            sort_value = self._validate_chronological_sort(sort_order)
         scope_context = self._exact_scope(scope, project_id, worktree_id, workflow_id, agent_id)
         if lifecycle_state is not None and lifecycle_state not in LIFECYCLE_STATES:
             raise AdapterError("INVALID_ENUM", "lifecycle_state filter is invalid")
@@ -762,6 +955,7 @@ class OwnerOverviewService:
             source_ref=source_ref_value,
             created_after=after_value,
             created_before=before_value,
+            sort_order=sort_value,
             page_size=page_size,
             cursor=cursor,
             request_id=request_id,

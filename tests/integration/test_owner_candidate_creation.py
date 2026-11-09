@@ -282,7 +282,7 @@ def test_batch_review_is_exact_scope_bounded_and_reports_concurrent_conflicts(tm
                 ],
             )
             assert result["status"] == "PARTIAL"
-            assert result["counts"] == {"applied": 1, "conflicted": 1, "failed": 0}
+            assert result["counts"] == {"applied": 1, "conflicted": 1, "failed": 0, "unattempted": 0}
             assert result["outcomes"][0]["status"] == "APPLIED"
             assert result["outcomes"][1]["status"] == "CONFLICTED"
             assert result["outcomes"][1]["error_code"] == "GROUP_VERSION_CONFLICT"
@@ -318,6 +318,107 @@ def test_batch_review_is_exact_scope_bounded_and_reports_concurrent_conflicts(tm
                     items=[{"action": "REJECT"}] * 51,
                 )
             assert oversized.value.code == "LIMIT_EXCEEDED"
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_batch_review_systemic_failure_marks_later_items_unattempted(tmp_path) -> None:
+    from factlane.contract import AdapterError, validate_scope
+
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "batch-systemic-stop.db"), _profile())
+        await engine.open()
+        try:
+            provider = _Provider()
+            adapter = MemoryAdapter(
+                engine,
+                provider,
+                trusted_write_context=trusted_write_context_for_profile(
+                    "owner-current", contributor_ref="owner-webui-test"
+                ),
+            )
+            service = OwnerControlService(adapter)
+            provenance = {
+                "source_class": "TEST",
+                "source_ref": "fixture:batch-systemic-stop",
+                "source_hash": "7" * 64,
+                "review_ref": "review:batch-systemic-stop",
+                "extraction_method": "explicit-owner-form",
+            }
+
+            records = []
+            for index in (1, 2, 3):
+                created = await service.create_candidate(
+                    fact=f"Systemic-stop candidate {index}",
+                    scope="PROJECT",
+                    project_id="factlane",
+                    memory_type="PROJECT_LEARNED_FACT",
+                    source_provenance=provenance,
+                    freshness_policy={"kind": "manual"},
+                    source_timestamp="2026-11-05T20:00:00Z",
+                    idempotency_key=f"batch-systemic-create-{index}",
+                    tags=[f"subject:batch-systemic-{index}"],
+                )
+                records.append(created["results"][0])
+
+            inventory = await service.inventory(scope="PROJECT", project_id="factlane")
+            by_id = {item["memory_id"]: item for item in inventory["items"]}
+            review_embedding_calls = 0
+            embed_documents = provider.embed_documents
+
+            def fail_second_review_embedding(texts: list[str]) -> list[list[float]]:
+                nonlocal review_embedding_calls
+                review_embedding_calls += 1
+                if review_embedding_calls == 2:
+                    raise AdapterError("EMBEDDING_UNAVAILABLE", "test provider unavailable")
+                return embed_documents(texts)
+
+            provider.embed_documents = fail_second_review_embedding  # type: ignore[method-assign]
+            verification = {
+                "source_provenance": provenance,
+                "freshness_policy": {"kind": "manual"},
+                "source_timestamp": "2026-11-05T20:01:00Z",
+                "verified_by": "OWNER",
+            }
+            items = [
+                {
+                    "action": "APPROVE",
+                    "memory_id": record["memory_id"],
+                    "expected_record_id": record["record_id"],
+                    "expected_revision": 1,
+                    "observed_group_token": by_id[record["memory_id"]]["group_cas"]["observed_group_token"],
+                    "idempotency_key": f"batch-systemic-approve-{index}",
+                    "verification": dict(verification),
+                }
+                for index, record in enumerate(records, start=1)
+            ]
+
+            result = await service.batch_review(scope="PROJECT", project_id="factlane", items=items)
+
+            assert result["status"] == "PARTIAL"
+            assert result["counts"] == {"applied": 1, "conflicted": 0, "failed": 1, "unattempted": 1}
+            assert [outcome["status"] for outcome in result["outcomes"]] == [
+                "APPLIED",
+                "FAILED",
+                "UNATTEMPTED",
+            ]
+            assert result["outcomes"][1]["error_code"] == "EMBEDDING_UNAVAILABLE"
+            assert result["outcomes"][2]["blocked_by_error_code"] == "EMBEDDING_UNAVAILABLE"
+            assert review_embedding_calls == 2
+
+            scope = validate_scope("PROJECT", project_id="factlane")
+            first_history = await engine.get_record(records[0]["memory_id"], scope, history=True)
+            second_history = await engine.get_record(records[1]["memory_id"], scope, history=True)
+            third_history = await engine.get_record(records[2]["memory_id"], scope, history=True)
+            assert any(row["lifecycle_state"] == "VALIDATED_CURRENT" for row in first_history)
+            assert [(row["record_id"], row["lifecycle_state"]) for row in second_history] == [
+                (records[1]["record_id"], "CANDIDATE")
+            ]
+            assert [(row["record_id"], row["lifecycle_state"]) for row in third_history] == [
+                (records[2]["record_id"], "CANDIDATE")
+            ]
         finally:
             await engine.close()
 
@@ -682,7 +783,7 @@ def test_batch_review_exact_success_retry_returns_idempotent_applied_outcome(tmp
             replay = await service.batch_review(scope="PROJECT", project_id="factlane", items=[item])
             assert first["status"] == "OK"
             assert replay["status"] == "OK"
-            assert replay["counts"] == {"applied": 1, "conflicted": 0, "failed": 0}
+            assert replay["counts"] == {"applied": 1, "conflicted": 0, "failed": 0, "unattempted": 0}
             assert replay["outcomes"][0]["status"] == "APPLIED"
             assert replay["outcomes"][0]["result"]["idempotent_replay"] is True
             assert replay["outcomes"][0]["result"]["results"][0]["record_id"] == first["outcomes"][0]["result"]["results"][0]["record_id"]
@@ -739,7 +840,7 @@ def test_batch_reject_exact_success_retry_returns_idempotent_applied_outcome(tmp
             replay = await service.batch_review(scope="PROJECT", project_id="factlane", items=[item])
             assert first["status"] == "OK"
             assert replay["status"] == "OK"
-            assert replay["counts"] == {"applied": 1, "conflicted": 0, "failed": 0}
+            assert replay["counts"] == {"applied": 1, "conflicted": 0, "failed": 0, "unattempted": 0}
             assert replay["outcomes"][0]["result"]["idempotent_replay"] is True
             assert replay["outcomes"][0]["result"]["result_record_id"] == first["outcomes"][0]["result"]["result_record_id"]
         finally:

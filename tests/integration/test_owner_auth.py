@@ -231,6 +231,41 @@ def test_local_pending_approval_distinguishes_open_not_claimed_from_invalid_or_e
     assert_error_code(exc_info, "PENDING_EXPIRED")
 
 
+def test_local_pending_approval_revalidates_expiry_after_native_confirmation() -> None:
+    class HookedConfirmation(FakeNativeConfirmation):
+        def __init__(self) -> None:
+            super().__init__(approved=True)
+            self.hook = None
+
+        def confirm(self, request: NativeConfirmationRequest) -> bool:
+            self.requests.append(request)
+            if request.kind == "ENROLLMENT" and self.hook is not None:
+                hook, self.hook = self.hook, None
+                hook()
+            return self.approved
+
+    confirmation = HookedConfirmation()
+    state, clock, _ = make_state(confirmation=confirmation)
+    pending = state.begin_enrollment(
+        caller_uid=OWNER_UID,
+        source="LOCAL_NATIVE",
+        device_label="FactLane local browser",
+    )
+    preauth = state.issue_preauth(origin=ORIGIN)
+    state.claim_pending(
+        locator=pending.locator,
+        origin=ORIGIN,
+        preauth_secret=preauth,
+    )
+    confirmation.hook = lambda: clock.advance(5 * 60)
+
+    with pytest.raises(AuthError) as exc_info:
+        state.approve_pending(locator=pending.locator, caller_uid=OWNER_UID)
+
+    assert_error_code(exc_info, "PENDING_EXPIRED")
+    assert confirmation.requests[-1].kind == "ENROLLMENT"
+
+
 def test_remote_enrollment_needs_no_uid_is_browser_bound_and_cannot_use_local_uid_approval() -> None:
     state, _, confirmation = make_state()
     pending, preauth = request_remote(state)
@@ -287,7 +322,9 @@ def test_primary_local_session_approves_remote_with_csrf_and_exact_fresh_single_
         '{"device_label":"Remote laptop","locator":"'
         + pending.locator
         + '","operation":"APPROVE_REMOTE_ENROLLMENT","origin":"https://factlane.example.test",'
-        '"source":"203.0.113.8"}'
+        '"source":"203.0.113.8","verification_phrase":"'
+        + pending.verification_phrase
+        + '"}'
     )
     challenge = state.begin_sensitive_challenge(
         session_secret=primary.session_secret,
@@ -518,6 +555,75 @@ def test_polling_does_not_renew_idle_session_but_user_activity_does_and_absolute
             user_activity=True,
         )
     assert_error_code(exc_info, "SESSION_EXPIRED")
+
+
+def test_session_credentials_expose_remaining_durations_without_changing_monotonic_deadlines() -> None:
+    state, _, _ = make_state()
+    credentials = enroll(state)
+
+    assert credentials.expires_at == pytest.approx(2_800.0)
+    assert credentials.absolute_expires_at == pytest.approx(29_800.0)
+    assert credentials.idle_remaining_seconds == pytest.approx(1_800.0)
+    assert credentials.absolute_remaining_seconds == pytest.approx(28_800.0)
+
+
+def test_session_resume_rotates_only_csrf_without_renewing_session_or_idle_ttl() -> None:
+    state, clock, _ = make_state()
+    credentials = enroll(state)
+    assert len(state._sessions) == 1
+    digest, session = next(iter(state._sessions.items()))
+    created_at = session.created_at
+    last_user_activity_at = session.last_user_activity_at
+    absolute_expires_at = session.absolute_expires_at
+    auth_epoch = session.auth_epoch
+    primary_local = session.primary_local
+
+    clock.advance(123)
+    resumed = state.resume_session(session_secret=credentials.session_secret, origin=ORIGIN)
+
+    assert len(state._sessions) == 1
+    assert next(iter(state._sessions)) == digest
+    assert state._sessions[digest] is session
+    assert session.created_at == created_at
+    assert session.last_user_activity_at == last_user_activity_at
+    assert session.absolute_expires_at == absolute_expires_at
+    assert session.auth_epoch == auth_epoch
+    assert session.primary_local == primary_local
+    assert resumed.idle_remaining_seconds == pytest.approx(1_677.0)
+    assert resumed.absolute_remaining_seconds == pytest.approx(28_677.0)
+    assert resumed.auth_epoch == auth_epoch
+    assert resumed.primary_local == primary_local
+    assert resumed.csrf_secret != credentials.csrf_secret
+
+    with pytest.raises(AuthError) as exc_info:
+        state.validate_session(
+            session_secret=credentials.session_secret,
+            origin=ORIGIN,
+            csrf_secret=credentials.csrf_secret,
+            require_csrf=True,
+        )
+    assert_error_code(exc_info, "CSRF_INVALID")
+    state.validate_session(
+        session_secret=credentials.session_secret,
+        origin=ORIGIN,
+        csrf_secret=resumed.csrf_secret,
+        require_csrf=True,
+    )
+
+    with pytest.raises(AuthError) as exc_info:
+        state.resume_session(session_secret=credentials.session_secret, origin="https://other.example.test")
+    assert_error_code(exc_info, "SESSION_ORIGIN_MISMATCH")
+
+    clock.advance(1_677)
+    with pytest.raises(AuthError) as exc_info:
+        state.resume_session(session_secret=credentials.session_secret, origin=ORIGIN)
+    assert_error_code(exc_info, "SESSION_EXPIRED")
+
+    fresh = enroll(state)
+    state.invalidate_all_sessions_after_maintenance()
+    with pytest.raises(AuthError) as exc_info:
+        state.resume_session(session_secret=fresh.session_secret, origin=ORIGIN)
+    assert_error_code(exc_info, "SESSION_INVALID")
 
 
 def test_sensitive_grant_is_preview_bound_single_use_and_expires_from_challenge_approval() -> None:

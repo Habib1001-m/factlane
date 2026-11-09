@@ -317,6 +317,88 @@ def test_current_only_housekeeping_never_compacts_current_authority(tmp_path, mo
     asyncio.run(run())
 
 
+def test_housekeeping_job_binds_preview_reports_progress_and_cancels_between_records(
+    tmp_path, monkeypatch
+) -> None:
+    async def run() -> None:
+        engine, adapter, service = await _services(tmp_path)
+        try:
+            first_old, _ = await _superseded(adapter, key="job-first")
+            second_old, _ = await _superseded(adapter, key="job-second")
+            monkeypatch.setattr(shutil, "disk_usage", lambda _path: _Usage(0))
+            preview = await service.housekeeping_preview(
+                scope="PROJECT",
+                project_id="project-a",
+                max_records=2,
+                required_free_bytes=100,
+                request_id="housekeeping-job-preview",
+            )
+            assert preview["eligibility"]["selected_upper_bound"] == 2
+            assert preview["reclaim_estimate"]["observation"] == "UNKNOWN"
+            assert len(preview["preview_digest"]) == 64
+
+            original = engine.compact_superseded_record
+            first_committed = asyncio.Event()
+            release_first = asyncio.Event()
+            calls = 0
+
+            async def paused_compaction(record_id: str) -> bool:
+                nonlocal calls
+                result = await original(record_id)
+                calls += 1
+                if calls == 1:
+                    first_committed.set()
+                    await release_first.wait()
+                return result
+
+            monkeypatch.setattr(engine, "compact_superseded_record", paused_compaction)
+            queued = await service.begin_housekeeping_job(
+                scope="PROJECT",
+                project_id="project-a",
+                max_records=2,
+                required_free_bytes=100,
+                preview_digest=preview["preview_digest"],
+                request_id="housekeeping-job-run",
+            )
+            assert queued["phase"] == "QUEUED"
+            assert queued["progress"]["cancellation_boundary"] == "BETWEEN_RECORDS"
+            await first_committed.wait()
+            cancelled = await service.cancel_housekeeping_job(queued["job_id"])
+            assert cancelled["cancel_requested"] is True
+            release_first.set()
+
+            for _ in range(100):
+                status = await service.housekeeping_job_status(queued["job_id"])
+                if status["phase"] in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                    break
+                await asyncio.sleep(0.01)
+            assert status["phase"] == "CANCELLED"
+            assert status["progress"]["selected_records"] == 2
+            assert status["progress"]["compacted_records"] == 1
+            assert status["result"]["outcome"] == "HOUSEKEEPING_CANCELLED"
+            assert status["result"]["compacted_records"] == 1
+
+            scope = adapter._safe_scope("PROJECT", "project-a", None, None, None)
+            first = await engine.get_record(first_old["memory_id"], scope, history=True)
+            second = await engine.get_record(second_old["memory_id"], scope, history=True)
+            states = {first[0]["lifecycle_state"], second[0]["lifecycle_state"]}
+            assert states == {"HISTORICAL", "SUPERSEDED"}
+
+            with pytest.raises(AdapterError) as stale:
+                await service.begin_housekeeping_job(
+                    scope="PROJECT",
+                    project_id="project-a",
+                    max_records=2,
+                    required_free_bytes=100,
+                    preview_digest="0" * 64,
+                )
+            assert stale.value.code == "HOUSEKEEPING_PREVIEW_STALE"
+        finally:
+            await adapter.close()
+
+    asyncio.run(run())
+
+
 def test_agent_inventory_never_infers_live_from_configuration_and_preserves_observation_truth(tmp_path) -> None:
     async def run() -> None:
         observer = _RuntimeObserver(

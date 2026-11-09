@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -58,6 +60,28 @@ def test_windows_owner_private_directory_and_file_use_current_user_dacl(tmp_path
     state.write_text("{}", encoding="utf-8")
     protect_owner_private_path(state, owner_sid=sid, directory=False)
     validate_owner_private_path(state, owner_sid=sid, directory=False)
+
+
+def test_windows_owner_private_directory_rejects_ancestor_junction_before_creation(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    junction = tmp_path / "junction"
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(real)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"junction creation unavailable: {completed.stderr or completed.stdout}")
+    try:
+        target = junction / "FactLane" / "state"
+        with pytest.raises(WindowsSecurityError) as caught:
+            ensure_owner_private_directory(target, owner_sid=current_user_sid())
+        assert caught.value.code == "WINDOWS_PATH_REPARSE_DENIED"
+        assert not (real / "FactLane").exists()
+    finally:
+        os.rmdir(junction)
 
 
 def test_windows_named_pipe_namespace_rejects_remote_and_tcp_substitutes() -> None:

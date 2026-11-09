@@ -72,6 +72,8 @@ class SessionCredentials:
     csrf_secret: str
     expires_at: float
     absolute_expires_at: float
+    idle_remaining_seconds: float
+    absolute_remaining_seconds: float
     auth_epoch: int
     primary_local: bool
 
@@ -80,6 +82,15 @@ class SessionCredentials:
 class SessionContext:
     expires_at: float
     absolute_expires_at: float
+    auth_epoch: int
+    primary_local: bool
+
+
+@dataclass(frozen=True)
+class SessionResumeCredentials:
+    csrf_secret: str
+    idle_remaining_seconds: float
+    absolute_remaining_seconds: float
     auth_epoch: int
     primary_local: bool
 
@@ -470,6 +481,29 @@ class OwnerAuthState:
                 csrf_secret=csrf_secret,
                 expires_at=session.expires_at(),
                 absolute_expires_at=session.absolute_expires_at,
+                idle_remaining_seconds=max(0.0, session.expires_at() - now),
+                absolute_remaining_seconds=max(0.0, session.absolute_expires_at - now),
+                auth_epoch=session.auth_epoch,
+                primary_local=session.primary_local,
+            )
+
+    def resume_session(
+        self,
+        *,
+        session_secret: str,
+        origin: str,
+    ) -> SessionResumeCredentials:
+        origin = self._validate_origin(origin)
+        digest = self._secret_digest(session_secret)
+        now = self._clock()
+        with self._lock:
+            session = self._session_for_use(digest, origin, now)
+            csrf_secret = self._new_secret()
+            session.csrf_digest = self._secret_digest(csrf_secret)
+            return SessionResumeCredentials(
+                csrf_secret=csrf_secret,
+                idle_remaining_seconds=max(0.0, session.expires_at() - now),
+                absolute_remaining_seconds=max(0.0, session.absolute_expires_at - now),
                 auth_epoch=session.auth_epoch,
                 primary_local=session.primary_local,
             )
@@ -1083,6 +1117,7 @@ class OwnerAuthState:
                 "operation": "APPROVE_REMOTE_ENROLLMENT",
                 "origin": pending.origin,
                 "source": pending.source,
+                "verification_phrase": pending.verification_phrase,
             },
             ensure_ascii=False,
             separators=(",", ":"),

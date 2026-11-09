@@ -1,40 +1,65 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import platform
 import re
 import shutil
 import socket
+import ssl
 import stat
 import subprocess
 import tempfile
 import time
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
+from http.client import HTTPException, HTTPResponse
 from importlib import resources
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Protocol
+from urllib.parse import urlsplit
 
 from .webui_runtime import WebUIRuntimeConfig
 from .webui_service import ServiceSnapshot, ServiceStatus
+from .webui_windows import (
+    WINDOWS_TASK_NAME,
+    WindowsBrowserInstall,
+    WindowsManagedConfig,
+    WindowsOwnerPaths,
+    WindowsTaskSchedulerSupervisor,
+    WindowsWebUIError,
+    discover_windows_browser,
+    ensure_windows_owner_paths,
+    render_windows_managed_config,
+    windows_managed_python_arguments,
+    windows_managed_python_executables,
+    windows_owner_paths,
+    write_owner_private_text_atomic,
+)
+from .windows_security import validate_windows_path_no_reparse
 
 
 WEBUI_SERVICE_NAME = "factlane-webui.service"
+OWNER_PANEL_LAUNCHER_LABEL = "FactLane Owner Panel"
+LINUX_OWNER_PANEL_LAUNCHER_FILENAME = f"{OWNER_PANEL_LAUNCHER_LABEL}.desktop"
+WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME = f"{OWNER_PANEL_LAUNCHER_LABEL}.lnk"
 WEBUI_PORT_MIN = 8765
 WEBUI_PORT_MAX = 8774
 OWNER_PRIVATE_ATOMIC_WRITE_CONTRACT = "OWNER_PRIVATE_ATOMIC_REGULAR_FILE_0600"
+WINDOWS_OWNER_PRIVATE_ATOMIC_WRITE_CONTRACT = "OWNER_PRIVATE_ATOMIC_REGULAR_FILE_SID_DACL"
 
 _INSTALLATION_ID_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 _HOSTNAME_RE = re.compile(r"factlane-([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\.test")
 _SAFE_TOKEN_RE = re.compile(r"[A-Za-z0-9_./:@+,-]+")
 _SUPPORTED_BROWSERS = (
-    ("google-chrome", "chromium"),
-    ("google-chrome-stable", "chromium"),
-    ("chromium", "chromium"),
-    ("chromium-browser", "chromium"),
     ("firefox", "firefox"),
+    ("firefox-esr", "firefox"),
 )
+LINUX_SETUP_JOURNAL_FILENAME = "webui-setup-provisional.json"
+LINUX_FIREFOX_MANAGED_USER_JS = "user.js"
+LINUX_FIREFOX_TRUST_MANIFEST = ".factlane-trust.json"
+LINUX_FIREFOX_CA_NICKNAME = "FactLane Local CA"
 _DEFAULT_GETEUID: Callable[[], int] = getattr(os, "geteuid", lambda: -1)
 
 
@@ -60,6 +85,10 @@ class ManagedServiceActivationStatus(str, Enum):
 
 
 class EndpointClaimError(RuntimeError):
+    pass
+
+
+class LinuxSetupRecoveryRequired(RuntimeError):
     pass
 
 
@@ -177,12 +206,42 @@ class BrowserInstall:
 
 
 @dataclass(frozen=True)
+class LinuxFirefoxNetworkPolicyReceipt:
+    status: str
+    profile_dir: str
+    user_js_path: str
+    profile_created: bool
+    user_js_created: bool
+
+
+@dataclass(frozen=True)
+class LinuxFirefoxTrustReceipt:
+    status: str
+    profile_dir: str
+    manifest_path: str
+    root_fingerprint_sha256: str
+    db_initialized: bool
+    certificate_imported: bool
+    manifest_created: bool
+
+
+@dataclass(frozen=True)
+class LinuxCaddyBootstrapReceipt:
+    status: str
+    root_cert_path: str
+    root_fingerprint_sha256: str
+    caddy_state_created: bool
+    caddy_state_device: int
+    caddy_state_inode: int
+
+
+@dataclass(frozen=True)
 class InstallEnvironment:
     system: str
     systemd: bool
     caddy_path: str | None
     zenity_path: str | None
-    browser: BrowserInstall | None
+    browser: BrowserInstall | WindowsBrowserInstall | None
     euid: int
 
     def __post_init__(self) -> None:
@@ -201,6 +260,7 @@ class SetupConsent:
     hostname_mapping: bool
     browser_profile_trust: bool
     user_lingering: bool
+    windows_native_setup: bool = False
 
     def __post_init__(self) -> None:
         if not all(
@@ -209,6 +269,7 @@ class SetupConsent:
                 self.hostname_mapping,
                 self.browser_profile_trust,
                 self.user_lingering,
+                self.windows_native_setup,
             )
         ):
             raise ValueError("setup consent values must be explicit booleans")
@@ -239,10 +300,16 @@ class SetupRequest:
     db: str | None = None
     profile: str | None = None
     host_id: str | None = None
+    native_control_socket: str | None = None
+    launcher_path: str | None = None
 
     def __post_init__(self) -> None:
         webui_hostname(self.installation_id)
         _validate_saved_port(self.saved_port)
+        windows_request = (
+            self.native_control_socket is not None
+            and self.native_control_socket.startswith("\\\\.\\pipe\\factlane-owner-")
+        )
         if not isinstance(self.lingering_required, bool):
             raise ValueError("lingering_required must be a boolean")
         if not self.installing_user or any(
@@ -267,7 +334,10 @@ class SetupRequest:
                 raise ValueError(
                     "db, profile, and host_id must be strings when configured"
                 )
-            _validate_absolute_path(self.db, "database path")
+            if windows_request:
+                _validate_windows_absolute_path(self.db, "database path")
+            else:
+                _validate_absolute_path(self.db, "database path")
             if not self.profile or any(
                 ch.isspace() or ord(ch) < 32 for ch in self.profile
             ):
@@ -276,6 +346,21 @@ class SetupRequest:
                 ch.isspace() or ord(ch) < 32 for ch in self.host_id
             ):
                 raise ValueError("host_id must be a non-empty identifier without whitespace")
+        if self.native_control_socket is not None:
+            if os.name == "nt":
+                if not self.native_control_socket.startswith("\\\\.\\pipe\\factlane-owner-"):
+                    raise ValueError("native_control_socket must be a FactLane local Windows Named Pipe")
+            else:
+                _validate_absolute_path(self.native_control_socket, "native control socket")
+        if self.launcher_path is not None:
+            if windows_request:
+                _validate_windows_absolute_path(self.launcher_path, "Owner Panel launcher path")
+                if PureWindowsPath(self.launcher_path).name != WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME:
+                    raise ValueError("Windows Owner Panel launcher must use the canonical shortcut filename")
+            else:
+                _validate_absolute_path(self.launcher_path, "Owner Panel launcher path")
+                if PurePosixPath(self.launcher_path).name != LINUX_OWNER_PANEL_LAUNCHER_FILENAME:
+                    raise ValueError("Linux Owner Panel launcher must use the canonical desktop filename")
         for value, label in (
             (self.factlane_executable, "FactLane executable"),
             (self.owner_config_home, "Owner config home"),
@@ -288,17 +373,28 @@ class SetupRequest:
             (self.caddy_state_dir, "Caddy state directory"),
             (self.browser_profile_dir, "browser profile directory"),
         ):
-            _validate_absolute_path(value, label)
-        canonical_config_home = str(PurePosixPath(self.owner_config_home))
-        if canonical_config_home != self.owner_config_home:
-            raise ValueError("Owner config home must be a canonical absolute POSIX path")
-        expected_service_config = str(
-            PurePosixPath(self.owner_config_home) / "factlane" / "webui.json"
-        )
-        if self.service_config_path != expected_service_config:
+            if windows_request:
+                _validate_windows_absolute_path(value, label)
+            else:
+                _validate_absolute_path(value, label)
+        if windows_request:
+            canonical_config_home = str(PureWindowsPath(self.owner_config_home))
+            if canonical_config_home.casefold() != self.owner_config_home.casefold():
+                raise ValueError("Owner config home must be a canonical absolute Windows path")
+            expected_service_config = str(PureWindowsPath(self.owner_config_home) / "webui.json")
+            service_matches = self.service_config_path.casefold() == expected_service_config.casefold()
+        else:
+            canonical_config_home = str(PurePosixPath(self.owner_config_home))
+            if canonical_config_home != self.owner_config_home:
+                raise ValueError("Owner config home must be a canonical absolute POSIX path")
+            expected_service_config = str(
+                PurePosixPath(self.owner_config_home) / "factlane" / "webui.json"
+            )
+            service_matches = self.service_config_path == expected_service_config
+        if not service_matches:
             raise ValueError(
                 "service_config_path must equal the canonical runtime config path "
-                "<owner_config_home>/factlane/webui.json"
+                "for the active platform"
             )
 
 
@@ -313,9 +409,12 @@ class PlannedOperation:
 
     def __post_init__(self) -> None:
         if self.kind == "WRITE_SERVICE_CONFIG":
-            if self.write_contract != OWNER_PRIVATE_ATOMIC_WRITE_CONTRACT:
+            if self.write_contract not in {
+                OWNER_PRIVATE_ATOMIC_WRITE_CONTRACT,
+                WINDOWS_OWNER_PRIVATE_ATOMIC_WRITE_CONTRACT,
+            }:
                 raise ValueError(
-                    "WRITE_SERVICE_CONFIG requires the fixed owner-private atomic 0600 contract"
+                    "WRITE_SERVICE_CONFIG requires a fixed owner-private atomic write contract"
                 )
         elif self.write_contract is not None:
             raise ValueError("write_contract is only valid for WRITE_SERVICE_CONFIG")
@@ -326,7 +425,7 @@ class SetupPlan:
     hostname: str
     origin: str
     saved_port: int
-    browser: BrowserInstall
+    browser: BrowserInstall | WindowsBrowserInstall
     backend_socket: str
     caddy_state_dir: str
     caddy_config: str
@@ -358,6 +457,16 @@ def detect_install_environment(
     """Return read-only receiving-host facts used by setup planning."""
 
     system = system_name()
+    if system == "Windows" and os.name == "nt":
+        discovered = discover_windows_browser(environ=os.environ, which=which)
+        return InstallEnvironment(
+            system="Windows",
+            systemd=False,
+            caddy_path=None,
+            zenity_path=None,
+            browser=discovered,
+            euid=-1,
+        )
     systemd = (
         system == "Linux"
         and which("systemctl") is not None
@@ -384,8 +493,9 @@ def consent_requirements(*, lingering_required: bool) -> tuple[ConsentRequiremen
         ConsentRequirement(
             key="hostname_mapping",
             explanation=(
-                "Allow one exact local hostname mapping for this FactLane installation; "
-                "all unrelated hostname mappings must be preserved."
+                "Bind this installation's exact local hostname only inside the isolated "
+                "FactLane Firefox profile; system hostname mappings and personal browser "
+                "profiles must remain untouched."
             ),
         ),
         ConsentRequirement(
@@ -474,6 +584,52 @@ def render_user_unit(*, factlane_executable: str, service_config_path: str) -> s
     return rendered
 
 
+def _desktop_exec_token(value: str) -> str:
+    if not isinstance(value, str) or not value or any(ord(char) < 32 for char in value):
+        raise ValueError("desktop launcher executable must be bounded text")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$")
+    return f'"{escaped}"'
+
+
+def render_linux_owner_panel_launcher(*, factlane_executable: str) -> str:
+    """Render one shell-free freedesktop launcher for the trusted managed open flow."""
+
+    _validate_absolute_path(factlane_executable, "FactLane executable")
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={OWNER_PANEL_LAUNCHER_LABEL}\n"
+        "Comment=Open the local FactLane Owner Panel\n"
+        f"Exec={_desktop_exec_token(factlane_executable)} launch webui\n"
+        "Terminal=false\n"
+        "Categories=Utility;\n"
+        "StartupNotify=true\n"
+    )
+
+
+def render_windows_owner_panel_launcher(*, factlane_executable: str, owner_config_home: str) -> str:
+    """Return the bounded shortcut specification consumed by the native installer backend."""
+
+    _validate_windows_absolute_path(
+        factlane_executable,
+        "FactLane environment executable",
+    )
+    executable = PureWindowsPath(factlane_executable)
+    pythonw = executable.with_name("pythonw.exe")
+    _validate_windows_absolute_path(owner_config_home, "Owner config home")
+    working_directory = PureWindowsPath(owner_config_home).parent
+    return json.dumps(
+        {
+            "arguments": "-m factlane.webui_launcher",
+            "description": "Open the local FactLane Owner Panel",
+            "target": str(pythonw),
+            "working_directory": str(working_directory),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+
+
 def plan_webui_setup(
     request: SetupRequest,
     environment: InstallEnvironment,
@@ -481,9 +637,14 @@ def plan_webui_setup(
 ) -> SetupReceipt:
     """Build a deterministic setup plan without applying any host mutation."""
 
+    if environment.system == "Windows":
+        return _plan_windows_webui_setup(request, environment, consent)
+
     blocked_reasons = list(_environment_blockers(environment))
     if not consent.hostname_mapping:
-        blocked_reasons.append("explicit consent for the exact hostname mapping is required")
+        blocked_reasons.append(
+            "explicit consent for the isolated Firefox hostname binding is required"
+        )
     if not consent.browser_profile_trust:
         blocked_reasons.append("explicit consent for isolated browser profile trust is required")
     if request.lingering_required and not consent.user_lingering:
@@ -502,6 +663,12 @@ def plan_webui_setup(
         return SetupReceipt(
             status="BLOCKED",
             blocked_reasons=("a supported browser is required",),
+            plan=None,
+        )
+    if browser.family != "firefox":
+        return SetupReceipt(
+            status="BLOCKED",
+            blocked_reasons=("Mozilla Firefox or Firefox ESR browser is required for managed Linux WebUI",),
             plan=None,
         )
 
@@ -525,8 +692,22 @@ def plan_webui_setup(
         runtime_dir=request.runtime_dir,
         state_dir=request.state_dir,
     )
+    # Preserve the exact pre-portability Linux on-disk schema.  Windows
+    # managed installs use the explicit platform/transport schema, but a
+    # Linux setup must not rewrite its already-qualified nine-field contract
+    # merely because WebUIRuntimeConfig now carries cross-platform defaults.
     runtime_config_json = json.dumps(
-        asdict(runtime_config),
+        {
+            "db": runtime_config.db,
+            "profile": runtime_config.profile,
+            "host_id": runtime_config.host_id,
+            "origin": runtime_config.origin,
+            "backend_socket": runtime_config.backend_socket,
+            "caddy_path": runtime_config.caddy_path,
+            "caddyfile": runtime_config.caddyfile,
+            "runtime_dir": runtime_config.runtime_dir,
+            "state_dir": runtime_config.state_dir,
+        },
         sort_keys=True,
         separators=(",", ":"),
     ) + "\n"
@@ -547,8 +728,44 @@ def plan_webui_setup(
         / "local"
         / "root.crt"
     )
+    setup_journal = str(linux_setup_journal_path(request.state_dir))
+    journal_state = render_linux_setup_journal(
+        request=request,
+        browser=browser,
+        hostname=hostname,
+    )
+    profile_network_policy = render_linux_firefox_network_policy(hostname)
 
     operations: list[PlannedOperation] = [
+        PlannedOperation(
+            kind="PERSIST_PROVISIONAL_SETUP",
+            target=setup_journal,
+            desired_state=journal_state,
+        ),
+        PlannedOperation(
+            kind="BOOTSTRAP_CADDY_CA",
+            target=public_root,
+            desired_state=(
+                "Materialize and verify this installation's Caddy local public root in the "
+                "owner-private Caddy state without publishing or claiming the managed endpoint."
+            ),
+            consent_key="browser_profile_trust",
+        ),
+        PlannedOperation(
+            kind="ENSURE_ISOLATED_PROFILE_NETWORK",
+            target=request.browser_profile_dir,
+            desired_state=profile_network_policy,
+            consent_key="hostname_mapping",
+        ),
+        PlannedOperation(
+            kind="ENSURE_ISOLATED_PROFILE_TRUST",
+            target=request.browser_profile_dir,
+            desired_state=(
+                f"Import only public root certificate {public_root} into this isolated "
+                "Firefox profile; leave every other profile and trust entry untouched."
+            ),
+            consent_key="browser_profile_trust",
+        ),
         PlannedOperation(
             kind="WRITE_SERVICE_CONFIG",
             target=request.service_config_path,
@@ -564,21 +781,6 @@ def plan_webui_setup(
             kind="INSTALL_USER_UNIT",
             target=request.user_unit_path,
             desired_state=user_unit,
-        ),
-        PlannedOperation(
-            kind="ENSURE_HOSTNAME_MAPPING",
-            target="/etc/hosts",
-            desired_state=f"127.0.0.1\t{hostname}",
-            consent_key="hostname_mapping",
-        ),
-        PlannedOperation(
-            kind="ENSURE_ISOLATED_PROFILE_TRUST",
-            target=request.browser_profile_dir,
-            desired_state=(
-                f"Import only public root certificate {public_root} into this isolated "
-                f"{browser.family} profile; leave every other profile and trust entry untouched."
-            ),
-            consent_key="browser_profile_trust",
         ),
     ]
     if request.lingering_required:
@@ -603,6 +805,16 @@ def plan_webui_setup(
             ),
         )
     )
+    if request.launcher_path is not None:
+        operations.append(
+            PlannedOperation(
+                kind="INSTALL_OWNER_LAUNCHER",
+                target=request.launcher_path,
+                desired_state=render_linux_owner_panel_launcher(
+                    factlane_executable=request.factlane_executable
+                ),
+            )
+        )
 
     return SetupReceipt(
         status="READY_TO_APPLY",
@@ -617,6 +829,89 @@ def plan_webui_setup(
             caddy_config=caddy_config,
             user_unit=user_unit,
             operations=tuple(operations),
+        ),
+    )
+
+
+def _plan_windows_webui_setup(
+    request: SetupRequest,
+    environment: InstallEnvironment,
+    consent: SetupConsent,
+) -> SetupReceipt:
+    blocked_reasons = list(_environment_blockers(environment))
+    if not consent.windows_native_setup:
+        blocked_reasons.append("explicit consent for owner-private Windows setup and current-user task registration is required")
+    if blocked_reasons:
+        return SetupReceipt(status="BLOCKED", blocked_reasons=tuple(blocked_reasons), plan=None)
+    if request.native_control_socket is None:
+        return SetupReceipt(
+            status="BLOCKED",
+            blocked_reasons=("native Windows control endpoint is missing",),
+            plan=None,
+        )
+    browser = environment.browser
+    if not isinstance(browser, WindowsBrowserInstall) or browser.family != "firefox":
+        return SetupReceipt(status="BLOCKED", blocked_reasons=("Mozilla Firefox is required for managed Windows WebUI",), plan=None)
+    hostname = webui_hostname(request.installation_id)
+    origin = f"https://{hostname}:{request.saved_port}"
+    managed = WindowsManagedConfig(
+        installation_id=request.installation_id,
+        origin=origin,
+        native_control_pipe=request.native_control_socket,
+        runtime_dir=request.runtime_dir,
+        state_dir=request.state_dir,
+        browser_profile_dir=request.browser_profile_dir,
+        db=request.db,
+        profile=request.profile,
+        host_id=request.host_id,
+    )
+    operations: tuple[PlannedOperation, ...] = (
+        PlannedOperation(
+            kind="ENSURE_WINDOWS_OWNER_STATE",
+            target=request.state_dir,
+            desired_state="Protect FactLane managed state with the current-user SID and owner-only DACL custody.",
+            consent_key="windows_native_setup",
+        ),
+        PlannedOperation(
+            kind="WRITE_SERVICE_CONFIG",
+            target=request.service_config_path,
+            desired_state=render_windows_managed_config(managed),
+            write_contract=WINDOWS_OWNER_PRIVATE_ATOMIC_WRITE_CONTRACT,
+            consent_key="windows_native_setup",
+        ),
+        PlannedOperation(
+            kind="REGISTER_WINDOWS_TASK",
+            target=WINDOWS_TASK_NAME,
+            desired_state=(
+                f"Register or update one current-user Task Scheduler entry with the exact base Python executable "
+                f"and an in-process bootstrap bound to FactLane environment {request.factlane_executable!r}."
+            ),
+            consent_key="windows_native_setup",
+        ),
+    )
+    if request.launcher_path is not None:
+        operations = (*operations, PlannedOperation(
+            kind="INSTALL_OWNER_LAUNCHER",
+            target=request.launcher_path,
+            desired_state=render_windows_owner_panel_launcher(
+                factlane_executable=request.factlane_executable,
+                owner_config_home=request.owner_config_home,
+            ),
+            consent_key="windows_native_setup",
+        ))
+    return SetupReceipt(
+        status="READY_TO_APPLY",
+        blocked_reasons=(),
+        plan=SetupPlan(
+            hostname=hostname,
+            origin=origin,
+            saved_port=request.saved_port,
+            browser=browser,
+            backend_socket=request.backend_socket,
+            caddy_state_dir=request.caddy_state_dir,
+            caddy_config="",
+            user_unit="",
+            operations=operations,
         ),
     )
 
@@ -641,6 +936,8 @@ def apply_webui_setup(
             detail="setup receipt is not READY_TO_APPLY",
         )
     plan = receipt.plan
+    if _is_windows_setup_plan(plan):
+        return _apply_windows_webui_setup(plan, consent, backend)
     if plan.endpoint_state is not EndpointState.PROPOSED:
         return SetupApplyResult(
             status=InstallerStepStatus.BLOCKED,
@@ -658,13 +955,46 @@ def apply_webui_setup(
                 detail=f"explicit consent is missing for {operation.consent_key}",
             )
     completed: list[str] = []
+
+    def failed(
+        status: InstallerStepStatus,
+        detail: str | None,
+    ) -> SetupApplyResult:
+        rollback = getattr(backend, "rollback_setup", None)
+        if callable(rollback) and completed:
+            rolled_back = rollback(plan=plan, completed_operations=tuple(completed))
+            if rolled_back.status is not InstallerStepStatus.APPLIED:
+                return SetupApplyResult(
+                    status=InstallerStepStatus.RECOVERY_REQUIRED,
+                    endpoint_state=EndpointState.PROPOSED,
+                    completed_operations=tuple(completed),
+                    detail=rolled_back.detail or "pre-claim rollback requires explicit recovery",
+                )
+        return SetupApplyResult(
+            status=status,
+            endpoint_state=EndpointState.PROPOSED,
+            completed_operations=tuple(completed),
+            detail=detail,
+        )
+
+    def recovery_without_rollback(detail: str) -> SetupApplyResult:
+        return SetupApplyResult(
+            status=InstallerStepStatus.RECOVERY_REQUIRED,
+            endpoint_state=EndpointState.PROPOSED,
+            completed_operations=tuple(completed),
+            detail=detail,
+        )
+
     try:
         crossing_kinds = {
-            "ENSURE_HOSTNAME_MAPPING",
+            "PERSIST_PROVISIONAL_SETUP",
+            "BOOTSTRAP_CADDY_CA",
+            "ENSURE_ISOLATED_PROFILE_NETWORK",
             "ENSURE_ISOLATED_PROFILE_TRUST",
             "ENABLE_USER_LINGERING",
         }
         endpoint_writes = {"WRITE_SERVICE_CONFIG", "WRITE_CADDY_CONFIG"}
+        post_activation_kinds = {"INSTALL_OWNER_LAUNCHER"}
         ordered_prerequisites = (
             [op for op in plan.operations if op.kind in crossing_kinds]
             + [
@@ -672,29 +1002,20 @@ def apply_webui_setup(
                 for op in plan.operations
                 if op.kind not in crossing_kinds
                 and op.kind not in endpoint_writes
+                and op.kind not in post_activation_kinds
             ]
         )
         for operation in ordered_prerequisites:
             result = backend.apply_operation(operation, plan=plan)
             if result.status is not InstallerStepStatus.APPLIED:
-                return SetupApplyResult(
-                    status=result.status,
-                    endpoint_state=EndpointState.PROPOSED,
-                    completed_operations=tuple(completed),
-                    detail=result.detail,
-                )
+                return failed(result.status, result.detail)
             completed.append(operation.kind)
         saved_endpoint = backend.read_saved_endpoint()
         if saved_endpoint is not None:
             try:
                 saved_port = _saved_endpoint_port_for_plan(saved_endpoint, plan)
             except ValueError as exc:
-                return SetupApplyResult(
-                    status=InstallerStepStatus.RECOVERY_REQUIRED,
-                    endpoint_state=EndpointState.PROPOSED,
-                    completed_operations=tuple(completed),
-                    detail=str(exc),
-                )
+                return failed(InstallerStepStatus.RECOVERY_REQUIRED, str(exc))
             candidate_ports = (saved_port,)
         else:
             candidate_ports = tuple(range(WEBUI_PORT_MIN, WEBUI_PORT_MAX + 1))
@@ -709,12 +1030,7 @@ def apply_webui_setup(
                 )
                 written = backend.apply_operation(operation, plan=candidate_plan)
                 if written.status is not InstallerStepStatus.APPLIED:
-                    return SetupApplyResult(
-                        status=written.status,
-                        endpoint_state=EndpointState.PROPOSED,
-                        completed_operations=tuple(completed),
-                        detail=written.detail,
-                    )
+                    return failed(written.status, written.detail)
                 completed.append(operation.kind)
 
             activation = backend.activate_candidate(plan=candidate_plan)
@@ -723,13 +1039,38 @@ def apply_webui_setup(
                     stopped = backend.stop_candidate(plan=candidate_plan)
                     detail = "managed service reported READY without the exact claimed candidate endpoint"
                     if stopped.status is not InstallerStepStatus.APPLIED:
-                        detail += "; managed service stop also failed"
-                    return SetupApplyResult(
-                        status=InstallerStepStatus.FAILED,
-                        endpoint_state=EndpointState.PROPOSED,
-                        completed_operations=tuple(completed),
-                        detail=detail,
-                    )
+                        return recovery_without_rollback(
+                            detail + "; managed service stop also failed; no rollback was attempted while liveness is ambiguous"
+                        )
+                    return failed(InstallerStepStatus.FAILED, detail)
+                for operation in candidate_plan.operations:
+                    if operation.kind not in post_activation_kinds:
+                        continue
+                    installed = backend.apply_operation(operation, plan=candidate_plan)
+                    if installed.status is not InstallerStepStatus.APPLIED:
+                        stopped = backend.stop_candidate(plan=candidate_plan)
+                        if stopped.status is not InstallerStepStatus.APPLIED:
+                            return recovery_without_rollback(
+                                "Owner Panel launcher failed and the managed service could not be proven stopped"
+                            )
+                        return failed(
+                            installed.status,
+                            installed.detail or "Owner Panel launcher installation failed",
+                        )
+                    completed.append(operation.kind)
+                finalize = getattr(backend, "finalize_setup", None)
+                if callable(finalize):
+                    finalized = finalize(plan=candidate_plan)
+                    if finalized.status is not InstallerStepStatus.APPLIED:
+                        stopped = backend.stop_candidate(plan=candidate_plan)
+                        if stopped.status is not InstallerStepStatus.APPLIED:
+                            return recovery_without_rollback(
+                                "final setup publication failed and the managed service could not be proven stopped"
+                            )
+                        return failed(
+                            InstallerStepStatus.RECOVERY_REQUIRED,
+                            finalized.detail or "final setup publication could not be recorded durably",
+                        )
                 return SetupApplyResult(
                     status=InstallerStepStatus.APPLIED,
                     endpoint_state=EndpointState.CLAIMED,
@@ -740,46 +1081,80 @@ def apply_webui_setup(
 
             stopped = backend.stop_candidate(plan=candidate_plan)
             if stopped.status is not InstallerStepStatus.APPLIED:
-                return SetupApplyResult(
-                    status=InstallerStepStatus.FAILED,
-                    endpoint_state=EndpointState.PROPOSED,
-                    completed_operations=tuple(completed),
-                    detail="candidate activation failed and managed service could not be stopped safely",
+                return recovery_without_rollback(
+                    "candidate activation failed and managed service could not be stopped safely; no rollback was attempted while liveness is ambiguous"
                 )
             if activation.status is ManagedServiceActivationStatus.PORT_CONFLICT:
                 if saved_endpoint is not None:
-                    return SetupApplyResult(
-                        status=InstallerStepStatus.RECOVERY_REQUIRED,
-                        endpoint_state=EndpointState.PROPOSED,
-                        completed_operations=tuple(completed),
-                        detail=(
-                            "saved endpoint is unavailable; explicit endpoint recovery is required"
-                        ),
+                    return failed(
+                        InstallerStepStatus.RECOVERY_REQUIRED,
+                        "saved endpoint is unavailable; explicit endpoint recovery is required",
                     )
                 continue
-            return SetupApplyResult(
-                status=InstallerStepStatus.FAILED,
-                endpoint_state=EndpointState.PROPOSED,
-                completed_operations=tuple(completed),
-                detail=activation.detail or "managed service candidate activation failed",
+            return failed(
+                InstallerStepStatus.FAILED,
+                activation.detail or "managed service candidate activation failed",
             )
 
+        return failed(
+            InstallerStepStatus.FAILED,
+            f"no managed endpoint from {WEBUI_PORT_MIN} through {WEBUI_PORT_MAX} could be activated",
+        )
+    except Exception as exc:
+        return failed(
+            InstallerStepStatus.FAILED,
+            f"setup apply failed safely: {type(exc).__name__}",
+        )
+
+
+def _apply_windows_webui_setup(
+    plan: SetupPlan,
+    consent: SetupConsent,
+    backend: LinuxInstallerBackend,
+) -> SetupApplyResult:
+    if plan.endpoint_state is not EndpointState.PROPOSED:
         return SetupApplyResult(
-            status=InstallerStepStatus.FAILED,
+            status=InstallerStepStatus.BLOCKED,
+            endpoint_state=plan.endpoint_state,
+            detail="Windows setup plan already crossed the proposed endpoint boundary",
+        )
+    completed: list[str] = []
+    try:
+        for operation in plan.operations:
+            if operation.consent_key is not None and not _consent_granted(consent, operation.consent_key):
+                return SetupApplyResult(
+                    status=InstallerStepStatus.BLOCKED,
+                    endpoint_state=EndpointState.PROPOSED,
+                    completed_operations=tuple(completed),
+                    detail=f"explicit consent is missing for {operation.consent_key}",
+                )
+            result = backend.apply_operation(operation, plan=plan)
+            if result.status is not InstallerStepStatus.APPLIED:
+                return SetupApplyResult(
+                    status=result.status,
+                    endpoint_state=EndpointState.PROPOSED,
+                    completed_operations=tuple(completed),
+                    detail=result.detail,
+                )
+            completed.append(operation.kind)
+        return SetupApplyResult(
+            status=InstallerStepStatus.APPLIED,
             endpoint_state=EndpointState.PROPOSED,
+            origin=plan.origin,
             completed_operations=tuple(completed),
-            detail=f"no managed endpoint from {WEBUI_PORT_MIN} through {WEBUI_PORT_MAX} could be activated",
+            detail="Windows lifecycle substrate configured; endpoint claim remains owned by the managed runtime",
         )
     except Exception as exc:
         return SetupApplyResult(
             status=InstallerStepStatus.FAILED,
             endpoint_state=EndpointState.PROPOSED,
             completed_operations=tuple(completed),
-            detail=f"setup apply failed safely: {type(exc).__name__}",
+            detail=f"Windows setup apply failed safely: {type(exc).__name__}",
         )
 
 
 CommandRunner = Callable[[tuple[str, ...]], int]
+ReadCommandRunner = Callable[[tuple[str, ...]], tuple[int, str]]
 ServiceStateReader = Callable[[], ServiceSnapshot]
 ActivationProbe = Callable[[str], ManagedServiceActivationResult]
 InstallClock = Callable[[], float]
@@ -787,18 +1162,19 @@ InstallSleep = Callable[[float], None]
 
 
 class ProductionLinuxInstallerBackend:
-    """Linux installer backend with explicit argv-only owner-side operations.
-
-    This backend intentionally does not invent privilege escalation or browser trust
-    mechanisms. Those crossings return typed incomplete results until a supported
-    privileged installer and browser-specific trust implementation are supplied.
-    """
+    """Linux installer backend with fixed-argv, owner-scoped setup operations."""
 
     def __init__(
         self,
         *,
         systemctl_path: str,
+        loginctl_path: str | None = None,
+        certutil_path: str | None = None,
+        caddy_path: str | None = None,
+        owner_uid: int | None = None,
         command_runner: CommandRunner | None = None,
+        read_command_runner: ReadCommandRunner | None = None,
+        caddy_bootstrap_process_factory: Callable[[tuple[str, ...]], object] | None = None,
         service_state_reader: ServiceStateReader | None = None,
         activation_probe: ActivationProbe | None = None,
         clock: InstallClock = time.monotonic,
@@ -807,18 +1183,42 @@ class ProductionLinuxInstallerBackend:
         poll_interval: float = 0.1,
     ) -> None:
         _validate_absolute_path(systemctl_path, "systemctl executable")
+        for value, label in (
+            (loginctl_path, "loginctl executable"),
+            (certutil_path, "certutil executable"),
+            (caddy_path, "Caddy executable"),
+        ):
+            if value is not None:
+                _validate_absolute_path(value, label)
+        uid = _DEFAULT_GETEUID() if owner_uid is None else owner_uid
+        if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
+            raise ValueError("owner_uid must be a non-negative integer")
         if activation_timeout <= 0:
             raise ValueError("activation_timeout must be positive")
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
         self._systemctl_path = systemctl_path
+        self._loginctl_path = loginctl_path
+        self._certutil_path = certutil_path
+        self._caddy_path = caddy_path
+        self._owner_uid = uid
         self._command_runner = command_runner or _run_argv
+        self._read_command_runner = read_command_runner or _run_argv_capture
+        self._caddy_bootstrap_process_factory = caddy_bootstrap_process_factory
         self._service_state_reader = service_state_reader
         self._activation_probe = activation_probe
         self._clock = clock
         self._sleep = sleep
         self._activation_timeout = activation_timeout
         self._poll_interval = poll_interval
+        self._journal_path: Path | None = None
+        self._attempt_file_targets: set[str] = set()
+        self._attempt_linger_changed = False
+        self._attempt_service_enable_changed = False
+        self._attempt_profile_created = False
+        self._attempt_profile_created_files: set[str] = set()
+        self._attempt_trust_imported = False
+        self._attempt_caddy_state_created = False
 
     def apply_operation(
         self,
@@ -826,17 +1226,527 @@ class ProductionLinuxInstallerBackend:
         *,
         plan: SetupPlan,
     ) -> InstallerStepResult:
-        del plan
+        if operation.kind == "PERSIST_PROVISIONAL_SETUP":
+            try:
+                journal = _ensure_linux_setup_journal(
+                    Path(operation.target),
+                    operation.desired_state,
+                    owner_uid=self._owner_uid,
+                )
+                self._journal_path = Path(operation.target)
+                if journal.get("phase") == "RECOVERY_REQUIRED":
+                    raise LinuxSetupRecoveryRequired(
+                        "provisional setup journal is already in RECOVERY_REQUIRED"
+                    )
+                if journal.get("phase") == "CLAIMED":
+                    journal["phase"] = "PROVISIONAL"
+                    journal["ownership"] = _new_linux_setup_ownership()
+                    _atomic_owner_file_write(
+                        self._journal_path,
+                        json.dumps(journal, sort_keys=True, separators=(",", ":")) + "\n",
+                        private_parent=True,
+                    )
+                ownership = journal.get("ownership")
+                if not isinstance(ownership, dict):
+                    raise LinuxSetupRecoveryRequired("provisional setup ownership state is invalid")
+                caddy_state = Path(plan.caddy_state_dir)
+                if ownership.get("caddy_state_preexisting") is None:
+                    try:
+                        caddy_info = _require_owner_private_directory(
+                            caddy_state,
+                            owner_uid=self._owner_uid,
+                        )
+                    except FileNotFoundError:
+                        caddy_preexisting = False
+                        caddy_dev = caddy_ino = None
+                    else:
+                        caddy_preexisting = True
+                        caddy_dev = int(caddy_info.st_dev)
+                        caddy_ino = int(caddy_info.st_ino)
+                    ownership.update(
+                        {
+                            "caddy_state_preexisting": caddy_preexisting,
+                            "caddy_state_device": caddy_dev,
+                            "caddy_state_inode": caddy_ino,
+                        }
+                    )
+                # SetupPlan carries browser identity; the exact profile path remains bound in
+                # the durable journal rendered from SetupRequest.
+                profile = Path(str(journal.get("browser_profile_dir")))
+                if ownership.get("profile_preexisting") is None:
+                    try:
+                        profile_info = _require_owner_private_directory(
+                            profile,
+                            owner_uid=self._owner_uid,
+                        )
+                    except FileNotFoundError:
+                        profile_preexisting = False
+                        profile_dev = profile_ino = None
+                    else:
+                        profile_preexisting = True
+                        profile_dev = int(profile_info.st_dev)
+                        profile_ino = int(profile_info.st_ino)
+                    user_js = profile / LINUX_FIREFOX_MANAGED_USER_JS
+                    nss_files = tuple(profile / name for name in ("cert9.db", "key4.db", "pkcs11.txt"))
+                    if profile_preexisting:
+                        try:
+                            _require_owner_private_regular_file(user_js, owner_uid=self._owner_uid)
+                        except FileNotFoundError:
+                            user_js_preexisting = False
+                        else:
+                            user_js_preexisting = True
+                        nss_present = [item.exists() for item in nss_files]
+                        if any(nss_present) and not all(nss_present):
+                            raise LinuxSetupRecoveryRequired("pre-existing Firefox NSS state is partial")
+                        if all(nss_present):
+                            for item in nss_files:
+                                _require_owner_private_regular_file(item, owner_uid=self._owner_uid)
+                        nss_preexisting = all(nss_present)
+                        manifest = profile / LINUX_FIREFOX_TRUST_MANIFEST
+                        try:
+                            _require_owner_private_regular_file(manifest, owner_uid=self._owner_uid)
+                        except FileNotFoundError:
+                            trust_preexisting = False
+                        else:
+                            trust_preexisting = True
+                    else:
+                        user_js_preexisting = False
+                        nss_preexisting = False
+                        trust_preexisting = False
+                    ownership.update(
+                        {
+                            "profile_preexisting": profile_preexisting,
+                            "profile_device": profile_dev,
+                            "profile_inode": profile_ino,
+                            "user_js_preexisting": user_js_preexisting,
+                            "nss_preexisting": nss_preexisting,
+                            "trust_preexisting": trust_preexisting,
+                        }
+                    )
+                _update_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                    ownership_updates=ownership,
+                )
+                files = ownership.get("files")
+                if isinstance(files, dict):
+                    self._attempt_file_targets = set(files)
+                self._attempt_linger_changed = ownership.get("linger_changed") is True
+                self._attempt_service_enable_changed = ownership.get("service_enable_changed") is True
+                self._attempt_profile_created = ownership.get("profile_created") is True
+                profile_files = ownership.get("profile_created_files")
+                if isinstance(profile_files, list):
+                    self._attempt_profile_created_files = {
+                        item for item in profile_files if isinstance(item, str)
+                    }
+                self._attempt_trust_imported = ownership.get("trust_imported") is True
+                self._attempt_caddy_state_created = ownership.get("caddy_state_created") is True
+            except LinuxSetupRecoveryRequired as exc:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.RECOVERY_REQUIRED,
+                    operation=operation.kind,
+                    detail=str(exc),
+                )
+            except (OSError, ValueError) as exc:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.FAILED,
+                    operation=operation.kind,
+                    detail=f"provisional setup journal failed safely: {type(exc).__name__}",
+                )
+            return InstallerStepResult(
+                status=InstallerStepStatus.APPLIED,
+                operation=operation.kind,
+            )
+        if operation.kind == "BOOTSTRAP_CADDY_CA":
+            if self._journal_path is None:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.RECOVERY_REQUIRED,
+                    operation=operation.kind,
+                    detail="provisional setup journal must be durable before Caddy CA bootstrap",
+                )
+            if self._caddy_path is None:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.FAILED,
+                    operation=operation.kind,
+                    detail="Caddy executable is unavailable for private CA bootstrap",
+                )
+            try:
+                journal = _parse_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                )
+                ownership = journal["ownership"]
+                assert isinstance(ownership, dict)
+                caddy_state = Path(plan.caddy_state_dir)
+                root_path = caddy_state / "pki" / "authorities" / "local" / "root.crt"
+                caddy_preexisting = ownership.get("caddy_state_preexisting")
+                caddy_created = ownership.get("caddy_state_created") is True
+                caddy_create_intent = ownership.get("caddy_state_create_intent") is True
+                if caddy_preexisting is False and not caddy_created:
+                    if caddy_state.exists():
+                        if not caddy_create_intent:
+                            raise LinuxSetupRecoveryRequired(
+                                "Caddy state appeared before a durable create intent"
+                            )
+                        info = _require_owner_private_directory(
+                            caddy_state,
+                            owner_uid=self._owner_uid,
+                        )
+                        try:
+                            next(caddy_state.iterdir())
+                        except StopIteration:
+                            pass
+                        else:
+                            raise LinuxSetupRecoveryRequired(
+                                "Caddy state appeared after create intent with unreceipted contents"
+                            )
+                        _update_linux_setup_journal(
+                            self._journal_path,
+                            owner_uid=self._owner_uid,
+                            ownership_updates={
+                                "caddy_state_created": True,
+                                "caddy_state_device": int(info.st_dev),
+                                "caddy_state_inode": int(info.st_ino),
+                            },
+                        )
+                        ownership["caddy_state_created"] = True
+                        ownership["caddy_state_device"] = int(info.st_dev)
+                        ownership["caddy_state_inode"] = int(info.st_ino)
+                        caddy_created = True
+                    else:
+                        if not caddy_create_intent:
+                            _update_linux_setup_journal(
+                                self._journal_path,
+                                owner_uid=self._owner_uid,
+                                ownership_updates={"caddy_state_create_intent": True},
+                            )
+                            ownership["caddy_state_create_intent"] = True
+                            caddy_create_intent = True
+                        _ensure_real_directory_chain(caddy_state.parent)
+                        caddy_state.mkdir(mode=0o700)
+                        os.chmod(caddy_state, 0o700)
+                        info = _require_owner_private_directory(
+                            caddy_state,
+                            owner_uid=self._owner_uid,
+                        )
+                        _update_linux_setup_journal(
+                            self._journal_path,
+                            owner_uid=self._owner_uid,
+                            ownership_updates={
+                                "caddy_state_created": True,
+                                "caddy_state_device": int(info.st_dev),
+                                "caddy_state_inode": int(info.st_ino),
+                            },
+                        )
+                        ownership["caddy_state_created"] = True
+                        ownership["caddy_state_device"] = int(info.st_dev)
+                        ownership["caddy_state_inode"] = int(info.st_ino)
+                        caddy_created = True
+                elif caddy_preexisting is False and caddy_created:
+                    info = _require_owner_private_directory(
+                        caddy_state,
+                        owner_uid=self._owner_uid,
+                    )
+                    if (
+                        info.st_dev != ownership.get("caddy_state_device")
+                        or info.st_ino != ownership.get("caddy_state_inode")
+                    ):
+                        raise LinuxSetupRecoveryRequired(
+                            "owned Caddy state identity changed after the durable receipt"
+                        )
+                if caddy_preexisting is True:
+                    info = _require_owner_private_directory(caddy_state, owner_uid=self._owner_uid)
+                    if (
+                        info.st_dev != ownership.get("caddy_state_device")
+                        or info.st_ino != ownership.get("caddy_state_inode")
+                    ):
+                        raise LinuxSetupRecoveryRequired("pre-existing Caddy state identity changed before bootstrap")
+                    if not root_path.exists():
+                        raise LinuxSetupRecoveryRequired(
+                            "pre-existing Caddy state has no exact managed public root and cannot be mutated implicitly"
+                        )
+                bootstrap_config = caddy_state / ".factlane-ca-bootstrap.Caddyfile"
+                if bootstrap_config.exists() or bootstrap_config.is_symlink():
+                    expected_bootstrap = _render_caddy_ca_bootstrap_config(
+                        hostname=plan.hostname,
+                        caddy_state_dir=plan.caddy_state_dir,
+                    )
+                    _require_owner_private_regular_file(
+                        bootstrap_config,
+                        owner_uid=self._owner_uid,
+                    )
+                    if bootstrap_config.read_text(encoding="utf-8") != expected_bootstrap:
+                        raise LinuxSetupRecoveryRequired(
+                            "Caddy bootstrap file is foreign or drifted"
+                        )
+                    if caddy_preexisting is not False or not caddy_create_intent:
+                        raise LinuxSetupRecoveryRequired(
+                            "Caddy bootstrap file is not owned by the current setup attempt"
+                        )
+                    bootstrap_config.unlink()
+                bootstrap = bootstrap_linux_caddy_root(
+                    caddy_path=self._caddy_path,
+                    caddy_state_dir=plan.caddy_state_dir,
+                    hostname=plan.hostname,
+                    owner_uid=self._owner_uid,
+                    process_factory=self._caddy_bootstrap_process_factory,
+                    clock=self._clock,
+                    sleep=self._sleep,
+                    timeout=self._activation_timeout,
+                )
+                _update_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                    root_fingerprint_sha256=bootstrap.root_fingerprint_sha256,
+                    ownership_updates={
+                        "caddy_state_create_intent": bool(
+                            ownership.get("caddy_state_create_intent")
+                            or bootstrap.caddy_state_created
+                        ),
+                        "caddy_state_created": bool(
+                            ownership.get("caddy_state_created")
+                            or bootstrap.caddy_state_created
+                        ),
+                        "caddy_state_device": bootstrap.caddy_state_device,
+                        "caddy_state_inode": bootstrap.caddy_state_inode,
+                    },
+                )
+                self._attempt_caddy_state_created = (
+                    self._attempt_caddy_state_created
+                    or bool(ownership.get("caddy_state_created"))
+                    or bootstrap.caddy_state_created
+                )
+            except LinuxSetupRecoveryRequired as exc:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.RECOVERY_REQUIRED,
+                    operation=operation.kind,
+                    detail=str(exc),
+                )
+            except (OSError, ValueError) as exc:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.FAILED,
+                    operation=operation.kind,
+                    detail=f"Caddy CA bootstrap failed safely: {type(exc).__name__}",
+                )
+            return InstallerStepResult(
+                status=InstallerStepStatus.APPLIED,
+                operation=operation.kind,
+            )
+        if operation.kind == "ENSURE_ISOLATED_PROFILE_NETWORK":
+            try:
+                if self._journal_path is None:
+                    raise LinuxSetupRecoveryRequired(
+                        "provisional setup journal is required before Firefox profile mutation"
+                    )
+                before = _parse_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                )
+                before_ownership = before["ownership"]
+                assert isinstance(before_ownership, dict)
+                profile = Path(operation.target)
+                profile_preexisting = before_ownership.get("profile_preexisting")
+                profile_created_receipt = before_ownership.get("profile_created") is True
+                profile_create_intent = before_ownership.get("profile_create_intent") is True
+                if profile_preexisting is False and not profile_created_receipt:
+                    if profile.exists():
+                        if not profile_create_intent:
+                            raise LinuxSetupRecoveryRequired(
+                                "Firefox profile appeared before a durable create intent"
+                            )
+                        info = _require_owner_private_directory(
+                            profile,
+                            owner_uid=self._owner_uid,
+                        )
+                        try:
+                            next(profile.iterdir())
+                        except StopIteration:
+                            pass
+                        else:
+                            raise LinuxSetupRecoveryRequired(
+                                "Firefox profile appeared after create intent with unreceipted contents"
+                            )
+                        _update_linux_setup_journal(
+                            self._journal_path,
+                            owner_uid=self._owner_uid,
+                            ownership_updates={
+                                "profile_created": True,
+                                "profile_device": int(info.st_dev),
+                                "profile_inode": int(info.st_ino),
+                            },
+                        )
+                        before_ownership["profile_created"] = True
+                        before_ownership["profile_device"] = int(info.st_dev)
+                        before_ownership["profile_inode"] = int(info.st_ino)
+                        profile_created_receipt = True
+                    else:
+                        if not profile_create_intent:
+                            _update_linux_setup_journal(
+                                self._journal_path,
+                                owner_uid=self._owner_uid,
+                                ownership_updates={"profile_create_intent": True},
+                            )
+                            before_ownership["profile_create_intent"] = True
+                            profile_create_intent = True
+                        _ensure_real_directory_chain(profile.parent)
+                        profile.mkdir(mode=0o700)
+                        os.chmod(profile, 0o700)
+                        info = _require_owner_private_directory(
+                            profile,
+                            owner_uid=self._owner_uid,
+                        )
+                        _update_linux_setup_journal(
+                            self._journal_path,
+                            owner_uid=self._owner_uid,
+                            ownership_updates={
+                                "profile_created": True,
+                                "profile_device": int(info.st_dev),
+                                "profile_inode": int(info.st_ino),
+                            },
+                        )
+                        before_ownership["profile_created"] = True
+                        before_ownership["profile_device"] = int(info.st_dev)
+                        before_ownership["profile_inode"] = int(info.st_ino)
+                        profile_created_receipt = True
+                if profile_preexisting is True or profile_created_receipt:
+                    info = _require_owner_private_directory(profile, owner_uid=self._owner_uid)
+                    expected_dev = before_ownership.get("profile_device")
+                    expected_ino = before_ownership.get("profile_inode")
+                    if expected_dev is not None and (
+                        info.st_dev != expected_dev or info.st_ino != expected_ino
+                    ):
+                        raise LinuxSetupRecoveryRequired("Firefox profile identity changed outside setup")
+                user_js = profile / LINUX_FIREFOX_MANAGED_USER_JS
+                user_js_preexisting = before_ownership.get("user_js_preexisting") is True
+                user_js_create_intent = before_ownership.get("user_js_create_intent") is True
+                created_before = before_ownership.get("profile_created_files")
+                if not isinstance(created_before, list):
+                    raise LinuxSetupRecoveryRequired("Firefox profile ownership receipt is invalid")
+                expected_user_js = render_linux_firefox_network_policy(plan.hostname)
+                if user_js_preexisting:
+                    try:
+                        _require_owner_private_regular_file(
+                            user_js,
+                            owner_uid=self._owner_uid,
+                        )
+                    except FileNotFoundError as exc:
+                        raise LinuxSetupRecoveryRequired(
+                            "pre-existing Firefox user.js disappeared before managed setup"
+                        ) from exc
+                    if user_js.read_text(encoding="utf-8") != expected_user_js:
+                        raise LinuxSetupRecoveryRequired(
+                            "pre-existing Firefox user.js conflicts with the exact managed network policy"
+                        )
+                elif user_js.exists() and LINUX_FIREFOX_MANAGED_USER_JS not in created_before:
+                    if not user_js_create_intent:
+                        raise LinuxSetupRecoveryRequired(
+                            "Firefox user.js appeared before a durable create intent"
+                        )
+                    _require_owner_private_regular_file(
+                        user_js,
+                        owner_uid=self._owner_uid,
+                    )
+                    if user_js.read_text(encoding="utf-8") != expected_user_js:
+                        raise LinuxSetupRecoveryRequired(
+                            "Firefox user.js created after intent has foreign bytes"
+                        )
+                    created_before.append(LINUX_FIREFOX_MANAGED_USER_JS)
+                    _update_linux_setup_journal(
+                        self._journal_path,
+                        owner_uid=self._owner_uid,
+                        ownership_updates={"profile_created_files": created_before},
+                    )
+                elif not user_js.exists() and LINUX_FIREFOX_MANAGED_USER_JS not in created_before:
+                    if not user_js_create_intent:
+                        _update_linux_setup_journal(
+                            self._journal_path,
+                            owner_uid=self._owner_uid,
+                            ownership_updates={"user_js_create_intent": True},
+                        )
+                        before_ownership["user_js_create_intent"] = True
+                        user_js_create_intent = True
+                network = ensure_linux_firefox_profile_network_policy(
+                    profile_dir=profile,
+                    hostname=plan.hostname,
+                    owner_uid=self._owner_uid,
+                )
+                journal = _parse_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                )
+                ownership = journal["ownership"]
+                assert isinstance(ownership, dict)
+                created_files = list(ownership.get("profile_created_files", []))
+                if network.user_js_created and LINUX_FIREFOX_MANAGED_USER_JS not in created_files:
+                    created_files.append(LINUX_FIREFOX_MANAGED_USER_JS)
+                profile_info = _require_owner_private_directory(profile, owner_uid=self._owner_uid)
+                _update_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                    ownership_updates={
+                        "profile_created": bool(
+                            ownership.get("profile_created") or network.profile_created
+                        ),
+                        "profile_create_intent": bool(
+                            ownership.get("profile_create_intent")
+                            or network.profile_created
+                        ),
+                        "user_js_create_intent": bool(
+                            ownership.get("user_js_create_intent")
+                            or network.user_js_created
+                        ),
+                        "profile_device": int(profile_info.st_dev),
+                        "profile_inode": int(profile_info.st_ino),
+                        "profile_created_files": created_files,
+                    },
+                )
+                self._attempt_profile_created = (
+                    self._attempt_profile_created or network.profile_created
+                )
+                if network.user_js_created:
+                    self._attempt_profile_created_files.add(LINUX_FIREFOX_MANAGED_USER_JS)
+            except (OSError, ValueError, RuntimeError) as exc:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.RECOVERY_REQUIRED,
+                    operation=operation.kind,
+                    detail=f"isolated Firefox profile network state is unsafe: {exc}",
+                )
+            return InstallerStepResult(
+                status=InstallerStepStatus.APPLIED,
+                operation=operation.kind,
+            )
         if operation.kind in {
             "WRITE_SERVICE_CONFIG",
             "WRITE_CADDY_CONFIG",
             "INSTALL_USER_UNIT",
+            "INSTALL_OWNER_LAUNCHER",
         }:
             try:
+                if self._journal_path is not None:
+                    should_write = self._prepare_managed_file_write(
+                        Path(operation.target),
+                        desired_state=operation.desired_state,
+                    )
+                    if not should_write:
+                        return InstallerStepResult(
+                            status=InstallerStepStatus.APPLIED,
+                            operation=operation.kind,
+                        )
                 _atomic_owner_file_write(
                     Path(operation.target),
                     operation.desired_state,
-                    private_parent=operation.kind != "INSTALL_USER_UNIT",
+                    private_parent=operation.kind not in {"INSTALL_USER_UNIT", "INSTALL_OWNER_LAUNCHER"},
+                )
+                if self._journal_path is not None:
+                    self._mark_managed_file_written(
+                        Path(operation.target),
+                        desired_state=operation.desired_state,
+                    )
+            except LinuxSetupRecoveryRequired as exc:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.RECOVERY_REQUIRED,
+                    operation=operation.kind,
+                    detail=str(exc),
                 )
             except (OSError, ValueError) as exc:
                 return InstallerStepResult(
@@ -849,32 +1759,227 @@ class ProductionLinuxInstallerBackend:
                 operation=operation.kind,
             )
 
-        if operation.kind == "ENSURE_HOSTNAME_MAPPING":
-            return InstallerStepResult(
-                status=InstallerStepStatus.NEEDS_PRIVILEGED_INSTALLER,
-                operation=operation.kind,
-                detail=(
-                    "exact /etc/hosts mutation needs a separately authorized privileged "
-                    "installer; no sudo/pkexec path is assumed"
-                ),
-            )
         if operation.kind == "ENABLE_USER_LINGERING":
-            return InstallerStepResult(
-                status=InstallerStepStatus.NEEDS_PRIVILEGED_INSTALLER,
-                operation=operation.kind,
-                detail=(
-                    "lingering change needs a separately authorized privileged installer; "
-                    "no elevation mechanism is assumed"
-                ),
-            )
+            return self._ensure_user_lingering(operation)
         if operation.kind == "ENSURE_ISOLATED_PROFILE_TRUST":
+            if self._journal_path is None:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.RECOVERY_REQUIRED,
+                    operation=operation.kind,
+                    detail="provisional setup journal is required before Firefox trust mutation",
+                )
+            if self._certutil_path is None:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.FAILED,
+                    operation=operation.kind,
+                    detail="certutil is required for isolated Firefox NSS trust",
+                )
+            if not isinstance(plan.browser, BrowserInstall) or plan.browser.family != "firefox":
+                return InstallerStepResult(
+                    status=InstallerStepStatus.FAILED,
+                    operation=operation.kind,
+                    detail="managed Linux browser must be Firefox",
+                )
+            root_path = Path(plan.caddy_state_dir) / "pki" / "authorities" / "local" / "root.crt"
+            try:
+                before = _parse_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                )
+                before_ownership = before["ownership"]
+                assert isinstance(before_ownership, dict)
+                nss_preexisting = before_ownership.get("nss_preexisting") is True
+                trust_preexisting = before_ownership.get("trust_preexisting") is True
+                nss_intent = before_ownership.get("nss_create_intent") is True
+                trust_intent = before_ownership.get("trust_import_intent") is True
+                manifest_intent = before_ownership.get("trust_manifest_intent") is True
+                profile = Path(operation.target)
+                db_files = tuple(
+                    profile / filename
+                    for filename in ("cert9.db", "key4.db", "pkcs11.txt")
+                )
+                present = [path.exists() for path in db_files]
+                if nss_preexisting:
+                    if not all(present):
+                        raise LinuxSetupRecoveryRequired(
+                            "pre-existing Firefox NSS state disappeared or became partial"
+                        )
+                    for path in db_files:
+                        _require_owner_private_regular_file(
+                            path,
+                            owner_uid=self._owner_uid,
+                        )
+                elif any(present) and not all(present):
+                    if not nss_intent:
+                        raise LinuxSetupRecoveryRequired(
+                            "Firefox NSS state appeared before a durable create intent"
+                        )
+                    for path, exists in zip(db_files, present, strict=True):
+                        if not exists:
+                            continue
+                        _require_owner_private_regular_file(
+                            path,
+                            owner_uid=self._owner_uid,
+                        )
+                        path.unlink()
+                    present = [False, False, False]
+                elif all(present) and not nss_preexisting:
+                    if not nss_intent:
+                        raise LinuxSetupRecoveryRequired(
+                            "Firefox NSS state appeared before a durable create intent"
+                        )
+                    for path in db_files:
+                        _require_owner_private_regular_file(
+                            path,
+                            owner_uid=self._owner_uid,
+                        )
+                    list_code, list_stdout = self._read_command_runner(
+                        (self._certutil_path, "-L", "-d", f"sql:{profile}")
+                    )
+                    if list_code != 0:
+                        raise LinuxSetupRecoveryRequired(
+                            "interrupted Firefox NSS state cannot be inspected safely"
+                        )
+                    entries = _certutil_entries(list_stdout)
+                    if any(
+                        nickname != LINUX_FIREFOX_CA_NICKNAME
+                        for nickname, _trust in entries
+                    ):
+                        raise LinuxSetupRecoveryRequired(
+                            "interrupted Firefox NSS state contains foreign certificate entries"
+                        )
+
+                root_fingerprint = _root_certificate_fingerprint(
+                    root_path,
+                    owner_uid=self._owner_uid,
+                )
+                manifest_path = profile / LINUX_FIREFOX_TRUST_MANIFEST
+                if manifest_path.exists() or manifest_path.is_symlink():
+                    if trust_preexisting:
+                        _require_owner_private_regular_file(
+                            manifest_path,
+                            owner_uid=self._owner_uid,
+                        )
+                    else:
+                        if not manifest_intent:
+                            raise LinuxSetupRecoveryRequired(
+                                "Firefox trust manifest appeared before a durable create intent"
+                            )
+                        _require_owner_private_regular_file(
+                            manifest_path,
+                            owner_uid=self._owner_uid,
+                        )
+                    expected_manifest = _linux_firefox_manifest_text(
+                        hostname=plan.hostname,
+                        profile=profile,
+                        firefox_executable=plan.browser.executable,
+                        root_fingerprint_sha256=root_fingerprint,
+                    )
+                    if manifest_path.read_text(encoding="utf-8") != expected_manifest:
+                        raise LinuxSetupRecoveryRequired(
+                            "Firefox trust manifest has foreign or drifted bytes"
+                        )
+
+                def persist_trust_intent(kind: str) -> None:
+                    field = {
+                        "nss": "nss_create_intent",
+                        "trust": "trust_import_intent",
+                        "manifest": "trust_manifest_intent",
+                    }.get(kind)
+                    if field is None:
+                        raise LinuxSetupRecoveryRequired(
+                            "unknown Firefox setup mutation intent"
+                        )
+                    _update_linux_setup_journal(
+                        self._journal_path,
+                        owner_uid=self._owner_uid,
+                        ownership_updates={field: True},
+                    )
+
+                trust = ensure_linux_firefox_profile_trust(
+                    certutil_path=self._certutil_path,
+                    firefox_executable=plan.browser.executable,
+                    profile_dir=profile,
+                    root_cert_path=root_path,
+                    hostname=plan.hostname,
+                    owner_uid=self._owner_uid,
+                    command_runner=self._command_runner,
+                    read_command_runner=self._read_command_runner,
+                    mutation_intent_hook=persist_trust_intent,
+                    recover_owned_missing_manifest=(
+                        not trust_preexisting and trust_intent
+                    ),
+                )
+                journal = _parse_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                )
+                ownership = journal["ownership"]
+                assert isinstance(ownership, dict)
+                created_files = list(ownership.get("profile_created_files", []))
+                owns_nss = bool(
+                    not nss_preexisting
+                    and ownership.get("nss_create_intent") is True
+                )
+                if owns_nss:
+                    for filename in ("cert9.db", "key4.db", "pkcs11.txt"):
+                        if filename not in created_files:
+                            created_files.append(filename)
+                owns_trust = bool(
+                    not trust_preexisting
+                    and ownership.get("trust_import_intent") is True
+                )
+                owns_manifest = bool(
+                    not trust_preexisting
+                    and ownership.get("trust_manifest_intent") is True
+                )
+                if owns_manifest and LINUX_FIREFOX_TRUST_MANIFEST not in created_files:
+                    created_files.append(LINUX_FIREFOX_TRUST_MANIFEST)
+                _update_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                    phase="TRUST_READY",
+                    root_fingerprint_sha256=trust.root_fingerprint_sha256,
+                    ownership_updates={
+                        "trust_imported": bool(
+                            ownership.get("trust_imported") or owns_trust
+                        ),
+                        "trust_import_intent": bool(
+                            ownership.get("trust_import_intent") or owns_trust
+                        ),
+                        "trust_manifest_created": bool(
+                            ownership.get("trust_manifest_created") or owns_manifest
+                        ),
+                        "trust_manifest_intent": bool(
+                            ownership.get("trust_manifest_intent") or owns_manifest
+                        ),
+                        "profile_created_files": created_files,
+                    },
+                )
+                self._attempt_trust_imported = (
+                    self._attempt_trust_imported or owns_trust
+                )
+                if owns_nss:
+                    self._attempt_profile_created_files.update(
+                        {"cert9.db", "key4.db", "pkcs11.txt"}
+                    )
+                if owns_manifest:
+                    self._attempt_profile_created_files.add(LINUX_FIREFOX_TRUST_MANIFEST)
+            except LinuxSetupRecoveryRequired as exc:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.RECOVERY_REQUIRED,
+                    operation=operation.kind,
+                    detail=str(exc),
+                )
+            except (OSError, ValueError) as exc:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.FAILED,
+                    operation=operation.kind,
+                    detail=f"isolated Firefox trust failed safely: {type(exc).__name__}",
+                )
             return InstallerStepResult(
-                status=InstallerStepStatus.INCOMPLETE_BROWSER_TRUST,
+                status=InstallerStepStatus.APPLIED,
                 operation=operation.kind,
-                detail=(
-                    "browser-specific isolated-profile trust mechanism is not proven by "
-                    "this backend"
-                ),
             )
         if operation.kind == "REGISTER_USER_SERVICE":
             if operation.target != WEBUI_SERVICE_NAME:
@@ -883,22 +1988,155 @@ class ProductionLinuxInstallerBackend:
                     operation=operation.kind,
                     detail="user service target is not the exact FactLane service",
                 )
-            commands = (
-                (self._systemctl_path, "--user", "daemon-reload"),
-                (
-                    self._systemctl_path,
-                    "--user",
-                    "enable",
-                    WEBUI_SERVICE_NAME,
-                ),
-            )
+            was_enabled = False
+            ownership: dict[str, object] | None = None
+            if self._journal_path is not None:
+                try:
+                    code, stdout = self._read_command_runner(
+                        (self._systemctl_path, "--user", "is-enabled", WEBUI_SERVICE_NAME)
+                    )
+                except Exception:
+                    return InstallerStepResult(
+                        status=InstallerStepStatus.FAILED,
+                        operation=operation.kind,
+                        detail="user-service enablement state could not be inspected",
+                    )
+                state = stdout.strip()
+                if code == 0 and state in {"enabled", "enabled-runtime"}:
+                    was_enabled = True
+                elif state not in {"disabled", "disabled-runtime", "not-found", ""}:
+                    return InstallerStepResult(
+                        status=InstallerStepStatus.RECOVERY_REQUIRED,
+                        operation=operation.kind,
+                        detail="user-service enablement state is ambiguous",
+                    )
+                try:
+                    journal = _parse_linux_setup_journal(
+                        self._journal_path,
+                        owner_uid=self._owner_uid,
+                    )
+                    ownership = journal["ownership"]
+                    assert isinstance(ownership, dict)
+                    preexisting = ownership.get("service_enabled_preexisting")
+                    intent = ownership.get("service_enable_intent") is True
+                    changed = ownership.get("service_enable_changed") is True
+                    if preexisting is None:
+                        _update_linux_setup_journal(
+                            self._journal_path,
+                            owner_uid=self._owner_uid,
+                            ownership_updates={"service_enabled_preexisting": was_enabled},
+                        )
+                        ownership["service_enabled_preexisting"] = was_enabled
+                        preexisting = was_enabled
+                    if preexisting is True and not was_enabled:
+                        raise LinuxSetupRecoveryRequired(
+                            "user service became disabled outside setup after the durable pre-mutation snapshot"
+                        )
+                    if preexisting is False and was_enabled and not (intent or changed):
+                        raise LinuxSetupRecoveryRequired(
+                            "user service became enabled outside the reviewed setup mutation"
+                        )
+                    if preexisting is False and was_enabled and intent and not changed:
+                        _update_linux_setup_journal(
+                            self._journal_path,
+                            owner_uid=self._owner_uid,
+                            ownership_updates={"service_enable_changed": True},
+                        )
+                        self._attempt_service_enable_changed = True
+                except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+                    return InstallerStepResult(
+                        status=InstallerStepStatus.RECOVERY_REQUIRED,
+                        operation=operation.kind,
+                        detail=str(exc),
+                    )
+            commands = [(self._systemctl_path, "--user", "daemon-reload")]
+            if not was_enabled:
+                if self._journal_path is not None:
+                    try:
+                        _update_linux_setup_journal(
+                            self._journal_path,
+                            owner_uid=self._owner_uid,
+                            ownership_updates={"service_enable_intent": True},
+                        )
+                    except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+                        return InstallerStepResult(
+                            status=InstallerStepStatus.RECOVERY_REQUIRED,
+                            operation=operation.kind,
+                            detail=f"service-enable intent could not be persisted before mutation: {exc}",
+                        )
+                    # From this point onward rollback must consult durable state even if
+                    # systemctl reports failure after partially changing enablement.
+                    self._attempt_service_enable_changed = True
+                commands.append(
+                    (
+                        self._systemctl_path,
+                        "--user",
+                        "enable",
+                        WEBUI_SERVICE_NAME,
+                    )
+                )
             for argv in commands:
-                if self._command_runner(argv) != 0:
+                command_code = self._command_runner(argv)
+                if command_code != 0:
+                    if (
+                        self._journal_path is not None
+                        and len(argv) >= 2
+                        and argv[-2:] == ("enable", WEBUI_SERVICE_NAME)
+                    ):
+                        try:
+                            partial_code, partial_stdout = self._read_command_runner(
+                                (self._systemctl_path, "--user", "is-enabled", WEBUI_SERVICE_NAME)
+                            )
+                        except Exception:
+                            partial_code, partial_stdout = 1, ""
+                        partial_state = partial_stdout.strip()
+                        if partial_code == 0 and partial_state in {"enabled", "enabled-runtime"}:
+                            _update_linux_setup_journal(
+                                self._journal_path,
+                                owner_uid=self._owner_uid,
+                                ownership_updates={"service_enable_changed": True},
+                            )
+                            return InstallerStepResult(
+                                status=InstallerStepStatus.RECOVERY_REQUIRED,
+                                operation=operation.kind,
+                                detail=(
+                                    "systemctl enable returned nonzero after the service became enabled; "
+                                    "durable rollback ownership is required"
+                                ),
+                            )
+                        if partial_state not in {"disabled", "disabled-runtime", "not-found", ""}:
+                            return InstallerStepResult(
+                                status=InstallerStepStatus.RECOVERY_REQUIRED,
+                                operation=operation.kind,
+                                detail="systemctl enable failure left ambiguous user-service state",
+                            )
                     return InstallerStepResult(
                         status=InstallerStepStatus.FAILED,
                         operation=operation.kind,
                         detail="exact user-service registration command failed",
                     )
+            if self._journal_path is not None and not was_enabled:
+                try:
+                    verify_code, verify_stdout = self._read_command_runner(
+                        (self._systemctl_path, "--user", "is-enabled", WEBUI_SERVICE_NAME)
+                    )
+                except Exception:
+                    verify_code, verify_stdout = 1, ""
+                if verify_code != 0 or verify_stdout.strip() not in {"enabled", "enabled-runtime"}:
+                    return InstallerStepResult(
+                        status=InstallerStepStatus.RECOVERY_REQUIRED,
+                        operation=operation.kind,
+                        detail="user-service enablement could not be positively verified",
+                    )
+                self._attempt_service_enable_changed = True
+                _update_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                    ownership_updates={
+                        "service_enable_intent": True,
+                        "service_enable_changed": True,
+                    },
+                )
             return InstallerStepResult(
                 status=InstallerStepStatus.APPLIED,
                 operation=operation.kind,
@@ -914,7 +2152,787 @@ class ProductionLinuxInstallerBackend:
             return None
         return self._service_state_reader().saved_endpoint
 
+    def _ensure_user_lingering(self, operation: PlannedOperation) -> InstallerStepResult:
+        if self._loginctl_path is None:
+            return InstallerStepResult(
+                status=InstallerStepStatus.FAILED,
+                operation=operation.kind,
+                detail="loginctl executable is unavailable for the reviewed lingering change",
+            )
+        probe = (
+            self._loginctl_path,
+            "show-user",
+            "--property=Linger",
+            "--value",
+            "--",
+            operation.target,
+        )
+        try:
+            returncode, stdout = self._read_command_runner(probe)
+        except Exception:
+            return InstallerStepResult(
+                status=InstallerStepStatus.FAILED,
+                operation=operation.kind,
+                detail="loginctl could not inspect user lingering safely",
+            )
+        if returncode != 0 or stdout.strip().casefold() not in {"yes", "no"}:
+            return InstallerStepResult(
+                status=InstallerStepStatus.FAILED,
+                operation=operation.kind,
+                detail="loginctl returned an untrusted lingering state",
+            )
+        observed_yes = stdout.strip().casefold() == "yes"
+        ownership: dict[str, object] | None = None
+        if self._journal_path is not None:
+            try:
+                journal = _parse_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                )
+                ownership = journal["ownership"]
+                assert isinstance(ownership, dict)
+                preexisting = ownership.get("linger_preexisting")
+                intent = ownership.get("linger_change_intent") is True
+                changed = ownership.get("linger_changed") is True
+                if preexisting is None:
+                    _update_linux_setup_journal(
+                        self._journal_path,
+                        owner_uid=self._owner_uid,
+                        ownership_updates={"linger_preexisting": observed_yes},
+                    )
+                    ownership["linger_preexisting"] = observed_yes
+                    preexisting = observed_yes
+                if preexisting is True and not observed_yes:
+                    raise LinuxSetupRecoveryRequired(
+                        "user lingering changed outside setup after the durable pre-mutation snapshot"
+                    )
+                if preexisting is False and observed_yes and not (intent or changed):
+                    raise LinuxSetupRecoveryRequired(
+                        "user lingering became enabled outside the reviewed setup mutation"
+                    )
+                if preexisting is False and observed_yes and intent and not changed:
+                    _update_linux_setup_journal(
+                        self._journal_path,
+                        owner_uid=self._owner_uid,
+                        ownership_updates={"linger_changed": True},
+                    )
+                    self._attempt_linger_changed = True
+                    changed = True
+            except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.RECOVERY_REQUIRED,
+                    operation=operation.kind,
+                    detail=str(exc),
+                )
+        if observed_yes:
+            return InstallerStepResult(
+                status=InstallerStepStatus.APPLIED,
+                operation=operation.kind,
+            )
+        if self._journal_path is not None:
+            try:
+                _update_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                    ownership_updates={"linger_change_intent": True},
+                )
+            except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.RECOVERY_REQUIRED,
+                    operation=operation.kind,
+                    detail=f"lingering intent could not be persisted before mutation: {exc}",
+                )
+            self._attempt_linger_changed = True
+        argv = (
+            self._loginctl_path,
+            "enable-linger",
+            "--",
+            operation.target,
+        )
+        if self._command_runner(argv) != 0:
+            return InstallerStepResult(
+                status=(
+                    InstallerStepStatus.RECOVERY_REQUIRED
+                    if self._journal_path is not None
+                    else InstallerStepStatus.FAILED
+                ),
+                operation=operation.kind,
+                detail="loginctl/logind did not complete the exact user lingering change; rollback verification is required",
+            )
+        try:
+            verified_code, verified_stdout = self._read_command_runner(probe)
+        except Exception:
+            verified_code, verified_stdout = 1, ""
+        if verified_code != 0 or verified_stdout.strip().casefold() != "yes":
+            return InstallerStepResult(
+                status=InstallerStepStatus.RECOVERY_REQUIRED,
+                operation=operation.kind,
+                detail="user lingering was not positively verified after loginctl returned",
+            )
+        if self._journal_path is not None:
+            _update_linux_setup_journal(
+                self._journal_path,
+                owner_uid=self._owner_uid,
+                ownership_updates={
+                    "linger_change_intent": True,
+                    "linger_changed": True,
+                },
+            )
+            self._attempt_linger_changed = True
+        return InstallerStepResult(
+            status=InstallerStepStatus.APPLIED,
+            operation=operation.kind,
+        )
+
+    def _prepare_managed_file_write(self, path: Path, *, desired_state: str) -> bool:
+        if self._journal_path is None:
+            return True
+        journal = _parse_linux_setup_journal(self._journal_path, owner_uid=self._owner_uid)
+        ownership = journal["ownership"]
+        assert isinstance(ownership, dict)
+        files = ownership.get("files")
+        if not isinstance(files, dict):
+            raise LinuxSetupRecoveryRequired("setup journal managed-file ownership is invalid")
+        order = ownership.get("file_order")
+        if not isinstance(order, list):
+            raise LinuxSetupRecoveryRequired("setup journal managed-file order is invalid")
+        key = str(path)
+        desired_sha = hashlib.sha256(desired_state.encode("utf-8")).hexdigest()
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            info = None
+        if info is not None:
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != self._owner_uid:
+                raise LinuxSetupRecoveryRequired("managed file target has foreign identity")
+            current_bytes = path.read_bytes()
+            current_sha = hashlib.sha256(current_bytes).hexdigest()
+        else:
+            current_bytes = None
+            current_sha = None
+
+        record = files.get(key)
+        if record is None:
+            if info is not None and current_sha == desired_sha and stat.S_IMODE(info.st_mode) == 0o600:
+                return False
+            files[key] = {
+                "before_exists": info is not None,
+                "before_text": None if current_bytes is None else current_bytes.decode("utf-8"),
+                "before_mode": None if info is None else stat.S_IMODE(info.st_mode),
+                "before_sha256": current_sha,
+                "intended_sha256": desired_sha,
+                "managed_sha256": None,
+            }
+            if key not in order:
+                order.append(key)
+            _update_linux_setup_journal(
+                self._journal_path,
+                owner_uid=self._owner_uid,
+                ownership_updates={"files": files, "file_order": order},
+            )
+            self._attempt_file_targets.add(key)
+            return True
+        if not isinstance(record, dict):
+            raise LinuxSetupRecoveryRequired("setup journal managed-file record is invalid")
+        before_sha = record.get("before_sha256")
+        intended_sha = record.get("intended_sha256")
+        managed_sha = record.get("managed_sha256")
+        if intended_sha != desired_sha:
+            raise LinuxSetupRecoveryRequired("managed file desired bytes changed across setup retry")
+        before_exists = record.get("before_exists") is True
+        if info is not None and current_sha == desired_sha and stat.S_IMODE(info.st_mode) == 0o600:
+            if managed_sha is None:
+                record["managed_sha256"] = desired_sha
+                _update_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                    ownership_updates={"files": files},
+                )
+            self._attempt_file_targets.add(key)
+            return False
+        if info is None:
+            if before_exists or managed_sha is not None:
+                raise LinuxSetupRecoveryRequired("managed file disappeared during setup")
+        else:
+            allowed = {
+                value
+                for value in (before_sha, intended_sha, managed_sha)
+                if isinstance(value, str)
+            }
+            if current_sha not in allowed:
+                raise LinuxSetupRecoveryRequired("managed file changed outside the setup attempt")
+        self._attempt_file_targets.add(key)
+        return True
+
+    def _mark_managed_file_written(self, path: Path, *, desired_state: str) -> None:
+        if self._journal_path is None:
+            return
+        journal = _parse_linux_setup_journal(self._journal_path, owner_uid=self._owner_uid)
+        ownership = journal["ownership"]
+        assert isinstance(ownership, dict)
+        files = ownership.get("files")
+        if not isinstance(files, dict) or not isinstance(files.get(str(path)), dict):
+            raise LinuxSetupRecoveryRequired("managed file write has no durable rollback ownership record")
+        record = files[str(path)]
+        assert isinstance(record, dict)
+        expected_sha = hashlib.sha256(desired_state.encode("utf-8")).hexdigest()
+        if _sha256_regular_owner_file(path, owner_uid=self._owner_uid) != expected_sha:
+            raise LinuxSetupRecoveryRequired("managed file write did not preserve exact desired bytes")
+        record["managed_sha256"] = expected_sha
+        _update_linux_setup_journal(
+            self._journal_path,
+            owner_uid=self._owner_uid,
+            ownership_updates={"files": files},
+        )
+        self._attempt_file_targets.add(str(path))
+
+    def _prepare_dynamic_managed_file(self, path: Path) -> None:
+        if self._journal_path is None:
+            return
+        journal = _parse_linux_setup_journal(self._journal_path, owner_uid=self._owner_uid)
+        ownership = journal["ownership"]
+        assert isinstance(ownership, dict)
+        files = ownership.get("files")
+        order = ownership.get("file_order")
+        if not isinstance(files, dict) or not isinstance(order, list):
+            raise LinuxSetupRecoveryRequired("setup journal dynamic-file ownership is invalid")
+        key = str(path)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            info = None
+        if info is not None:
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != self._owner_uid:
+                raise LinuxSetupRecoveryRequired("dynamic managed file has foreign identity")
+            current_bytes = path.read_bytes()
+            current_sha = hashlib.sha256(current_bytes).hexdigest()
+        else:
+            current_bytes = None
+            current_sha = None
+        record = files.get(key)
+        if record is None:
+            files[key] = {
+                "before_exists": info is not None,
+                "before_text": None if current_bytes is None else current_bytes.decode("utf-8"),
+                "before_mode": None if info is None else stat.S_IMODE(info.st_mode),
+                "before_sha256": current_sha,
+                "managed_sha256": None,
+            }
+            if key not in order:
+                order.append(key)
+            _update_linux_setup_journal(
+                self._journal_path,
+                owner_uid=self._owner_uid,
+                ownership_updates={"files": files, "file_order": order},
+            )
+        else:
+            if not isinstance(record, dict):
+                raise LinuxSetupRecoveryRequired("dynamic managed-file record is invalid")
+            before_exists = record.get("before_exists") is True
+            before_sha = record.get("before_sha256")
+            managed_sha = record.get("managed_sha256")
+            if info is None:
+                if before_exists and managed_sha is not None:
+                    raise LinuxSetupRecoveryRequired("dynamic managed file disappeared outside setup")
+            else:
+                allowed = {value for value in (before_sha, managed_sha) if isinstance(value, str)}
+                if allowed and current_sha not in allowed:
+                    raise LinuxSetupRecoveryRequired("dynamic managed file changed outside setup")
+        self._attempt_file_targets.add(key)
+
+    def _mark_dynamic_managed_file(self, path: Path) -> None:
+        if self._journal_path is None:
+            return
+        journal = _parse_linux_setup_journal(self._journal_path, owner_uid=self._owner_uid)
+        ownership = journal["ownership"]
+        assert isinstance(ownership, dict)
+        files = ownership.get("files")
+        if not isinstance(files, dict):
+            raise LinuxSetupRecoveryRequired("setup journal dynamic-file ownership is invalid")
+        record = files.get(str(path))
+        if not isinstance(record, dict):
+            raise LinuxSetupRecoveryRequired("dynamic managed file has no durable rollback record")
+        try:
+            managed_sha = _sha256_regular_owner_file(path, owner_uid=self._owner_uid)
+        except FileNotFoundError:
+            managed_sha = None
+        record["managed_sha256"] = managed_sha
+        _update_linux_setup_journal(
+            self._journal_path,
+            owner_uid=self._owner_uid,
+            ownership_updates={"files": files},
+        )
+
+    def finalize_setup(self, *, plan: SetupPlan) -> InstallerStepResult:
+        if self._journal_path is None:
+            return InstallerStepResult(
+                status=InstallerStepStatus.RECOVERY_REQUIRED,
+                operation="FINALIZE_SETUP",
+                detail="provisional setup journal is unavailable at claim time",
+            )
+        try:
+            _update_linux_setup_journal(
+                self._journal_path,
+                owner_uid=self._owner_uid,
+                phase="CLAIMED",
+            )
+        except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+            return InstallerStepResult(
+                status=InstallerStepStatus.RECOVERY_REQUIRED,
+                operation="FINALIZE_SETUP",
+                detail=f"claimed setup journal could not be persisted: {type(exc).__name__}",
+            )
+        return InstallerStepResult(
+            status=InstallerStepStatus.APPLIED,
+            operation="FINALIZE_SETUP",
+        )
+
+    def rollback_setup(
+        self,
+        *,
+        plan: SetupPlan,
+        completed_operations: tuple[str, ...],
+    ) -> InstallerStepResult:
+        del completed_operations
+        if self._journal_path is None:
+            return InstallerStepResult(
+                status=InstallerStepStatus.APPLIED,
+                operation="ROLLBACK_SETUP",
+            )
+        try:
+            journal = _parse_linux_setup_journal(self._journal_path, owner_uid=self._owner_uid)
+            ownership = journal["ownership"]
+            assert isinstance(ownership, dict)
+            profile = Path(str(journal["browser_profile_dir"]))
+            installing_user = str(journal["installing_user"])
+
+            service_preexisting = ownership.get("service_enabled_preexisting")
+            service_intent = ownership.get("service_enable_intent") is True
+            service_changed = ownership.get("service_enable_changed") is True
+            if service_preexisting not in {None, True, False}:
+                raise LinuxSetupRecoveryRequired("service enablement ownership state is invalid")
+            if service_preexisting is not None:
+                try:
+                    service_code, service_stdout = self._read_command_runner(
+                        (self._systemctl_path, "--user", "is-enabled", WEBUI_SERVICE_NAME)
+                    )
+                except Exception as exc:
+                    raise LinuxSetupRecoveryRequired(
+                        "rollback could not inspect current user-service enablement"
+                    ) from exc
+                service_state = service_stdout.strip()
+                service_enabled = service_code == 0 and service_state in {
+                    "enabled",
+                    "enabled-runtime",
+                }
+                service_disabled = service_state in {
+                    "disabled",
+                    "disabled-runtime",
+                    "not-found",
+                    "",
+                }
+                if not service_enabled and not service_disabled:
+                    raise LinuxSetupRecoveryRequired(
+                        "rollback observed ambiguous user-service enablement state"
+                    )
+                if service_preexisting is True:
+                    if not service_enabled:
+                        raise LinuxSetupRecoveryRequired(
+                            "pre-existing user-service enablement changed outside setup"
+                        )
+                elif service_intent or service_changed:
+                    if service_enabled:
+                        if self._command_runner(
+                            (self._systemctl_path, "--user", "disable", WEBUI_SERVICE_NAME)
+                        ) != 0:
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback could not disable the service enablement it owns"
+                            )
+                        verify_code, verify_stdout = self._read_command_runner(
+                            (self._systemctl_path, "--user", "is-enabled", WEBUI_SERVICE_NAME)
+                        )
+                        verify_state = verify_stdout.strip()
+                        if verify_code == 0 or verify_state not in {
+                            "disabled",
+                            "disabled-runtime",
+                            "not-found",
+                            "",
+                        }:
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback could not verify restored user-service disablement"
+                            )
+                elif service_enabled:
+                    raise LinuxSetupRecoveryRequired(
+                        "user service became enabled without durable setup intent"
+                    )
+
+            profile_exists = profile.exists() or profile.is_symlink()
+            profile_preexisting = ownership.get("profile_preexisting")
+            profile_create_intent = ownership.get("profile_create_intent") is True
+            profile_created = ownership.get("profile_created") is True
+            user_js_preexisting = ownership.get("user_js_preexisting")
+            user_js_intent = ownership.get("user_js_create_intent") is True
+            nss_preexisting = ownership.get("nss_preexisting")
+            nss_intent = ownership.get("nss_create_intent") is True
+            trust_preexisting = ownership.get("trust_preexisting")
+            trust_intent = ownership.get("trust_import_intent") is True
+            trust_imported = ownership.get("trust_imported") is True
+            manifest_intent = ownership.get("trust_manifest_intent") is True
+            manifest_created = ownership.get("trust_manifest_created") is True
+            for state_value, label in (
+                (profile_preexisting, "profile"),
+                (user_js_preexisting, "user.js"),
+                (nss_preexisting, "NSS"),
+                (trust_preexisting, "trust"),
+            ):
+                if state_value not in {None, True, False}:
+                    raise LinuxSetupRecoveryRequired(
+                        f"{label} ownership state is invalid"
+                    )
+
+            if profile_preexisting is True and not profile_exists:
+                raise LinuxSetupRecoveryRequired(
+                    "pre-existing Firefox profile disappeared outside setup"
+                )
+            if profile_exists:
+                profile_info = _require_owner_private_directory(
+                    profile,
+                    owner_uid=self._owner_uid,
+                )
+                expected_profile_dev = ownership.get("profile_device")
+                expected_profile_ino = ownership.get("profile_inode")
+                if expected_profile_dev is not None and (
+                    profile_info.st_dev != expected_profile_dev
+                    or profile_info.st_ino != expected_profile_ino
+                ):
+                    raise LinuxSetupRecoveryRequired(
+                        "Firefox profile identity changed outside setup"
+                    )
+
+                root_fingerprint = journal.get("root_fingerprint_sha256")
+                nss_files = tuple(
+                    profile / filename
+                    for filename in ("cert9.db", "key4.db", "pkcs11.txt")
+                )
+                nss_present = [path.exists() for path in nss_files]
+                if (
+                    trust_preexisting is False
+                    and (trust_intent or trust_imported)
+                    and all(nss_present)
+                ):
+                    if self._certutil_path is None:
+                        raise LinuxSetupRecoveryRequired(
+                            "rollback cannot inspect imported Firefox trust"
+                        )
+                    list_code, list_stdout = self._read_command_runner(
+                        (self._certutil_path, "-L", "-d", f"sql:{profile}")
+                    )
+                    if list_code != 0:
+                        raise LinuxSetupRecoveryRequired(
+                            "rollback cannot inspect Firefox NSS certificate state"
+                        )
+                    entry = next(
+                        (
+                            item
+                            for item in _certutil_entries(list_stdout)
+                            if item[0] == LINUX_FIREFOX_CA_NICKNAME
+                        ),
+                        None,
+                    )
+                    if entry is not None:
+                        if entry[1] != "C,," or not isinstance(root_fingerprint, str):
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback found ambiguous FactLane Firefox trust state"
+                            )
+                        export_code, export_stdout = self._read_command_runner(
+                            (
+                                self._certutil_path,
+                                "-L",
+                                "-d",
+                                f"sql:{profile}",
+                                "-n",
+                                LINUX_FIREFOX_CA_NICKNAME,
+                                "-a",
+                            )
+                        )
+                        if (
+                            export_code != 0
+                            or _certificate_fingerprint_from_pem_text(export_stdout)
+                            != root_fingerprint
+                        ):
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback found a foreign FactLane Firefox root"
+                            )
+                        if self._command_runner(
+                            (
+                                self._certutil_path,
+                                "-D",
+                                "-d",
+                                f"sql:{profile}",
+                                "-n",
+                                LINUX_FIREFOX_CA_NICKNAME,
+                            )
+                        ) != 0:
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback could not remove the imported Firefox trust"
+                            )
+                        verify_code, verify_stdout = self._read_command_runner(
+                            (self._certutil_path, "-L", "-d", f"sql:{profile}")
+                        )
+                        if verify_code != 0 or any(
+                            nickname == LINUX_FIREFOX_CA_NICKNAME
+                            for nickname, _trust in _certutil_entries(verify_stdout)
+                        ):
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback could not verify imported Firefox trust removal"
+                            )
+                elif trust_preexisting is False and trust_imported and not all(nss_present):
+                    raise LinuxSetupRecoveryRequired(
+                        "rollback cannot prove imported Firefox trust ownership from partial NSS state"
+                    )
+
+                manifest_path = profile / LINUX_FIREFOX_TRUST_MANIFEST
+                if trust_preexisting is False and (manifest_intent or manifest_created):
+                    if manifest_path.exists() or manifest_path.is_symlink():
+                        _require_owner_private_regular_file(
+                            manifest_path,
+                            owner_uid=self._owner_uid,
+                        )
+                        if not isinstance(root_fingerprint, str):
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback lacks the exact Firefox root fingerprint"
+                            )
+                        expected_manifest = _linux_firefox_manifest_text(
+                            hostname=str(journal["hostname"]),
+                            profile=profile,
+                            firefox_executable=str(journal["browser_executable"]),
+                            root_fingerprint_sha256=root_fingerprint,
+                        )
+                        if manifest_path.read_text(encoding="utf-8") != expected_manifest:
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback will not remove foreign Firefox trust-manifest bytes"
+                            )
+                        manifest_path.unlink()
+
+                if nss_preexisting is False and nss_intent:
+                    nss_present = [path.exists() for path in nss_files]
+                    if all(nss_present):
+                        if self._certutil_path is None:
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback cannot inspect owned Firefox NSS state"
+                            )
+                        list_code, list_stdout = self._read_command_runner(
+                            (self._certutil_path, "-L", "-d", f"sql:{profile}")
+                        )
+                        if list_code != 0:
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback cannot inspect owned Firefox NSS state"
+                            )
+                        if _certutil_entries(list_stdout):
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback found unrelated certificate entries in setup-created NSS state"
+                            )
+                    for path, exists in zip(nss_files, nss_present, strict=True):
+                        if not exists:
+                            continue
+                        _require_owner_private_regular_file(
+                            path,
+                            owner_uid=self._owner_uid,
+                        )
+                        path.unlink()
+
+                user_js = profile / LINUX_FIREFOX_MANAGED_USER_JS
+                created_files = ownership.get("profile_created_files")
+                if not isinstance(created_files, list):
+                    raise LinuxSetupRecoveryRequired(
+                        "Firefox profile-created file ownership is invalid"
+                    )
+                if user_js_preexisting is False and (
+                    user_js_intent
+                    or LINUX_FIREFOX_MANAGED_USER_JS in created_files
+                ):
+                    if user_js.exists() or user_js.is_symlink():
+                        _require_owner_private_regular_file(
+                            user_js,
+                            owner_uid=self._owner_uid,
+                        )
+                        if user_js.read_text(encoding="utf-8") != render_linux_firefox_network_policy(
+                            str(journal["hostname"])
+                        ):
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback will not remove foreign Firefox user.js bytes"
+                            )
+                        user_js.unlink()
+
+                if profile_preexisting is False and (
+                    profile_create_intent or profile_created
+                ):
+                    try:
+                        profile.rmdir()
+                    except OSError as exc:
+                        raise LinuxSetupRecoveryRequired(
+                            "rollback found unrelated state in the setup-created Firefox profile"
+                        ) from exc
+
+            files = ownership.get("files")
+            order = ownership.get("file_order")
+            if not isinstance(files, dict) or not isinstance(order, list):
+                raise LinuxSetupRecoveryRequired("setup journal rollback file ownership is invalid")
+            for key in reversed(order):
+                record = files.get(key)
+                if not isinstance(record, dict):
+                    raise LinuxSetupRecoveryRequired("setup journal rollback file record is invalid")
+                _restore_managed_file_from_record(
+                    Path(key),
+                    record,
+                    owner_uid=self._owner_uid,
+                )
+
+            linger_preexisting = ownership.get("linger_preexisting")
+            linger_intent = ownership.get("linger_change_intent") is True
+            linger_changed = ownership.get("linger_changed") is True
+            if linger_preexisting not in {None, True, False}:
+                raise LinuxSetupRecoveryRequired("lingering ownership state is invalid")
+            if linger_preexisting is not None:
+                if self._loginctl_path is None:
+                    raise LinuxSetupRecoveryRequired("rollback cannot inspect user lingering")
+                code, stdout = self._read_command_runner(
+                    (
+                        self._loginctl_path,
+                        "show-user",
+                        "--property=Linger",
+                        "--value",
+                        "--",
+                        installing_user,
+                    )
+                )
+                state = stdout.strip().casefold()
+                if code != 0 or state not in {"yes", "no"}:
+                    raise LinuxSetupRecoveryRequired(
+                        "rollback observed ambiguous user lingering state"
+                    )
+                if linger_preexisting is True:
+                    if state != "yes":
+                        raise LinuxSetupRecoveryRequired(
+                            "pre-existing user lingering changed outside setup"
+                        )
+                elif linger_intent or linger_changed:
+                    if state == "yes":
+                        if self._command_runner(
+                            (self._loginctl_path, "disable-linger", "--", installing_user)
+                        ) != 0:
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback could not restore user lingering"
+                            )
+                        verify_code, verify_stdout = self._read_command_runner(
+                            (
+                                self._loginctl_path,
+                                "show-user",
+                                "--property=Linger",
+                                "--value",
+                                "--",
+                                installing_user,
+                            )
+                        )
+                        if verify_code != 0 or verify_stdout.strip().casefold() != "no":
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback could not verify restored user lingering"
+                            )
+                elif state == "yes":
+                    raise LinuxSetupRecoveryRequired(
+                        "user lingering became enabled without durable setup intent"
+                    )
+
+            caddy_preexisting = ownership.get("caddy_state_preexisting")
+            caddy_intent = ownership.get("caddy_state_create_intent") is True
+            caddy_created = ownership.get("caddy_state_created") is True
+            if caddy_preexisting not in {None, True, False}:
+                raise LinuxSetupRecoveryRequired("Caddy ownership state is invalid")
+            if caddy_preexisting is False and (caddy_intent or caddy_created):
+                caddy_state = Path(plan.caddy_state_dir)
+                if caddy_state.exists() or caddy_state.is_symlink():
+                    info = _require_owner_private_directory(
+                        caddy_state,
+                        owner_uid=self._owner_uid,
+                    )
+                    expected_dev = ownership.get("caddy_state_device")
+                    expected_ino = ownership.get("caddy_state_inode")
+                    if caddy_created and (
+                        info.st_dev != expected_dev or info.st_ino != expected_ino
+                    ):
+                        raise LinuxSetupRecoveryRequired(
+                            "rollback Caddy state identity changed outside setup"
+                        )
+                    if not caddy_created:
+                        try:
+                            next(caddy_state.iterdir())
+                        except StopIteration:
+                            caddy_state.rmdir()
+                        else:
+                            raise LinuxSetupRecoveryRequired(
+                                "rollback found unreceipted Caddy contents after create intent"
+                            )
+                    else:
+                        _remove_owned_caddy_state_tree(
+                            caddy_state,
+                            owner_uid=self._owner_uid,
+                            hostname=str(journal["hostname"]),
+                        )
+
+            _update_linux_setup_journal(
+                self._journal_path,
+                owner_uid=self._owner_uid,
+                phase="PROVISIONAL",
+                ownership_replace=_new_linux_setup_ownership(),
+            )
+        except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+            try:
+                _update_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                    phase="RECOVERY_REQUIRED",
+                )
+            except Exception:
+                pass
+            return InstallerStepResult(
+                status=InstallerStepStatus.RECOVERY_REQUIRED,
+                operation="ROLLBACK_SETUP",
+                detail=str(exc),
+            )
+        return InstallerStepResult(
+            status=InstallerStepStatus.APPLIED,
+            operation="ROLLBACK_SETUP",
+        )
+
     def activate_candidate(self, *, plan: SetupPlan) -> ManagedServiceActivationResult:
+        state_path: Path | None = None
+        if self._journal_path is not None:
+            try:
+                _update_linux_setup_journal(
+                    self._journal_path,
+                    owner_uid=self._owner_uid,
+                    phase="ACTIVATING",
+                )
+                state_path = self._journal_path.parent / "webui-service.json"
+                self._prepare_dynamic_managed_file(state_path)
+            except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+                return ManagedServiceActivationResult(
+                    status=ManagedServiceActivationStatus.FAILED,
+                    detail=f"service-state rollback ownership could not be established: {exc}",
+                )
+
+        def finish(result: ManagedServiceActivationResult) -> ManagedServiceActivationResult:
+            if state_path is None:
+                return result
+            try:
+                self._mark_dynamic_managed_file(state_path)
+            except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+                return ManagedServiceActivationResult(
+                    status=ManagedServiceActivationStatus.FAILED,
+                    detail=f"service-state rollback ownership became ambiguous: {exc}",
+                )
+            return result
+
         start_argv = (
             self._systemctl_path,
             "--user",
@@ -925,16 +2943,16 @@ class ProductionLinuxInstallerBackend:
         if start_code != 0:
             probed = self._probe_activation(plan.origin)
             if probed is not None and probed.status is ManagedServiceActivationStatus.PORT_CONFLICT:
-                return probed
-            return ManagedServiceActivationResult(
+                return finish(probed)
+            return finish(ManagedServiceActivationResult(
                 status=ManagedServiceActivationStatus.FAILED,
                 detail="managed service start command failed",
-            )
+            ))
         if self._service_state_reader is None:
-            return ManagedServiceActivationResult(
+            return finish(ManagedServiceActivationResult(
                 status=ManagedServiceActivationStatus.FAILED,
                 detail="owner-private service-state reader is required for activation proof",
-            )
+            ))
 
         deadline = self._clock() + self._activation_timeout
         while True:
@@ -943,15 +2961,15 @@ class ProductionLinuxInstallerBackend:
                 ManagedServiceActivationStatus.PORT_CONFLICT,
                 ManagedServiceActivationStatus.FAILED,
             }:
-                return probed
+                return finish(probed)
 
             snapshot = self._service_state_reader()
             if snapshot.saved_endpoint is not None and snapshot.saved_endpoint != plan.origin:
-                return ManagedServiceActivationResult(
+                return finish(ManagedServiceActivationResult(
                     status=ManagedServiceActivationStatus.FAILED,
                     saved_endpoint=snapshot.saved_endpoint,
                     detail="service state saved endpoint differs from the candidate origin",
-                )
+                ))
             if snapshot.status is ServiceStatus.READY and snapshot.saved_endpoint == plan.origin:
                 if (
                     probed is not None
@@ -959,30 +2977,30 @@ class ProductionLinuxInstallerBackend:
                 ):
                     now = self._clock()
                     if now >= deadline:
-                        return ManagedServiceActivationResult(
+                        return finish(ManagedServiceActivationResult(
                             status=ManagedServiceActivationStatus.FAILED,
                             saved_endpoint=snapshot.saved_endpoint,
                             detail="managed service endpoint claimed but activation probe never confirmed readiness",
-                        )
+                        ))
                     self._sleep(min(self._poll_interval, deadline - now))
                     continue
-                return ManagedServiceActivationResult(
+                return finish(ManagedServiceActivationResult(
                     status=ManagedServiceActivationStatus.READY,
                     saved_endpoint=snapshot.saved_endpoint,
-                )
+                ))
             if snapshot.status is ServiceStatus.FAILED:
-                return ManagedServiceActivationResult(
+                return finish(ManagedServiceActivationResult(
                     status=ManagedServiceActivationStatus.FAILED,
                     saved_endpoint=snapshot.saved_endpoint,
                     detail="managed service entered FAILED before candidate readiness",
-                )
+                ))
             now = self._clock()
             if now >= deadline:
-                return ManagedServiceActivationResult(
+                return finish(ManagedServiceActivationResult(
                     status=ManagedServiceActivationStatus.FAILED,
                     saved_endpoint=snapshot.saved_endpoint,
                     detail="managed service activation readiness timed out",
-                )
+                ))
             self._sleep(min(self._poll_interval, deadline - now))
 
     def stop_candidate(self, *, plan: SetupPlan) -> InstallerStepResult:
@@ -999,6 +3017,17 @@ class ProductionLinuxInstallerBackend:
                 operation="STOP_MANAGED_SERVICE",
                 detail="managed service stop command failed",
             )
+        if self._journal_path is not None:
+            state_path = self._journal_path.parent / "webui-service.json"
+            if str(state_path) in self._attempt_file_targets:
+                try:
+                    self._mark_dynamic_managed_file(state_path)
+                except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+                    return InstallerStepResult(
+                        status=InstallerStepStatus.RECOVERY_REQUIRED,
+                        operation="STOP_MANAGED_SERVICE",
+                        detail=f"stopped service state could not be bound for rollback: {exc}",
+                    )
         return InstallerStepResult(
             status=InstallerStepStatus.APPLIED,
             operation="STOP_MANAGED_SERVICE",
@@ -1010,34 +3039,256 @@ class ProductionLinuxInstallerBackend:
         return self._activation_probe(origin)
 
 
-def render_hosts_with_mapping(
-    existing: str,
-    *,
-    hostname: str,
-    address: str = "127.0.0.1",
-) -> str:
-    """Return hosts text with one exact mapping while preserving unrelated entries."""
+def _parse_windows_owner_panel_launcher(value: str) -> dict[str, str]:
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise WindowsWebUIError(
+            "WINDOWS_LAUNCHER_SPEC_INVALID",
+            "Owner Panel shortcut specification is invalid",
+        ) from exc
+    expected = {"arguments", "description", "target", "working_directory"}
+    if not isinstance(payload, dict) or set(payload) != expected:
+        raise WindowsWebUIError(
+            "WINDOWS_LAUNCHER_SPEC_INVALID",
+            "Owner Panel shortcut specification is invalid",
+        )
+    for field in expected:
+        item = payload.get(field)
+        if not isinstance(item, str) or not item or any(ord(char) < 32 for char in item):
+            raise WindowsWebUIError(
+                "WINDOWS_LAUNCHER_SPEC_INVALID",
+                "Owner Panel shortcut specification is invalid",
+            )
+    if payload["arguments"] != "-m factlane.webui_launcher":
+        raise WindowsWebUIError(
+            "WINDOWS_LAUNCHER_SPEC_INVALID",
+            "Owner Panel shortcut arguments changed",
+        )
+    _validate_windows_absolute_path(payload["target"], "Owner Panel shortcut runtime")
+    _validate_windows_absolute_path(
+        payload["working_directory"],
+        "Owner Panel shortcut working directory",
+    )
+    if PureWindowsPath(payload["target"]).name.casefold() != "pythonw.exe":
+        raise WindowsWebUIError(
+            "WINDOWS_LAUNCHER_SPEC_INVALID",
+            "Owner Panel shortcut must use pythonw.exe",
+        )
+    return {field: str(payload[field]) for field in expected}
 
-    _validate_hostname(hostname)
-    if address != "127.0.0.1":
-        raise ValueError("FactLane WebUI hostname mapping must target 127.0.0.1")
-    output: list[str] = []
-    for raw_line in existing.splitlines():
-        content, marker, comment = raw_line.partition("#")
-        tokens = content.split()
-        if len(tokens) >= 2 and hostname in tokens[1:]:
-            aliases = [token for token in tokens[1:] if token != hostname]
-            if aliases:
-                rebuilt = " ".join((tokens[0], *aliases))
-                if marker:
-                    rebuilt += f" #{comment}"
-                output.append(rebuilt)
-            elif marker and comment:
-                output.append(f"#{comment}")
-            continue
-        output.append(raw_line)
-    output.append(f"{address}\t{hostname}")
-    return "\n".join(output) + "\n"
+
+def _write_windows_owner_panel_shortcut(
+    destination: str,
+    target: str,
+    arguments: str,
+    working_directory: str,
+) -> None:
+    if os.name != "nt":
+        raise WindowsWebUIError(
+            "WINDOWS_PLATFORM_REQUIRED",
+            "Windows shortcut creation requires native Windows",
+        )
+    try:
+        import ctypes
+        import uuid
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_uint32),
+                ("Data2", ctypes.c_uint16),
+                ("Data3", ctypes.c_uint16),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        def guid(value: str) -> GUID:
+            raw = uuid.UUID(value).bytes_le
+            result = GUID()
+            ctypes.memmove(ctypes.byref(result), raw, 16)
+            return result
+
+        def check(hr: int, operation: str) -> None:
+            if hr < 0:
+                raise OSError(f"{operation} failed with HRESULT 0x{hr & 0xffffffff:08x}")
+
+        ole32 = ctypes.OleDLL("ole32")
+        ole32.CoInitialize.argtypes = [ctypes.c_void_p]
+        ole32.CoInitialize.restype = ctypes.c_long
+        ole32.CoUninitialize.argtypes = []
+        ole32.CoUninitialize.restype = None
+        check(ole32.CoInitialize(None), "CoInitialize")
+        clsid = guid("00021401-0000-0000-C000-000000000046")
+        iid_shell_link = guid("000214F9-0000-0000-C000-000000000046")
+        iid_persist_file = guid("0000010b-0000-0000-C000-000000000046")
+        shell_link = ctypes.c_void_p()
+        ole32.CoCreateInstance.argtypes = [
+            ctypes.POINTER(GUID), ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p),
+        ]
+        ole32.CoCreateInstance.restype = ctypes.c_long
+        try:
+            check(
+                ole32.CoCreateInstance(
+                    ctypes.byref(clsid), None, 1, ctypes.byref(iid_shell_link), ctypes.byref(shell_link)
+                ),
+                "CoCreateInstance(IShellLinkW)",
+            )
+            winfunctype = ctypes.WINFUNCTYPE
+
+            def method(pointer: ctypes.c_void_p, index: int, restype, *argtypes):
+                vtable = ctypes.cast(pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+                return winfunctype(restype, ctypes.c_void_p, *argtypes)(vtable[index])
+
+            release = method(shell_link, 2, ctypes.c_ulong)
+            query_interface = method(
+                shell_link, 0, ctypes.c_long, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)
+            )
+            set_description = method(shell_link, 7, ctypes.c_long, ctypes.c_wchar_p)
+            set_working_directory = method(shell_link, 9, ctypes.c_long, ctypes.c_wchar_p)
+            set_arguments = method(shell_link, 11, ctypes.c_long, ctypes.c_wchar_p)
+            set_path = method(shell_link, 20, ctypes.c_long, ctypes.c_wchar_p)
+            persist_file = ctypes.c_void_p()
+            check(
+                set_path(shell_link, target), "IShellLinkW.SetPath"
+            )
+            try:
+                check(set_arguments(shell_link, arguments), "IShellLinkW.SetArguments")
+                check(set_working_directory(shell_link, working_directory), "IShellLinkW.SetWorkingDirectory")
+                check(set_description(shell_link, "Open the local FactLane Owner Panel"), "IShellLinkW.SetDescription")
+                check(query_interface(shell_link, ctypes.byref(iid_persist_file), ctypes.byref(persist_file)), "IShellLinkW.QueryInterface(IPersistFile)")
+                persist_release = method(persist_file, 2, ctypes.c_ulong)
+                save = method(persist_file, 6, ctypes.c_long, ctypes.c_wchar_p, ctypes.c_int)
+                try:
+                    check(save(persist_file, destination, 1), "IPersistFile.Save")
+                finally:
+                    persist_release(persist_file)
+            finally:
+                release(shell_link)
+        finally:
+            ole32.CoUninitialize()
+    except Exception as exc:
+        raise WindowsWebUIError(
+            "WINDOWS_LAUNCHER_WRITE_FAILED",
+            "Owner Panel shortcut could not be created",
+        ) from exc
+    created = validate_windows_path_no_reparse(destination)
+    if not created.is_file():
+        raise WindowsWebUIError(
+            "WINDOWS_LAUNCHER_WRITE_FAILED",
+            "Owner Panel shortcut was not created",
+        )
+
+
+class ProductionWindowsInstallerBackend:
+    """Owner-side native Windows setup backend; no system service or trust-store mutation."""
+
+    def __init__(
+        self,
+        *,
+        request: SetupRequest,
+        supervisor: WindowsTaskSchedulerSupervisor | None = None,
+        shortcut_writer: Callable[[str, str, str, str], None] | None = None,
+    ) -> None:
+        if os.name != "nt":
+            raise ValueError("native Windows installer backend requires Windows")
+        self.request = request
+        base_executable, environment_executable = windows_managed_python_executables(
+            environment_executable=request.factlane_executable,
+        )
+        self._task_executable = base_executable
+        self._task_arguments = windows_managed_python_arguments(environment_executable, "serve")
+        self.supervisor = supervisor or WindowsTaskSchedulerSupervisor(
+            expected_executable=base_executable,
+            environment_executable=environment_executable,
+        )
+        self._shortcut_writer = shortcut_writer or _write_windows_owner_panel_shortcut
+        root = PureWindowsPath(request.owner_config_home).parent
+        if request.native_control_socket is None:
+            raise ValueError("native Windows control endpoint is required")
+        self._paths = WindowsOwnerPaths(
+            root_dir=str(root),
+            owner_config_home=request.owner_config_home,
+            service_config_path=request.service_config_path,
+            runtime_dir=request.runtime_dir,
+            state_dir=request.state_dir,
+            browser_profile_dir=request.browser_profile_dir,
+            native_control_socket=request.native_control_socket,
+            backend_endpoint=request.backend_socket,
+            task_receipt_path=request.user_unit_path,
+        )
+
+    def apply_operation(
+        self,
+        operation: PlannedOperation,
+        *,
+        plan: SetupPlan,
+    ) -> InstallerStepResult:
+        if not _is_windows_setup_plan(plan):
+            return InstallerStepResult(
+                status=InstallerStepStatus.FAILED,
+                operation=operation.kind,
+                detail="Windows installer received a non-Windows setup plan",
+            )
+        try:
+            if operation.kind == "ENSURE_WINDOWS_OWNER_STATE":
+                ensure_windows_owner_paths(self._paths)
+            elif operation.kind == "WRITE_SERVICE_CONFIG":
+                if operation.target.casefold() != self.request.service_config_path.casefold():
+                    raise WindowsWebUIError("WINDOWS_CONFIG_TARGET_INVALID", "managed config target changed")
+                write_owner_private_text_atomic(operation.target, operation.desired_state)
+            elif operation.kind == "REGISTER_WINDOWS_TASK":
+                if operation.target != WINDOWS_TASK_NAME:
+                    raise WindowsWebUIError("WINDOWS_TASK_TARGET_INVALID", "scheduled task target changed")
+                self.supervisor.register_or_update(self._task_executable)
+            elif operation.kind == "INSTALL_OWNER_LAUNCHER":
+                if self.request.launcher_path is None or operation.target.casefold() != self.request.launcher_path.casefold():
+                    raise WindowsWebUIError("WINDOWS_LAUNCHER_TARGET_INVALID", "Owner Panel shortcut target changed")
+                if PureWindowsPath(operation.target).name != WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME:
+                    raise WindowsWebUIError("WINDOWS_LAUNCHER_TARGET_INVALID", "Owner Panel shortcut filename changed")
+                payload = _parse_windows_owner_panel_launcher(operation.desired_state)
+                target = Path(payload["target"])
+                if not target.is_file() or target.name.casefold() != "pythonw.exe":
+                    raise WindowsWebUIError("WINDOWS_LAUNCHER_RUNTIME_INVALID", "FactLane pythonw runtime is unavailable")
+                destination = validate_windows_path_no_reparse(operation.target)
+                parent = validate_windows_path_no_reparse(destination.parent)
+                if not parent.is_dir():
+                    raise WindowsWebUIError("WINDOWS_LAUNCHER_TARGET_INVALID", "Owner Panel shortcut directory is unavailable")
+                self._shortcut_writer(
+                    str(destination),
+                    payload["target"],
+                    payload["arguments"],
+                    payload["working_directory"],
+                )
+            else:
+                return InstallerStepResult(
+                    status=InstallerStepStatus.FAILED,
+                    operation=operation.kind,
+                    detail="unsupported Windows installer operation",
+                )
+        except Exception as exc:
+            return InstallerStepResult(
+                status=InstallerStepStatus.FAILED,
+                operation=operation.kind,
+                detail=f"Windows owner setup operation failed safely: {type(exc).__name__}",
+            )
+        return InstallerStepResult(status=InstallerStepStatus.APPLIED, operation=operation.kind)
+
+    def read_saved_endpoint(self) -> str | None:
+        return None
+
+    def activate_candidate(self, *, plan: SetupPlan) -> ManagedServiceActivationResult:
+        del plan
+        return ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.PENDING,
+            detail="Windows endpoint activation is owned by the managed runtime",
+        )
+
+    def stop_candidate(self, *, plan: SetupPlan) -> InstallerStepResult:
+        del plan
+        return InstallerStepResult(
+            status=InstallerStepStatus.APPLIED,
+            operation="STOP_MANAGED_SERVICE",
+        )
 
 
 def _rebind_plan_endpoint(
@@ -1111,7 +3362,14 @@ def _consent_granted(consent: SetupConsent, key: str) -> bool:
         return consent.browser_profile_trust
     if key == "user_lingering":
         return consent.user_lingering
+    if key == "windows_native_setup":
+        return consent.windows_native_setup
     return False
+
+
+def _is_windows_setup_plan(plan: SetupPlan) -> bool:
+    kinds = {operation.kind for operation in plan.operations}
+    return "ENSURE_WINDOWS_OWNER_STATE" in kinds or "REGISTER_WINDOWS_TASK" in kinds
 
 
 def _atomic_owner_file_write(
@@ -1175,6 +3433,1029 @@ def _ensure_real_directory_chain(path: Path) -> None:
             raise ValueError("owner file path must not traverse symlink or non-directory components")
 
 
+def linux_setup_journal_path(state_dir: str | os.PathLike[str]) -> Path:
+    value = os.fspath(state_dir)
+    _validate_absolute_path(value, "Linux setup state directory")
+    return Path(value) / LINUX_SETUP_JOURNAL_FILENAME
+
+
+def render_linux_firefox_network_policy(hostname: str) -> str:
+    _validate_hostname(hostname)
+    return (
+        f'user_pref("network.dns.localDomains", "{hostname}");\n'
+        'user_pref("network.trr.mode", 5);\n'
+        'user_pref("network.proxy.type", 0);\n'
+    )
+
+
+def render_linux_setup_journal(
+    *,
+    request: SetupRequest,
+    browser: BrowserInstall,
+    hostname: str,
+) -> str:
+    if browser.family != "firefox":
+        raise ValueError("Linux managed setup journal requires Firefox")
+    _validate_hostname(hostname)
+    payload = {
+        "version": 1,
+        "phase": "PROVISIONAL",
+        "installation_id": request.installation_id,
+        "hostname": hostname,
+        "installing_user": request.installing_user,
+        "browser_family": browser.family,
+        "browser_executable": browser.executable,
+        "browser_profile_dir": request.browser_profile_dir,
+        "state_dir": request.state_dir,
+        "caddy_state_dir": request.caddy_state_dir,
+        "root_fingerprint_sha256": None,
+        "ownership": _new_linux_setup_ownership(),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def _new_linux_setup_ownership() -> dict[str, object]:
+    return {
+        "files": {},
+        "file_order": [],
+        "linger_preexisting": None,
+        "linger_change_intent": False,
+        "linger_changed": False,
+        "service_enabled_preexisting": None,
+        "service_enable_intent": False,
+        "service_enable_changed": False,
+        "profile_preexisting": None,
+        "profile_device": None,
+        "profile_inode": None,
+        "profile_create_intent": False,
+        "profile_created": False,
+        "profile_created_files": [],
+        "user_js_preexisting": None,
+        "user_js_create_intent": False,
+        "nss_preexisting": None,
+        "nss_create_intent": False,
+        "trust_preexisting": None,
+        "trust_import_intent": False,
+        "trust_imported": False,
+        "trust_manifest_intent": False,
+        "trust_manifest_created": False,
+        "caddy_state_preexisting": None,
+        "caddy_state_create_intent": False,
+        "caddy_state_device": None,
+        "caddy_state_inode": None,
+        "caddy_state_created": False,
+    }
+
+
+def _require_owner_private_regular_file(path: Path, *, owner_uid: int) -> os.stat_result:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        raise
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise LinuxSetupRecoveryRequired("foreign managed state is not a regular file")
+    if info.st_uid != owner_uid:
+        raise LinuxSetupRecoveryRequired("foreign managed state is not owned by the installing user")
+    if stat.S_IMODE(info.st_mode) != 0o600:
+        raise LinuxSetupRecoveryRequired("foreign managed state is not owner-private mode 0600")
+    return info
+
+
+def _require_owner_private_directory(path: Path, *, owner_uid: int) -> os.stat_result:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise LinuxSetupRecoveryRequired("foreign managed state is not a real directory")
+    if info.st_uid != owner_uid:
+        raise LinuxSetupRecoveryRequired("foreign managed directory is not owned by the installing user")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        raise LinuxSetupRecoveryRequired("foreign managed directory is not owner-private mode 0700")
+    return info
+
+
+def _sha256_regular_owner_file(path: Path, *, owner_uid: int) -> str:
+    _require_owner_private_regular_file(path, owner_uid=owner_uid)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _restore_managed_file_from_record(
+    path: Path,
+    record: dict[str, object],
+    *,
+    owner_uid: int,
+) -> None:
+    before_exists = record.get("before_exists") is True
+    before_sha = record.get("before_sha256")
+    intended_sha = record.get("intended_sha256")
+    managed_sha = record.get("managed_sha256")
+    try:
+        current_info = path.lstat()
+    except FileNotFoundError:
+        current_info = None
+    if current_info is not None:
+        if stat.S_ISLNK(current_info.st_mode) or not stat.S_ISREG(current_info.st_mode):
+            raise LinuxSetupRecoveryRequired("rollback target changed to foreign non-regular state")
+        if current_info.st_uid != owner_uid:
+            raise LinuxSetupRecoveryRequired("rollback target ownership changed outside setup")
+        current_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        allowed = {
+            value
+            for value in (before_sha, intended_sha, managed_sha)
+            if isinstance(value, str)
+        }
+        if current_sha not in allowed:
+            raise LinuxSetupRecoveryRequired("rollback target bytes changed outside setup")
+        if before_exists and current_sha == before_sha:
+            return
+    elif before_exists:
+        raise LinuxSetupRecoveryRequired("rollback target disappeared outside setup")
+    else:
+        return
+
+    if not before_exists:
+        assert current_info is not None
+        path.unlink()
+        return
+    before_text = record.get("before_text")
+    before_mode = record.get("before_mode")
+    if not isinstance(before_text, str) or isinstance(before_mode, bool) or not isinstance(before_mode, int):
+        raise LinuxSetupRecoveryRequired("rollback journal lacks exact original file bytes/mode")
+    _atomic_owner_file_write(path, before_text, private_parent=False)
+    os.chmod(path, before_mode)
+    if hashlib.sha256(path.read_bytes()).hexdigest() != before_sha:
+        raise LinuxSetupRecoveryRequired("rollback failed to restore exact original file bytes")
+
+
+def _remove_owner_created_tree(path: Path, *, owner_uid: int) -> None:
+    _require_owner_private_directory(path, owner_uid=owner_uid)
+    for root, directories, files in os.walk(path, topdown=False, followlinks=False):
+        root_path = Path(root)
+        root_info = root_path.lstat()
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != owner_uid:
+            raise LinuxSetupRecoveryRequired("rollback found foreign directory state")
+        for filename in files:
+            target = root_path / filename
+            info = target.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != owner_uid:
+                raise LinuxSetupRecoveryRequired("rollback found foreign file state")
+            target.unlink()
+        for dirname in directories:
+            target = root_path / dirname
+            info = target.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != owner_uid:
+                raise LinuxSetupRecoveryRequired("rollback found foreign nested directory state")
+            target.rmdir()
+    path.rmdir()
+
+
+def _remove_owned_caddy_state_tree(
+    path: Path,
+    *,
+    owner_uid: int,
+    hostname: str,
+) -> None:
+    """Remove only the dedicated Caddy state namespace proven owned by setup."""
+
+    _require_owner_private_directory(path, owner_uid=owner_uid)
+    _validate_hostname(hostname)
+    bootstrap = path / ".factlane-ca-bootstrap.Caddyfile"
+    for child in path.iterdir():
+        if child.name == "pki":
+            info = child.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != owner_uid:
+                raise LinuxSetupRecoveryRequired("Caddy PKI state has foreign identity")
+            continue
+        if child.name in {"certificates", "locks"}:
+            _require_owner_private_directory(child, owner_uid=owner_uid)
+            continue
+        if child == bootstrap:
+            _require_owner_private_regular_file(child, owner_uid=owner_uid)
+            expected = _render_caddy_ca_bootstrap_config(
+                hostname=hostname,
+                caddy_state_dir=str(path),
+            )
+            if child.read_text(encoding="utf-8") != expected:
+                raise LinuxSetupRecoveryRequired("Caddy bootstrap state has foreign bytes")
+            child.unlink()
+            continue
+        raise LinuxSetupRecoveryRequired(
+            "Caddy state contains unrelated top-level content; rollback will not remove it"
+        )
+    pki = path / "pki"
+    if pki.exists() or pki.is_symlink():
+        allowed_directories = {
+            "pki",
+            "pki/authorities",
+            "pki/authorities/local",
+        }
+        allowed_files = {
+            "pki/authorities/local/root.crt",
+            "pki/authorities/local/root.key",
+            "pki/authorities/local/intermediate.crt",
+            "pki/authorities/local/intermediate.key",
+        }
+        for root, directories, files in os.walk(pki, topdown=False, followlinks=False):
+            root_path = Path(root)
+            root_relative = root_path.relative_to(path).as_posix()
+            if root_relative not in allowed_directories:
+                raise LinuxSetupRecoveryRequired(
+                    "Caddy PKI state contains an unrelated directory"
+                )
+            root_info = root_path.lstat()
+            if (
+                stat.S_ISLNK(root_info.st_mode)
+                or not stat.S_ISDIR(root_info.st_mode)
+                or root_info.st_uid != owner_uid
+            ):
+                raise LinuxSetupRecoveryRequired("Caddy PKI directory has foreign identity")
+            for filename in files:
+                target = root_path / filename
+                target_relative = target.relative_to(path).as_posix()
+                if target_relative not in allowed_files:
+                    raise LinuxSetupRecoveryRequired(
+                        "Caddy PKI state contains an unrelated file"
+                    )
+                info = target.lstat()
+                if (
+                    stat.S_ISLNK(info.st_mode)
+                    or not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != owner_uid
+                ):
+                    raise LinuxSetupRecoveryRequired("Caddy PKI file has foreign identity")
+                target.unlink()
+            for dirname in directories:
+                target = root_path / dirname
+                target_relative = target.relative_to(path).as_posix()
+                if target_relative not in allowed_directories:
+                    raise LinuxSetupRecoveryRequired(
+                        "Caddy PKI state contains an unrelated directory"
+                    )
+                info = target.lstat()
+                if (
+                    stat.S_ISLNK(info.st_mode)
+                    or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != owner_uid
+                ):
+                    raise LinuxSetupRecoveryRequired(
+                        "Caddy PKI nested directory has foreign identity"
+                    )
+                target.rmdir()
+        pki.rmdir()
+
+    certificates = path / "certificates"
+    if certificates.exists() or certificates.is_symlink():
+        leaf_dir = f"certificates/local/{hostname}"
+        allowed_directories = {
+            "certificates",
+            "certificates/local",
+            leaf_dir,
+        }
+        allowed_files = {
+            f"{leaf_dir}/{hostname}.crt",
+            f"{leaf_dir}/{hostname}.key",
+            f"{leaf_dir}/{hostname}.json",
+        }
+        for root, directories, files in os.walk(
+            certificates,
+            topdown=False,
+            followlinks=False,
+        ):
+            root_path = Path(root)
+            root_relative = root_path.relative_to(path).as_posix()
+            if root_relative not in allowed_directories:
+                raise LinuxSetupRecoveryRequired(
+                    "Caddy certificate state contains an unrelated directory"
+                )
+            _require_owner_private_directory(root_path, owner_uid=owner_uid)
+            for filename in files:
+                target = root_path / filename
+                target_relative = target.relative_to(path).as_posix()
+                if target_relative not in allowed_files:
+                    raise LinuxSetupRecoveryRequired(
+                        "Caddy certificate state contains an unrelated file"
+                    )
+                _require_owner_private_regular_file(target, owner_uid=owner_uid)
+                target.unlink()
+            for dirname in directories:
+                target = root_path / dirname
+                target_relative = target.relative_to(path).as_posix()
+                if target_relative not in allowed_directories:
+                    raise LinuxSetupRecoveryRequired(
+                        "Caddy certificate state contains an unrelated directory"
+                    )
+                _require_owner_private_directory(target, owner_uid=owner_uid)
+                target.rmdir()
+        certificates.rmdir()
+
+    locks = path / "locks"
+    if locks.exists() or locks.is_symlink():
+        _require_owner_private_directory(locks, owner_uid=owner_uid)
+        if any(locks.iterdir()):
+            raise LinuxSetupRecoveryRequired(
+                "Caddy lock state is not empty after the managed service stopped"
+            )
+        locks.rmdir()
+    path.rmdir()
+
+
+def _parse_linux_setup_journal(path: Path, *, owner_uid: int) -> dict[str, object]:
+    _require_owner_private_regular_file(path, owner_uid=owner_uid)
+    try:
+        raw = path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LinuxSetupRecoveryRequired("provisional setup journal is unreadable or invalid") from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise LinuxSetupRecoveryRequired("provisional setup journal has a foreign schema")
+    installation_id = payload.get("installation_id")
+    hostname = payload.get("hostname")
+    if not isinstance(installation_id, str) or hostname != webui_hostname(installation_id):
+        raise LinuxSetupRecoveryRequired("provisional setup journal has a foreign installation binding")
+    phase = payload.get("phase")
+    if phase not in {"PROVISIONAL", "TRUST_READY", "ACTIVATING", "CLAIMED", "RECOVERY_REQUIRED"}:
+        raise LinuxSetupRecoveryRequired("provisional setup journal has an invalid phase")
+    ownership = payload.get("ownership")
+    if not isinstance(ownership, dict):
+        raise LinuxSetupRecoveryRequired("provisional setup journal ownership state is invalid")
+    return payload
+
+
+def load_linux_provisional_installation_id(
+    state_dir: str | os.PathLike[str],
+    *,
+    owner_uid: int,
+) -> str | None:
+    path = linux_setup_journal_path(state_dir)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    payload = _parse_linux_setup_journal(path, owner_uid=owner_uid)
+    expected_state = str(Path(os.fspath(state_dir)))
+    if payload.get("state_dir") != expected_state:
+        raise LinuxSetupRecoveryRequired("provisional setup journal is bound to a different state directory")
+    installation_id = payload["installation_id"]
+    assert isinstance(installation_id, str)
+    return installation_id
+
+
+def _ensure_linux_setup_journal(
+    path: Path,
+    desired_state: str,
+    *,
+    owner_uid: int,
+) -> dict[str, object]:
+    try:
+        expected = json.loads(desired_state)
+    except json.JSONDecodeError as exc:
+        raise ValueError("provisional setup journal desired state is invalid") from exc
+    if not isinstance(expected, dict) or expected.get("version") != 1:
+        raise ValueError("provisional setup journal desired state has an invalid schema")
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        _atomic_owner_file_write(path, desired_state, private_parent=True)
+        _require_owner_private_regular_file(path, owner_uid=owner_uid)
+        _require_owner_private_directory(path.parent, owner_uid=owner_uid)
+        return expected
+    current = _parse_linux_setup_journal(path, owner_uid=owner_uid)
+    binding_keys = (
+        "version",
+        "installation_id",
+        "hostname",
+        "installing_user",
+        "browser_family",
+        "browser_executable",
+        "browser_profile_dir",
+        "state_dir",
+        "caddy_state_dir",
+    )
+    if any(current.get(key) != expected.get(key) for key in binding_keys):
+        raise LinuxSetupRecoveryRequired("provisional setup journal conflicts with the exact setup target")
+    return current
+
+
+def _update_linux_setup_journal(
+    path: Path,
+    *,
+    owner_uid: int,
+    phase: str | None = None,
+    root_fingerprint_sha256: str | None = None,
+    ownership_updates: dict[str, object] | None = None,
+    ownership_replace: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload = _parse_linux_setup_journal(path, owner_uid=owner_uid)
+    if phase is not None:
+        if phase not in {"PROVISIONAL", "TRUST_READY", "ACTIVATING", "CLAIMED", "RECOVERY_REQUIRED"}:
+            raise ValueError("invalid Linux setup journal phase")
+        payload["phase"] = phase
+    if root_fingerprint_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", root_fingerprint_sha256):
+            raise ValueError("root fingerprint must be lowercase SHA-256 hex")
+        payload["root_fingerprint_sha256"] = root_fingerprint_sha256
+    if ownership_replace is not None:
+        payload["ownership"] = ownership_replace
+    elif ownership_updates:
+        ownership = payload.get("ownership")
+        if not isinstance(ownership, dict):
+            raise LinuxSetupRecoveryRequired("provisional setup journal ownership state is invalid")
+        ownership.update(ownership_updates)
+    rendered = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    _atomic_owner_file_write(path, rendered, private_parent=True)
+    _require_owner_private_regular_file(path, owner_uid=owner_uid)
+    return payload
+
+
+def ensure_linux_firefox_profile_network_policy(
+    *,
+    profile_dir: str | os.PathLike[str] | Path,
+    hostname: str,
+    owner_uid: int,
+) -> LinuxFirefoxNetworkPolicyReceipt:
+    _validate_hostname(hostname)
+    profile = Path(profile_dir)
+    _validate_absolute_path(str(profile), "isolated Firefox profile")
+    try:
+        profile.lstat()
+        profile_created = False
+        _require_owner_private_directory(profile, owner_uid=owner_uid)
+    except FileNotFoundError:
+        _ensure_real_directory_chain(profile.parent)
+        profile.mkdir(mode=0o700)
+        os.chmod(profile, 0o700)
+        _require_owner_private_directory(profile, owner_uid=owner_uid)
+        profile_created = True
+    user_js = profile / LINUX_FIREFOX_MANAGED_USER_JS
+    expected = render_linux_firefox_network_policy(hostname)
+    try:
+        user_js.lstat()
+    except FileNotFoundError:
+        _atomic_owner_file_write(user_js, expected, private_parent=True)
+        _require_owner_private_regular_file(user_js, owner_uid=owner_uid)
+        user_js_created = True
+    else:
+        _require_owner_private_regular_file(user_js, owner_uid=owner_uid)
+        try:
+            current = user_js.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise LinuxSetupRecoveryRequired("foreign Firefox user.js cannot be read safely") from exc
+        if current != expected:
+            raise LinuxSetupRecoveryRequired("foreign Firefox user.js conflicts with managed network policy")
+        user_js_created = False
+    return LinuxFirefoxNetworkPolicyReceipt(
+        status="CREATED" if profile_created or user_js_created else "REUSED",
+        profile_dir=str(profile),
+        user_js_path=str(user_js),
+        profile_created=profile_created,
+        user_js_created=user_js_created,
+    )
+
+
+def _certificate_fingerprint_from_pem_text(pem_text: str) -> str:
+    if pem_text.count("-----BEGIN CERTIFICATE-----") != 1 or pem_text.count(
+        "-----END CERTIFICATE-----"
+    ) != 1:
+        raise LinuxSetupRecoveryRequired("Caddy public root must contain exactly one certificate")
+    if "PRIVATE KEY" in pem_text:
+        raise LinuxSetupRecoveryRequired("Caddy public root file unexpectedly contains private key material")
+    try:
+        der = ssl.PEM_cert_to_DER_cert(pem_text)
+    except ValueError as exc:
+        raise LinuxSetupRecoveryRequired("Caddy public root certificate is invalid") from exc
+    return hashlib.sha256(der).hexdigest()
+
+
+def _root_certificate_fingerprint(path: Path, *, owner_uid: int) -> str:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        raise
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise LinuxSetupRecoveryRequired("Caddy public root must be a regular file")
+    if info.st_uid != owner_uid:
+        raise LinuxSetupRecoveryRequired("Caddy public root is not owned by the installing user")
+    try:
+        pem_text = path.read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise LinuxSetupRecoveryRequired("Caddy public root could not be read safely") from exc
+    return _certificate_fingerprint_from_pem_text(pem_text)
+
+
+def _linux_firefox_manifest_text(
+    *,
+    hostname: str,
+    profile: Path,
+    firefox_executable: str,
+    root_fingerprint_sha256: str,
+) -> str:
+    payload = {
+        "version": 1,
+        "hostname": hostname,
+        "profile_dir": str(profile),
+        "firefox_executable": firefox_executable,
+        "root_fingerprint_sha256": root_fingerprint_sha256,
+        "nickname": LINUX_FIREFOX_CA_NICKNAME,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def _certutil_entries(output: str) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for raw in output.splitlines():
+        line = raw.rstrip()
+        if not line or "Trust Attributes" in line or line.strip().startswith("SSL,S/MIME"):
+            continue
+        match = re.match(r"^(?P<nickname>.+?)(?:\s{2,})(?P<trust>[A-Za-z0-9,]+)\s*$", line)
+        if match is None:
+            continue
+        entries.append((match.group("nickname").rstrip(), match.group("trust")))
+    return entries
+
+
+def ensure_linux_firefox_profile_trust(
+    *,
+    certutil_path: str,
+    firefox_executable: str,
+    profile_dir: str | os.PathLike[str] | Path,
+    root_cert_path: str | os.PathLike[str] | Path,
+    hostname: str,
+    owner_uid: int,
+    command_runner: CommandRunner | None = None,
+    read_command_runner: ReadCommandRunner | None = None,
+    mutation_intent_hook: Callable[[str], None] | None = None,
+    recover_owned_missing_manifest: bool = False,
+) -> LinuxFirefoxTrustReceipt:
+    _validate_absolute_path(certutil_path, "certutil executable")
+    _validate_absolute_path(firefox_executable, "Firefox executable")
+    _validate_hostname(hostname)
+    runner = command_runner or _run_argv
+    reader = read_command_runner or _run_argv_capture
+    profile = Path(profile_dir)
+    _validate_absolute_path(str(profile), "isolated Firefox profile")
+    _require_owner_private_directory(profile, owner_uid=owner_uid)
+    user_js = profile / LINUX_FIREFOX_MANAGED_USER_JS
+    _require_owner_private_regular_file(user_js, owner_uid=owner_uid)
+    if user_js.read_text(encoding="utf-8") != render_linux_firefox_network_policy(hostname):
+        raise LinuxSetupRecoveryRequired("foreign Firefox network policy conflicts with the managed profile")
+
+    root_path = Path(root_cert_path)
+    _validate_absolute_path(str(root_path), "Caddy public root certificate")
+    root_fingerprint = _root_certificate_fingerprint(root_path, owner_uid=owner_uid)
+    manifest_path = profile / LINUX_FIREFOX_TRUST_MANIFEST
+    expected_manifest = _linux_firefox_manifest_text(
+        hostname=hostname,
+        profile=profile,
+        firefox_executable=firefox_executable,
+        root_fingerprint_sha256=root_fingerprint,
+    )
+    manifest_exists = False
+    try:
+        manifest_path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        _require_owner_private_regular_file(manifest_path, owner_uid=owner_uid)
+        if manifest_path.read_text(encoding="utf-8") != expected_manifest:
+            raise LinuxSetupRecoveryRequired("foreign Firefox trust manifest conflicts with the exact managed binding")
+        manifest_exists = True
+
+    db_files = tuple(profile / name for name in ("cert9.db", "key4.db", "pkcs11.txt"))
+    present = [path.exists() for path in db_files]
+    if any(present) and not all(present):
+        raise LinuxSetupRecoveryRequired("Firefox NSS SQL profile is incomplete or foreign")
+    db_initialized = not any(present)
+    created_db_files: list[Path] = []
+    certificate_imported = False
+    manifest_created = False
+    db_arg = f"sql:{profile}"
+    try:
+        if db_initialized:
+            if mutation_intent_hook is not None:
+                mutation_intent_hook("nss")
+            if runner((certutil_path, "-N", "--empty-password", "-d", db_arg)) != 0:
+                raise LinuxSetupRecoveryRequired("Firefox NSS SQL profile could not be initialized")
+            for path in db_files:
+                if not path.exists():
+                    raise LinuxSetupRecoveryRequired("Firefox NSS initialization did not create the exact SQL profile")
+                os.chmod(path, 0o600)
+                _require_owner_private_regular_file(path, owner_uid=owner_uid)
+                created_db_files.append(path)
+        else:
+            for path in db_files:
+                _require_owner_private_regular_file(path, owner_uid=owner_uid)
+
+        list_code, list_stdout = reader((certutil_path, "-L", "-d", db_arg))
+        if list_code != 0:
+            raise LinuxSetupRecoveryRequired("Firefox NSS certificate database could not be inspected")
+        entries = _certutil_entries(list_stdout)
+        managed_entry = next((item for item in entries if item[0] == LINUX_FIREFOX_CA_NICKNAME), None)
+        same_root_other_nickname: str | None = None
+        for nickname, _trust in entries:
+            export_code, export_stdout = reader(
+                (certutil_path, "-L", "-d", db_arg, "-n", nickname, "-a")
+            )
+            if export_code != 0:
+                raise LinuxSetupRecoveryRequired("Firefox NSS certificate state could not be verified")
+            try:
+                fingerprint = _certificate_fingerprint_from_pem_text(export_stdout)
+            except LinuxSetupRecoveryRequired:
+                continue
+            if fingerprint == root_fingerprint and nickname != LINUX_FIREFOX_CA_NICKNAME:
+                same_root_other_nickname = nickname
+                break
+        if same_root_other_nickname is not None:
+            raise LinuxSetupRecoveryRequired(
+                "foreign Firefox trust already contains the FactLane root under another nickname"
+            )
+
+        if managed_entry is not None:
+            export_code, export_stdout = reader(
+                (
+                    certutil_path,
+                    "-L",
+                    "-d",
+                    db_arg,
+                    "-n",
+                    LINUX_FIREFOX_CA_NICKNAME,
+                    "-a",
+                )
+            )
+            if export_code != 0 or _certificate_fingerprint_from_pem_text(export_stdout) != root_fingerprint:
+                raise LinuxSetupRecoveryRequired("foreign Firefox FactLane nickname is bound to a different root")
+            if managed_entry[1] != "C,,":
+                raise LinuxSetupRecoveryRequired("Firefox FactLane root trust flags drifted from the exact SSL CA binding")
+            if not manifest_exists:
+                if not recover_owned_missing_manifest:
+                    raise LinuxSetupRecoveryRequired("Firefox FactLane trust exists without its ownership manifest")
+                if mutation_intent_hook is not None:
+                    mutation_intent_hook("manifest")
+                _atomic_owner_file_write(manifest_path, expected_manifest, private_parent=True)
+                _require_owner_private_regular_file(manifest_path, owner_uid=owner_uid)
+                return LinuxFirefoxTrustReceipt(
+                    status="RECOVERED",
+                    profile_dir=str(profile),
+                    manifest_path=str(manifest_path),
+                    root_fingerprint_sha256=root_fingerprint,
+                    db_initialized=False,
+                    certificate_imported=True,
+                    manifest_created=True,
+                )
+            return LinuxFirefoxTrustReceipt(
+                status="REUSED",
+                profile_dir=str(profile),
+                manifest_path=str(manifest_path),
+                root_fingerprint_sha256=root_fingerprint,
+                db_initialized=db_initialized,
+                certificate_imported=False,
+                manifest_created=False,
+            )
+        if manifest_exists:
+            raise LinuxSetupRecoveryRequired("Firefox trust manifest exists but the managed root is missing")
+
+        import_argv = (
+            certutil_path,
+            "-A",
+            "-d",
+            db_arg,
+            "-n",
+            LINUX_FIREFOX_CA_NICKNAME,
+            "-t",
+            "C,,",
+            "-i",
+            str(root_path),
+        )
+        if mutation_intent_hook is not None:
+            mutation_intent_hook("trust")
+        if runner(import_argv) != 0:
+            raise LinuxSetupRecoveryRequired("Firefox NSS rejected the exact FactLane public root import")
+        certificate_imported = True
+        verify_code, verify_stdout = reader((certutil_path, "-L", "-d", db_arg))
+        if verify_code != 0:
+            raise LinuxSetupRecoveryRequired("Firefox NSS trust import could not be verified")
+        verified = next(
+            (item for item in _certutil_entries(verify_stdout) if item[0] == LINUX_FIREFOX_CA_NICKNAME),
+            None,
+        )
+        if verified is None or verified[1] != "C,,":
+            raise LinuxSetupRecoveryRequired("Firefox NSS trust import did not bind exact SSL CA trust")
+        export_code, export_stdout = reader(
+            (certutil_path, "-L", "-d", db_arg, "-n", LINUX_FIREFOX_CA_NICKNAME, "-a")
+        )
+        if export_code != 0 or _certificate_fingerprint_from_pem_text(export_stdout) != root_fingerprint:
+            raise LinuxSetupRecoveryRequired("Firefox NSS trust import fingerprint verification failed")
+        if mutation_intent_hook is not None:
+            mutation_intent_hook("manifest")
+        _atomic_owner_file_write(manifest_path, expected_manifest, private_parent=True)
+        _require_owner_private_regular_file(manifest_path, owner_uid=owner_uid)
+        manifest_created = True
+        return LinuxFirefoxTrustReceipt(
+            status="IMPORTED",
+            profile_dir=str(profile),
+            manifest_path=str(manifest_path),
+            root_fingerprint_sha256=root_fingerprint,
+            db_initialized=db_initialized,
+            certificate_imported=True,
+            manifest_created=True,
+        )
+    except BaseException:
+        if certificate_imported:
+            try:
+                runner((certutil_path, "-D", "-d", db_arg, "-n", LINUX_FIREFOX_CA_NICKNAME))
+            except Exception:
+                pass
+        if manifest_created:
+            try:
+                manifest_path.unlink()
+            except OSError:
+                pass
+        if db_initialized:
+            for path in reversed(created_db_files):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        raise
+
+
+def validate_linux_firefox_managed_profile(
+    *,
+    certutil_path: str,
+    firefox_executable: str,
+    profile_dir: str | os.PathLike[str] | Path,
+    root_cert_path: str | os.PathLike[str] | Path,
+    hostname: str,
+    owner_uid: int,
+    read_command_runner: ReadCommandRunner | None = None,
+) -> str:
+    """Validate the already-provisioned isolated Firefox profile without mutating it."""
+
+    _validate_absolute_path(certutil_path, "certutil executable")
+    _validate_absolute_path(firefox_executable, "Firefox executable")
+    _validate_hostname(hostname)
+    profile = Path(profile_dir)
+    _require_owner_private_directory(profile, owner_uid=owner_uid)
+    user_js = profile / LINUX_FIREFOX_MANAGED_USER_JS
+    _require_owner_private_regular_file(user_js, owner_uid=owner_uid)
+    if user_js.read_text(encoding="utf-8") != render_linux_firefox_network_policy(hostname):
+        raise LinuxSetupRecoveryRequired("managed Firefox network policy drifted")
+    root_path = Path(root_cert_path)
+    root_fingerprint = _root_certificate_fingerprint(root_path, owner_uid=owner_uid)
+    manifest_path = profile / LINUX_FIREFOX_TRUST_MANIFEST
+    _require_owner_private_regular_file(manifest_path, owner_uid=owner_uid)
+    expected_manifest = _linux_firefox_manifest_text(
+        hostname=hostname,
+        profile=profile,
+        firefox_executable=firefox_executable,
+        root_fingerprint_sha256=root_fingerprint,
+    )
+    if manifest_path.read_text(encoding="utf-8") != expected_manifest:
+        raise LinuxSetupRecoveryRequired("managed Firefox trust manifest drifted")
+    for filename in ("cert9.db", "key4.db", "pkcs11.txt"):
+        _require_owner_private_regular_file(profile / filename, owner_uid=owner_uid)
+    reader = read_command_runner or _run_argv_capture
+    db_arg = f"sql:{profile}"
+    code, output = reader((certutil_path, "-L", "-d", db_arg))
+    if code != 0:
+        raise LinuxSetupRecoveryRequired("managed Firefox NSS database is unreadable")
+    entry = next(
+        (item for item in _certutil_entries(output) if item[0] == LINUX_FIREFOX_CA_NICKNAME),
+        None,
+    )
+    if entry is None or entry[1] != "C,,":
+        raise LinuxSetupRecoveryRequired("managed Firefox NSS trust binding is missing or drifted")
+    code, pem = reader(
+        (certutil_path, "-L", "-d", db_arg, "-n", LINUX_FIREFOX_CA_NICKNAME, "-a")
+    )
+    if code != 0 or _certificate_fingerprint_from_pem_text(pem) != root_fingerprint:
+        raise LinuxSetupRecoveryRequired("managed Firefox NSS root fingerprint drifted")
+    return root_fingerprint
+
+
+def _render_caddy_ca_bootstrap_config(*, hostname: str, caddy_state_dir: str) -> str:
+    _validate_hostname(hostname)
+    _validate_absolute_path(caddy_state_dir, "Caddy state directory")
+    return (
+        "{\n"
+        "    admin off\n"
+        "    auto_https disable_redirects\n"
+        "    skip_install_trust\n"
+        f"    storage file_system {_caddy_token(caddy_state_dir)}\n"
+        "}\n\n"
+        f"https://{hostname}:0 {{\n"
+        "    bind 127.0.0.1\n"
+        "    tls {\n"
+        "        issuer internal\n"
+        "    }\n"
+        "    respond 503\n"
+        "}\n"
+    )
+
+
+def _spawn_caddy_bootstrap(argv: tuple[str, ...]) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        argv,
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def bootstrap_linux_caddy_root(
+    *,
+    caddy_path: str,
+    caddy_state_dir: str | os.PathLike[str],
+    hostname: str,
+    owner_uid: int,
+    process_factory: Callable[[tuple[str, ...]], object] | None = None,
+    clock: InstallClock = time.monotonic,
+    sleep: InstallSleep = time.sleep,
+    timeout: float = 10.0,
+) -> LinuxCaddyBootstrapReceipt:
+    _validate_absolute_path(caddy_path, "Caddy executable")
+    _validate_hostname(hostname)
+    if timeout <= 0:
+        raise ValueError("Caddy bootstrap timeout must be positive")
+    state_dir = Path(caddy_state_dir)
+    _validate_absolute_path(str(state_dir), "Caddy state directory")
+    try:
+        state_dir.lstat()
+        state_created = False
+        state_info = _require_owner_private_directory(state_dir, owner_uid=owner_uid)
+    except FileNotFoundError:
+        _ensure_real_directory_chain(state_dir.parent)
+        state_dir.mkdir(mode=0o700)
+        os.chmod(state_dir, 0o700)
+        state_info = _require_owner_private_directory(state_dir, owner_uid=owner_uid)
+        state_created = True
+    root_path = state_dir / "pki" / "authorities" / "local" / "root.crt"
+    try:
+        fingerprint = _root_certificate_fingerprint(root_path, owner_uid=owner_uid)
+    except FileNotFoundError:
+        fingerprint = None
+    if fingerprint is not None:
+        return LinuxCaddyBootstrapReceipt(
+            status="REUSED",
+            root_cert_path=str(root_path),
+            root_fingerprint_sha256=fingerprint,
+            caddy_state_created=state_created,
+            caddy_state_device=int(state_info.st_dev),
+            caddy_state_inode=int(state_info.st_ino),
+        )
+
+    bootstrap_config = state_dir / ".factlane-ca-bootstrap.Caddyfile"
+    if bootstrap_config.exists() or bootstrap_config.is_symlink():
+        raise LinuxSetupRecoveryRequired("foreign Caddy bootstrap config already exists")
+    content = _render_caddy_ca_bootstrap_config(
+        hostname=hostname,
+        caddy_state_dir=str(state_dir),
+    )
+    _atomic_owner_file_write(bootstrap_config, content, private_parent=True)
+    _require_owner_private_regular_file(bootstrap_config, owner_uid=owner_uid)
+    factory = process_factory or _spawn_caddy_bootstrap
+    process = None
+    bootstrap_completed = False
+    try:
+        argv = (caddy_path, "run", "--config", str(bootstrap_config), "--adapter", "caddyfile")
+        process = factory(argv)
+        deadline = clock() + timeout
+        while True:
+            try:
+                fingerprint = _root_certificate_fingerprint(root_path, owner_uid=owner_uid)
+                bootstrap_completed = True
+                break
+            except FileNotFoundError:
+                pass
+            poll = getattr(process, "poll", None)
+            if not callable(poll) or poll() is not None:
+                raise LinuxSetupRecoveryRequired("Caddy CA bootstrap exited before materializing the public root")
+            now = clock()
+            if now >= deadline:
+                raise LinuxSetupRecoveryRequired("Caddy CA bootstrap timed out before public-root readiness")
+            sleep(min(0.05, deadline - now))
+    finally:
+        if process is not None:
+            poll = getattr(process, "poll", None)
+            terminate = getattr(process, "terminate", None)
+            wait = getattr(process, "wait", None)
+            kill = getattr(process, "kill", None)
+            try:
+                if callable(poll) and poll() is None and callable(terminate):
+                    terminate()
+                if callable(wait):
+                    try:
+                        wait(timeout=2.0)
+                    except Exception:
+                        if callable(kill):
+                            kill()
+                        try:
+                            wait(timeout=2.0)
+                        except Exception as exc:
+                            raise LinuxSetupRecoveryRequired("Caddy CA bootstrap could not be proven stopped") from exc
+                if callable(poll) and poll() is None:
+                    raise LinuxSetupRecoveryRequired("Caddy CA bootstrap remained running after termination")
+            finally:
+                try:
+                    bootstrap_config.unlink()
+                except FileNotFoundError:
+                    pass
+        else:
+            try:
+                bootstrap_config.unlink()
+            except FileNotFoundError:
+                pass
+        if not bootstrap_completed and state_created:
+            try:
+                _remove_owner_created_tree(state_dir, owner_uid=owner_uid)
+            except (OSError, LinuxSetupRecoveryRequired) as exc:
+                raise LinuxSetupRecoveryRequired(
+                    "failed Caddy CA bootstrap could not roll back the state directory it created"
+                ) from exc
+    assert fingerprint is not None
+    return LinuxCaddyBootstrapReceipt(
+        status="CREATED",
+        root_cert_path=str(root_path),
+        root_fingerprint_sha256=fingerprint,
+        caddy_state_created=state_created,
+        caddy_state_device=int(state_info.st_dev),
+        caddy_state_inode=int(state_info.st_ino),
+    )
+
+
+def probe_linux_managed_https(
+    origin: str,
+    *,
+    root_cert_path: str | os.PathLike[str],
+    timeout_seconds: float = 1.0,
+) -> ManagedServiceActivationResult:
+    try:
+        parsed = urlsplit(origin)
+        port = parsed.port
+    except ValueError:
+        return ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.FAILED,
+            detail="managed HTTPS origin is invalid",
+        )
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or port is None
+        or origin != f"https://{hostname}:{port}"
+    ):
+        return ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.FAILED,
+            detail="managed HTTPS origin is invalid",
+        )
+    try:
+        _validate_hostname(hostname)
+        context = ssl.create_default_context(cafile=os.fspath(root_cert_path))
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout_seconds) as raw:
+            raw.settimeout(timeout_seconds)
+            with context.wrap_socket(raw, server_hostname=hostname) as tls_socket:
+                tls_socket.settimeout(timeout_seconds)
+                tls_socket.sendall(
+                    (
+                        "GET /health HTTP/1.1\r\n"
+                        f"Host: {hostname}:{port}\r\n"
+                        "Connection: close\r\n\r\n"
+                    ).encode("ascii")
+                )
+                response = HTTPResponse(tls_socket)
+                response.begin()
+                payload = response.read(1024)
+                if response.status == 200 and payload == b'{"status":"OK"}':
+                    return ManagedServiceActivationResult(
+                        status=ManagedServiceActivationStatus.READY,
+                        saved_endpoint=origin,
+                    )
+                if response.status in {502, 503, 504}:
+                    return ManagedServiceActivationResult(
+                        status=ManagedServiceActivationStatus.PENDING,
+                        detail="managed HTTPS gateway is up but backend health is not ready",
+                    )
+                return ManagedServiceActivationResult(
+                    status=ManagedServiceActivationStatus.FAILED,
+                    detail="managed HTTPS health response is not the exact backend readiness proof",
+                )
+    except (FileNotFoundError, ValueError):
+        return ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.FAILED,
+            detail="managed Caddy public root is unavailable or invalid",
+        )
+    except ssl.SSLError:
+        return ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.PORT_CONFLICT,
+            detail="loopback listener failed exact Caddy CA/SNI verification",
+        )
+    except (HTTPException, OSError, TimeoutError):
+        return ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.PENDING,
+            detail="managed HTTPS endpoint is not ready",
+        )
+
+
 def _run_argv(argv: tuple[str, ...]) -> int:
     completed = subprocess.run(
         argv,
@@ -1187,8 +4468,27 @@ def _run_argv(argv: tuple[str, ...]) -> int:
     return completed.returncode
 
 
+def _run_argv_capture(argv: tuple[str, ...]) -> tuple[int, str]:
+    completed = subprocess.run(
+        argv,
+        check=False,
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return int(completed.returncode), completed.stdout
+
+
 def _environment_blockers(environment: InstallEnvironment) -> tuple[str, ...]:
     reasons: list[str] = []
+    if environment.system == "Windows":
+        if os.name != "nt":
+            reasons.append("native Windows setup is unavailable from this Linux host")
+        if not isinstance(environment.browser, WindowsBrowserInstall) or environment.browser.family != "firefox":
+            reasons.append("Mozilla Firefox is required for managed Windows WebUI")
+        return tuple(reasons)
     if environment.system != "Linux":
         reasons.append("Linux is the only supported WebUI service platform")
     if not environment.systemd:
@@ -1198,7 +4498,9 @@ def _environment_blockers(environment: InstallEnvironment) -> tuple[str, ...]:
     if environment.zenity_path is None:
         reasons.append("zenity is required for native setup confirmation")
     if environment.browser is None:
-        reasons.append("a supported Chromium or Firefox browser is required")
+        reasons.append("Mozilla Firefox or Firefox ESR browser is required for managed Linux WebUI")
+    elif isinstance(environment.browser, BrowserInstall) and environment.browser.family != "firefox":
+        reasons.append("Mozilla Firefox or Firefox ESR browser is required for managed Linux WebUI")
     if environment.euid == 0:
         reasons.append("WebUI setup must run as the installing user, not root")
     return tuple(reasons)
@@ -1226,6 +4528,23 @@ def _validate_absolute_path(value: str, label: str) -> None:
     path = PurePosixPath(value)
     if ".." in path.parts:
         raise ValueError(f"{label} must not contain parent traversal")
+
+
+def _validate_windows_absolute_path(value: str, label: str) -> None:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError(f"{label} must be an absolute Windows path")
+    if any(ch in value for ch in ("\n", "\r")):
+        raise ValueError(f"{label} must not contain line breaks")
+    path = PureWindowsPath(value)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"{label} must be an absolute Windows path")
+    folded = value.replace("/", "\\").casefold()
+    if folded.startswith("\\\\wsl") or folded.startswith("\\\\wsl.localhost"):
+        raise ValueError(f"{label} must not use WSL paths")
+    if value.startswith("/home/") or value.startswith("/mnt/"):
+        raise ValueError(f"{label} must not use Linux paths")
+
+
 
 
 def _caddy_token(value: str) -> str:

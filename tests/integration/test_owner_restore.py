@@ -22,6 +22,7 @@ from factlane.owner_database import ArtifactRegistry, create_consistent_backup
 from factlane.owner_restore import FullRestoreService, RestoreRecoveryRequired
 from factlane.runtime_control import PROTOCOL_VERSION, RuntimeIdentity
 from factlane.webui_service import ServiceStatus, WebUIServiceState
+from factlane.windows_owner_restore import WindowsRestoreMutationError
 
 
 class _Prepared:
@@ -379,6 +380,173 @@ def _interlock(path: Path) -> str | None:
     finally:
         conn.close()
     return None if row is None else str(row[0])
+
+
+class _FakeWindowsRestoreOperator:
+    def __init__(
+        self,
+        *,
+        active_db: Path,
+        state_dir: Path,
+        registry: ArtifactRegistry,
+        operation_id: str,
+        events: list[str],
+        fail_promote: bool = False,
+        fail_enter: bool = False,
+        fail_before_backup: bool = False,
+        fail_classify: bool = False,
+    ) -> None:
+        self.active_db = Path(active_db)
+        self.state_dir = Path(state_dir)
+        self.registry = registry
+        self.operation_id = operation_id
+        self.events = events
+        self.fail_promote = fail_promote
+        self.fail_enter = fail_enter
+        self.fail_before_backup = fail_before_backup
+        self.fail_classify = fail_classify
+        self.stage: Path | None = None
+        self.retained = False
+
+    def __enter__(self):
+        self.events.append("windows_exclusive_acquire")
+        if self.fail_enter:
+            raise AdapterError("WINDOWS_RESTORE_EXCLUSION_UNAVAILABLE", "injected Windows exclusion failure")
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        self.close()
+
+    def close(self) -> None:
+        if self.retained:
+            return
+        self.events.append("windows_exclusive_release")
+
+    def capture_pre_restore_backup(self, *, artifact_id: str):
+        self.events.append("windows_snapshot")
+        receipt = create_consistent_backup(self.active_db, self.registry, artifact_id=artifact_id)
+        info = self.active_db.stat()
+        return receipt, {
+            "main": {
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "sha256": owner_restore_module._sha256_file(self.active_db),
+            }
+        }
+
+    def prepare_activation(self, stage: Path):
+        self.events.append("windows_prepare_activation")
+        self.stage = Path(stage)
+        info = self.stage.stat()
+        active_info = self.active_db.stat()
+        return {
+            "stage_name": self.stage.name,
+            "stage_device": info.st_dev,
+            "stage_inode": info.st_ino,
+            "stage_sha256": owner_restore_module._sha256_file(self.stage),
+            "active_device": active_info.st_dev,
+            "active_inode": active_info.st_ino,
+        }
+
+    def activate_and_verify(self, intent):
+        self.events.append("windows_activate")
+        assert self.stage is not None
+        if self.fail_before_backup:
+            raise WindowsRestoreMutationError(
+                "WINDOWS_STAGE_REJECTED",
+                "injected pre-backup Windows stage failure",
+                mutation_may_have_started=False,
+            )
+        before = self.active_db.stat()
+        source = sqlite3.connect(self.stage)
+        target = sqlite3.connect(self.active_db)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        after = self.active_db.stat()
+        assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+        if self.fail_promote:
+            error = RuntimeError("injected Windows activation ambiguity after active-image mutation")
+            error.code = "WINDOWS_ACTIVATION_AMBIGUOUS"  # type: ignore[attr-defined]
+            error.safe_message = "Windows activation outcome is ambiguous"  # type: ignore[attr-defined]
+            raise error
+        self.stage.unlink()
+        self.stage = None
+        self.events.append("windows_postflight")
+        return {
+            "active_device": after.st_dev,
+            "active_inode": after.st_ino,
+            "active_interlock": _interlock(self.active_db),
+            "intent_stage_sha256": intent["stage_sha256"],
+        }
+
+    def recover_activation(self, intent):
+        self.events.append("windows_recover_activation")
+        stage_name = intent.get("stage_name")
+        stage = self.active_db.parent / stage_name if isinstance(stage_name, str) else None
+        if _interlock(self.active_db) != self.operation_id and stage is not None and stage.exists():
+            source = sqlite3.connect(stage)
+            target = sqlite3.connect(self.active_db)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+        if stage is not None and stage.exists():
+            stage.unlink()
+        info = self.active_db.stat()
+        return {
+            "active_device": info.st_dev,
+            "active_inode": info.st_ino,
+            "active_interlock": _interlock(self.active_db),
+            "intent_stage_sha256": intent["stage_sha256"],
+        }
+
+    def classify_activation(self, intent):
+        self.events.append("windows_classify_activation")
+        if self.fail_classify:
+            raise WindowsRestoreMutationError(
+                "WINDOWS_RESTORE_OUTCOME_UNPROVEN",
+                "injected unprovable Windows activation outcome",
+                mutation_may_have_started=True,
+            )
+        if _interlock(self.active_db) == self.operation_id:
+            stage_name = intent.get("stage_name")
+            stage = self.active_db.parent / stage_name if isinstance(stage_name, str) else None
+            if stage is not None and stage.exists():
+                stage.unlink()
+            return {"state": "COMMITTED"}
+        return {"state": "NOT_COMMITTED"}
+
+    def verify_active(self, intent, proof, *, interlock_required: bool):
+        info = self.active_db.stat()
+        assert (info.st_dev, info.st_ino) == (intent["active_device"], intent["active_inode"])
+        expected = self.operation_id if interlock_required else None
+        assert _interlock(self.active_db) == expected
+        return dict(proof)
+
+    def prepare_runtime_handoff(self):
+        self.events.append("windows_runtime_handoff")
+        return {
+            "journal_mode": "wal",
+            "synchronous": 2,
+            "busy_timeout_ms": 5000,
+            "locking_mode": "normal",
+        }
+
+    def clear_interlock(self) -> None:
+        self.events.append("windows_clear_interlock")
+        owner_restore_module._clear_interlock(self.active_db, self.operation_id)
+
+    def restore_interlock(self) -> None:
+        self.events.append("windows_restore_interlock")
+        owner_restore_module._write_interlock(self.active_db, self.operation_id)
+
+    def retain_fail_closed(self) -> None:
+        self.retained = True
+        self.events.append("windows_retain_fail_closed")
 
 
 def _disk_usage_with_free(free: int):
@@ -760,6 +928,301 @@ def test_full_restore_success_creates_pre_restore_snapshot_promotes_verified_ima
         assert conn.execute("SELECT value FROM adapter_meta WHERE key='sensitive_recovery_interlock'").fetchone() is None
     finally:
         conn.close()
+
+
+def test_windows_restore_operator_orders_exclusion_snapshot_promotion_release_and_resume(tmp_path: Path) -> None:
+    active = tmp_path / "active.db"
+    replacement_source = tmp_path / "replacement-source.db"
+    _db(active, "current")
+    _db(replacement_source, "replacement")
+    registry = ArtifactRegistry(tmp_path / "artifacts")
+    replacement = create_consistent_backup(replacement_source, registry, artifact_id="replacement")
+    events: list[str] = []
+    coordinator = _Coordinator(active_db=active, events=events)
+    service_state = _ServiceState(events=events)
+
+    def operator_factory(**kwargs):
+        return _FakeWindowsRestoreOperator(events=events, **kwargs)
+
+    def product_proof(**kwargs):
+        events.append("product_proof")
+        return _verified_product_proof(**kwargs)
+
+    service = _service(
+        active_db=active,
+        registry=registry,
+        state_dir=tmp_path / "state",
+        service_state=service_state,
+        coordinator=coordinator,
+        authorize=lambda _preview: events.append("authorize"),
+        postflight=lambda _db, _capability: pytest.fail("Windows handle-bound postflight must not call POSIX callback"),
+        invalidate_sessions=lambda: events.append("invalidate"),
+        post_activation_verify=product_proof,
+        windows_restore_operator_factory=operator_factory,
+    )
+    preview = service.preview(artifact_id=replacement["artifact_id"], trusted_origin_attested=True)
+
+    result = asyncio.run(service.execute(preview=preview, operation_id=_Prepared.operation_id, now=100.0))
+
+    assert result["status"] == "OK"
+    assert _read(active) == "replacement"
+    assert _interlock(active) is None
+    assert events == [
+        "service_begin",
+        "prepare",
+        "windows_exclusive_acquire",
+        "windows_snapshot",
+        "authorize",
+        "windows_prepare_activation",
+        "windows_activate",
+        "windows_postflight",
+        "begin_activation",
+        "invalidate",
+        "windows_runtime_handoff",
+        "windows_clear_interlock",
+        "publish_running",
+        "windows_exclusive_release",
+        "resume",
+        "product_proof",
+        "service_finish",
+    ]
+    journal = service.read_journal(_Prepared.operation_id)
+    assert journal["phase"] == "VERIFIED"
+    assert journal["windows_snapshot_receipt"]["main"]["sha256"]
+    assert journal["windows_mutation_intent"]["stage_sha256"]
+    assert journal["windows_mutation_proof"]["active_interlock"] == _Prepared.operation_id
+    assert journal["windows_runtime_handoff"]["journal_mode"] == "wal"
+
+
+def test_windows_restore_exclusion_failure_aborts_before_snapshot_authorization_or_database_mutation(tmp_path: Path) -> None:
+    active = tmp_path / "active.db"
+    replacement_source = tmp_path / "replacement-source.db"
+    _db(active, "current")
+    _db(replacement_source, "replacement")
+    registry = ArtifactRegistry(tmp_path / "artifacts")
+    replacement = create_consistent_backup(replacement_source, registry, artifact_id="replacement")
+    events: list[str] = []
+    coordinator = _Coordinator(active_db=active, events=events)
+    service_state = _ServiceState(events=events)
+
+    def operator_factory(**kwargs):
+        return _FakeWindowsRestoreOperator(events=events, fail_enter=True, **kwargs)
+
+    service = _service(
+        active_db=active,
+        registry=registry,
+        state_dir=tmp_path / "state",
+        service_state=service_state,
+        coordinator=coordinator,
+        authorize=lambda _preview: pytest.fail("authorization must not run without Windows exclusion"),
+        postflight=lambda _db, _capability: None,
+        windows_restore_operator_factory=operator_factory,
+    )
+    preview = service.preview(artifact_id=replacement["artifact_id"], trusted_origin_attested=True)
+
+    with pytest.raises(AdapterError) as caught:
+        asyncio.run(service.execute(preview=preview, operation_id=_Prepared.operation_id, now=100.0))
+
+    assert caught.value.code == "WINDOWS_RESTORE_EXCLUSION_UNAVAILABLE"
+    assert _read(active) == "current"
+    assert coordinator.aborted is True
+    assert service_state.status == "RUNNING"
+    assert events == ["service_begin", "prepare", "windows_exclusive_acquire", "service_finish"]
+    assert f"pre-restore-{_Prepared.operation_id}" not in registry._load()
+    assert service.read_journal(_Prepared.operation_id)["phase"] == "ABORTED_BEFORE_ACTIVATION"
+
+
+def test_windows_restore_postcommit_ambiguity_is_classified_released_and_recovered_from_intent(
+    tmp_path: Path,
+) -> None:
+    active = tmp_path / "active.db"
+    replacement_source = tmp_path / "replacement-source.db"
+    _db(active, "current")
+    _db(replacement_source, "replacement")
+    registry = ArtifactRegistry(tmp_path / "artifacts")
+    replacement = create_consistent_backup(replacement_source, registry, artifact_id="replacement")
+    events: list[str] = []
+    coordinator = _Coordinator(active_db=active, events=events)
+    service_state = _ServiceState(events=events)
+    attempts = 0
+
+    def operator_factory(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        return _FakeWindowsRestoreOperator(events=events, fail_promote=attempts == 1, **kwargs)
+
+    service = _service(
+        active_db=active,
+        registry=registry,
+        state_dir=tmp_path / "state",
+        service_state=service_state,
+        coordinator=coordinator,
+        authorize=lambda _preview: events.append("authorize_initial"),
+        postflight=lambda _db, _capability: None,
+        invalidate_sessions=lambda: events.append("invalidate"),
+        post_activation_verify=lambda **kwargs: _verified_product_proof(**kwargs),
+        windows_restore_operator_factory=operator_factory,
+    )
+    preview = service.preview(artifact_id=replacement["artifact_id"], trusted_origin_attested=True)
+
+    with pytest.raises(RestoreRecoveryRequired):
+        asyncio.run(service.execute(preview=preview, operation_id=_Prepared.operation_id, now=100.0))
+
+    assert _read(active) == "replacement"
+    assert service_state.status == "RECOVERY_REQUIRED"
+    assert coordinator.state == "RECOVERY_REQUIRED"
+    assert "windows_retain_fail_closed" not in events
+    assert "windows_classify_activation" in events
+    journal = service.read_journal(_Prepared.operation_id)
+    assert journal["phase"] == "WINDOWS_MUTATION_INTENT"
+    assert journal["windows_mutation_recovery_required"] is True
+    assert journal["windows_mutation_classification"]["state"] == "COMMITTED"
+    assert journal["windows_exclusion_retained"] is False
+    assert journal["windows_runtime_handoff"]["journal_mode"] == "wal"
+    stage = active.parent / journal["windows_mutation_intent"]["stage_name"]
+    assert not stage.exists()
+
+    recovered = asyncio.run(
+        service.execute(
+            preview=preview,
+            operation_id=_Prepared.operation_id,
+            now=101.0,
+            authorize=lambda _preview: events.append("authorize_recovery"),
+        )
+    )
+
+    assert recovered["status"] == "OK"
+    assert recovered["idempotent_replay"] is True
+    assert _read(active) == "replacement"
+    assert not stage.exists()
+    assert coordinator.rearm_calls == 1
+    assert service_state.status == "RUNNING"
+    assert events.index("windows_recover_activation") < events.index("rearm_recovery")
+    assert events.index("windows_exclusive_release", events.index("windows_recover_activation")) < events.index("resume")
+    assert service.read_journal(_Prepared.operation_id)["phase"] == "VERIFIED"
+
+
+def test_windows_restore_prebackup_failure_aborts_without_recovery_or_retained_exclusion(tmp_path: Path) -> None:
+    active = tmp_path / "active.db"
+    replacement_source = tmp_path / "replacement-source.db"
+    _db(active, "current")
+    _db(replacement_source, "replacement")
+    registry = ArtifactRegistry(tmp_path / "artifacts")
+    replacement = create_consistent_backup(replacement_source, registry, artifact_id="replacement")
+    events: list[str] = []
+    coordinator = _Coordinator(active_db=active, events=events)
+    service_state = _ServiceState(events=events)
+
+    def operator_factory(**kwargs):
+        return _FakeWindowsRestoreOperator(events=events, fail_before_backup=True, **kwargs)
+
+    service = _service(
+        active_db=active,
+        registry=registry,
+        state_dir=tmp_path / "state",
+        service_state=service_state,
+        coordinator=coordinator,
+        authorize=lambda _preview: None,
+        postflight=lambda _db, _capability: None,
+        windows_restore_operator_factory=operator_factory,
+    )
+    preview = service.preview(artifact_id=replacement["artifact_id"], trusted_origin_attested=True)
+
+    with pytest.raises(WindowsRestoreMutationError) as caught:
+        asyncio.run(service.execute(preview=preview, operation_id=_Prepared.operation_id, now=100.0))
+
+    assert caught.value.mutation_may_have_started is False
+    assert _read(active) == "current"
+    assert coordinator.aborted is True
+    assert coordinator.recovery is False
+    assert service_state.status == "RUNNING"
+    assert "windows_retain_fail_closed" not in events
+    assert "windows_classify_activation" not in events
+    assert not list(active.parent.glob(f".{active.name}.restore-*.stage"))
+    assert service.read_journal(_Prepared.operation_id)["phase"] == "ABORTED_BEFORE_ACTIVATION"
+
+
+def test_windows_restore_unprovable_postbackup_outcome_retains_exclusion_fail_closed(tmp_path: Path) -> None:
+    active = tmp_path / "active.db"
+    replacement_source = tmp_path / "replacement-source.db"
+    _db(active, "current")
+    _db(replacement_source, "replacement")
+    registry = ArtifactRegistry(tmp_path / "artifacts")
+    replacement = create_consistent_backup(replacement_source, registry, artifact_id="replacement")
+    events: list[str] = []
+    coordinator = _Coordinator(active_db=active, events=events)
+    service_state = _ServiceState(events=events)
+
+    def operator_factory(**kwargs):
+        return _FakeWindowsRestoreOperator(events=events, fail_promote=True, fail_classify=True, **kwargs)
+
+    service = _service(
+        active_db=active,
+        registry=registry,
+        state_dir=tmp_path / "state",
+        service_state=service_state,
+        coordinator=coordinator,
+        authorize=lambda _preview: None,
+        postflight=lambda _db, _capability: None,
+        windows_restore_operator_factory=operator_factory,
+    )
+    preview = service.preview(artifact_id=replacement["artifact_id"], trusted_origin_attested=True)
+
+    with pytest.raises(RestoreRecoveryRequired):
+        asyncio.run(service.execute(preview=preview, operation_id=_Prepared.operation_id, now=100.0))
+
+    assert _read(active) == "replacement"
+    assert service_state.status == "RECOVERY_REQUIRED"
+    assert coordinator.state == "RECOVERY_REQUIRED"
+    assert "windows_retain_fail_closed" in events
+    assert "windows_exclusive_release" not in events
+    journal = service.read_journal(_Prepared.operation_id)
+    assert journal["phase"] == "WINDOWS_MUTATION_INTENT"
+    assert journal["windows_exclusion_retained"] is True
+    assert journal["windows_mutation_classification"] is None
+
+
+def test_windows_restore_publish_failure_restores_interlock_and_retains_exclusion(tmp_path: Path) -> None:
+    active = tmp_path / "active.db"
+    replacement_source = tmp_path / "replacement-source.db"
+    _db(active, "current")
+    _db(replacement_source, "replacement")
+    registry = ArtifactRegistry(tmp_path / "artifacts")
+    replacement = create_consistent_backup(replacement_source, registry, artifact_id="replacement")
+    events: list[str] = []
+    coordinator = _Coordinator(active_db=active, events=events)
+    coordinator.fail_publish = True
+    service_state = _ServiceState(events=events)
+
+    def operator_factory(**kwargs):
+        return _FakeWindowsRestoreOperator(events=events, **kwargs)
+
+    service = _service(
+        active_db=active,
+        registry=registry,
+        state_dir=tmp_path / "state",
+        service_state=service_state,
+        coordinator=coordinator,
+        authorize=lambda _preview: None,
+        postflight=lambda _db, _capability: None,
+        windows_restore_operator_factory=operator_factory,
+    )
+    preview = service.preview(artifact_id=replacement["artifact_id"], trusted_origin_attested=True)
+
+    with pytest.raises(RestoreRecoveryRequired):
+        asyncio.run(service.execute(preview=preview, operation_id=_Prepared.operation_id, now=100.0))
+
+    assert _read(active) == "replacement"
+    assert _interlock(active) == _Prepared.operation_id
+    assert service_state.status == "RECOVERY_REQUIRED"
+    assert coordinator.state == "RECOVERY_REQUIRED"
+    assert "windows_runtime_handoff" in events
+    assert events.index("windows_clear_interlock") < events.index("publish_running")
+    assert events.index("publish_running") < events.index("windows_restore_interlock")
+    assert events.index("windows_restore_interlock") < events.index("windows_retain_fail_closed")
+    journal = service.read_journal(_Prepared.operation_id)
+    assert journal["phase"] == "RECOVERY_REQUIRED"
+    assert journal["windows_runtime_handoff"]["journal_mode"] == "wal"
 
 
 def test_post_activation_proof_binds_fresh_restored_metadata_and_resumed_runtime_identity(

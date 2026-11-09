@@ -57,6 +57,14 @@ _MANUAL_RECHECK_METHODS = frozenset(
     {"OWNER_HASHED_SOURCE", "OWNER_REVIEWED_SOURCE", "TRUSTED_LOCAL_RESULT_REFERENCE"}
 )
 _MANUAL_RECHECK_CLAIMS = frozenset({"OBSERVED_HASH", "UNAVAILABLE", "INDETERMINATE"})
+_BATCH_SYSTEMIC_STOP_CODES = frozenset(
+    {
+        "EMBEDDING_UNAVAILABLE",
+        "BACKEND_UNAVAILABLE",
+        "PROFILE_MISMATCH",
+        "WRITE_UNCONFIRMED",
+    }
+)
 _STATUS_LIFECYCLE_STATES = (
     "CANDIDATE",
     "VALIDATED_CURRENT",
@@ -558,6 +566,140 @@ class OwnerControlService:
         }
 
     @owner_adapter_request
+    async def activity(
+        self,
+        *,
+        scope: str | None = None,
+        project_id: str | None = None,
+        worktree_id: str | None = None,
+        workflow_id: str | None = None,
+        agent_id: str | None = None,
+        operation_kind: str | None = None,
+        actor_class: str | None = None,
+        result_outcome: str | None = None,
+        occurred_after: str | None = None,
+        occurred_before: str | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        page_size = validate_owner_page_size(limit)
+        if scope is None:
+            if any(value is not None for value in (project_id, worktree_id, workflow_id, agent_id)):
+                raise AdapterError("INVALID_ENVELOPE", "activity scope identifiers require an exact scope")
+            exact_scope = None
+            cursor_scope = validate_scope("GLOBAL_USER")
+        else:
+            exact_scope = self._scope(scope, project_id, worktree_id, workflow_id, agent_id)
+            cursor_scope = exact_scope
+        after_time = parse_iso(occurred_after)
+        before_time = parse_iso(occurred_before)
+        if after_time is not None and before_time is not None and after_time > before_time:
+            raise AdapterError("INVALID_TIMESTAMP", "activity start time must not be after end time")
+        after_text = after_time.isoformat().replace("+00:00", "Z") if after_time is not None else None
+        before_text = before_time.isoformat().replace("+00:00", "Z") if before_time is not None else None
+        filters = {
+            "kind": "activity",
+            "scope_filter": exact_scope.to_dict() if exact_scope is not None else None,
+            "operation_kind": validate_identifier(operation_kind, "operation_kind") if operation_kind else None,
+            "actor_class": validate_identifier(actor_class, "actor_class") if actor_class else None,
+            "result_outcome": validate_identifier(result_outcome, "result_outcome") if result_outcome else None,
+            "occurred_after": after_text,
+            "occurred_before": before_text,
+        }
+        after = decode_page_cursor(cursor, cursor_scope, filters)
+
+        def query() -> list[tuple[Any, ...]]:
+            assert self._engine.conn is not None
+            clauses = ["1=1"]
+            values: list[Any] = []
+            if exact_scope is not None:
+                where, params = self._engine._scope_where(exact_scope)
+                clauses.append(where)
+                values.extend(params)
+            if filters["operation_kind"] is not None:
+                clauses.append("o.operation_kind=?")
+                values.append(filters["operation_kind"])
+            if filters["actor_class"] is not None:
+                clauses.append("o.actor_class=?")
+                values.append(filters["actor_class"])
+            if filters["result_outcome"] is not None:
+                clauses.append("o.result_outcome=?")
+                values.append(filters["result_outcome"])
+            if filters["occurred_after"] is not None:
+                clauses.append("o.commit_timestamp>=?")
+                values.append(filters["occurred_after"])
+            if filters["occurred_before"] is not None:
+                clauses.append("o.commit_timestamp<=?")
+                values.append(filters["occurred_before"])
+            if after is not None:
+                clauses.append("(o.commit_timestamp < ? OR (o.commit_timestamp = ? AND o.operation_id < ?))")
+                values.extend([after[0], after[0], after[1]])
+            return self._engine.conn.execute(
+                "SELECT o.operation_id,o.request_id,o.operation_kind,o.actor_class,o.target_memory_id,"
+                "o.target_record_id,o.result_record_id,o.result_revision,o.result_lifecycle_state,"
+                "o.result_outcome,o.replay_status,o.commit_timestamp,"
+                "a.scope,a.project_id,a.worktree_id,a.workflow_id,a.agent_id "
+                "FROM lifecycle_operations o LEFT JOIN adapter_records a ON a.record_id="
+                "COALESCE(o.result_record_id,o.target_record_id,o.winner_record_id) "
+                f"WHERE {' AND '.join(clauses)} ORDER BY o.commit_timestamp DESC,o.operation_id DESC LIMIT ?",
+                [*values, page_size + 1],
+            ).fetchall()
+
+        rows = await self._engine._run(query)
+        visible = rows[:page_size]
+        items = [
+            {
+                "domain": "LIFECYCLE",
+                "operation_id": str(row[0]),
+                "correlation_reference": str(row[1]),
+                "operation": str(row[2]),
+                "actor": str(row[3]),
+                "target": {"memory_id": row[4], "record_id": row[6] or row[5]},
+                "result": {
+                    "revision": row[7],
+                    "lifecycle_state": row[8],
+                    "outcome": row[9],
+                    "replay_status": row[10],
+                },
+                "time": str(row[11]),
+                "scope": {
+                    "scope": row[12],
+                    "project_id": row[13],
+                    "worktree_id": row[14],
+                    "workflow_id": row[15],
+                    "agent_id": row[16],
+                }
+                if row[12] is not None
+                else None,
+            }
+            for row in visible
+        ]
+        next_cursor = None
+        if len(rows) > page_size and visible:
+            last = visible[-1]
+            next_cursor = encode_page_cursor(
+                cursor_scope,
+                filters,
+                created_at=str(last[11]),
+                record_id=str(last[0]),
+            )
+        return {
+            "status": "OK",
+            "request_id": self._request_id(request_id),
+            "filters": {
+                "scope": exact_scope.to_dict() if exact_scope is not None else None,
+                "operation_kind": filters["operation_kind"],
+                "actor_class": filters["actor_class"],
+                "result_outcome": filters["result_outcome"],
+                "occurred_after": filters["occurred_after"],
+                "occurred_before": filters["occurred_before"],
+            },
+            "items": items,
+            "next_cursor": next_cursor,
+        }
+
+    @owner_adapter_request
     async def conflicts(
         self,
         *,
@@ -880,8 +1022,20 @@ class OwnerControlService:
                 )
 
         outcomes: list[dict[str, Any]] = []
-        counts = {"applied": 0, "conflicted": 0, "failed": 0}
+        counts = {"applied": 0, "conflicted": 0, "failed": 0, "unattempted": 0}
+        systemic_stop_code: str | None = None
         for item in prepared:
+            if systemic_stop_code is not None:
+                counts["unattempted"] += 1
+                outcomes.append(
+                    {
+                        "status": "UNATTEMPTED",
+                        "memory_id": item["memory_id"],
+                        "expected_record_id": item["expected_record_id"],
+                        "blocked_by_error_code": systemic_stop_code,
+                    }
+                )
+                continue
             try:
                 preflight_error = item.get("preflight_error")
                 if isinstance(preflight_error, AdapterError):
@@ -922,6 +1076,8 @@ class OwnerControlService:
                         "message": exc.safe_message,
                     }
                 )
+                if not conflict and exc.code in _BATCH_SYSTEMIC_STOP_CODES:
+                    systemic_stop_code = exc.code
             else:
                 counts["applied"] += 1
                 outcomes.append(
@@ -933,7 +1089,11 @@ class OwnerControlService:
                     }
                 )
 
-        status = "OK" if counts["conflicted"] == 0 and counts["failed"] == 0 else "PARTIAL"
+        status = (
+            "OK"
+            if counts["conflicted"] == 0 and counts["failed"] == 0 and counts["unattempted"] == 0
+            else "PARTIAL"
+        )
         return {
             "status": status,
             "request_id": self._request_id(request_id),

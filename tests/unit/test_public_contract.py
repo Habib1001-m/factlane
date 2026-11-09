@@ -222,6 +222,11 @@ def test_store_and_update_contracts_explain_governed_write_fields() -> None:
     assert "idempotency_key" in store["required"]
     assert "authority_role" not in store["properties"]
     assert "expected_revision" in update["required"]
+    expected_record = update["properties"]["expected_record_id"]
+    expected_record_description = expected_record["description"]
+    assert "promoting a CANDIDATE with REVERIFY" in expected_record_description
+    assert "Owner-only REVOKE/REJECT" in expected_record_description
+    assert "expected_record_id" not in update["required"]
     assert set(update["properties"]["mode"]["enum"]) == {"REVERIFY", "REPLACE", "REVOKE", "REJECT"}
     assert "observed_group_token" in update["properties"]
     assert "reason_code" in update["properties"]
@@ -244,8 +249,22 @@ def test_runtime_constants_cli_help_and_mcp_schema_stay_in_parity() -> None:
     assert _request_schema("memory_update")["properties"]["mode"]["enum"] == sorted(UPDATE_MODES)
 
     help_text = render_tool_help()
+    assert "required when promoting a CANDIDATE with REVERIFY and for Owner-only REVOKE/REJECT" in help_text
+    assert "Owner-only REVOKE/REJECT additionally require expected_record_id" in help_text
     for value in (*PUBLIC_TOOL_NAMES, *INTENT_CLASSES, *RETRIEVAL_MODES, *RETRIEVAL_MODE_KINDS, *UPDATE_MODES):
         assert value in help_text
+
+
+def test_cli_help_tools_preserves_expected_record_id_runtime_requirement() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", "from factlane.server import main; main(['--help-tools'])"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "required when promoting a CANDIDATE with REVERIFY and for Owner-only REVOKE/REJECT" in result.stdout
+    assert "Owner-only REVOKE/REJECT additionally require expected_record_id" in result.stdout
 
 
 def test_gateway_operation_surface_uses_the_canonical_tool_names() -> None:

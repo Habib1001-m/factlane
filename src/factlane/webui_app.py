@@ -5,16 +5,20 @@ import hashlib
 import inspect
 import json
 import os
+import re
+import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import metadata as importlib_metadata
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -27,13 +31,14 @@ from .adapter import (
 )
 from .contract import AdapterError, ScopeContext, validate_scope
 from .embeddings import EmbeddingProfile
+from .embedding_compatibility import parse_embedding_profile_metadata
 from .maintenance_coordinator import (
     MaintenanceBarrierStore,
     MaintenanceCoordinator,
     MaintenanceCoordinatorError,
     ResumeReport,
 )
-from .owner_auth import NativeConfirmation, OwnerAuthState
+from .owner_auth import NativeConfirmation, NativeConfirmationRequest, OwnerAuthState
 from .owner_control import OwnerAdapterMaintenanceGate, OwnerControlService
 from .owner_database import (
     ArtifactRegistry,
@@ -43,8 +48,8 @@ from .owner_database import (
 )
 from .owner_database_service import OwnerDatabaseService
 from .owner_destructive import OwnerDestructiveOrchestrator, PurgeTargetIdentity
-from .owner_http import OwnerHTTPServer
-from .owner_native_control import OwnerNativeControlServer, ZenityNativeConfirmation
+from .owner_http import OwnerHTTPServer, OwnerSetupError, WindowsOwnerHTTPServer
+from .owner_native_control import OwnerNativeControlServer, WindowsOwnerNativeControlServer, ZenityNativeConfirmation
 from .owner_operations import OwnerOperationsService
 from .owner_overview import OwnerOverviewService
 from .owner_restore import FullRestoreService, RestoreRecoveryRequired
@@ -63,14 +68,77 @@ from .runtime_control import (
     RuntimeControlRequest,
     RuntimeIdentity,
     RuntimeRegistry,
+    WindowsRuntimeControlClient,
 )
-from .storage import LOGICAL_EXPORT_LIFECYCLE_STATES, STORAGE_CONTRACT_VERSION, SQLiteVecEngine
-from .webui_runtime import BackendLaunchSpec, BackendMode, WebUIRuntimeConfig, caddy_command
+from .storage import (
+    LOGICAL_EXPORT_LIFECYCLE_STATES,
+    STORAGE_CONTRACT_VERSION,
+    SQLiteVecEngine,
+    inspect_storage_contract_version,
+)
+from .webui_runtime import (
+    BackendLaunchSpec,
+    BackendMode,
+    BackendTransportKind,
+    PlatformKind,
+    RuntimeConfigError,
+    WebUIRuntimeConfig,
+    caddy_command,
+    default_runtime_config_path,
+    load_runtime_config,
+)
+from .webui_install import WEBUI_SERVICE_NAME, _atomic_owner_file_write
 from .webui_service import ServiceSnapshot, ServiceStatus, WebUIServiceState
+from .webui_windows import (
+    WindowsManagedConfig,
+    WindowsWebUIError,
+    load_windows_managed_config,
+    prepare_windows_managed_restart,
+    render_windows_managed_config,
+    validate_windows_database_binding_path,
+    windows_boot_id,
+    windows_native_confirm,
+    windows_owner_paths,
+    write_owner_private_text_atomic,
+)
+from .windows_maintenance import WindowsInPlaceMaintenanceLease
+from .windows_owner_purge import WindowsOwnerPurgeOperator, resolve_windows_permanent_purge_targets_exclusive
+from .windows_owner_restore import WindowsOwnerRestoreOperator
+from .windows_security import WindowsSecurityError, current_user_sid, process_identity as windows_process_identity
+from .windows_tls import (
+    build_windows_client_ssl_context,
+    build_windows_server_ssl_context,
+    load_windows_tls_material,
+)
 
 
 AdapterFactory = Callable[..., Awaitable[MemoryAdapter]]
 _CADDY_READINESS_CONNECT_TIMEOUT_SECONDS = 0.2
+
+
+class _WindowsNativeConfirmation:
+    """Owner confirmation through the existing Win32 MessageBox safety boundary."""
+
+    def confirm(self, request: NativeConfirmationRequest) -> bool:
+        parts = [
+            f"Action: {request.kind}",
+            f"Verification phrase: {request.verification_phrase}",
+        ]
+        if request.device_label:
+            parts.append(f"Device: {request.device_label}")
+        if request.origin:
+            parts.append(f"Origin: {request.origin}")
+        if request.locator:
+            parts.append(f"Request: {request.locator}")
+        if request.preview:
+            parts.append(f"Preview: {request.preview}")
+        message = "\n".join(parts)
+        if len(message) > 4096:
+            return False
+        try:
+            return bool(windows_native_confirm(message))
+        except Exception:
+            return False
 
 
 @dataclass(frozen=True)
@@ -366,16 +434,13 @@ class _OwnerAdapterMaintenanceCoordinator:
     async def resume_running(self, prepared, *, new_generation: int) -> ResumeReport:
         report = await self._delegate.resume_running(prepared, new_generation=new_generation)
         failure_code, _reopen_error = await self._reopen_participant_bounded()
+        participant_failures = dict(report.participant_failures)
         if failure_code is not None:
-            return ResumeReport(
-                ready_instance_ids=report.ready_instance_ids,
-                failures=report.failures,
-                participant_failures={"owner_adapter": failure_code},
-            )
+            participant_failures["owner_adapter"] = failure_code
         return ResumeReport(
             ready_instance_ids=report.ready_instance_ids,
             failures=report.failures,
-            participant_failures={},
+            participant_failures=participant_failures,
         )
 
     async def publish_activation_and_resume(self, prepared, *, new_generation: int) -> ResumeReport:
@@ -383,8 +448,17 @@ class _OwnerAdapterMaintenanceCoordinator:
         self.publish_running(prepared, new_generation=new_generation)
         return await self.resume_running(prepared, new_generation=new_generation)
 
-    async def resume_activating(self, prepared, *, new_generation: int):
-        return await self._delegate.resume_activating(prepared, new_generation=new_generation)
+    async def resume_activating(self, prepared, *, new_generation: int) -> ResumeReport:
+        report = await self._delegate.resume_activating(prepared, new_generation=new_generation)
+        failure_code, _reopen_error = await self._reopen_participant_bounded()
+        participant_failures = dict(report.participant_failures)
+        if failure_code is not None:
+            participant_failures["owner_adapter"] = failure_code
+        return ResumeReport(
+            ready_instance_ids=report.ready_instance_ids,
+            failures=report.failures,
+            participant_failures=participant_failures,
+        )
 
     def rearm_recovery(self, prepared):
         return self._delegate.rearm_recovery(prepared)
@@ -753,6 +827,9 @@ def _validated_caddy_config(config: WebUIRuntimeConfig) -> WebUIRuntimeConfig:
         caddyfile=config.caddyfile,
         runtime_dir=config.runtime_dir,
         state_dir=config.state_dir,
+        public_origins=config.public_origins,
+        platform_kind=config.platform_kind,
+        backend_transport=config.backend_transport,
     )
 
 
@@ -760,7 +837,7 @@ def create_caddy_process(
     config: WebUIRuntimeConfig,
     argv: tuple[str, ...],
 ) -> _CaddySubprocess:
-    """Start the exact configured Caddy argv and prove its saved TCP listener before readiness."""
+    """Start the exact configured Caddy argv and prove its loopback TCP listener."""
 
     validated = _validated_caddy_config(config)
     expected_argv = caddy_command(validated)
@@ -772,7 +849,11 @@ def create_caddy_process(
     if host is None or port is None or parsed.scheme != "https":
         raise ValueError("Caddy readiness origin is unsafe")
     process = subprocess.Popen(argv, shell=False)
-    return _CaddySubprocess(process, host=host, port=port)
+    # The managed .test hostname is intentionally resolvable only inside the
+    # isolated Firefox profile.  Internal process-liveness probing therefore
+    # targets the exact loopback bind directly; setup's outer HTTPS probe owns
+    # the stronger CA/SNI/Host/backend-readiness proof before CLAIMED.
+    return _CaddySubprocess(process, host="127.0.0.1", port=port)
 
 
 class _RegistryRuntimeObserver:
@@ -834,6 +915,868 @@ class _UnconfiguredOperationsConfig:
         raise AdapterError("SETTING_NOT_ALLOWED", "no Owner-editable production settings are configured")
 
 
+_WINDOWS_SETUP_HOST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_WINDOWS_SETUP_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_WINDOWS_SETUP_INSTALLATION_ID_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?")
+
+
+def _validate_existing_windows_setup_database(
+    database_path: str,
+    profile_name: str,
+    *,
+    platform_name: str = "Windows",
+) -> None:
+    if not os.path.exists(database_path):
+        return
+    if not os.path.isfile(database_path):
+        raise OwnerSetupError(
+            "SETUP_DATABASE_INVALID",
+            "selected database is not a regular FactLane database file",
+        )
+    try:
+        if os.path.getsize(database_path) <= 0:
+            raise OwnerSetupError(
+                "SETUP_DATABASE_INVALID",
+                "existing database has no FactLane storage contract",
+            )
+    except OSError as exc:
+        raise OwnerSetupError(
+            "SETUP_DATABASE_INVALID",
+            "existing database identity could not be inspected",
+        ) from exc
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="factlane-setup-db-preflight-") as directory:
+            copied = os.path.join(directory, "factlane.db")
+            shutil.copy2(database_path, copied)
+            for suffix in ("-wal", "-shm"):
+                source = database_path + suffix
+                if os.path.exists(source):
+                    shutil.copy2(source, copied + suffix)
+
+            version = inspect_storage_contract_version(copied)
+            if version == 2:
+                raise OwnerSetupError(
+                    "SETUP_DATABASE_MIGRATION_REQUIRED",
+                    f"selected database uses storage v2 and must be migrated before {platform_name} setup can bind it",
+                    status=409,
+                )
+            if version != STORAGE_CONTRACT_VERSION:
+                raise OwnerSetupError(
+                    "SETUP_DATABASE_INVALID",
+                    "selected database is not a current FactLane storage database",
+                )
+
+            uri = "file:" + quote(copied, safe="/") + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            try:
+                import sqlite_vec
+
+                conn.enable_load_extension(True)
+                try:
+                    sqlite_vec.load(conn)
+                finally:
+                    conn.enable_load_extension(False)
+                row = conn.execute(
+                    "SELECT value FROM adapter_meta WHERE key='embedding_profile'"
+                ).fetchone()
+                if row is None:
+                    materialized = sum(
+                        int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                        for table in ("adapter_records", "memories", "memory_embeddings")
+                    )
+                    if materialized:
+                        raise OwnerSetupError(
+                            "SETUP_DATABASE_PROFILE_UNPROVEN",
+                            "existing FactLane records have no stored embedding profile binding",
+                            status=409,
+                        )
+                    return
+                try:
+                    raw_profile = json.loads(row[0])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise OwnerSetupError(
+                        "SETUP_DATABASE_PROFILE_INVALID",
+                        "stored embedding profile metadata is invalid",
+                        status=409,
+                    ) from exc
+                stored_profile = parse_embedding_profile_metadata(raw_profile)
+                if stored_profile is None:
+                    raise OwnerSetupError(
+                        "SETUP_DATABASE_PROFILE_INVALID",
+                        "stored embedding profile metadata is invalid",
+                        status=409,
+                    )
+                selected = _configured_embedding_profile(profile_name)
+                if stored_profile.get("semantic_identity") != selected.semantic_identity():
+                    raise OwnerSetupError(
+                        "SETUP_DATABASE_PROFILE_MISMATCH",
+                        "selected embedding profile does not match the existing database binding",
+                        status=409,
+                    )
+            finally:
+                conn.close()
+    except OwnerSetupError:
+        raise
+    except AdapterError as exc:
+        raise OwnerSetupError(
+            "SETUP_DATABASE_INVALID",
+            "existing database failed FactLane storage validation",
+        ) from exc
+    except (ImportError, OSError, sqlite3.Error) as exc:
+        raise OwnerSetupError(
+            "SETUP_DATABASE_INVALID",
+            "existing database could not be inspected safely",
+        ) from exc
+
+
+class _WindowsSetupBindingService:
+    """Bind the missing Windows memory authority from the authenticated setup shell."""
+
+    def __init__(
+        self,
+        *,
+        config_path: str,
+        baseline_config: WindowsManagedConfig,
+        owner_sid: str,
+        supported_profiles: set[str] | frozenset[str],
+        config_loader: Callable[..., WindowsManagedConfig | None] = load_windows_managed_config,
+        config_writer: Callable[..., None] = write_owner_private_text_atomic,
+        database_validator: Callable[..., str] = validate_windows_database_binding_path,
+        database_inspector: Callable[[str, str], None] = _validate_existing_windows_setup_database,
+        restart_preparer: Callable[[], Any] = prepare_windows_managed_restart,
+    ) -> None:
+        if any(
+            value is not None
+            for value in (baseline_config.db, baseline_config.profile, baseline_config.host_id)
+        ):
+            raise ValueError("Windows setup binding requires an unconfigured managed config")
+        self.config_path = config_path
+        self.baseline_config = baseline_config
+        self.owner_sid = owner_sid
+        self.supported_profiles = frozenset(supported_profiles)
+        if not self.supported_profiles:
+            raise ValueError("Windows setup binding requires at least one supported profile")
+        self._config_loader = config_loader
+        self._config_writer = config_writer
+        self._database_validator = database_validator
+        self._database_inspector = database_inspector
+        self._restart_preparer = restart_preparer
+        self._lock = threading.Lock()
+        self._published_config: WindowsManagedConfig | None = None
+        self._restart_plan: Any | None = None
+        self._restart_request_id: str | None = None
+        self._restart_handed_off = False
+        self._restart_error: str | None = None
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            current = self._load_current()
+            if current == self.baseline_config:
+                return self._setup_required_payload()
+            if self._published_config is not None and current == self._published_config:
+                payload: dict[str, Any] = {
+                    "status": (
+                        "CONFIG_PUBLISHED_RESTART_REQUIRED"
+                        if self._restart_error is not None
+                        else "CONFIG_PUBLISHED_RESTART_REQUESTED"
+                    ),
+                    "profiles": sorted(self.supported_profiles),
+                    "suggested_host_id": self._suggested_host_id(),
+                    "suggested_db": self._suggested_database_path(),
+                    "binding": {
+                        "db": current.db,
+                        "profile": current.profile,
+                        "host_id": current.host_id,
+                    },
+                }
+                if self._restart_error is not None:
+                    payload["restart_error"] = self._restart_error
+                return payload
+            raise OwnerSetupError(
+                "SETUP_CONFIG_CHANGED",
+                "managed Windows configuration changed while setup was active",
+                status=409,
+            )
+
+    def bind(
+        self,
+        *,
+        db: str,
+        profile: str,
+        host_id: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._validate_request_id(request_id)
+            if profile not in self.supported_profiles:
+                raise OwnerSetupError(
+                    "SETUP_PROFILE_UNSUPPORTED",
+                    "selected embedding profile is not supported",
+                )
+            if _WINDOWS_SETUP_HOST_ID_RE.fullmatch(host_id) is None:
+                raise OwnerSetupError(
+                    "SETUP_HOST_ID_INVALID",
+                    "host ID must be a bounded non-secret identifier",
+                )
+            try:
+                canonical_db = self._database_validator(db, owner_sid=self.owner_sid)
+            except WindowsWebUIError as exc:
+                raise OwnerSetupError(exc.code, exc.safe_message) from exc
+            except Exception as exc:
+                raise OwnerSetupError(
+                    "WINDOWS_DATABASE_PATH_INVALID",
+                    "database path could not be validated safely",
+                ) from exc
+            self._database_inspector(canonical_db, profile)
+
+            current = self._load_current()
+            if self._published_config is not None and current == self._published_config:
+                if (
+                    current.db != canonical_db
+                    or current.profile != profile
+                    or current.host_id != host_id
+                ):
+                    raise OwnerSetupError(
+                        "SETUP_ALREADY_CONFIGURED",
+                        "managed Windows memory binding is already published",
+                        status=409,
+                    )
+                if self._restart_error is None:
+                    return {
+                        "status": "CONFIG_PUBLISHED",
+                        "restart": "REQUESTED",
+                        "request_id": self._restart_request_id or request_id,
+                    }
+                restart_plan = self._prepare_restart()
+                self._restart_plan = restart_plan
+                self._restart_request_id = request_id
+                self._restart_handed_off = False
+                self._restart_error = None
+                return {
+                    "status": "CONFIG_PUBLISHED",
+                    "restart": "REQUESTED",
+                    "request_id": request_id,
+                }
+            if current != self.baseline_config:
+                raise OwnerSetupError(
+                    "SETUP_CONFIG_CHANGED",
+                    "managed Windows configuration changed while setup was active",
+                    status=409,
+                )
+
+            restart_plan = self._prepare_restart()
+            published = replace(
+                current,
+                db=canonical_db,
+                profile=profile,
+                host_id=host_id,
+            )
+            try:
+                self._config_writer(
+                    self.config_path,
+                    render_windows_managed_config(published),
+                    owner_sid=self.owner_sid,
+                )
+                observed = self._config_loader(self.config_path, owner_sid=self.owner_sid)
+                if observed != published:
+                    raise WindowsWebUIError(
+                        "WINDOWS_CONFIG_PUBLICATION_UNVERIFIED",
+                        "managed Windows configuration publication could not be verified",
+                    )
+            except Exception as exc:
+                self._restore_baseline_after_publication_failure()
+                if isinstance(exc, WindowsWebUIError):
+                    raise OwnerSetupError(exc.code, exc.safe_message, status=500) from exc
+                raise OwnerSetupError(
+                    "WINDOWS_CONFIG_PUBLICATION_FAILED",
+                    "managed Windows configuration could not be published safely",
+                    status=500,
+                ) from exc
+
+            self._published_config = published
+            self._restart_plan = restart_plan
+            self._restart_request_id = request_id
+            self._restart_handed_off = False
+            self._restart_error = None
+            return {
+                "status": "CONFIG_PUBLISHED",
+                "restart": "REQUESTED",
+                "request_id": request_id,
+            }
+
+    def handoff_restart(self, request_id: str) -> bool:
+        with self._lock:
+            if (
+                request_id != self._restart_request_id
+                or self._restart_plan is None
+                or self._restart_handed_off
+            ):
+                return False
+            plan = self._restart_plan
+            try:
+                plan.handoff()
+            except WindowsWebUIError as exc:
+                self._restart_error = exc.code
+                self._restart_plan = None
+                return False
+            except Exception:
+                self._restart_error = "WINDOWS_RESTART_HANDOFF_FAILED"
+                self._restart_plan = None
+                return False
+            self._restart_handed_off = True
+            self._restart_plan = None
+            return True
+
+    def _prepare_restart(self) -> Any:
+        try:
+            return self._restart_preparer()
+        except WindowsWebUIError as exc:
+            raise OwnerSetupError(exc.code, exc.safe_message, status=503) from exc
+        except Exception as exc:
+            raise OwnerSetupError(
+                "WINDOWS_RESTART_UNAVAILABLE",
+                "managed Windows restart could not be proven before configuration publication",
+                status=503,
+            ) from exc
+
+    def _load_current(self) -> WindowsManagedConfig:
+        try:
+            current = self._config_loader(self.config_path, owner_sid=self.owner_sid)
+        except WindowsWebUIError as exc:
+            raise OwnerSetupError(exc.code, exc.safe_message, status=500) from exc
+        except Exception as exc:
+            raise OwnerSetupError(
+                "WINDOWS_CONFIG_INVALID",
+                "managed Windows configuration could not be read safely",
+                status=500,
+            ) from exc
+        if current is None:
+            raise OwnerSetupError(
+                "WINDOWS_MANAGED_CONFIG_UNAVAILABLE",
+                "managed Windows configuration is unavailable",
+                status=409,
+            )
+        return current
+
+    def _restore_baseline_after_publication_failure(self) -> None:
+        try:
+            observed = self._config_loader(self.config_path, owner_sid=self.owner_sid)
+            if observed == self.baseline_config:
+                return
+            self._config_writer(
+                self.config_path,
+                render_windows_managed_config(self.baseline_config),
+                owner_sid=self.owner_sid,
+            )
+            restored = self._config_loader(self.config_path, owner_sid=self.owner_sid)
+            if restored != self.baseline_config:
+                raise RuntimeError("baseline verification failed")
+        except Exception as exc:
+            raise OwnerSetupError(
+                "SETUP_CONFIG_RECOVERY_REQUIRED",
+                "managed Windows configuration could not be restored after publication failure",
+                status=500,
+            ) from exc
+
+    def _setup_required_payload(self) -> dict[str, Any]:
+        return {
+            "status": "SETUP_REQUIRED",
+            "profiles": sorted(self.supported_profiles),
+            "suggested_host_id": self._suggested_host_id(),
+            "suggested_db": self._suggested_database_path(),
+        }
+
+    def _suggested_host_id(self) -> str:
+        installation_id = self.baseline_config.installation_id
+        if _WINDOWS_SETUP_INSTALLATION_ID_RE.fullmatch(installation_id) is None:
+            return ""
+        suggested = f"owner-{installation_id}"
+        return suggested if _WINDOWS_SETUP_HOST_ID_RE.fullmatch(suggested) is not None else ""
+
+    def _suggested_database_path(self) -> str:
+        return str(PureWindowsPath(self.baseline_config.state_dir) / "memory.db")
+
+    @staticmethod
+    def _validate_request_id(request_id: str) -> None:
+        if _WINDOWS_SETUP_REQUEST_ID_RE.fullmatch(request_id) is None:
+            raise OwnerSetupError(
+                "SETUP_REQUEST_ID_INVALID",
+                "setup request ID is invalid",
+            )
+
+
+_LINUX_SETUP_SYSTEMCTL_TIMEOUT_SECONDS = 5.0
+
+
+def _run_linux_setup_systemctl(argv: tuple[str, ...]) -> tuple[int, str]:
+    completed = subprocess.run(
+        argv,
+        check=False,
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=_LINUX_SETUP_SYSTEMCTL_TIMEOUT_SECONDS,
+    )
+    return completed.returncode, completed.stdout
+
+
+class _LinuxManagedRestartPlan:
+    def __init__(
+        self,
+        systemctl_path: str,
+        *,
+        runner: Callable[[tuple[str, ...]], tuple[int, str]] = _run_linux_setup_systemctl,
+    ) -> None:
+        self.systemctl_path = systemctl_path
+        self._runner = runner
+
+    def handoff(self) -> None:
+        try:
+            returncode, _stdout = self._runner(
+                (
+                    self.systemctl_path,
+                    "--user",
+                    "restart",
+                    "--no-block",
+                    WEBUI_SERVICE_NAME,
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError("managed Linux restart handoff failed") from exc
+        if returncode != 0:
+            raise RuntimeError("managed Linux restart handoff failed")
+
+
+def _prepare_linux_managed_restart(
+    *,
+    systemctl_resolver: Callable[[str], str | None] = shutil.which,
+    runner: Callable[[tuple[str, ...]], tuple[int, str]] = _run_linux_setup_systemctl,
+) -> _LinuxManagedRestartPlan:
+    systemctl_path = systemctl_resolver("systemctl")
+    if (
+        not isinstance(systemctl_path, str)
+        or not os.path.isabs(systemctl_path)
+        or not os.path.isfile(systemctl_path)
+        or not os.access(systemctl_path, os.X_OK)
+    ):
+        raise OwnerSetupError(
+            "LINUX_RESTART_UNAVAILABLE",
+            "managed Linux WebUI restart is unavailable",
+            status=503,
+        )
+    try:
+        active_rc, active_out = runner(
+            (systemctl_path, "--user", "is-active", WEBUI_SERVICE_NAME)
+        )
+        enabled_rc, enabled_out = runner(
+            (systemctl_path, "--user", "is-enabled", WEBUI_SERVICE_NAME)
+        )
+    except Exception as exc:
+        raise OwnerSetupError(
+            "LINUX_RESTART_UNAVAILABLE",
+            "managed Linux WebUI restart could not be proven before configuration publication",
+            status=503,
+        ) from exc
+    if active_rc != 0 or active_out.strip().casefold() != "active":
+        raise OwnerSetupError(
+            "LINUX_RESTART_UNAVAILABLE",
+            "managed Linux WebUI user service is not active",
+            status=503,
+        )
+    if enabled_rc != 0 or enabled_out.strip().casefold() not in {"enabled", "enabled-runtime"}:
+        raise OwnerSetupError(
+            "LINUX_RESTART_UNAVAILABLE",
+            "managed Linux WebUI user service is not enabled",
+            status=503,
+        )
+    return _LinuxManagedRestartPlan(systemctl_path, runner=runner)
+
+
+def _validate_linux_setup_database_path(value: str, *, owner_uid: int) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        or any(ch in value for ch in ("\n", "\r"))
+        or not os.path.isabs(value)
+    ):
+        raise OwnerSetupError(
+            "SETUP_DATABASE_PATH_INVALID",
+            "database path must be one canonical absolute POSIX path",
+        )
+    canonical = os.path.normpath(value)
+    if canonical != value:
+        raise OwnerSetupError(
+            "SETUP_DATABASE_PATH_INVALID",
+            "database path must be one canonical absolute POSIX path",
+        )
+    target = Path(canonical)
+    try:
+        current = target.parent
+        child_stat: os.stat_result | None = None
+        while True:
+            current_stat = current.lstat()
+            if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISDIR(current_stat.st_mode):
+                raise OwnerSetupError(
+                    "SETUP_DATABASE_PATH_INVALID",
+                    "database path must not traverse symlink or non-directory components",
+                )
+            mode = stat.S_IMODE(current_stat.st_mode)
+            if current == target.parent:
+                if current_stat.st_uid != owner_uid or mode & 0o022:
+                    raise OwnerSetupError(
+                        "SETUP_DATABASE_PATH_INVALID",
+                        "database parent must be Owner-owned and must not be writable by group or other users",
+                    )
+            else:
+                if current_stat.st_uid not in {0, owner_uid}:
+                    raise OwnerSetupError(
+                        "SETUP_DATABASE_PATH_INVALID",
+                        "database path ancestor is owned by an untrusted OS identity",
+                    )
+                if mode & 0o022:
+                    sticky_protects_child = bool(current_stat.st_mode & stat.S_ISVTX) and child_stat is not None and (
+                        child_stat.st_uid in {0, owner_uid}
+                    )
+                    if not sticky_protects_child:
+                        raise OwnerSetupError(
+                            "SETUP_DATABASE_PATH_INVALID",
+                            "database path ancestor permits replacement by another OS identity",
+                        )
+            if current.parent == current:
+                break
+            child_stat = current_stat
+            current = current.parent
+        if target.is_symlink():
+            raise OwnerSetupError(
+                "SETUP_DATABASE_PATH_INVALID",
+                "database path must not be a symlink",
+            )
+        if target.exists():
+            target_stat = target.stat()
+            if (
+                not target.is_file()
+                or target_stat.st_uid != owner_uid
+                or stat.S_IMODE(target_stat.st_mode) & 0o022
+            ):
+                raise OwnerSetupError(
+                    "SETUP_DATABASE_PATH_INVALID",
+                    "existing database must be one Owner-owned regular file that is not writable by group or other users",
+                )
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(canonical + suffix)
+            if not sidecar.exists() and not sidecar.is_symlink():
+                continue
+            if sidecar.is_symlink():
+                raise OwnerSetupError(
+                    "SETUP_DATABASE_PATH_INVALID",
+                    "database sidecars must be Owner-owned regular files that are not writable by group or other users",
+                )
+            sidecar_stat = sidecar.stat()
+            if (
+                not sidecar.is_file()
+                or sidecar_stat.st_uid != owner_uid
+                or stat.S_IMODE(sidecar_stat.st_mode) & 0o022
+            ):
+                raise OwnerSetupError(
+                    "SETUP_DATABASE_PATH_INVALID",
+                    "database sidecars must be Owner-owned regular files that are not writable by group or other users",
+                )
+    except OwnerSetupError:
+        raise
+    except OSError as exc:
+        raise OwnerSetupError(
+            "SETUP_DATABASE_PATH_INVALID",
+            "database path could not be validated safely",
+        ) from exc
+    return canonical
+
+
+def _render_linux_runtime_config(config: WebUIRuntimeConfig) -> str:
+    if (
+        config.platform_kind is not PlatformKind.LINUX
+        or config.backend_transport is not BackendTransportKind.AF_UNIX
+    ):
+        raise ValueError("Linux setup can publish only the AF_UNIX Linux runtime config")
+    payload = {
+        "db": config.db,
+        "profile": config.profile,
+        "host_id": config.host_id,
+        "origin": config.origin,
+        "backend_socket": config.backend_socket,
+        "caddy_path": config.caddy_path,
+        "caddyfile": config.caddyfile,
+        "runtime_dir": config.runtime_dir,
+        "state_dir": config.state_dir,
+    }
+    if config.public_origins:
+        payload["public_origins"] = list(config.public_origins)
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+
+
+def _write_linux_runtime_config_atomic(path: str, content: str) -> None:
+    _atomic_owner_file_write(Path(path), content, private_parent=True)
+
+
+class _LinuxSetupBindingService:
+    """Bind missing Linux memory authority without changing transport or host setup."""
+
+    def __init__(
+        self,
+        *,
+        config_path: str,
+        baseline_config: WebUIRuntimeConfig,
+        owner_uid: int,
+        supported_profiles: set[str] | frozenset[str],
+        config_loader: Callable[..., WebUIRuntimeConfig] = load_runtime_config,
+        config_writer: Callable[[str, str], None] = _write_linux_runtime_config_atomic,
+        database_validator: Callable[..., str] = _validate_linux_setup_database_path,
+        database_inspector: Callable[..., None] = _validate_existing_windows_setup_database,
+        restart_preparer: Callable[[], Any] | None = None,
+    ) -> None:
+        if baseline_config.memory_configured:
+            raise ValueError("Linux setup binding requires an unconfigured runtime config")
+        if (
+            baseline_config.platform_kind is not PlatformKind.LINUX
+            or baseline_config.backend_transport is not BackendTransportKind.AF_UNIX
+        ):
+            raise ValueError("Linux setup binding requires the Linux AF_UNIX runtime config")
+        self.config_path = config_path
+        self.baseline_config = baseline_config
+        self.owner_uid = owner_uid
+        self.supported_profiles = frozenset(supported_profiles)
+        if not self.supported_profiles:
+            raise ValueError("Linux setup binding requires at least one supported profile")
+        self._config_loader = config_loader
+        self._config_writer = config_writer
+        self._database_validator = database_validator
+        self._database_inspector = database_inspector
+        self._restart_preparer = restart_preparer or _prepare_linux_managed_restart
+        self._lock = threading.Lock()
+        self._published_config: WebUIRuntimeConfig | None = None
+        self._restart_plan: Any | None = None
+        self._restart_request_id: str | None = None
+        self._restart_handed_off = False
+        self._restart_error: str | None = None
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            current = self._load_current()
+            if current == self.baseline_config:
+                return self._setup_required_payload()
+            if self._published_config is not None and current == self._published_config:
+                payload: dict[str, Any] = {
+                    "status": (
+                        "CONFIG_PUBLISHED_RESTART_REQUIRED"
+                        if self._restart_error is not None
+                        else "CONFIG_PUBLISHED_RESTART_REQUESTED"
+                    ),
+                    "profiles": sorted(self.supported_profiles),
+                    "suggested_host_id": self._suggested_host_id(),
+                    "suggested_db": self._suggested_database_path(),
+                    "binding": {
+                        "db": current.db,
+                        "profile": current.profile,
+                        "host_id": current.host_id,
+                    },
+                }
+                if self._restart_error is not None:
+                    payload["restart_error"] = self._restart_error
+                return payload
+            raise OwnerSetupError(
+                "SETUP_CONFIG_CHANGED",
+                "managed Linux runtime configuration changed while setup was active",
+                status=409,
+            )
+
+    def bind(
+        self,
+        *,
+        db: str,
+        profile: str,
+        host_id: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._validate_request_id(request_id)
+            if profile not in self.supported_profiles:
+                raise OwnerSetupError(
+                    "SETUP_PROFILE_UNSUPPORTED",
+                    "selected embedding profile is not supported",
+                )
+            if _WINDOWS_SETUP_HOST_ID_RE.fullmatch(host_id) is None:
+                raise OwnerSetupError(
+                    "SETUP_HOST_ID_INVALID",
+                    "host ID must be a bounded non-secret identifier",
+                )
+            canonical_db = self._database_validator(db, owner_uid=self.owner_uid)
+            self._database_inspector(canonical_db, profile, platform_name="Linux")
+
+            current = self._load_current()
+            if self._published_config is not None and current == self._published_config:
+                if (
+                    current.db != canonical_db
+                    or current.profile != profile
+                    or current.host_id != host_id
+                ):
+                    raise OwnerSetupError(
+                        "SETUP_ALREADY_CONFIGURED",
+                        "managed Linux memory binding is already published",
+                        status=409,
+                    )
+                if self._restart_error is None:
+                    return {
+                        "status": "CONFIG_PUBLISHED",
+                        "restart": "REQUESTED",
+                        "request_id": self._restart_request_id or request_id,
+                    }
+                self._restart_plan = self._prepare_restart()
+                self._restart_request_id = request_id
+                self._restart_handed_off = False
+                self._restart_error = None
+                return {
+                    "status": "CONFIG_PUBLISHED",
+                    "restart": "REQUESTED",
+                    "request_id": request_id,
+                }
+            if current != self.baseline_config:
+                raise OwnerSetupError(
+                    "SETUP_CONFIG_CHANGED",
+                    "managed Linux runtime configuration changed while setup was active",
+                    status=409,
+                )
+
+            restart_plan = self._prepare_restart()
+            published = replace(
+                current,
+                db=canonical_db,
+                profile=profile,
+                host_id=host_id,
+            )
+            try:
+                self._config_writer(self.config_path, _render_linux_runtime_config(published))
+                observed = self._config_loader(self.config_path, owner_uid=self.owner_uid)
+                if observed != published:
+                    raise RuntimeConfigError("runtime config publication could not be verified")
+            except Exception as exc:
+                self._restore_baseline_after_publication_failure()
+                raise OwnerSetupError(
+                    "LINUX_CONFIG_PUBLICATION_FAILED",
+                    "managed Linux runtime configuration could not be published safely",
+                    status=500,
+                ) from exc
+
+            self._published_config = published
+            self._restart_plan = restart_plan
+            self._restart_request_id = request_id
+            self._restart_handed_off = False
+            self._restart_error = None
+            return {
+                "status": "CONFIG_PUBLISHED",
+                "restart": "REQUESTED",
+                "request_id": request_id,
+            }
+
+    def handoff_restart(self, request_id: str) -> bool:
+        with self._lock:
+            if (
+                request_id != self._restart_request_id
+                or self._restart_plan is None
+                or self._restart_handed_off
+            ):
+                return False
+            plan = self._restart_plan
+            try:
+                plan.handoff()
+            except Exception:
+                self._restart_error = "LINUX_RESTART_HANDOFF_FAILED"
+                self._restart_plan = None
+                return False
+            self._restart_handed_off = True
+            self._restart_plan = None
+            return True
+
+    def _prepare_restart(self) -> Any:
+        try:
+            return self._restart_preparer()
+        except OwnerSetupError:
+            raise
+        except Exception as exc:
+            raise OwnerSetupError(
+                "LINUX_RESTART_UNAVAILABLE",
+                "managed Linux restart could not be proven before configuration publication",
+                status=503,
+            ) from exc
+
+    def _load_current(self) -> WebUIRuntimeConfig:
+        try:
+            return self._config_loader(self.config_path, owner_uid=self.owner_uid)
+        except RuntimeConfigError as exc:
+            raise OwnerSetupError(
+                "LINUX_CONFIG_INVALID",
+                "managed Linux runtime configuration could not be read safely",
+                status=500,
+            ) from exc
+        except Exception as exc:
+            raise OwnerSetupError(
+                "LINUX_CONFIG_INVALID",
+                "managed Linux runtime configuration could not be read safely",
+                status=500,
+            ) from exc
+
+    def _restore_baseline_after_publication_failure(self) -> None:
+        try:
+            observed = self._config_loader(self.config_path, owner_uid=self.owner_uid)
+            if observed == self.baseline_config:
+                return
+            self._config_writer(self.config_path, _render_linux_runtime_config(self.baseline_config))
+            restored = self._config_loader(self.config_path, owner_uid=self.owner_uid)
+            if restored != self.baseline_config:
+                raise RuntimeError("baseline verification failed")
+        except Exception as exc:
+            raise OwnerSetupError(
+                "SETUP_CONFIG_RECOVERY_REQUIRED",
+                "managed Linux runtime configuration could not be restored after publication failure",
+                status=500,
+            ) from exc
+
+    def _setup_required_payload(self) -> dict[str, Any]:
+        return {
+            "status": "SETUP_REQUIRED",
+            "profiles": sorted(self.supported_profiles),
+            "suggested_host_id": self._suggested_host_id(),
+            "suggested_db": self._suggested_database_path(),
+        }
+
+    def _suggested_host_id(self) -> str:
+        hostname = urlsplit(self.baseline_config.origin).hostname
+        if hostname is None or not hostname.startswith("factlane-") or not hostname.endswith(".test"):
+            return ""
+        installation_id = hostname[len("factlane-") : -len(".test")]
+        if _WINDOWS_SETUP_INSTALLATION_ID_RE.fullmatch(installation_id) is None:
+            return ""
+        suggested = f"owner-{installation_id}"
+        return suggested if _WINDOWS_SETUP_HOST_ID_RE.fullmatch(suggested) is not None else ""
+
+    def _suggested_database_path(self) -> str:
+        return str(Path(self.baseline_config.state_dir) / "memory.db")
+
+    @staticmethod
+    def _validate_request_id(request_id: str) -> None:
+        if _WINDOWS_SETUP_REQUEST_ID_RE.fullmatch(request_id) is None:
+            raise OwnerSetupError(
+                "SETUP_REQUEST_ID_INVALID",
+                "setup request ID is invalid",
+            )
+
+
 class _LiveServiceControl:
     """Bounded control for the native socket owned by a running WebUI instance."""
 
@@ -869,7 +1812,7 @@ class OwnerRuntimeBackend:
         service_state: WebUIServiceState,
         auth_state: OwnerAuthState,
         http_server: OwnerHTTPServer,
-        native_server: OwnerNativeControlServer,
+        native_server: Any,
         adapter: MemoryAdapter | None,
         runtime_registry: RuntimeRegistry | None,
         maintenance_coordinator: Any | None,
@@ -877,6 +1820,7 @@ class OwnerRuntimeBackend:
         owner_adapter_executor: _OwnerAdapterExecutor | None = None,
         database_service: OwnerDatabaseService | None = None,
         full_restore_service: FullRestoreService | None = None,
+        readiness_probe: Callable[[], bool] | None = None,
     ) -> None:
         self.service_state = service_state
         self.auth_state = auth_state
@@ -889,6 +1833,7 @@ class OwnerRuntimeBackend:
         self.maintenance_coordinator = maintenance_coordinator
         self.database_service = database_service
         self.full_restore_service = full_restore_service
+        self._readiness_probe = readiness_probe
         self._http_thread: threading.Thread | None = None
         self._native_thread: threading.Thread | None = None
         self._draining = False
@@ -919,7 +1864,7 @@ class OwnerRuntimeBackend:
         self._http_thread.start()
 
     def is_ready(self) -> bool:
-        return (
+        structurally_ready = (
             not self._draining
             and not self._closed
             and self._http_thread is not None
@@ -928,6 +1873,14 @@ class OwnerRuntimeBackend:
             and self._native_thread.is_alive()
             and self.http_server.service_loop_thread_alive
         )
+        if not structurally_ready:
+            return False
+        if self._readiness_probe is None:
+            return True
+        try:
+            return bool(self._readiness_probe())
+        except Exception:
+            return False
 
     def is_alive(self) -> bool:
         return (
@@ -984,11 +1937,51 @@ def _database_runtime_roots(spec: BackendLaunchSpec, database_path: str) -> tupl
     )
 
 
+def _is_windows_backend_spec(spec: BackendLaunchSpec) -> bool:
+    if spec.platform_kind is PlatformKind.WINDOWS:
+        if spec.backend_transport is not BackendTransportKind.WINDOWS_HTTPS:
+            raise ValueError("Windows Owner backend requires WINDOWS_HTTPS transport")
+        return True
+    if spec.platform_kind is not PlatformKind.LINUX or spec.backend_transport is not BackendTransportKind.AF_UNIX:
+        raise ValueError("Linux Owner backend requires AF_UNIX transport")
+    return False
+
+
 def _prove_exclusion(database_path: str) -> bool:
     """Use the same exclusive maintenance lease as recovery; never synthesize proof."""
 
     with MaintenanceLease(database_path, f"webui-exclusion-{uuid.uuid4()}"):
         return True
+
+
+def _prove_windows_exclusion(database_path: str) -> bool:
+    lease = WindowsInPlaceMaintenanceLease.acquire(database_path)
+    try:
+        lease.revalidate()
+        lease.release_unmutated()
+        return True
+    except BaseException:
+        lease.retain_fail_closed()
+        raise
+
+
+def _windows_process_start_provider(pid: int) -> int | None:
+    try:
+        return windows_process_identity(pid).creation_time_us
+    except WindowsSecurityError:
+        return None
+
+
+def _runtime_control_client_for_spec(
+    spec: BackendLaunchSpec,
+    registry: RuntimeRegistry,
+    *,
+    owner_sid: str | None = None,
+) -> Any:
+    if _is_windows_backend_spec(spec):
+        sid = current_user_sid() if owner_sid is None else owner_sid
+        return WindowsRuntimeControlClient(registry, owner_sid=sid)
+    return RuntimeControlClient(registry)
 
 
 def _build_maintenance(
@@ -998,14 +1991,26 @@ def _build_maintenance(
     owner_uid: int,
 ) -> tuple[RuntimeRegistry, MaintenanceCoordinator]:
     runtime_root, barrier_root = _database_runtime_roots(spec, database_path)
-    registry = RuntimeRegistry(runtime_root, owner_uid=owner_uid)
+    windows_backend = _is_windows_backend_spec(spec)
+    owner_sid: str | None = None
+    if windows_backend:
+        owner_sid = current_user_sid()
+        registry = RuntimeRegistry(
+            runtime_root,
+            owner_uid=0,
+            boot_id_provider=windows_boot_id,
+            process_start_provider=_windows_process_start_provider,
+        )
+    else:
+        registry = RuntimeRegistry(runtime_root, owner_uid=owner_uid)
     barrier = MaintenanceBarrierStore(barrier_root, database_path)
     barrier.initialize(generation=1)
+    runtime_client = _runtime_control_client_for_spec(spec, registry, owner_sid=owner_sid)
     coordinator = MaintenanceCoordinator(
         barrier=barrier,
         registry=registry,
-        call_runtime=RuntimeControlClient(registry).call,
-        exclusion_check=_prove_exclusion,
+        call_runtime=runtime_client.call,
+        exclusion_check=_prove_windows_exclusion if windows_backend else _prove_exclusion,
     )
     return registry, coordinator
 
@@ -1034,6 +2039,17 @@ def _validate_recovery_spec(spec: BackendLaunchSpec) -> tuple[str, str, str]:
     return os.path.realpath(os.path.abspath(spec.db)), spec.profile, spec.host_id
 
 
+def _owner_capabilities_for_spec(spec: BackendLaunchSpec) -> dict[str, bool] | None:
+    if not _is_windows_backend_spec(spec):
+        return None
+    normal = spec.mode is BackendMode.NORMAL and spec.normal_adapter_required
+    return {
+        "database_management": normal,
+        "full_restore": normal,
+        "permanent_purge": normal,
+    }
+
+
 def _compose_database_authority(
     *,
     spec: BackendLaunchSpec,
@@ -1045,10 +2061,11 @@ def _compose_database_authority(
     coordinator: Any,
     adapter_executor: _OwnerAdapterExecutor | None,
 ) -> tuple[OwnerDatabaseService, FullRestoreService, OwnerDestructiveOrchestrator]:
+    windows_backend = _is_windows_backend_spec(spec)
     artifacts_root, restore_root, purge_root = _database_state_roots(spec, database_path)
     artifact_registry = ArtifactRegistry(artifacts_root)
     embedding_profile = _configured_embedding_profile(profile_name)
-    runtime_client = RuntimeControlClient(runtime_registry)
+    runtime_client = _runtime_control_client_for_spec(spec, runtime_registry)
     postflight = _make_restore_postflight(database_path, embedding_profile)
     post_activation_verify = _make_post_activation_verifier(
         database_path,
@@ -1064,6 +2081,7 @@ def _compose_database_authority(
         postflight=postflight,
         invalidate_sessions=auth_state.invalidate_all_sessions_after_maintenance,
         post_activation_verify=post_activation_verify,
+        windows_restore_operator_factory=WindowsOwnerRestoreOperator if windows_backend else None,
     )
 
     async def restore_preview(binding: dict[str, Any]) -> dict[str, Any]:
@@ -1260,7 +2278,12 @@ def _compose_database_authority(
         operation_id: str,
         identities: tuple[PurgeTargetIdentity, ...],
     ) -> tuple[RecoveryTarget, ...]:
-        return await resolve_permanent_purge_targets_exclusive(
+        resolver = (
+            resolve_windows_permanent_purge_targets_exclusive
+            if windows_backend
+            else resolve_permanent_purge_targets_exclusive
+        )
+        return await resolver(
             operation_id=operation_id,
             db_path=database_path,
             profile=embedding_profile,
@@ -1274,7 +2297,7 @@ def _compose_database_authority(
         post_close_target_resolver=post_close_target_resolver,
         require_post_close_target_resolver=True,
         coordinator=coordinator,
-        recovery_operator=SensitiveMemoryRecoveryOperator(),
+        recovery_operator=WindowsOwnerPurgeOperator() if windows_backend else SensitiveMemoryRecoveryOperator(),
         service_state=service_state,
         state_root=purge_root,
         retained_identity_fields_classified_non_sensitive=True,
@@ -1296,24 +2319,15 @@ def create_owner_runtime_backend(
         raise TypeError("spec must be a BackendLaunchSpec")
     if not isinstance(service_state, WebUIServiceState):
         raise TypeError("service_state must be the runtime WebUIServiceState")
-    uid = os.getuid() if owner_uid is None else owner_uid
+    windows_backend = _is_windows_backend_spec(spec)
+    uid = 0 if windows_backend else (os.getuid() if owner_uid is None else owner_uid)
     if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
         raise ValueError("owner_uid must be a non-negative integer")
-
-    auth_state = OwnerAuthState(
-        owner_uid=uid,
-        native_confirmation=native_confirmation or ZenityNativeConfirmation(),
-    )
-    http_server = OwnerHTTPServer(
-        socket_path=spec.socket_path,
-        origin=spec.expected_origin,
-        auth_state=auth_state,
-        overview_service=None,
-        control_service=None,
-        operations_service=None,
-        destructive_service=None,
-        database_service=None,
-    )
+    owner_sid: str | None = None
+    owner_paths: Any | None = None
+    setup_service: _WindowsSetupBindingService | _LinuxSetupBindingService | None = None
+    readiness_probe: Callable[[], bool] | None = None
+    http_server: OwnerHTTPServer | None = None
     adapter: MemoryAdapter | None = None
     registry: RuntimeRegistry | None = None
     coordinator: Any | None = None
@@ -1321,8 +2335,109 @@ def create_owner_runtime_backend(
     owner_adapter_executor: _OwnerAdapterExecutor | None = None
     database_service: OwnerDatabaseService | None = None
     full_restore_service: FullRestoreService | None = None
-    native_server: OwnerNativeControlServer | None = None
+    native_server: Any | None = None
     try:
+        if windows_backend:
+            if spec.socket_path is not None:
+                raise ValueError("Windows Owner backend must not configure an AF_UNIX socket path")
+            owner_sid = current_user_sid()
+            owner_paths = windows_owner_paths(owner_sid=owner_sid)
+            if spec.mode is BackendMode.SETUP_SHELL:
+                managed = load_windows_managed_config(
+                    owner_paths.service_config_path,
+                    owner_sid=owner_sid,
+                )
+                if managed is None:
+                    raise ValueError("Windows SETUP_SHELL requires the managed configuration created by setup")
+                if any(value is not None for value in (managed.db, managed.profile, managed.host_id)):
+                    raise ValueError("Windows SETUP_SHELL managed configuration must remain unbound")
+                if (
+                    managed.origin != spec.expected_origin
+                    or managed.runtime_dir != spec.runtime_dir
+                    or managed.state_dir != spec.state_dir
+                    or managed.native_control_pipe != owner_paths.native_control_socket
+                    or managed.browser_profile_dir != owner_paths.browser_profile_dir
+                ):
+                    raise ValueError("Windows SETUP_SHELL managed configuration differs from runtime authority")
+                setup_service = _WindowsSetupBindingService(
+                    config_path=owner_paths.service_config_path,
+                    baseline_config=managed,
+                    owner_sid=owner_sid,
+                    supported_profiles=set(PROFILE_DEFINITIONS),
+                )
+            parsed = urlsplit(spec.expected_origin)
+            hostname = parsed.hostname
+            if hostname is None:
+                raise ValueError("Windows Owner backend origin must contain a hostname")
+            tls_material = load_windows_tls_material(
+                Path(spec.state_dir) / "tls",
+                hostname,
+                owner_sid=owner_sid,
+            )
+            server_tls_context = build_windows_server_ssl_context(tls_material)
+            client_tls_context = build_windows_client_ssl_context(tls_material)
+            confirmer = native_confirmation or _WindowsNativeConfirmation()
+        else:
+            if not isinstance(spec.socket_path, str) or not spec.socket_path:
+                raise ValueError("Linux Owner backend requires an AF_UNIX socket path")
+            if spec.mode is BackendMode.SETUP_SHELL:
+                config_path = default_runtime_config_path()
+                baseline = load_runtime_config(config_path, owner_uid=uid)
+                if baseline.memory_configured:
+                    raise ValueError("Linux SETUP_SHELL runtime configuration must remain unbound")
+                if (
+                    baseline.origin != spec.expected_origin
+                    or baseline.backend_socket != spec.socket_path
+                    or baseline.runtime_dir != spec.runtime_dir
+                    or baseline.state_dir != spec.state_dir
+                    or baseline.platform_kind is not PlatformKind.LINUX
+                    or baseline.backend_transport is not BackendTransportKind.AF_UNIX
+                ):
+                    raise ValueError("Linux SETUP_SHELL runtime configuration differs from runtime authority")
+                setup_service = _LinuxSetupBindingService(
+                    config_path=str(config_path),
+                    baseline_config=baseline,
+                    owner_uid=uid,
+                    supported_profiles=set(PROFILE_DEFINITIONS),
+                )
+            confirmer = native_confirmation or ZenityNativeConfirmation()
+
+        auth_state = OwnerAuthState(owner_uid=uid, native_confirmation=confirmer)
+        service_control = _LiveServiceControl(service_state)
+        if windows_backend:
+            http_server = WindowsOwnerHTTPServer(
+                origin=spec.expected_origin,
+                public_origins=spec.public_origins,
+                tls_context=server_tls_context,
+                auth_state=auth_state,
+                overview_service=None,
+                control_service=None,
+                operations_service=None,
+                service_control=service_control,
+                destructive_service=None,
+                database_service=None,
+                setup_service=setup_service,
+                capabilities=_owner_capabilities_for_spec(spec),
+            )
+            readiness_probe = lambda: http_server.probe_ready(
+                trust_context=client_tls_context,
+                timeout_seconds=1.0,
+            )
+        else:
+            http_server = OwnerHTTPServer(
+                socket_path=spec.socket_path,
+                origin=spec.expected_origin,
+                public_origins=spec.public_origins,
+                auth_state=auth_state,
+                overview_service=None,
+                control_service=None,
+                operations_service=None,
+                service_control=service_control,
+                destructive_service=None,
+                database_service=None,
+                setup_service=setup_service,
+            )
+
         if spec.normal_adapter_required:
             database_path, profile, host_id = _validate_normal_spec(spec)
             owner_context = trusted_write_context_for_profile(
@@ -1410,12 +2525,23 @@ def create_owner_runtime_backend(
                 database_service=database_service,
             )
 
-        native_server = OwnerNativeControlServer(
-            socket_path=Path(spec.runtime_dir) / "owner-control.sock",
-            owner_uid=uid,
-            auth_state=auth_state,
-            service_control=_LiveServiceControl(service_state),
-        )
+        if windows_backend:
+            assert owner_sid is not None
+            assert owner_paths is not None
+            native_server = WindowsOwnerNativeControlServer(
+                pipe_name=owner_paths.native_control_socket,
+                owner_uid=0,
+                auth_state=auth_state,
+                service_control=service_control,
+                owner_sid=owner_sid,
+            )
+        else:
+            native_server = OwnerNativeControlServer(
+                socket_path=Path(spec.runtime_dir) / "owner-control.sock",
+                owner_uid=uid,
+                auth_state=auth_state,
+                service_control=service_control,
+            )
         return OwnerRuntimeBackend(
             service_state=service_state,
             auth_state=auth_state,
@@ -1428,9 +2554,11 @@ def create_owner_runtime_backend(
             owner_adapter_executor=owner_adapter_executor,
             database_service=database_service,
             full_restore_service=full_restore_service,
+            readiness_probe=readiness_probe,
         )
     except BaseException:
         if native_server is not None:
             native_server.server_close()
-        http_server.server_close()
+        if http_server is not None:
+            http_server.server_close()
         raise

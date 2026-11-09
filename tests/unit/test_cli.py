@@ -4,7 +4,7 @@ import io
 import json
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 
@@ -55,8 +55,8 @@ def _setup_configuration() -> cli.SetupConfiguration:
             caddy_path="/usr/bin/caddy",
             zenity_path="/usr/bin/zenity",
             browser=BrowserInstall(
-                family="chromium",
-                executable="/usr/bin/google-chrome",
+                family="firefox",
+                executable="/usr/bin/firefox",
             ),
             euid=1000,
         ),
@@ -73,6 +73,12 @@ def _setup_configuration() -> cli.SetupConfiguration:
         ["setup", "webui", "--apply"],
         ["setup", "webui", "-h"],
         ["setup", "other"],
+        ["doctor"],
+        ["doctor", "webui", "--json"],
+        ["doctor", "WEBUI"],
+        ["launch"],
+        ["launch", "webui", "--verbose"],
+        ["launch", "WEBUI"],
         ["serve", "webui", "--config", "/tmp/webui.json"],
         ["status", "webui", "--verbose"],
         ["unknown", "webui"],
@@ -100,7 +106,7 @@ def test_every_non_exact_webui_form_delegates_legacy_argv_byte_for_byte(
 
 @pytest.mark.parametrize(
     "action",
-    ["setup", "serve", "open", "start", "stop", "status", "restart"],
+    ["setup", "doctor", "launch", "serve", "open", "start", "stop", "status", "restart"],
 )
 def test_only_exact_supported_webui_pairs_are_recognized(action: str) -> None:
     parsed = cli.parse_webui_command([action, "webui"])
@@ -131,7 +137,17 @@ def test_top_level_help_exposes_managed_webui_and_preserves_legacy_help(
     rendered = output.getvalue()
     assert result == 0
     assert calls == [["--help"]]
-    for action in ("setup", "serve", "open", "start", "stop", "status", "restart"):
+    for action in (
+        "setup",
+        "doctor",
+        "launch",
+        "serve",
+        "open",
+        "start",
+        "stop",
+        "status",
+        "restart",
+    ):
         assert f"factlane {action} webui" in rendered
     assert "--db DB" in rendered
     assert "--host-id HOST_ID" in rendered
@@ -140,7 +156,7 @@ def test_top_level_help_exposes_managed_webui_and_preserves_legacy_help(
 
 @pytest.mark.parametrize(
     "action",
-    ["setup", "serve", "open", "start", "stop", "status", "restart"],
+    ["setup", "doctor", "launch", "serve", "open", "start", "stop", "status", "restart"],
 )
 def test_managed_webui_help_is_exact_and_has_no_execution_side_effects(
     monkeypatch: pytest.MonkeyPatch,
@@ -465,6 +481,369 @@ def test_service_actions_delegate_only_to_explicitly_injected_controller(action:
         "ok": True,
         "status": "OK",
     }
+
+
+def test_launch_webui_already_ready_dispatches_status_then_open() -> None:
+    calls: list[str] = []
+
+    class Controller:
+        def dispatch(self, requested: str) -> dict[str, object]:
+            calls.append(requested)
+            if requested == "status":
+                return {
+                    "status": "OK",
+                    "unit": {"active": True},
+                    "service": {"status": "READY"},
+                }
+            assert requested == "open"
+            return {"status": "OK", "ok": True, "opened": True}
+
+    output = io.StringIO()
+    result = cli.main(
+        ["launch", "webui"],
+        service_controller=Controller(),
+        output=output,
+    )
+
+    assert result == 0
+    assert calls == ["status", "open"]
+    assert json.loads(output.getvalue()) == {
+        "command": "launch webui",
+        "ok": True,
+        "opened": True,
+        "status": "OK",
+    }
+
+
+def test_launch_webui_inactive_dispatches_status_start_then_open() -> None:
+    calls: list[str] = []
+
+    class Controller:
+        def dispatch(self, requested: str) -> dict[str, object]:
+            calls.append(requested)
+            if requested == "status":
+                return {
+                    "status": "OK",
+                    "unit": {"active": False},
+                    "service": {"status": "STOPPED"},
+                }
+            if requested == "start":
+                return {"status": "OK", "ok": True}
+            assert requested == "open"
+            return {"status": "OK", "ok": True, "opened": True}
+
+    output = io.StringIO()
+    result = cli.main(
+        ["launch", "webui"],
+        service_controller=Controller(),
+        output=output,
+    )
+
+    assert result == 0
+    assert calls == ["status", "start", "open"]
+
+
+def test_launch_webui_intentional_same_boot_stop_requires_explicit_start_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    approvals: list[dict[str, object]] = []
+
+    class Controller:
+        def dispatch(self, requested: str) -> dict[str, object]:
+            calls.append(requested)
+            assert requested == "status"
+            return {
+                "status": "OK",
+                "unit": {"active": False},
+                "service": {"status": "STOPPED_UNTIL_REBOOT"},
+            }
+
+    def deny(status: Mapping[str, object]) -> bool:
+        approvals.append(dict(status))
+        return False
+
+    monkeypatch.setattr(cli, "_confirm_stopped_launch_start", deny)
+    output = io.StringIO()
+    result = cli.main(
+        ["launch", "webui"],
+        service_controller=Controller(),
+        output=output,
+    )
+
+    payload = json.loads(output.getvalue())
+    assert result == 1
+    assert calls == ["status"]
+    assert len(approvals) == 1
+    assert approvals[0]["service"] == {"status": "STOPPED_UNTIL_REBOOT"}
+    assert payload == {
+        "command": "launch webui",
+        "error_code": "SERVICE_START_REQUIRES_APPROVAL",
+        "message": (
+            "FactLane Owner Panel remains stopped until the next device restart. "
+            "Start it explicitly with 'factlane start webui' if you want to reopen it earlier."
+        ),
+        "status": "BLOCKED",
+    }
+
+
+def test_launch_webui_intentional_same_boot_stop_starts_only_after_explicit_approval() -> None:
+    calls: list[str] = []
+    approvals: list[str] = []
+
+    class Controller:
+        def dispatch(self, requested: str) -> dict[str, object]:
+            calls.append(requested)
+            if requested == "status":
+                return {
+                    "status": "OK",
+                    "unit": {"active": False},
+                    "service": {"status": "STOPPED_UNTIL_REBOOT"},
+                }
+            if requested == "start":
+                return {"status": "OK", "ok": True}
+            assert requested == "open"
+            return {"status": "OK", "ok": True, "opened": True}
+
+    def approve(status: Mapping[str, object]) -> bool:
+        approvals.append(str(status["service"]))
+        return True
+
+    output = io.StringIO()
+    result = cli.main(
+        ["launch", "webui"],
+        service_controller=Controller(),
+        launch_start_approval=approve,
+        output=output,
+    )
+
+    assert result == 0
+    assert calls == ["status", "start", "open"]
+    assert approvals == ["{'status': 'STOPPED_UNTIL_REBOOT'}"]
+
+
+def test_launch_webui_start_failure_stops_before_open() -> None:
+    calls: list[str] = []
+
+    class Controller:
+        def dispatch(self, requested: str) -> dict[str, object]:
+            calls.append(requested)
+            if requested == "status":
+                return {
+                    "status": "OK",
+                    "unit": {"active": False},
+                    "service": {"status": "STOPPED"},
+                }
+            assert requested == "start"
+            return {
+                "status": "ERROR",
+                "error_code": "SERVICE_START_FAILED",
+                "message": "start failed",
+            }
+
+    output = io.StringIO()
+    result = cli.main(
+        ["launch", "webui"],
+        service_controller=Controller(),
+        output=output,
+    )
+
+    payload = json.loads(output.getvalue())
+    assert result == 1
+    assert calls == ["status", "start"]
+    assert payload["command"] == "launch webui"
+    assert payload["error_code"] == "SERVICE_START_FAILED"
+
+
+def test_launch_webui_passes_through_sensitive_approved_open_success() -> None:
+    calls: list[str] = []
+    approved = {
+        "status": "OK",
+        "ok": True,
+        "opened": True,
+        "sensitive_approval": {
+            "status": "APPROVED",
+            "request_id": "approval-123",
+        },
+    }
+
+    class Controller:
+        def dispatch(self, requested: str) -> dict[str, object]:
+            calls.append(requested)
+            if requested == "status":
+                return {
+                    "status": "OK",
+                    "unit": {"active": True},
+                    "service": {"status": "READY"},
+                }
+            assert requested == "open"
+            return approved
+
+    output = io.StringIO()
+    result = cli.main(
+        ["launch", "webui"],
+        service_controller=Controller(),
+        output=output,
+    )
+
+    assert result == 0
+    assert calls == ["status", "open"]
+    assert json.loads(output.getvalue()) == {
+        **approved,
+        "command": "launch webui",
+    }
+
+
+def test_launch_webui_invalid_status_fails_closed_before_start_or_open() -> None:
+    calls: list[str] = []
+
+    class Controller:
+        def dispatch(self, requested: str) -> dict[str, object]:
+            calls.append(requested)
+            assert requested == "status"
+            return {"status": "OK", "unit": {"active": False}}
+
+    output = io.StringIO()
+    result = cli.main(
+        ["launch", "webui"],
+        service_controller=Controller(),
+        output=output,
+    )
+
+    payload = json.loads(output.getvalue())
+    assert result == 1
+    assert calls == ["status"]
+    assert payload["error_code"] == "SERVICE_STATUS_INVALID"
+
+
+def test_doctor_webui_emits_machine_readable_read_only_report_without_service_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = {
+        "status": "OK",
+        "mode": "READ_ONLY",
+        "managed_binding": {
+            "state": "UNCONFIGURED",
+            "db": None,
+            "profile": None,
+            "supported_profiles": ["nomic-768"],
+        },
+        "mcp": {
+            "host_id": {"state": "EXPLICIT_REQUIRED", "value": None},
+            "scope": {"state": "EXPLICIT_PER_REQUEST", "value": None},
+        },
+        "next_actions": [
+            {
+                "id": "CONFIGURE_OWNER_PANEL_MEMORY",
+                "message": "Choose a profile explicitly.",
+            }
+        ],
+    }
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "build_webui_doctor_report", lambda: report)
+
+    class Controller:
+        def dispatch(self, requested: str) -> dict[str, object]:
+            calls.append(requested)
+            pytest.fail("doctor must not dispatch managed service actions")
+
+    output = io.StringIO()
+    result = cli.main(
+        ["doctor", "webui"],
+        service_controller=Controller(),
+        output=output,
+    )
+
+    payload = json.loads(output.getvalue())
+    assert result == 0
+    assert calls == []
+    assert payload["command"] == "doctor webui"
+    assert payload["mode"] == "READ_ONLY"
+    assert payload["mcp"]["host_id"]["state"] == "EXPLICIT_REQUIRED"
+    assert payload["mcp"]["scope"]["state"] == "EXPLICIT_PER_REQUEST"
+    assert payload["next_actions"]
+
+
+def test_register_database_validates_local_source_and_returns_only_custody_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from factlane import owner_database, webui_app, webui_runtime
+
+    active = tmp_path / "active.db"
+    candidate = tmp_path / "candidate.db"
+    active.write_bytes(b"active")
+    candidate.write_bytes(b"candidate")
+    state_dir = tmp_path / "state"
+    calls: dict[str, object] = {}
+
+    config = type(
+        "Config",
+        (),
+        {
+            "memory_configured": True,
+            "db": str(active),
+            "profile": "nomic-768",
+            "state_dir": str(state_dir),
+        },
+    )()
+
+    monkeypatch.setattr(webui_runtime, "default_runtime_config_path", lambda: tmp_path / "webui.json")
+    monkeypatch.setattr(
+        webui_runtime,
+        "load_runtime_config",
+        lambda path, owner_uid: config,
+    )
+    monkeypatch.setattr(
+        webui_app,
+        "_validate_linux_setup_database_path",
+        lambda source, owner_uid: str(Path(source).resolve()),
+    )
+    monkeypatch.setattr(
+        webui_app,
+        "_validate_existing_windows_setup_database",
+        lambda source, profile, platform_name: calls.update(
+            validation=(source, profile, platform_name)
+        ),
+    )
+    monkeypatch.setattr(
+        owner_database,
+        "ArtifactRegistry",
+        lambda root: calls.setdefault("registry_root", Path(root)),
+    )
+
+    def create_backup(source, registry, *, metadata_extra):
+        calls["backup"] = (source, registry, metadata_extra)
+        return {
+            "artifact_id": "registration-1",
+            "sha256": "a" * 64,
+            "size_bytes": 123,
+            "storage_contract_version": 3,
+            "embedding_profile": "nomic-768",
+        }
+
+    monkeypatch.setattr(owner_database, "create_consistent_backup", create_backup)
+    output = io.StringIO()
+
+    result = cli.main(["register", "database", str(candidate)], output=output)
+
+    payload = json.loads(output.getvalue())
+    assert result == 0
+    assert payload == {
+        "command": "register database",
+        "status": "REGISTERED",
+        "registration_id": "registration-1",
+        "sha256": "a" * 64,
+        "size_bytes": 123,
+        "storage_contract_version": 3,
+        "embedding_profile": "nomic-768",
+    }
+    assert calls["validation"] == (str(candidate.resolve()), "nomic-768", "Linux")
+    assert calls["backup"][0] == str(candidate.resolve())
+    assert calls["backup"][2] == {"local_database_registration": True}
+    assert calls["registry_root"] == calls["backup"][1]
+    assert str(candidate) not in output.getvalue()
+    assert str(active) not in output.getvalue()
 
 
 def test_pyproject_routes_factlane_to_cli_and_preserves_other_console_scripts() -> None:

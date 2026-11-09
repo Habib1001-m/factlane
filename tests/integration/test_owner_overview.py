@@ -207,6 +207,19 @@ def test_overview_counts_database_and_exact_scope_breakdown_without_cross_projec
                 "candidates": {"value": 3, "completeness": "EXACT", "reason": None},
                 "conflicts": {"value": 3, "completeness": "EXACT", "reason": None},
             }
+            assert first["lifecycle_breakdown"] == {
+                "CANDIDATE": {"value": 3, "completeness": "EXACT", "reason": None},
+                "HISTORICAL": {"value": 0, "completeness": "EXACT", "reason": None},
+                "QUARANTINED": {"value": 0, "completeness": "EXACT", "reason": None},
+                "REJECTED": {"value": 0, "completeness": "EXACT", "reason": None},
+                "REVOKED": {"value": 0, "completeness": "EXACT", "reason": None},
+                "STALE": {"value": 0, "completeness": "EXACT", "reason": None},
+                "SUPERSEDED": {"value": 0, "completeness": "EXACT", "reason": None},
+                "VALIDATED_CURRENT": {"value": 1, "completeness": "EXACT", "reason": None},
+            }
+            assert sum(metric["value"] for metric in first["lifecycle_breakdown"].values()) == first["totals"][
+                "logical_memories"
+            ]["value"]
             assert first["scope_index"]["total"] == {
                 "value": 3,
                 "completeness": "EXACT",
@@ -245,6 +258,176 @@ def test_overview_counts_database_and_exact_scope_breakdown_without_cross_projec
             assert projects["project-a"]["revisions"] == 3
             assert projects["project-b"]["logical_memories"] == 1
             assert "CROSS_PROJECT_WORKFLOW" not in projects
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_discovery_lists_latest_logical_memories_across_scopes_with_bound_cursor_and_no_mutation(tmp_path) -> None:
+    async def run() -> None:
+        engine, _, _, overview = await _services(tmp_path)
+        try:
+            older = _record(
+                marker="discover-old",
+                fact="Older project A revision",
+                lifecycle="VALIDATED_CURRENT",
+                created_at="2026-11-05T20:00:01Z",
+            )
+            newer = _record(
+                marker="discover-new",
+                fact="Latest project A revision",
+                lifecycle="VALIDATED_CURRENT",
+                created_at="2026-11-05T20:00:05Z",
+            )
+            newer["memory_id"] = older["memory_id"]
+            newer["revision"] = 2
+            newer["parent_record_id"] = older["record_id"]
+            newer["contradiction_key"] = older["contradiction_key"]
+            rows = [
+                _record(
+                    marker="discover-project-a",
+                    fact="Project A candidate",
+                    created_at="2026-11-05T20:00:06Z",
+                ),
+                _record(
+                    marker="discover-project-b",
+                    fact="Project B candidate",
+                    project_id="project-b",
+                    created_at="2026-11-05T20:00:04Z",
+                ),
+                _record(
+                    marker="discover-workflow",
+                    fact="Workflow candidate",
+                    scope="WORKFLOW",
+                    project_id="project-a",
+                    worktree_id="worktree-a",
+                    workflow_id="workflow-a",
+                    agent_id="agent-a",
+                    created_at="2026-11-05T20:00:03Z",
+                ),
+                _record(
+                    marker="discover-cross",
+                    fact="Cross-project current",
+                    scope="CROSS_PROJECT_WORKFLOW",
+                    lifecycle="VALIDATED_CURRENT",
+                    created_at="2026-11-05T20:00:02Z",
+                ),
+            ]
+            await _write(engine, older)
+            await engine.write_record(
+                newer,
+                [1.0] + [0.0] * 255,
+                supersede_record_id=older["record_id"],
+            )
+            for row in rows:
+                await _write(engine, row)
+
+            changes_before = engine.conn.total_changes if engine.conn is not None else -1
+            first = await overview.discover(lifecycle_state="CANDIDATE", limit=2)
+            assert first["status"] == "OK"
+            assert first["scope"] is None
+            assert first["filters"]["sort_order"] == "NEWEST"
+            assert first["counts"]["filtered_logical"] == {
+                "value": 3,
+                "completeness": "EXACT",
+                "reason": None,
+            }
+            assert first["counts"]["filtered_revisions"] == {
+                "value": 3,
+                "completeness": "EXACT",
+                "reason": None,
+            }
+            assert first["next_cursor"] is not None
+
+            second = await overview.discover(
+                lifecycle_state="CANDIDATE",
+                limit=2,
+                cursor=first["next_cursor"],
+            )
+            items = first["items"] + second["items"]
+            assert [item["fact"] for item in items] == [
+                "Project A candidate",
+                "Project B candidate",
+                "Workflow candidate",
+            ]
+            assert len(items) == 3
+            assert {item["fact"] for item in items} == {
+                "Project A candidate",
+                "Project B candidate",
+                "Workflow candidate",
+            }
+            assert all(set(item["scope"]) == {"scope", "project_id", "worktree_id", "workflow_id", "agent_id"} for item in items)
+            assert all("group_cas" not in item for item in items)
+            assert all("observed_group_token" not in item for item in items)
+            assert all("mutation_proof" not in item for item in items)
+
+            scoped = await overview.discover(
+                scope="PROJECT",
+                project_id="project-a",
+            )
+            assert {item["fact"] for item in scoped["items"]} == {
+                "Latest project A revision",
+                "Project A candidate",
+            }
+            assert "Older project A revision" not in {item["fact"] for item in scoped["items"]}
+            assert all(item["scope"] == {
+                "scope": "PROJECT",
+                "project_id": "project-a",
+                "worktree_id": None,
+                "workflow_id": None,
+                "agent_id": None,
+            } for item in scoped["items"])
+
+            filtered = await overview.discover(
+                source_ref="source:discover-new",
+                created_after="2026-11-05T20:00:04Z",
+                created_before="2026-11-05T20:00:06Z",
+            )
+            assert [item["fact"] for item in filtered["items"]] == ["Latest project A revision"]
+
+            oldest_first = await overview.discover(lifecycle_state="CANDIDATE", sort_order="OLDEST", limit=2)
+            assert oldest_first["filters"]["sort_order"] == "OLDEST"
+            assert [item["fact"] for item in oldest_first["items"]] == [
+                "Workflow candidate",
+                "Project B candidate",
+            ]
+            oldest_second = await overview.discover(
+                lifecycle_state="CANDIDATE",
+                sort_order="OLDEST",
+                limit=2,
+                cursor=oldest_first["next_cursor"],
+            )
+            assert [item["fact"] for item in oldest_second["items"]] == ["Project A candidate"]
+            assert {item["record_id"] for item in oldest_first["items"]}.isdisjoint(
+                {item["record_id"] for item in oldest_second["items"]}
+            )
+
+            with pytest.raises(AdapterError) as exc_info:
+                await overview.discover(
+                    lifecycle_state="CANDIDATE",
+                    sort_order="OLDEST",
+                    limit=2,
+                    cursor=first["next_cursor"],
+                )
+            assert exc_info.value.code == "INVALID_CURSOR"
+
+            with pytest.raises(AdapterError) as exc_info:
+                await overview.discover(sort_order="RELEVANCE")
+            assert exc_info.value.code == "INVALID_ENUM"
+
+            with pytest.raises(AdapterError) as exc_info:
+                await overview.discover(
+                    scope="PROJECT",
+                    project_id="project-a",
+                    lifecycle_state="CANDIDATE",
+                    limit=2,
+                    cursor=first["next_cursor"],
+                )
+            assert exc_info.value.code == "INVALID_CURSOR"
+
+            changes_after = engine.conn.total_changes if engine.conn is not None else -1
+            assert changes_after == changes_before
         finally:
             await engine.close()
 
@@ -295,6 +478,7 @@ def test_text_search_is_exact_scope_filtered_keyset_paginated_and_returns_detail
                 limit=2,
             )
             assert first["status"] == "OK"
+            assert first["filters"]["sort_order"] == "NEWEST"
             assert first["search"] == {
                 "requested_mode": "TEXT",
                 "effective_mode": "TEXT",
@@ -333,6 +517,32 @@ def test_text_search_is_exact_scope_filtered_keyset_paginated_and_returns_detail
                 {item["record_id"] for item in second["items"]}
             )
 
+            oldest_first = await overview.search(
+                query="needle",
+                search_mode="TEXT",
+                scope="PROJECT",
+                project_id="project-a",
+                lifecycle_state="CANDIDATE",
+                sort_order="OLDEST",
+                limit=2,
+            )
+            assert oldest_first["filters"]["sort_order"] == "OLDEST"
+            assert [item["fact"] for item in oldest_first["items"]] == ["Needle alpha", "Needle beta"]
+            oldest_second = await overview.search(
+                query="needle",
+                search_mode="TEXT",
+                scope="PROJECT",
+                project_id="project-a",
+                lifecycle_state="CANDIDATE",
+                sort_order="OLDEST",
+                limit=2,
+                cursor=oldest_first["next_cursor"],
+            )
+            assert [item["fact"] for item in oldest_second["items"]] == ["Needle gamma"]
+            assert {item["record_id"] for item in oldest_first["items"]}.isdisjoint(
+                {item["record_id"] for item in oldest_second["items"]}
+            )
+
             source_filtered = await overview.search(
                 query="needle",
                 search_mode="TEXT",
@@ -355,6 +565,23 @@ def test_text_search_is_exact_scope_filtered_keyset_paginated_and_returns_detail
                     cursor=first["next_cursor"],
                 )
             assert exc_info.value.code == "INVALID_CURSOR"
+
+            with pytest.raises(AdapterError) as exc_info:
+                await overview.search(
+                    query="needle",
+                    search_mode="TEXT",
+                    scope="PROJECT",
+                    project_id="project-a",
+                    lifecycle_state="CANDIDATE",
+                    sort_order="OLDEST",
+                    limit=2,
+                    cursor=first["next_cursor"],
+                )
+            assert exc_info.value.code == "INVALID_CURSOR"
+
+            with pytest.raises(AdapterError) as exc_info:
+                await overview.search(query="needle", search_mode="TEXT", sort_order="RELEVANCE")
+            assert exc_info.value.code == "INVALID_ENUM"
         finally:
             await engine.close()
 
@@ -384,6 +611,7 @@ def test_semantic_provider_failure_degrades_to_exact_text_fallback_without_mutat
                 "degraded": True,
                 "degradation": "EMBEDDING_UNAVAILABLE",
             }
+            assert result["filters"]["sort_order"] == "NEWEST"
             assert [item["memory_id"] for item in result["items"]] == [row["memory_id"]]
             assert result["counts"]["filtered_logical"]["completeness"] == "EXACT"
             changes_after = engine.conn.total_changes if engine.conn is not None else -1
@@ -464,15 +692,28 @@ def test_successful_semantic_search_marks_bounded_match_total_partial(tmp_path) 
                 search_mode="SEMANTIC",
                 scope="PROJECT",
                 project_id="project-a",
+                sort_order="RELEVANCE",
             )
 
             assert provider.query_calls == 1
             assert result["status"] == "OK"
             assert result["search"]["effective_mode"] == "SEMANTIC"
+            assert result["filters"]["sort_order"] == "RELEVANCE"
             assert result["counts"]["filtered_logical"]["value"] == 1
             assert result["counts"]["filtered_logical"]["completeness"] == "PARTIAL"
             assert result["counts"]["filtered_logical"]["reason"] == "SEMANTIC_TOP_K_BOUNDED"
             assert result["items"][0]["memory_id"] == row["memory_id"]
+
+            with pytest.raises(AdapterError) as exc_info:
+                await overview.search(
+                    query="semantic candidate",
+                    search_mode="SEMANTIC",
+                    scope="PROJECT",
+                    project_id="project-a",
+                    sort_order="NEWEST",
+                )
+            assert exc_info.value.code == "INVALID_ENUM"
+            assert provider.query_calls == 1
         finally:
             await engine.close()
 

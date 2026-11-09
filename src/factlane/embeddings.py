@@ -16,6 +16,51 @@ EMBEDDING_COMPATIBILITY_REVISION = 1
 MIN_OLLAMA_VERSION = (0, 22, 1)
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)  # type: ignore[arg-type]
+
+
+def _validated_loopback_base_url(base_url: str) -> str:
+    if (
+        not isinstance(base_url, str)
+        or not base_url
+        or base_url.strip() != base_url
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in base_url)
+        or ";" in base_url
+        or "?" in base_url
+        or "#" in base_url
+    ):
+        raise AdapterError("INVALID_ENVELOPE", "embedding provider URL is invalid")
+    try:
+        parsed = urllib.parse.urlparse(base_url)
+        hostname = parsed.hostname
+        port = parsed.port
+        username = parsed.username
+        password = parsed.password
+    except (TypeError, ValueError) as exc:
+        raise AdapterError("INVALID_ENVELOPE", "embedding provider URL is invalid") from exc
+    if parsed.scheme != "http" or hostname not in {"127.0.0.1", "::1"}:
+        raise AdapterError("INVALID_ENVELOPE", "embedding provider must use local HTTP only")
+    if username is not None or password is not None:
+        raise AdapterError("INVALID_ENVELOPE", "embedding provider URL is invalid")
+    if parsed.params or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise AdapterError("INVALID_ENVELOPE", "embedding provider URL is invalid")
+    if parsed.netloc.endswith(":") or parsed.netloc.endswith("]:") or port == 0:
+        raise AdapterError("INVALID_ENVELOPE", "embedding provider URL is invalid")
+    if hostname == "::1" and not parsed.netloc.startswith("["):
+        raise AdapterError("INVALID_ENVELOPE", "embedding provider URL is invalid")
+    return base_url.rstrip("/")
+
+
 def _parse_semver(value: object) -> tuple[int, int, int] | None:
     if not isinstance(value, str):
         return None
@@ -143,16 +188,16 @@ class OllamaLocalProvider:
         base_url: str = "http://127.0.0.1:11434",
         timeout: float = 120.0,
     ) -> None:
-        parsed = urllib.parse.urlparse(base_url)
-        if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1"}:
-            raise AdapterError("INVALID_ENVELOPE", "embedding provider must use local HTTP only")
-        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
-            raise AdapterError("INVALID_ENVELOPE", "embedding provider URL is invalid")
+        validated_base_url = _validated_loopback_base_url(base_url)
         if output_dimension <= 0 or source_dimension < output_dimension:
             raise AdapterError("INVALID_ENVELOPE", "embedding dimensions are invalid")
-        self.base_url = base_url.rstrip("/")
+        self.base_url = validated_base_url
         self.model = model
         self.timeout = timeout
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _RejectRedirects(),
+        )
         self.document_prefix = document_prefix
         self.query_prefix = query_prefix
         self.document_calls = 0
@@ -178,7 +223,7 @@ class OllamaLocalProvider:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with self._opener.open(request, timeout=self.timeout) as response:
                 raw = response.read()
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise AdapterError("EMBEDDING_UNAVAILABLE", "local embedding provider is unavailable") from exc

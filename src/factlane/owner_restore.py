@@ -15,10 +15,17 @@ import uuid
 
 from .contract import AdapterError, canonical_json, iso_now
 from .maintenance_coordinator import MaintenanceCoordinatorError, PreparedMaintenance
-from .owner_database import ArtifactRegistry, create_consistent_backup
+from .owner_database import ArtifactRegistry, _flush_private_file, create_consistent_backup
 from .recovery import MaintenanceLease, RecoveryHold
 from .runtime_control import RuntimeIdentity
 from .storage import STORAGE_CONTRACT_VERSION
+from .windows_security import (
+    WindowsSecurityError,
+    current_user_sid,
+    ensure_owner_private_directory,
+    validate_owner_private_path,
+    validate_windows_path_no_reparse,
+)
 
 
 _RECOVERY_INTERLOCK_KEY = "sensitive_recovery_interlock"
@@ -66,6 +73,21 @@ def _canonical_operation_id(value: str) -> str:
 
 
 def _private_dir(path: Path) -> None:
+    if os.name == "nt":
+        try:
+            validate_windows_path_no_reparse(path)
+            owner_sid = current_user_sid()
+            if path.exists() or path.is_symlink():
+                validate_owner_private_path(path, owner_sid=owner_sid, directory=True)
+            else:
+                ensure_owner_private_directory(path, owner_sid=owner_sid)
+                validate_owner_private_path(path, owner_sid=owner_sid, directory=True)
+        except WindowsSecurityError as exc:
+            raise AdapterError(
+                "RESTORE_STATE_UNAVAILABLE",
+                "restore state directory is not owner-controlled",
+            ) from exc
+        return
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_dir() or path.stat().st_uid != os.getuid():
             raise AdapterError("RESTORE_STATE_UNAVAILABLE", "restore state directory is not owner-controlled")
@@ -75,7 +97,399 @@ def _private_dir(path: Path) -> None:
     os.chmod(path, 0o700)
 
 
+def _windows_validate_private_handle(handle: Any, *, message: str) -> None:
+    try:
+        import win32security
+
+        from .windows_security import _validate_descriptor
+
+        descriptor = win32security.GetSecurityInfo(
+            int(handle),
+            win32security.SE_FILE_OBJECT,
+            win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION,
+        )
+        _validate_descriptor(descriptor, current_user_sid(), win32security)
+    except (ImportError, WindowsSecurityError) as exc:
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", message) from exc
+    except Exception as exc:
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", message) from exc
+
+
+def _windows_create_new_private_handle(
+    parent_handle: Any,
+    path: Path,
+    *,
+    delete_access: bool,
+    message: str,
+) -> Any:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        from . import windows_maintenance as windows_maintenance_module
+    except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", message) from exc
+
+    leaf_name = path.name
+    if not leaf_name or "\\" in leaf_name or "/" in leaf_name:
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", message)
+    try:
+        owner_sid = current_user_sid()
+    except WindowsSecurityError as exc:
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", message) from exc
+
+    name_buffer = ctypes.create_unicode_buffer(leaf_name)
+    name = windows_maintenance_module._UNICODE_STRING(
+        Length=len(leaf_name.encode("utf-16-le")),
+        MaximumLength=ctypes.sizeof(name_buffer),
+        Buffer=ctypes.cast(name_buffer, wintypes.LPWSTR),
+    )
+    descriptor = wintypes.LPVOID()
+    try:
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+        convert.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        convert.restype = wintypes.BOOL
+        if not convert(
+            f"O:{owner_sid}D:P(A;;GA;;;{owner_sid})",
+            1,
+            ctypes.byref(descriptor),
+            None,
+        ):
+            raise AdapterError("RESTORE_STATE_UNAVAILABLE", message)
+
+        attributes = windows_maintenance_module._OBJECT_ATTRIBUTES(
+            Length=ctypes.sizeof(windows_maintenance_module._OBJECT_ATTRIBUTES),
+            RootDirectory=windows_maintenance_module._handle_value(parent_handle),
+            ObjectName=ctypes.pointer(name),
+            Attributes=windows_maintenance_module._OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor=descriptor,
+            SecurityQualityOfService=None,
+        )
+        io_status = windows_maintenance_module._IO_STATUS_BLOCK()
+        raw_handle = wintypes.HANDLE()
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        nt_create = ntdll.NtCreateFile
+        nt_create.argtypes = [
+            ctypes.POINTER(wintypes.HANDLE),
+            wintypes.DWORD,
+            ctypes.POINTER(windows_maintenance_module._OBJECT_ATTRIBUTES),
+            ctypes.POINTER(windows_maintenance_module._IO_STATUS_BLOCK),
+            wintypes.LPVOID,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.LPVOID,
+            wintypes.ULONG,
+        ]
+        nt_create.restype = wintypes.LONG
+        desired_access = windows_maintenance_module._GENERIC_WRITE | 0x00100000
+        if delete_access:
+            desired_access |= windows_maintenance_module._DELETE
+        status = int(
+            nt_create(
+                ctypes.byref(raw_handle),
+                desired_access,
+                ctypes.byref(attributes),
+                ctypes.byref(io_status),
+                None,
+                windows_maintenance_module._FILE_ATTRIBUTE_NORMAL,
+                0,
+                2,
+                windows_maintenance_module._FILE_NON_DIRECTORY_FILE
+                | windows_maintenance_module._FILE_FLAG_OPEN_REPARSE_POINT
+                | 0x20,
+                None,
+                0,
+            )
+        )
+        if status < 0:
+            rtl_status_to_dos = ntdll.RtlNtStatusToDosError
+            rtl_status_to_dos.argtypes = [wintypes.LONG]
+            rtl_status_to_dos.restype = wintypes.ULONG
+            error = int(rtl_status_to_dos(status))
+            if error in {80, 183}:
+                raise FileExistsError(str(path))
+            raise AdapterError("RESTORE_STATE_UNAVAILABLE", message)
+        value = int(raw_handle.value or 0)
+        if value == 0:
+            raise AdapterError("RESTORE_STATE_UNAVAILABLE", message)
+        handle = windows_maintenance_module._NativeHandle(value)
+        try:
+            _windows_validate_private_handle(handle, message=message)
+            return handle
+        except BaseException:
+            handle.Close()
+            raise
+    finally:
+        if descriptor:
+            local_free = ctypes.WinDLL("kernel32", use_last_error=True).LocalFree
+            local_free.argtypes = [wintypes.HLOCAL]
+            local_free.restype = wintypes.HLOCAL
+            local_free(descriptor)
+
+
+def _windows_write_handle(handle: Any, data: bytes, *, message: str) -> None:
+    if not data:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        raw_handle = wintypes.HANDLE(int(handle))
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        write_file = kernel32.WriteFile
+        write_file.argtypes = [
+            wintypes.HANDLE,
+            wintypes.LPCVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
+        ]
+        write_file.restype = wintypes.BOOL
+        buffer = ctypes.create_string_buffer(data)
+        written = wintypes.DWORD()
+        if not write_file(raw_handle, buffer, len(data), ctypes.byref(written), None) or written.value != len(data):
+            raise OSError(ctypes.get_last_error(), message)
+    except Exception as exc:
+        if isinstance(exc, AdapterError):
+            raise
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", message) from exc
+
+
+def _windows_flush_handle(handle: Any, *, message: str) -> None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        flush = kernel32.FlushFileBuffers
+        flush.argtypes = [wintypes.HANDLE]
+        flush.restype = wintypes.BOOL
+        if not flush(wintypes.HANDLE(int(handle))):
+            raise OSError(ctypes.get_last_error(), message)
+    except Exception as exc:
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", message) from exc
+
+
+def _windows_validate_private_file(path: Path, *, message: str) -> None:
+    try:
+        validate_windows_path_no_reparse(path)
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise AdapterError("RESTORE_STATE_UNAVAILABLE", message)
+        validate_owner_private_path(path, owner_sid=current_user_sid(), directory=False)
+    except FileNotFoundError:
+        raise
+    except AdapterError:
+        raise
+    except WindowsSecurityError as exc:
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", message) from exc
+
+
+def _windows_open_pinned_parent(path: Path, *, label: str, message: str) -> tuple[str, Any, Any]:
+    try:
+        from .windows_maintenance import WindowsMaintenanceError, _open_parent_guard
+    except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", message) from exc
+    try:
+        return _open_parent_guard(
+            str(path),
+            label=label,
+            contention_code="RESTORE_STATE_UNAVAILABLE",
+            contention_message=message,
+        )
+    except WindowsMaintenanceError as exc:
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", message) from exc
+
+
+def _windows_verify_pinned_parent(
+    parent: str,
+    handle: Any,
+    identity: Any,
+    *,
+    message: str,
+) -> None:
+    try:
+        from .windows_maintenance import WindowsMaintenanceError, _require_parent_guard
+    except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", message) from exc
+    try:
+        _require_parent_guard(
+            parent,
+            handle,
+            identity,
+            code="RESTORE_STATE_UNAVAILABLE",
+            message=message,
+        )
+    except WindowsMaintenanceError as exc:
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", message) from exc
+
+
+def _windows_close_handle(handle: Any) -> None:
+    close = getattr(handle, "Close", None)
+    if callable(close):
+        close()
+        return
+    close = getattr(handle, "close", None)
+    if callable(close):
+        close()
+
+
+def _windows_rename_handle_replace_relative(
+    source_handle: Any,
+    parent_handle: Any,
+    destination: Path,
+) -> None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        from . import windows_maintenance as windows_maintenance_module
+    except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+        raise AdapterError(
+            "RESTORE_STATE_UNAVAILABLE",
+            "restore journal durable publication is unavailable",
+        ) from exc
+
+    leaf_name = destination.name
+    if not leaf_name or "\\" in leaf_name or "/" in leaf_name:
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", "restore journal publication path is invalid")
+    encoded = leaf_name.encode("utf-16-le")
+    filename_offset = (
+        windows_maintenance_module._FILE_RENAME_INFO_EX_HEADER.FileNameLength.offset
+        + ctypes.sizeof(wintypes.DWORD)
+    )
+    buffer = ctypes.create_string_buffer(filename_offset + len(encoded) + ctypes.sizeof(wintypes.WCHAR))
+    header = windows_maintenance_module._FILE_RENAME_INFO_EX_HEADER.from_buffer(buffer)
+    header.Flags = 1
+    header.RootDirectory = windows_maintenance_module._handle_value(parent_handle)
+    header.FileNameLength = len(encoded)
+    ctypes.memmove(ctypes.addressof(buffer) + filename_offset, encoded, len(encoded))
+
+    io_status = windows_maintenance_module._IO_STATUS_BLOCK()
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    nt_set = ntdll.NtSetInformationFile
+    nt_set.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(windows_maintenance_module._IO_STATUS_BLOCK),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        ctypes.c_int,
+    ]
+    nt_set.restype = wintypes.LONG
+    status = int(
+        nt_set(
+            windows_maintenance_module._handle_value(source_handle),
+            ctypes.byref(io_status),
+            ctypes.byref(buffer),
+            filename_offset + len(encoded),
+            10,
+        )
+    )
+    if status >= 0:
+        return
+    rtl_status_to_dos = ntdll.RtlNtStatusToDosError
+    rtl_status_to_dos.argtypes = [wintypes.LONG]
+    rtl_status_to_dos.restype = wintypes.ULONG
+    error = int(rtl_status_to_dos(status))
+    raise AdapterError(
+        "RESTORE_STATE_UNAVAILABLE",
+        "restore journal could not be published atomically",
+    ) from OSError(error, "Windows rooted rename failed")
+
+
+def _windows_atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    _private_dir(path.parent)
+    stage = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    parent, parent_handle, parent_identity = _windows_open_pinned_parent(
+        path,
+        label="restore journal",
+        message="restore journal parent cannot be guarded safely",
+    )
+    stage_handle: Any | None = None
+    published = False
+    try:
+        if path.exists() or path.is_symlink():
+            _windows_validate_private_file(path, message="restore journal is not owner-controlled")
+        stage_handle = _windows_create_new_private_handle(
+            parent_handle,
+            stage,
+            delete_access=True,
+            message="restore journal staging file is not owner-controlled",
+        )
+        _windows_write_handle(
+            stage_handle,
+            (canonical_json(payload) + "\n").encode("utf-8"),
+            message="restore journal staging file could not be written durably",
+        )
+        _windows_flush_handle(
+            stage_handle,
+            message="restore journal staging file could not be flushed durably",
+        )
+        _windows_verify_pinned_parent(
+            parent,
+            parent_handle,
+            parent_identity,
+            message="restore journal parent changed during publication",
+        )
+        if path.exists() or path.is_symlink():
+            _windows_validate_private_file(path, message="restore journal is not owner-controlled")
+        else:
+            try:
+                validate_windows_path_no_reparse(path)
+            except WindowsSecurityError as exc:
+                raise AdapterError(
+                    "RESTORE_STATE_UNAVAILABLE",
+                    "restore journal path changed before publication",
+                ) from exc
+        _windows_rename_handle_replace_relative(stage_handle, parent_handle, path)
+        published = True
+        _windows_flush_handle(
+            stage_handle,
+            message="restore journal could not be flushed after publication",
+        )
+        _windows_verify_pinned_parent(
+            parent,
+            parent_handle,
+            parent_identity,
+            message="restore journal parent changed during publication",
+        )
+        _windows_validate_private_file(path, message="restore journal is not owner-controlled")
+        _windows_verify_pinned_parent(
+            parent,
+            parent_handle,
+            parent_identity,
+            message="restore journal parent changed during publication",
+        )
+    finally:
+        _windows_close_handle(stage_handle)
+        if not published:
+            try:
+                _windows_verify_pinned_parent(
+                    parent,
+                    parent_handle,
+                    parent_identity,
+                    message="restore journal parent changed during cleanup",
+                )
+            except AdapterError:
+                pass
+            else:
+                if stage.exists() and not stage.is_symlink():
+                    stage.unlink()
+        _windows_close_handle(parent_handle)
+
+
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    if os.name == "nt":
+        _windows_atomic_json(path, payload)
+        return
     _private_dir(path.parent)
     stage = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -89,6 +503,74 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     finally:
         if stage.exists():
             stage.unlink()
+
+
+def _windows_create_restore_stage(source: Path, stage: Path) -> Path:
+    parent, parent_handle, parent_identity = _windows_open_pinned_parent(
+        stage,
+        label="restore staging file",
+        message="restore staging parent cannot be guarded safely",
+    )
+    created = False
+    ready = False
+    stage_handle: Any | None = None
+    try:
+        if stage.exists() or stage.is_symlink():
+            raise AdapterError("RESTORE_STAGE_COLLISION", "restore staging path already exists")
+        stage_handle = _windows_create_new_private_handle(
+            parent_handle,
+            stage,
+            delete_access=False,
+            message="restore staging file is not owner-controlled",
+        )
+        created = True
+        with source.open("rb") as source_handle:
+            while chunk := source_handle.read(1024 * 1024):
+                _windows_write_handle(
+                    stage_handle,
+                    chunk,
+                    message="restore staging file could not be written",
+                )
+        _windows_flush_handle(stage_handle, message="restore staging file could not be flushed")
+        _windows_close_handle(stage_handle)
+        stage_handle = None
+        _windows_verify_pinned_parent(
+            parent,
+            parent_handle,
+            parent_identity,
+            message="restore staging parent changed during creation",
+        )
+        _windows_validate_private_file(stage, message="restore staging file is not owner-controlled")
+        _windows_verify_pinned_parent(
+            parent,
+            parent_handle,
+            parent_identity,
+            message="restore staging parent changed during creation",
+        )
+        ready = True
+        return stage
+    except FileExistsError as exc:
+        raise AdapterError("RESTORE_STAGE_COLLISION", "restore staging path already exists") from exc
+    except WindowsSecurityError as exc:
+        raise AdapterError("RESTORE_STATE_UNAVAILABLE", "restore staging file is not owner-controlled") from exc
+    except BaseException:
+        raise
+    finally:
+        _windows_close_handle(stage_handle)
+        if created and not ready:
+            try:
+                _windows_verify_pinned_parent(
+                    parent,
+                    parent_handle,
+                    parent_identity,
+                    message="restore staging parent changed during cleanup",
+                )
+            except AdapterError:
+                pass
+            else:
+                if stage.exists() and not stage.is_symlink():
+                    stage.unlink()
+        _windows_close_handle(parent_handle)
 
 
 def _validate_sqlite_image(path: Path) -> dict[str, Any]:
@@ -234,8 +716,12 @@ def _write_interlock(path: Path, operation_id: str) -> None:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         conn.close()
-    with path.open("rb") as handle:
-        os.fsync(handle.fileno())
+    if os.name == "nt":
+        with path.open("r+b", buffering=0) as handle:
+            _flush_private_file(handle.fileno())
+    else:
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
 
 
 def _clear_interlock(path: Path, operation_id: str) -> None:
@@ -290,6 +776,7 @@ class FullRestoreService:
         postflight: PostflightCallback | None = None,
         invalidate_sessions: InvalidateSessionsCallback | None = None,
         post_activation_verify: PostActivationVerificationCallback | None = None,
+        windows_restore_operator_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.active_db = Path(active_db).resolve(strict=False)
         self.registry = registry
@@ -301,6 +788,57 @@ class FullRestoreService:
         self._postflight = postflight
         self._invalidate_sessions = invalidate_sessions
         self._post_activation_verify = post_activation_verify
+        self._windows_restore_operator_factory = windows_restore_operator_factory
+
+    def _uses_windows_restore_operator(self) -> bool:
+        return os.name == "nt" or self._windows_restore_operator_factory is not None
+
+    def _open_windows_restore_operator(self, operation_id: str) -> Any:
+        factory = self._windows_restore_operator_factory
+        if factory is None:
+            try:
+                from .windows_owner_restore import WindowsOwnerRestoreOperator
+            except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+                raise AdapterError(
+                    "WINDOWS_RESTORE_KERNEL_UNAVAILABLE",
+                    "native Windows restore operator is unavailable",
+                ) from exc
+            factory = WindowsOwnerRestoreOperator
+        try:
+            operator = factory(
+                active_db=self.active_db,
+                state_dir=self.state_dir,
+                registry=self.registry,
+                operation_id=operation_id,
+            )
+        except AdapterError:
+            raise
+        except Exception as exc:
+            raise AdapterError(
+                "WINDOWS_RESTORE_KERNEL_UNAVAILABLE",
+                "native Windows restore operator could not be constructed",
+            ) from exc
+        required = (
+            "capture_pre_restore_backup",
+            "prepare_activation",
+            "activate_and_verify",
+            "recover_activation",
+            "classify_activation",
+            "verify_active",
+            "prepare_runtime_handoff",
+            "clear_interlock",
+            "restore_interlock",
+            "retain_fail_closed",
+            "close",
+            "__enter__",
+            "__exit__",
+        )
+        if not all(callable(getattr(operator, name, None)) for name in required):
+            raise AdapterError(
+                "WINDOWS_RESTORE_KERNEL_INVALID",
+                "native Windows restore operator contract is incomplete",
+            )
+        return operator
 
     def _require_executable_configuration(
         self,
@@ -1035,16 +1573,29 @@ class FullRestoreService:
 
     def _read_journal_optional(self, operation_id: str) -> dict[str, Any] | None:
         path = self._journal_path(operation_id)
+        if os.name == "nt":
+            try:
+                validate_windows_path_no_reparse(path)
+            except WindowsSecurityError as exc:
+                raise AdapterError(
+                    "RESTORE_STATE_UNAVAILABLE",
+                    "restore journal is not owner-controlled",
+                ) from exc
         if not path.exists():
             return None
         try:
             info = path.lstat()
         except FileNotFoundError:
             return None
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             raise AdapterError("RESTORE_STATE_UNAVAILABLE", "restore journal is not owner-controlled")
-        if stat.S_IMODE(info.st_mode) & 0o077:
-            raise AdapterError("RESTORE_STATE_UNAVAILABLE", "restore journal permissions are too broad")
+        if os.name == "nt":
+            _windows_validate_private_file(path, message="restore journal is not owner-controlled")
+        else:
+            if info.st_uid != os.getuid():
+                raise AdapterError("RESTORE_STATE_UNAVAILABLE", "restore journal is not owner-controlled")
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                raise AdapterError("RESTORE_STATE_UNAVAILABLE", "restore journal permissions are too broad")
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1559,6 +2110,389 @@ class FullRestoreService:
             recovery_service=recovery_service,
         )
 
+    @staticmethod
+    def _windows_receipt(value: Any, *, label: str) -> dict[str, Any]:
+        if not isinstance(value, dict) or not value:
+            raise AdapterError("RESTORE_STATE_UNAVAILABLE", f"Windows restore {label} receipt is missing or malformed")
+        try:
+            size = len(canonical_json(value).encode("utf-8"))
+        except (TypeError, ValueError) as exc:
+            raise AdapterError("RESTORE_STATE_UNAVAILABLE", f"Windows restore {label} receipt is not serializable") from exc
+        if size > 32768:
+            raise AdapterError("RESTORE_STATE_UNAVAILABLE", f"Windows restore {label} receipt is oversized")
+        return dict(value)
+
+    async def _windows_publish_running_under_exclusion(
+        self,
+        *,
+        operator: Any,
+        preview: dict[str, Any],
+        prepared: PreparedMaintenance,
+        operation_id: str,
+        pre_restore_artifact_id: str,
+        promotion_intent: dict[str, Any],
+        promotion_proof: dict[str, Any],
+        rearm_recovery: bool,
+    ) -> tuple[dict[str, Any], int, int, int]:
+        active_info = self.active_db.stat()
+        generation = prepared.original_generation + 1
+        self._journal(
+            operation_id,
+            phase="ACTIVATED_UNVERIFIED",
+            artifact_id=preview["artifact_id"],
+            artifact_sha256=preview["artifact_sha256"],
+            pre_restore_artifact_id=pre_restore_artifact_id,
+            generation=prepared.original_generation,
+            activation_device=active_info.st_dev,
+            activation_inode=active_info.st_ino,
+            data_postflight_verified=False,
+            prepared_maintenance=self._prepared_receipt(prepared),
+            windows_mutation_intent=promotion_intent,
+            windows_mutation_proof=promotion_proof,
+        )
+        self._journal(
+            operation_id,
+            phase="POSTFLIGHT_VERIFIED",
+            generation=generation,
+            activation_device=active_info.st_dev,
+            activation_inode=active_info.st_ino,
+            data_postflight_verified=True,
+            windows_mutation_intent=promotion_intent,
+            windows_mutation_proof=promotion_proof,
+        )
+        if rearm_recovery:
+            self.coordinator.rearm_recovery(prepared)
+        activation = self.coordinator.begin_activation(prepared, new_generation=generation)
+        if (
+            getattr(activation, "generation", None) != generation
+            or getattr(activation, "device", None) != active_info.st_dev
+            or getattr(activation, "inode", None) != active_info.st_ino
+        ):
+            raise RestoreRecoveryRequired(
+                operation_id,
+                "durable activation barrier does not match the restored Windows database identity",
+            )
+        await _maybe_await(self._invalidate_sessions())
+        result_candidate = {
+            "status": "OK",
+            "operation": "FULL_RESTORE",
+            "operation_id": operation_id,
+            "artifact_id": preview["artifact_id"],
+            "artifact_sha256": preview["artifact_sha256"],
+            "pre_restore_artifact_id": pre_restore_artifact_id,
+            "generation": generation,
+            "ready_instance_ids": [],
+            "reconnect_failures": {},
+        }
+        self._journal(
+            operation_id,
+            phase="ACTIVATION_READY",
+            result=result_candidate,
+            generation=generation,
+            activation_device=active_info.st_dev,
+            activation_inode=active_info.st_ino,
+            prepared_maintenance=self._prepared_receipt(prepared),
+            data_postflight_verified=True,
+            windows_mutation_intent=promotion_intent,
+            windows_mutation_proof=promotion_proof,
+        )
+        handoff = self._windows_receipt(operator.prepare_runtime_handoff(), label="runtime handoff")
+        self._journal(
+            operation_id,
+            phase="ACTIVATION_READY",
+            windows_runtime_handoff=handoff,
+        )
+        operator.clear_interlock()
+        try:
+            operator.verify_active(promotion_intent, promotion_proof, interlock_required=False)
+        except BaseException:
+            operator.restore_interlock()
+            raise
+        try:
+            self.coordinator.publish_running(prepared, new_generation=generation)
+        except Exception as publish_exc:
+            try:
+                published = self.coordinator.activation_state(
+                    operation_id,
+                    new_generation=generation,
+                    device=active_info.st_dev,
+                    inode=active_info.st_ino,
+                )
+            except Exception:
+                operator.restore_interlock()
+                raise publish_exc
+            if getattr(published, "state", None) != "RUNNING":
+                operator.restore_interlock()
+                raise publish_exc
+        return result_candidate, generation, int(active_info.st_dev), int(active_info.st_ino)
+
+    async def _execute_windows_prepared(
+        self,
+        *,
+        current: dict[str, Any],
+        journal: dict[str, Any] | None,
+        prepared: PreparedMaintenance,
+        snapshot_required: bool,
+        effective_authorize: AuthorizeCallback,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        stage: Path | None = None
+        promoted = False
+        running_published = False
+        operator = self._open_windows_restore_operator(operation_id)
+        pre_restore_artifact_id = f"pre-restore-{operation_id}"
+        promotion_intent: dict[str, Any] | None = None
+        try:
+            with operator:
+                current = self._assert_preview_current(current)
+                self._preflight_restore_capacity(current, snapshot_required=snapshot_required)
+                if journal is not None and isinstance(journal.get("pre_restore_artifact_id"), str):
+                    pre_restore = self.registry.get(journal["pre_restore_artifact_id"])
+                    if pre_restore.get("kind") != "SQLITE_BACKUP":
+                        raise AdapterError("RESTORE_STATE_UNAVAILABLE", "pre-restore artifact identity is invalid")
+                    snapshot_receipt = self._windows_receipt(
+                        journal.get("windows_snapshot_receipt"),
+                        label="snapshot",
+                    )
+                else:
+                    pre_restore, raw_snapshot_receipt = operator.capture_pre_restore_backup(
+                        artifact_id=pre_restore_artifact_id
+                    )
+                    if not isinstance(pre_restore, dict) or pre_restore.get("kind") != "SQLITE_BACKUP":
+                        raise AdapterError("RESTORE_STATE_UNAVAILABLE", "Windows pre-restore snapshot is invalid")
+                    snapshot_receipt = self._windows_receipt(raw_snapshot_receipt, label="snapshot")
+                self._journal(
+                    operation_id,
+                    phase="SNAPSHOT_READY",
+                    artifact_id=current["artifact_id"],
+                    artifact_sha256=current["artifact_sha256"],
+                    trusted_origin_attested=True,
+                    authorization_preview=current["authorization_preview"],
+                    original_database_device=current["active_database_device"],
+                    original_database_inode=current["active_database_inode"],
+                    pre_restore_artifact_id=pre_restore["artifact_id"],
+                    generation=prepared.original_generation,
+                    prepared_maintenance=self._prepared_receipt(prepared),
+                    windows_snapshot_receipt=snapshot_receipt,
+                )
+                await _maybe_await(effective_authorize(current["authorization_preview"]))
+                current = self._assert_preview_current(current)
+                artifact_receipt = self.registry.get(current["artifact_id"])
+                artifact = self._artifact_path(artifact_receipt)
+                stage_path = self.active_db.with_name(f".{self.active_db.name}.restore-{operation_id}.stage")
+                if os.name == "nt":
+                    stage = _windows_create_restore_stage(artifact, stage_path)
+                else:
+                    # Off-platform orchestration tests inject a fake Windows
+                    # operator but must not depend on native Win32 custody APIs.
+                    # Production Windows always takes the guarded branch above.
+                    if stage_path.exists() or stage_path.is_symlink():
+                        raise AdapterError("RESTORE_STAGE_COLLISION", "restore staging path already exists")
+                    shutil.copyfile(artifact, stage_path)
+                    os.chmod(stage_path, 0o600)
+                    stage = stage_path
+                _validate_sqlite_image(stage)
+                _write_interlock(stage, operation_id)
+                promotion_intent = self._windows_receipt(
+                    operator.prepare_activation(stage),
+                    label="activation intent",
+                )
+                self._journal(
+                    operation_id,
+                    phase="WINDOWS_MUTATION_INTENT",
+                    artifact_id=current["artifact_id"],
+                    artifact_sha256=current["artifact_sha256"],
+                    pre_restore_artifact_id=pre_restore["artifact_id"],
+                    generation=prepared.original_generation,
+                    prepared_maintenance=self._prepared_receipt(prepared),
+                    windows_snapshot_receipt=snapshot_receipt,
+                    windows_mutation_intent=promotion_intent,
+                )
+                try:
+                    promotion_proof = self._windows_receipt(
+                        operator.activate_and_verify(promotion_intent),
+                        label="activation proof",
+                    )
+                except BaseException as exc:
+                    if getattr(exc, "mutation_may_have_started", True) is False:
+                        raise
+                    # The durable intent exists and SQLite backup may have started.
+                    # Keep the stage for authenticated recovery.  Retain exclusion
+                    # process-lifetime only when exact interlock/identity truth cannot
+                    # classify the outcome; otherwise return the DB to runtime posture
+                    # while the durable recovery barrier remains authoritative.
+                    stage = None
+                    self.coordinator.mark_recovery_required(operation_id)
+                    await self._mark_service_recovery_required()
+                    classification: dict[str, Any] | None = None
+                    handoff: dict[str, Any] | None = None
+                    retain_required = False
+                    try:
+                        classification = self._windows_receipt(
+                            operator.classify_activation(promotion_intent),
+                            label="activation classification",
+                        )
+                        handoff = self._windows_receipt(
+                            operator.prepare_runtime_handoff(),
+                            label="runtime handoff",
+                        )
+                    except Exception:
+                        retain_required = True
+                    self._journal(
+                        operation_id,
+                        phase="WINDOWS_MUTATION_INTENT",
+                        windows_mutation_recovery_required=True,
+                        windows_mutation_classification=classification,
+                        windows_runtime_handoff=handoff,
+                        windows_exclusion_retained=retain_required,
+                        verification_error={
+                            "code": str(getattr(exc, "code", "WINDOWS_RESTORE_MUTATION_FAILED")),
+                            "message": str(
+                                getattr(exc, "safe_message", "Windows restore activation requires recovery")
+                            ),
+                        },
+                    )
+                    if retain_required:
+                        operator.retain_fail_closed()
+                    raise RestoreRecoveryRequired(
+                        operation_id,
+                        "Windows restore activation requires authenticated recovery",
+                    ) from exc
+                promoted = True
+                stage = None
+                try:
+                    result_candidate, generation, device, inode = await self._windows_publish_running_under_exclusion(
+                        operator=operator,
+                        preview=current,
+                        prepared=prepared,
+                        operation_id=operation_id,
+                        pre_restore_artifact_id=pre_restore["artifact_id"],
+                        promotion_intent=promotion_intent,
+                        promotion_proof=promotion_proof,
+                        rearm_recovery=False,
+                    )
+                    running_published = True
+                except BaseException as exc:
+                    try:
+                        operator.retain_fail_closed()
+                    finally:
+                        recovery_info = self.active_db.stat()
+                        self.coordinator.mark_recovery_required(operation_id)
+                        await self._mark_service_recovery_required()
+                        self._record_recovery_required(
+                            operation_id,
+                            fallback_from_phase="POSTFLIGHT_VERIFIED",
+                            activation_device=recovery_info.st_dev,
+                            activation_inode=recovery_info.st_ino,
+                        )
+                    if isinstance(exc, RestoreRecoveryRequired):
+                        raise
+                    raise RestoreRecoveryRequired(
+                        operation_id,
+                        "Windows restore activation requires authenticated recovery",
+                    ) from exc
+            return await self._complete_running_activation(
+                preview=current,
+                prepared=prepared,
+                result=result_candidate,
+                generation=generation,
+                device=device,
+                inode=inode,
+                replay=False,
+            )
+        except RestoreRecoveryRequired:
+            raise
+        except Exception:
+            if promoted or running_published:
+                raise
+            try:
+                await self.coordinator.abort_pre_mutation(prepared)
+            except BaseException:
+                await self._mark_service_recovery_required()
+                raise
+            await self._finish_service_maintenance(operation_id)
+            self._journal(
+                operation_id,
+                phase="ABORTED_BEFORE_ACTIVATION",
+                artifact_id=current["artifact_id"],
+                artifact_sha256=current["artifact_sha256"],
+                trusted_origin_attested=True,
+                authorization_preview=current["authorization_preview"],
+            )
+            raise
+        finally:
+            if stage is not None and stage.exists() and not stage.is_symlink():
+                try:
+                    stage.unlink()
+                except OSError:
+                    pass
+
+    async def _resume_windows_mutation_intent(
+        self,
+        *,
+        preview: dict[str, Any],
+        journal: dict[str, Any],
+        authorize: AuthorizeCallback | None,
+    ) -> dict[str, Any]:
+        operation_id = _canonical_operation_id(str(journal.get("operation_id")))
+        effective_authorize = self._require_recovery_authorize(authorize)
+        if not self._journal_matches_preview(journal, preview):
+            raise AdapterError("IDEMPOTENCY_CONFLICT", "restore recovery preview no longer matches the durable operation")
+        prepared = self._prepared_from_receipt(journal.get("prepared_maintenance"))
+        intent = self._windows_receipt(journal.get("windows_mutation_intent"), label="activation intent")
+        pre_restore_artifact_id = journal.get("pre_restore_artifact_id")
+        if not isinstance(pre_restore_artifact_id, str) or not pre_restore_artifact_id:
+            raise AdapterError("RESTORE_STATE_UNAVAILABLE", "Windows restore recovery lost the pre-restore snapshot")
+        pre_restore = self.registry.get(pre_restore_artifact_id)
+        if pre_restore.get("kind") != "SQLITE_BACKUP":
+            raise AdapterError("RESTORE_STATE_UNAVAILABLE", "Windows restore recovery snapshot identity is invalid")
+        exact_preview = journal.get("authorization_preview")
+        if not isinstance(exact_preview, str):
+            raise AdapterError("RESTORE_STATE_UNAVAILABLE", "Windows restore recovery lost its authorization preview")
+        await _maybe_await(effective_authorize(exact_preview))
+        recovery_service = await self._service_status() == "RECOVERY_REQUIRED"
+        operator = self._open_windows_restore_operator(operation_id)
+        try:
+            with operator:
+                try:
+                    proof = self._windows_receipt(operator.recover_activation(intent), label="activation proof")
+                    result, generation, device, inode = await self._windows_publish_running_under_exclusion(
+                        operator=operator,
+                        preview=preview,
+                        prepared=prepared,
+                        operation_id=operation_id,
+                        pre_restore_artifact_id=pre_restore_artifact_id,
+                        promotion_intent=intent,
+                        promotion_proof=proof,
+                        rearm_recovery=bool(journal.get("windows_mutation_recovery_required") is True),
+                    )
+                except BaseException as exc:
+                    try:
+                        operator.retain_fail_closed()
+                    finally:
+                        try:
+                            self.coordinator.mark_recovery_required(operation_id)
+                        finally:
+                            await self._mark_service_recovery_required()
+                    if isinstance(exc, RestoreRecoveryRequired):
+                        raise
+                    raise RestoreRecoveryRequired(
+                        operation_id,
+                        "Windows restore activation recovery did not reach safe RUNNING publication",
+                    ) from exc
+            return await self._complete_running_activation(
+                preview=preview,
+                prepared=prepared,
+                result=result,
+                generation=generation,
+                device=device,
+                inode=inode,
+                replay=True,
+                recovery_service=recovery_service,
+            )
+        except RestoreRecoveryRequired:
+            raise
+
     def _recovery_result_candidate(
         self,
         preview: dict[str, Any],
@@ -1769,6 +2703,23 @@ class FullRestoreService:
             raise AdapterError("RESTORE_STATE_UNAVAILABLE", "restore recovery lost its authorization preview")
         await _maybe_await(effective_authorize(exact_authorization_preview))
 
+        if self._uses_windows_restore_operator() and phase in {
+            "ACTIVATED_UNVERIFIED",
+            "POSTFLIGHT_VERIFIED",
+            "RECOVERY_REQUIRED",
+            "ACTIVATION_READY",
+        }:
+            return await self._resume_windows_postmutation_recovery(
+                preview=preview,
+                journal=journal,
+                prepared=prepared,
+                generation=generation,
+                device=device,
+                inode=inode,
+                phase=str(phase),
+                validated_activation=validated_activation,
+            )
+
         if phase == "SERVICE_STATE_RECOVERY_REQUIRED":
             snapshot = validated_activation
             if getattr(snapshot, "state", None) != "RUNNING" or _read_interlock(self.active_db) is not None:
@@ -1835,6 +2786,117 @@ class FullRestoreService:
             inode=inode,
         )
 
+    async def _resume_windows_postmutation_recovery(
+        self,
+        *,
+        preview: dict[str, Any],
+        journal: dict[str, Any],
+        prepared: PreparedMaintenance,
+        generation: int,
+        device: int,
+        inode: int,
+        phase: str,
+        validated_activation: Any,
+    ) -> dict[str, Any]:
+        operation_id = prepared.operation_id
+        recovery_service = await self._service_status() == "RECOVERY_REQUIRED"
+        result_candidate = self._recovery_result_candidate(preview, journal, generation=generation)
+
+        if phase == "ACTIVATION_READY" and getattr(validated_activation, "state", None) == "RUNNING":
+            return await self._complete_running_activation(
+                preview=preview,
+                prepared=prepared,
+                result=result_candidate,
+                generation=generation,
+                device=device,
+                inode=inode,
+                replay=True,
+                recovery_service=recovery_service,
+            )
+
+        intent = self._windows_receipt(journal.get("windows_mutation_intent"), label="activation intent")
+        pre_restore_artifact_id = journal.get("pre_restore_artifact_id")
+        if not isinstance(pre_restore_artifact_id, str) or not pre_restore_artifact_id:
+            raise AdapterError("RESTORE_STATE_UNAVAILABLE", "Windows restore recovery lost its pre-restore snapshot")
+        operator = self._open_windows_restore_operator(operation_id)
+        try:
+            with operator:
+                try:
+                    if phase == "ACTIVATION_READY":
+                        proof = self._windows_receipt(journal.get("windows_mutation_proof"), label="activation proof")
+                        interlock_present = False
+                        try:
+                            operator.verify_active(intent, proof, interlock_required=False)
+                        except Exception:
+                            operator.verify_active(intent, proof, interlock_required=True)
+                            interlock_present = True
+                        handoff = self._windows_receipt(
+                            operator.prepare_runtime_handoff(),
+                            label="runtime handoff",
+                        )
+                        self._journal(
+                            operation_id,
+                            phase="ACTIVATION_READY",
+                            windows_runtime_handoff=handoff,
+                        )
+                        if interlock_present:
+                            operator.clear_interlock()
+                        operator.verify_active(intent, proof, interlock_required=False)
+                        try:
+                            self.coordinator.publish_running(prepared, new_generation=generation)
+                        except Exception as publish_exc:
+                            try:
+                                published = self.coordinator.activation_state(
+                                    operation_id,
+                                    new_generation=generation,
+                                    device=device,
+                                    inode=inode,
+                                )
+                            except Exception:
+                                operator.restore_interlock()
+                                raise publish_exc
+                            if getattr(published, "state", None) != "RUNNING":
+                                operator.restore_interlock()
+                                raise publish_exc
+                    else:
+                        proof = self._windows_receipt(operator.recover_activation(intent), label="activation proof")
+                        result_candidate, generation, device, inode = await self._windows_publish_running_under_exclusion(
+                            operator=operator,
+                            preview=preview,
+                            prepared=prepared,
+                            operation_id=operation_id,
+                            pre_restore_artifact_id=pre_restore_artifact_id,
+                            promotion_intent=intent,
+                            promotion_proof=proof,
+                            rearm_recovery=phase == "RECOVERY_REQUIRED",
+                        )
+                except BaseException as exc:
+                    try:
+                        operator.retain_fail_closed()
+                    finally:
+                        try:
+                            self.coordinator.mark_recovery_required(operation_id)
+                        finally:
+                            await self._mark_service_recovery_required()
+                    if isinstance(exc, RestoreRecoveryRequired):
+                        raise
+                    raise RestoreRecoveryRequired(
+                        operation_id,
+                        "Windows restore recovery did not reach safe RUNNING publication",
+                    ) from exc
+            return await self._complete_running_activation(
+                preview=preview,
+                prepared=prepared,
+                result=result_candidate,
+                generation=generation,
+                device=device,
+                inode=inode,
+                replay=True,
+                recovery_service=recovery_service,
+            )
+        except RestoreRecoveryRequired:
+            raise
+
     async def execute(
         self,
         *,
@@ -1850,6 +2912,16 @@ class FullRestoreService:
         if journal is not None and journal.get("phase") == "POST_ACTIVATION_VERIFIED":
             self._require_executable_configuration(authorize)
             return await self._finish_verified_journal(preview, journal)
+        if (
+            journal is not None
+            and journal.get("phase") == "WINDOWS_MUTATION_INTENT"
+            and self._uses_windows_restore_operator()
+        ):
+            return await self._resume_windows_mutation_intent(
+                preview=preview,
+                journal=journal,
+                authorize=authorize,
+            )
         if journal is not None and journal.get("phase") in {
             "ACTIVATION_VERIFICATION_FAILED",
             "SERVICE_STATE_RECOVERY_REQUIRED",
@@ -1922,6 +2994,16 @@ class FullRestoreService:
             self._journal(operation_id, phase="ABORTED_BEFORE_PREPARE")
             raise AdapterError("RESTORE_COORDINATION_FAILED", "maintenance coordinator returned the wrong operation")
 
+        if self._uses_windows_restore_operator():
+            return await self._execute_windows_prepared(
+                current=current,
+                journal=journal,
+                prepared=prepared,
+                snapshot_required=snapshot_required,
+                effective_authorize=effective_authorize,
+                operation_id=operation_id,
+            )
+
         promoted = False
         running_published = False
         stage: Path | None = None
@@ -1960,13 +3042,17 @@ class FullRestoreService:
             artifact_receipt = self.registry.get(current["artifact_id"])
             artifact = self._artifact_path(artifact_receipt)
 
-            stage = self.active_db.with_name(f".{self.active_db.name}.restore-{operation_id}.stage")
-            if stage.exists() or stage.is_symlink():
-                raise AdapterError("RESTORE_STAGE_COLLISION", "restore staging path already exists")
-            fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            os.close(fd)
-            shutil.copyfile(artifact, stage)
-            os.chmod(stage, 0o600)
+            stage_path = self.active_db.with_name(f".{self.active_db.name}.restore-{operation_id}.stage")
+            if os.name == "nt":
+                stage = _windows_create_restore_stage(artifact, stage_path)
+            else:
+                stage = stage_path
+                if stage.exists() or stage.is_symlink():
+                    raise AdapterError("RESTORE_STAGE_COLLISION", "restore staging path already exists")
+                fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(fd)
+                shutil.copyfile(artifact, stage)
+                os.chmod(stage, 0o600)
             _validate_sqlite_image(stage)
             _write_interlock(stage, operation_id)
             self._journal(

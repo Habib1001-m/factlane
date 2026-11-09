@@ -25,18 +25,21 @@ from factlane.webui_install import (
     InstallerStepStatus,
     PortClaim,
     ProductionLinuxInstallerBackend,
+    LINUX_OWNER_PANEL_LAUNCHER_FILENAME,
     SetupConsent,
     SetupRequest,
     WEBUI_SERVICE_NAME,
     apply_webui_setup,
     consent_requirements,
     detect_install_environment,
-    render_hosts_with_mapping,
     plan_webui_setup,
     render_caddy_config,
+    render_linux_owner_panel_launcher,
+    render_windows_owner_panel_launcher,
     render_user_unit,
     webui_hostname,
 )
+from factlane.webui_windows import WindowsBrowserInstall
 
 
 class _FakeInstallerBackend:
@@ -117,7 +120,7 @@ def _environment() -> InstallEnvironment:
         systemd=True,
         caddy_path="/usr/bin/caddy",
         zenity_path="/usr/bin/zenity",
-        browser=BrowserInstall(family="chromium", executable="/usr/bin/google-chrome"),
+        browser=BrowserInstall(family="firefox", executable="/usr/bin/firefox"),
         euid=1000,
     )
 
@@ -161,7 +164,7 @@ def test_detects_linux_systemd_caddy_zenity_and_supported_browser() -> None:
         "systemctl": "/usr/bin/systemctl",
         "caddy": "/usr/bin/caddy",
         "zenity": "/usr/bin/zenity",
-        "google-chrome": "/opt/google/chrome/google-chrome",
+        "firefox": "/usr/bin/firefox",
     }
 
     environment = detect_install_environment(
@@ -177,8 +180,8 @@ def test_detects_linux_systemd_caddy_zenity_and_supported_browser() -> None:
         caddy_path="/usr/bin/caddy",
         zenity_path="/usr/bin/zenity",
         browser=BrowserInstall(
-            family="chromium",
-            executable="/opt/google/chrome/google-chrome",
+            family="firefox",
+            executable="/usr/bin/firefox",
         ),
         euid=1000,
     )
@@ -331,7 +334,7 @@ def test_consent_explanations_name_the_exact_state_changes() -> None:
         "browser_profile_trust",
         "user_lingering",
     }
-    assert "exact local hostname" in requirements["hostname_mapping"].explanation
+    assert "isolated FactLane Firefox profile" in requirements["hostname_mapping"].explanation
     assert "isolated FactLane browser profile" in requirements["browser_profile_trust"].explanation
     assert "boot before login" in requirements["user_lingering"].explanation
 
@@ -496,19 +499,22 @@ def test_successful_setup_returns_explicit_preserving_operations_and_generated_m
 
     operations = {operation.kind: operation for operation in receipt.operations}
     assert set(operations) == {
+        "PERSIST_PROVISIONAL_SETUP",
+        "BOOTSTRAP_CADDY_CA",
+        "ENSURE_ISOLATED_PROFILE_NETWORK",
+        "ENSURE_ISOLATED_PROFILE_TRUST",
         "WRITE_SERVICE_CONFIG",
         "WRITE_CADDY_CONFIG",
         "INSTALL_USER_UNIT",
-        "ENSURE_HOSTNAME_MAPPING",
-        "ENSURE_ISOLATED_PROFILE_TRUST",
         "ENABLE_USER_LINGERING",
         "REGISTER_USER_SERVICE",
     }
-    hostname = operations["ENSURE_HOSTNAME_MAPPING"]
-    assert hostname.target == "/etc/hosts"
-    assert hostname.desired_state == "127.0.0.1\tfactlane-1a2b3c4d-55aa.test"
-    assert hostname.preserve_unrelated_state is True
-    assert hostname.consent_key == "hostname_mapping"
+    assert all(operation.target != "/etc/hosts" for operation in receipt.operations)
+    network = operations["ENSURE_ISOLATED_PROFILE_NETWORK"]
+    assert network.target == "/home/alice/.local/state/factlane/browser"
+    assert 'network.dns.localDomains' in network.desired_state
+    assert "factlane-1a2b3c4d-55aa.test" in network.desired_state
+    assert network.consent_key == "hostname_mapping"
 
     trust = operations["ENSURE_ISOLATED_PROFILE_TRUST"]
     assert trust.target == "/home/alice/.local/state/factlane/browser"
@@ -665,18 +671,135 @@ def test_apply_refuses_non_ready_receipt_and_missing_operation_consent() -> None
     assert backend.operations == []
 
 
-def test_apply_propagates_typed_privileged_and_browser_trust_incomplete_results() -> None:
+def test_linux_owner_panel_launcher_is_planned_and_applied_only_after_ready_activation() -> None:
+    request = replace(
+        _request(lingering_required=False),
+        launcher_path=f"/home/alice/.local/share/applications/{LINUX_OWNER_PANEL_LAUNCHER_FILENAME}",
+    )
+    receipt = plan_webui_setup(request, _environment(), _consent(lingering=False))
+    assert receipt.plan is not None
+    launcher = next(op for op in receipt.operations if op.kind == "INSTALL_OWNER_LAUNCHER")
+    assert launcher.target == request.launcher_path
+    assert launcher.desired_state == render_linux_owner_panel_launcher(
+        factlane_executable=request.factlane_executable
+    )
+    assert "Terminal=false" in launcher.desired_state
+    assert 'Exec="/home/alice/.local/bin/factlane" launch webui' in launcher.desired_state
+
+    backend = _FakeInstallerBackend()
+    result = apply_webui_setup(receipt, _consent(lingering=False), backend)
+
+    assert result.status is InstallerStepStatus.APPLIED
+    kinds = [operation.kind for operation, _plan in backend.operations]
+    assert kinds[-1] == "INSTALL_OWNER_LAUNCHER"
+    assert result.completed_operations[-1] == "INSTALL_OWNER_LAUNCHER"
+
+
+@_LINUX_OWNER_PRIVATE_WRITE
+def test_linux_production_backend_writes_owner_launcher_without_shell_or_terminal(tmp_path: Path) -> None:
+    request = replace(
+        _request(lingering_required=False),
+        launcher_path=f"/home/alice/.local/share/applications/{LINUX_OWNER_PANEL_LAUNCHER_FILENAME}",
+    )
+    receipt = plan_webui_setup(request, _environment(), _consent(lingering=False))
+    assert receipt.plan is not None
+    planned = next(op for op in receipt.operations if op.kind == "INSTALL_OWNER_LAUNCHER")
+    target = tmp_path / LINUX_OWNER_PANEL_LAUNCHER_FILENAME
+    operation = replace(planned, target=str(target))
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        command_runner=lambda _argv: pytest.fail("launcher write must not invoke a shell or command runner"),
+    )
+
+    result = backend.apply_operation(operation, plan=receipt.plan)
+
+    assert result.status is InstallerStepStatus.APPLIED
+    content = target.read_text(encoding="utf-8")
+    assert "Terminal=false" in content
+    assert 'Exec="/home/alice/.local/bin/factlane" launch webui' in content
+    assert all(token not in content for token in ("sh -c", "bash -c", "sudo", "pkexec"))
+
+
+def test_windows_owner_panel_launcher_spec_is_current_user_pythonw_and_shell_free() -> None:
+    rendered = render_windows_owner_panel_launcher(
+        factlane_executable=r"C:\Users\Alice\factlane\Scripts\python.exe",
+        owner_config_home=r"C:\Users\Alice\AppData\Local\FactLane\config",
+    )
+    payload = json.loads(rendered)
+
+    assert payload == {
+        "arguments": "-m factlane.webui_launcher",
+        "description": "Open the local FactLane Owner Panel",
+        "target": r"C:\Users\Alice\factlane\Scripts\pythonw.exe",
+        "working_directory": r"C:\Users\Alice\AppData\Local\FactLane",
+    }
+    assert all(token not in rendered.casefold() for token in ("cmd.exe", "powershell", "wscript.exe"))
+
+
+def test_windows_setup_plan_adds_only_current_user_start_menu_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    import factlane.webui_install as install
+
+    monkeypatch.setattr(install.os, "name", "nt")
+    request = SetupRequest(
+        installation_id="windows-owner-1",
+        saved_port=8765,
+        lingering_required=False,
+        installing_user=r"DESKTOP\Alice",
+        factlane_executable=r"C:\Users\Alice\factlane\Scripts\python.exe",
+        owner_config_home=r"C:\Users\Alice\AppData\Local\FactLane\config",
+        service_config_path=r"C:\Users\Alice\AppData\Local\FactLane\config\webui.json",
+        caddy_config_path=r"C:\Users\Alice\AppData\Local\FactLane\config\transport.json",
+        user_unit_path=r"C:\Users\Alice\AppData\Local\FactLane\state\task-scheduler.json",
+        backend_socket=r"C:\Users\Alice\AppData\Local\FactLane\runtime\owner-http",
+        runtime_dir=r"C:\Users\Alice\AppData\Local\FactLane\runtime",
+        state_dir=r"C:\Users\Alice\AppData\Local\FactLane\state",
+        caddy_state_dir=r"C:\Users\Alice\AppData\Local\FactLane\state\transport",
+        browser_profile_dir=r"C:\Users\Alice\AppData\Local\FactLane\browser",
+        native_control_socket=r"\\.\pipe\factlane-owner-test",
+        launcher_path=(
+            r"C:\Users\Alice\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\FactLane Owner Panel.lnk"
+        ),
+    )
+    environment = InstallEnvironment(
+        system="Windows",
+        systemd=False,
+        caddy_path=None,
+        zenity_path=None,
+        browser=WindowsBrowserInstall(
+            family="firefox",
+            executable=r"C:\Program Files\Mozilla Firefox\firefox.exe",
+        ),
+        euid=-1,
+    )
+    consent = SetupConsent(
+        hostname_mapping=False,
+        browser_profile_trust=False,
+        user_lingering=False,
+        windows_native_setup=True,
+    )
+
+    receipt = plan_webui_setup(request, environment, consent)
+
+    assert receipt.status == "READY_TO_APPLY"
+    launcher = next(op for op in receipt.operations if op.kind == "INSTALL_OWNER_LAUNCHER")
+    assert launcher.target == request.launcher_path
+    assert launcher.consent_key == "windows_native_setup"
+    assert launcher.target.endswith(r"\Start Menu\Programs\FactLane Owner Panel.lnk")
+    assert "ProgramData" not in launcher.target
+
+
+def test_apply_propagates_typed_preclaim_failures_before_endpoint_writes() -> None:
     receipt = plan_webui_setup(_request(), _environment(), _consent())
-    privileged = _FakeInstallerBackend(
+    bootstrap_failed = _FakeInstallerBackend(
         step_statuses={
-            "ENSURE_HOSTNAME_MAPPING": InstallerStepStatus.NEEDS_PRIVILEGED_INSTALLER,
+            "BOOTSTRAP_CADDY_CA": InstallerStepStatus.RECOVERY_REQUIRED,
         }
     )
-    result = apply_webui_setup(receipt, _consent(), privileged)
-    assert result.status is InstallerStepStatus.NEEDS_PRIVILEGED_INSTALLER
+    result = apply_webui_setup(receipt, _consent(), bootstrap_failed)
+    assert result.status is InstallerStepStatus.RECOVERY_REQUIRED
     assert result.endpoint_state is EndpointState.PROPOSED
     assert result.claimed_port is None
-    assert all(op.kind != "WRITE_SERVICE_CONFIG" for op, _plan in privileged.operations)
+    assert all(op.kind != "WRITE_SERVICE_CONFIG" for op, _plan in bootstrap_failed.operations)
 
     incomplete = _FakeInstallerBackend(
         step_statuses={
@@ -701,7 +824,11 @@ def test_production_backend_owner_private_write_is_atomic_regular_0600_under_070
     )
     target = tmp_path / "private" / "webui.json"
     operation = replace(
-        plan_webui_setup(_request(), _environment(), _consent()).operations[0],
+        next(
+            op
+            for op in plan_webui_setup(_request(), _environment(), _consent()).operations
+            if op.kind == "WRITE_SERVICE_CONFIG"
+        ),
         target=str(target),
     )
     plan = plan_webui_setup(_request(), _environment(), _consent()).plan
@@ -731,7 +858,10 @@ def test_production_backend_rejects_symlink_target_without_touching_referent(
     target.symlink_to(referent)
     receipt = plan_webui_setup(_request(), _environment(), _consent())
     assert receipt.plan is not None
-    operation = replace(receipt.operations[0], target=str(target))
+    operation = replace(
+        next(op for op in receipt.operations if op.kind == "WRITE_SERVICE_CONFIG"),
+        target=str(target),
+    )
 
     result = backend.apply_operation(operation, plan=receipt.plan)
 
@@ -752,7 +882,7 @@ def test_production_backend_rejects_symlink_directory_component(tmp_path: Path) 
     receipt = plan_webui_setup(_request(), _environment(), _consent())
     assert receipt.plan is not None
     operation = replace(
-        receipt.operations[0],
+        next(op for op in receipt.operations if op.kind == "WRITE_SERVICE_CONFIG"),
         target=str(linked_parent / "webui.json"),
     )
 
@@ -784,45 +914,12 @@ def test_user_unit_write_preserves_unrelated_sibling_units(tmp_path: Path) -> No
     assert (unit_dir / WEBUI_SERVICE_NAME).read_text(encoding="utf-8") == unit.desired_state
 
 
-def test_production_backend_fails_closed_for_privilege_and_trust() -> None:
-    calls: list[tuple[str, ...]] = []
-    backend = ProductionLinuxInstallerBackend(
-        systemctl_path="/usr/bin/systemctl",
-        command_runner=lambda argv: calls.append(argv) or 0,
-    )
+def test_linux_plan_has_no_system_hostname_mutation_or_chromium_path() -> None:
     receipt = plan_webui_setup(_request(), _environment(), _consent())
     assert receipt.plan is not None
-    operations = {operation.kind: operation for operation in receipt.operations}
-
-    privileged = backend.apply_operation(
-        operations["ENSURE_HOSTNAME_MAPPING"], plan=receipt.plan
-    )
-    trust = backend.apply_operation(
-        operations["ENSURE_ISOLATED_PROFILE_TRUST"], plan=receipt.plan
-    )
-    lingering = backend.apply_operation(
-        operations["ENABLE_USER_LINGERING"], plan=receipt.plan
-    )
-    assert privileged.status is InstallerStepStatus.NEEDS_PRIVILEGED_INSTALLER
-    assert lingering.status is InstallerStepStatus.NEEDS_PRIVILEGED_INSTALLER
-    assert trust.status is InstallerStepStatus.INCOMPLETE_BROWSER_TRUST
-    assert calls == []
-
-
-def test_production_apply_stops_at_privilege_boundary_before_files_or_commands() -> None:
-    calls: list[tuple[str, ...]] = []
-    backend = ProductionLinuxInstallerBackend(
-        systemctl_path="/usr/bin/systemctl",
-        command_runner=lambda argv: calls.append(argv) or 0,
-    )
-    receipt = plan_webui_setup(_request(), _environment(), _consent())
-
-    result = apply_webui_setup(receipt, _consent(), backend)
-
-    assert result.status is InstallerStepStatus.NEEDS_PRIVILEGED_INSTALLER
-    assert result.endpoint_state is EndpointState.PROPOSED
-    assert result.completed_operations == ()
-    assert calls == []
+    assert receipt.plan.browser.family == "firefox"
+    assert "ENSURE_HOSTNAME_MAPPING" not in {operation.kind for operation in receipt.operations}
+    assert all(operation.target != "/etc/hosts" for operation in receipt.operations)
 
 
 def test_production_backend_registers_only_exact_user_service_with_argv_no_shell() -> None:
@@ -943,23 +1040,3 @@ def test_activation_ready_must_report_exact_claimed_endpoint() -> None:
     assert result.status is InstallerStepStatus.FAILED
     assert result.endpoint_state is EndpointState.PROPOSED
     assert [plan.saved_port for plan in backend.stops] == [8765]
-
-
-def test_hosts_renderer_preserves_unrelated_entries_and_replaces_only_exact_hostname() -> None:
-    existing = (
-        "127.0.0.1 localhost\n"
-        "10.0.0.9 factlane-old.test other-name\n"
-        "192.0.2.7 factlane-1a2b3c4d-55aa.test keep-me\n"
-        "# custom comment\n"
-    )
-
-    rendered = render_hosts_with_mapping(
-        existing,
-        hostname="factlane-1a2b3c4d-55aa.test",
-    )
-
-    assert "127.0.0.1 localhost" in rendered
-    assert "10.0.0.9 factlane-old.test other-name" in rendered
-    assert "192.0.2.7 keep-me" in rendered
-    assert "# custom comment" in rendered
-    assert rendered.endswith("127.0.0.1\tfactlane-1a2b3c4d-55aa.test\n")

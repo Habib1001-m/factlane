@@ -214,9 +214,69 @@ def _path_has_reparse_point(path: Path) -> bool:
     return bool(attributes & reparse_flag)
 
 
+def validate_windows_path_no_reparse(path: str | os.PathLike[str]) -> Path:
+    """Reject any existing reparse component in one absolute local-drive path.
+
+    This is deliberately lexical: resolving the path first would erase the exact
+    junction/symlink crossing that custody validation needs to detect.  Missing
+    trailing components are allowed only after every existing ancestor has been
+    checked, which makes this suitable for pre-creation validation.
+    """
+
+    _require_windows()
+    target = Path(path)
+    raw = os.fspath(target)
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or "\x00" in raw
+        or any(char in raw for char in ("\n", "\r"))
+        or not target.is_absolute()
+        or not target.drive
+        or raw.startswith(("\\\\", "\\?\\", "\\.\\"))
+    ):
+        raise WindowsSecurityError(
+            "WINDOWS_PATH_UNSAFE",
+            "Windows owner-private path must be one absolute local-drive path",
+        )
+
+    current = Path(target.anchor)
+    try:
+        anchor_info = current.lstat()
+    except OSError as exc:
+        raise WindowsSecurityError(
+            "WINDOWS_PATH_UNAVAILABLE",
+            "Windows path anchor identity is unavailable",
+        ) from exc
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    if int(getattr(anchor_info, "st_file_attributes", 0)) & reparse_flag:
+        raise WindowsSecurityError(
+            "WINDOWS_PATH_REPARSE_DENIED",
+            "Windows owner-private path contains a reparse point",
+        )
+
+    for component in target.parts[1:]:
+        current = current / component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise WindowsSecurityError(
+                "WINDOWS_PATH_UNAVAILABLE",
+                "Windows path component identity is unavailable",
+            ) from exc
+        if int(getattr(info, "st_file_attributes", 0)) & reparse_flag:
+            raise WindowsSecurityError(
+                "WINDOWS_PATH_REPARSE_DENIED",
+                "Windows owner-private path contains a reparse point",
+            )
+    return target
+
+
 def validate_owner_private_path(path: str | os.PathLike[str], *, owner_sid: str, directory: bool) -> None:
     _pywintypes, _win32api, _win32con, _win32process, win32security = _require_windows()
-    target = Path(path)
+    target = validate_windows_path_no_reparse(path)
     if _path_has_reparse_point(target):
         raise WindowsSecurityError("WINDOWS_PATH_REPARSE_DENIED", "Windows owner-private path is a reparse point")
     if directory and not target.is_dir():
@@ -236,7 +296,7 @@ def validate_owner_private_path(path: str | os.PathLike[str], *, owner_sid: str,
 
 def protect_owner_private_path(path: str | os.PathLike[str], *, owner_sid: str, directory: bool) -> None:
     _pywintypes, _win32api, _win32con, _win32process, win32security = _require_windows()
-    target = Path(path)
+    target = validate_windows_path_no_reparse(path)
     if _path_has_reparse_point(target):
         raise WindowsSecurityError("WINDOWS_PATH_REPARSE_DENIED", "refusing to protect a Windows reparse point")
     if directory and not target.is_dir():
@@ -272,7 +332,7 @@ def protect_owner_private_path(path: str | os.PathLike[str], *, owner_sid: str, 
 
 
 def ensure_owner_private_directory(path: str | os.PathLike[str], *, owner_sid: str) -> None:
-    target = Path(path)
+    target = validate_windows_path_no_reparse(path)
     target.mkdir(parents=True, exist_ok=True)
     protect_owner_private_path(target, owner_sid=owner_sid, directory=True)
 

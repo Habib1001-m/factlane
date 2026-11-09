@@ -29,6 +29,14 @@ from .contract import (
     validate_provenance,
     validate_scope,
 )
+from .windows_security import (
+    WindowsSecurityError,
+    current_user_sid,
+    owner_only_security_attributes,
+    protect_owner_private_path,
+    validate_owner_private_path,
+    validate_windows_path_no_reparse,
+)
 
 
 LOGICAL_FORMAT = "factlane.logical.v1"
@@ -85,16 +93,528 @@ def _validate_artifact_id(value: str) -> str:
     return value
 
 
+def _windows_path_guard(
+    path: Path,
+    *,
+    directory: bool,
+    protect: bool,
+    code: str,
+    message: str,
+) -> None:
+    try:
+        owner_sid = current_user_sid()
+        if protect:
+            protect_owner_private_path(path, owner_sid=owner_sid, directory=directory)
+        else:
+            validate_owner_private_path(path, owner_sid=owner_sid, directory=directory)
+    except WindowsSecurityError as exc:
+        raise AdapterError(code, message) from exc
+
+
+def _validate_private_regular_file(
+    path: Path,
+    *,
+    code: str,
+    message: str,
+    type_message: str | None = None,
+) -> os.stat_result:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        raise
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        _raise(code, type_message or message)
+    if os.name == "nt":
+        _windows_path_guard(path, directory=False, protect=False, code=code, message=message)
+    elif info.st_uid != os.getuid():
+        _raise(code, message)
+    return info
+
+
+def _protect_created_private_file(path: Path, *, code: str, message: str) -> None:
+    if os.name == "nt":
+        _windows_path_guard(path, directory=False, protect=True, code=code, message=message)
+    else:
+        os.chmod(path, 0o600)
+
+
+class _WindowsParentGuard:
+    def __init__(
+        self,
+        *,
+        path: Path,
+        handle: Any,
+        identity: tuple[int, int, int],
+        owner_sid: str,
+        code: str,
+        message: str,
+    ) -> None:
+        self.path = path
+        self._handle = handle
+        self._identity = identity
+        self._owner_sid = owner_sid
+        self._code = code
+        self._message = message
+
+    def require_current(self) -> None:
+        if self._handle is None:
+            _raise(self._code, self._message)
+        current = _windows_parent_identity(
+            self._handle,
+            self.path,
+            code=self._code,
+            message=self._message,
+        )
+        if current != self._identity:
+            _raise(self._code, self._message)
+        try:
+            validate_owner_private_path(self.path, owner_sid=self._owner_sid, directory=True)
+        except WindowsSecurityError as exc:
+            raise AdapterError(self._code, self._message) from exc
+
+    def raw_handle(self) -> int:
+        if self._handle is None:
+            _raise(self._code, self._message)
+        value = int(self._handle)
+        if value in {0, -1}:
+            _raise(self._code, self._message)
+        return value
+
+    def close(self) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is not None:
+            try:
+                handle.Close()
+            except Exception:
+                pass
+
+
+def _windows_handle_final_path(raw_handle: int, *, code: str, message: str) -> str:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_final = kernel32.GetFinalPathNameByHandleW
+        get_final.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+        get_final.restype = wintypes.DWORD
+        required = int(get_final(raw_handle, None, 0, 0))
+        if required <= 0 or required > 32768:
+            _raise(code, message)
+        buffer = ctypes.create_unicode_buffer(required + 1)
+        written = int(get_final(raw_handle, buffer, len(buffer), 0))
+        if written <= 0 or written >= len(buffer):
+            _raise(code, message)
+        final_path = buffer.value
+        if final_path.startswith("\\\\?\\UNC\\"):
+            final_path = "\\\\" + final_path[8:]
+        elif final_path.startswith("\\\\?\\"):
+            final_path = final_path[4:]
+        return final_path
+    except AdapterError:
+        raise
+    except Exception as exc:
+        raise AdapterError(code, message) from exc
+
+
+def _windows_parent_identity(
+    handle: Any,
+    expected_path: Path,
+    *,
+    code: str,
+    message: str,
+) -> tuple[int, int, int]:
+    try:
+        import win32con
+        import win32file
+
+        info = win32file.GetFileInformationByHandle(handle)
+        attributes = int(info[0])
+        directory_flag = int(getattr(win32con, "FILE_ATTRIBUTE_DIRECTORY", 0x10))
+        reparse_flag = int(getattr(win32con, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        if not attributes & directory_flag or attributes & reparse_flag:
+            _raise(code, message)
+        final_path = _windows_handle_final_path(int(handle), code=code, message=message)
+        expected_key = os.path.normcase(os.path.normpath(os.path.abspath(str(expected_path))))
+        observed_key = os.path.normcase(os.path.normpath(os.path.abspath(final_path)))
+        if observed_key != expected_key:
+            _raise(code, message)
+        return int(info[4]), int(info[8]), int(info[9])
+    except AdapterError:
+        raise
+    except Exception as exc:
+        raise AdapterError(code, message) from exc
+
+
+def _open_windows_parent_guard(path: Path, *, code: str, message: str) -> _WindowsParentGuard:
+    parent = path.parent
+    try:
+        import win32con
+        import win32file
+
+        owner_sid = current_user_sid()
+        validate_windows_path_no_reparse(parent)
+        validate_owner_private_path(parent, owner_sid=owner_sid, directory=True)
+        handle = win32file.CreateFile(
+            str(parent),
+            int(getattr(win32con, "FILE_READ_ATTRIBUTES", 0x80))
+            | int(getattr(win32con, "FILE_ADD_FILE", 0x2))
+            | int(getattr(win32con, "FILE_DELETE_CHILD", 0x40)),
+            int(win32con.FILE_SHARE_READ) | int(win32con.FILE_SHARE_WRITE),
+            None,
+            win32con.OPEN_EXISTING,
+            int(getattr(win32con, "FILE_FLAG_OPEN_REPARSE_POINT", 0x00200000))
+            | int(getattr(win32con, "FILE_FLAG_BACKUP_SEMANTICS", 0x02000000)),
+            None,
+        )
+    except (ImportError, OSError, WindowsSecurityError) as exc:
+        raise AdapterError(code, message) from exc
+    try:
+        identity = _windows_parent_identity(handle, parent, code=code, message=message)
+        validate_owner_private_path(parent, owner_sid=owner_sid, directory=True)
+        guard = _WindowsParentGuard(
+            path=parent,
+            handle=handle,
+            identity=identity,
+            owner_sid=owner_sid,
+            code=code,
+            message=message,
+        )
+        guard.require_current()
+        return guard
+    except BaseException:
+        try:
+            handle.Close()
+        except Exception:
+            pass
+        raise
+
+
+def _flush_private_file(fd: int) -> None:
+    if os.name != "nt":
+        os.fsync(fd)
+        return
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    raw_handle = msvcrt.get_osfhandle(fd)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    flush = kernel32.FlushFileBuffers
+    flush.argtypes = [wintypes.HANDLE]
+    flush.restype = wintypes.BOOL
+    if not flush(wintypes.HANDLE(raw_handle)):
+        error = ctypes.get_last_error()
+        raise OSError(error, "FlushFileBuffers failed")
+
+
+def _write_private_bytes(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    written = 0
+    while written < len(view):
+        count = os.write(fd, view[written:])
+        if count <= 0:
+            raise OSError("private file write made no progress")
+        written += count
+    _flush_private_file(fd)
+
+
+def _unlink_private_file(
+    path: Path,
+    *,
+    parent_guard: _WindowsParentGuard | None,
+    expected_identity: tuple[int, int] | None = None,
+) -> bool:
+    if os.name == "nt":
+        if parent_guard is None or parent_guard.path != path.parent:
+            return False
+        try:
+            parent_guard.require_current()
+        except AdapterError:
+            return False
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return True
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            return False
+        if expected_identity is not None and (info.st_dev, info.st_ino) != expected_identity:
+            return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return True
+    return True
+
+
+def _open_new_private_file(
+    path: Path,
+    flags: int,
+    *,
+    code: str,
+    message: str,
+) -> tuple[int, _WindowsParentGuard | None]:
+    parent_guard: _WindowsParentGuard | None = None
+    if os.name == "nt":
+        validate_windows_path_no_reparse(path)
+        try:
+            import msvcrt
+            import win32api
+            import win32con
+            import win32file
+        except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+            raise AdapterError("WINDOWS_SECURITY_UNAVAILABLE", "Windows private file creation is unavailable") from exc
+        parent_guard = _open_windows_parent_guard(path, code=code, message=message)
+        try:
+            parent_guard.require_current()
+            sid = current_user_sid()
+            desired_access = int(win32con.GENERIC_WRITE) | int(getattr(win32con, "DELETE", 0x00010000))
+            if flags & os.O_RDWR:
+                desired_access |= int(win32con.GENERIC_READ)
+            handle = None
+            raw_handle: int | None = None
+            try:
+                handle = win32file.CreateFile(
+                    str(path),
+                    desired_access,
+                    0,
+                    owner_only_security_attributes(sid),
+                    win32con.CREATE_NEW,
+                    win32con.FILE_ATTRIBUTE_NORMAL,
+                    None,
+                )
+                raw_handle = int(handle.Detach())
+                handle = None
+                fd = msvcrt.open_osfhandle(
+                    raw_handle,
+                    flags | getattr(os, "O_BINARY", 0),
+                )
+                raw_handle = None
+            except FileExistsError:
+                raise
+            except Exception as exc:
+                winerror = getattr(exc, "winerror", None)
+                if winerror in {80, 183}:
+                    raise FileExistsError(str(path)) from exc
+                raise AdapterError(code, message) from exc
+            finally:
+                if handle is not None:
+                    handle.Close()
+                if raw_handle is not None:
+                    try:
+                        win32api.CloseHandle(raw_handle)
+                    except Exception:
+                        pass
+        except BaseException:
+            parent_guard.close()
+            raise
+    else:
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        _protect_created_private_file(path, code=code, message=message)
+        path_info = _validate_private_regular_file(path, code=code, message=message)
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (path_info.st_dev, path_info.st_ino):
+            _raise(code, message)
+        return fd, parent_guard
+    except BaseException:
+        os.close(fd)
+        _unlink_private_file(path, parent_guard=parent_guard)
+        if parent_guard is not None:
+            parent_guard.close()
+        raise
+
+
+def _windows_move_file(
+    source: Path,
+    destination: Path,
+    *,
+    replace: bool,
+    source_fd: int,
+    source_parent_guard: _WindowsParentGuard,
+    destination_parent_guard: _WindowsParentGuard,
+) -> None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+    except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+        raise AdapterError("WINDOWS_SECURITY_UNAVAILABLE", "Windows durable file publication is unavailable") from exc
+    try:
+        if source_parent_guard.path != source.parent or destination_parent_guard.path != destination.parent:
+            _raise("ARTIFACT_PATH_INVALID", "Windows publication parent binding changed")
+        source_parent_guard.require_current()
+        if destination_parent_guard is not source_parent_guard:
+            destination_parent_guard.require_current()
+        source_info = os.fstat(source_fd)
+        source_path_info = _validate_private_regular_file(
+            source,
+            code="ARTIFACT_PATH_INVALID",
+            message="Windows publication source identity changed",
+        )
+        if (source_info.st_dev, source_info.st_ino) != (source_path_info.st_dev, source_path_info.st_ino):
+            _raise("ARTIFACT_PATH_INVALID", "Windows publication source identity changed")
+        raw_handle = int(msvcrt.get_osfhandle(source_fd))
+        observed_source = _windows_handle_final_path(
+            raw_handle,
+            code="ARTIFACT_PATH_INVALID",
+            message="Windows publication source handle changed identity",
+        )
+        if os.path.normcase(os.path.abspath(observed_source)) != os.path.normcase(os.path.abspath(str(source))):
+            _raise("ARTIFACT_PATH_INVALID", "Windows publication source handle changed identity")
+
+        class _FileRenameChoice(ctypes.Union):
+            _fields_ = [("ReplaceIfExists", ctypes.c_ubyte), ("Flags", wintypes.ULONG)]
+
+        class _FileRenameInfoHeader(ctypes.Structure):
+            _fields_ = [
+                ("Choice", _FileRenameChoice),
+                ("RootDirectory", wintypes.HANDLE),
+                ("FileNameLength", wintypes.ULONG),
+            ]
+
+        class _IoStatusBlockStatus(ctypes.Union):
+            _fields_ = [("Status", wintypes.LONG), ("Pointer", wintypes.LPVOID)]
+
+        class _IoStatusBlock(ctypes.Structure):
+            _fields_ = [("u", _IoStatusBlockStatus), ("Information", ctypes.c_size_t)]
+
+        encoded = destination.name.encode("utf-16-le")
+        filename_offset = _FileRenameInfoHeader.FileNameLength.offset + ctypes.sizeof(wintypes.ULONG)
+        buffer = ctypes.create_string_buffer(filename_offset + len(encoded))
+        header = _FileRenameInfoHeader.from_buffer(buffer)
+        header.Choice.ReplaceIfExists = 1 if replace else 0
+        header.RootDirectory = wintypes.HANDLE(destination_parent_guard.raw_handle())
+        header.FileNameLength = len(encoded)
+        ctypes.memmove(ctypes.addressof(buffer) + filename_offset, encoded, len(encoded))
+        io_status = _IoStatusBlock()
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        nt_set_information = ntdll.NtSetInformationFile
+        nt_set_information.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_IoStatusBlock),
+            wintypes.LPVOID,
+            wintypes.ULONG,
+            ctypes.c_int,
+        ]
+        nt_set_information.restype = wintypes.LONG
+        status = int(
+            nt_set_information(
+                wintypes.HANDLE(raw_handle),
+                ctypes.byref(io_status),
+                ctypes.byref(buffer),
+                len(buffer),
+                10,
+            )
+        )
+        if status < 0:
+            rtl_status_to_dos = ntdll.RtlNtStatusToDosError
+            rtl_status_to_dos.argtypes = [wintypes.LONG]
+            rtl_status_to_dos.restype = wintypes.ULONG
+            error = int(rtl_status_to_dos(status))
+            if not replace and error in {80, 183}:
+                raise FileExistsError(str(destination))
+            raise OSError(error, "NtSetInformationFile rename failed")
+
+        destination_parent_guard.require_current()
+        destination_info = _validate_private_regular_file(
+            destination,
+            code="ARTIFACT_PATH_INVALID",
+            message="Windows publication destination identity changed",
+        )
+        current_info = os.fstat(source_fd)
+        if (current_info.st_dev, current_info.st_ino) != (source_info.st_dev, source_info.st_ino):
+            _raise("ARTIFACT_PATH_INVALID", "Windows publication source handle changed identity")
+        if (destination_info.st_dev, destination_info.st_ino) != (source_info.st_dev, source_info.st_ino):
+            _raise("ARTIFACT_PATH_INVALID", "Windows publication did not preserve source identity")
+        observed_destination = _windows_handle_final_path(
+            raw_handle,
+            code="ARTIFACT_PATH_INVALID",
+            message="Windows publication handle did not become the destination",
+        )
+        if os.path.normcase(os.path.abspath(observed_destination)) != os.path.normcase(os.path.abspath(str(destination))):
+            _raise("ARTIFACT_PATH_INVALID", "Windows publication handle did not become the destination")
+        _flush_private_file(source_fd)
+    except Exception:
+        raise
+
+
+def _replace_private_file(
+    source: Path,
+    destination: Path,
+    *,
+    source_fd: int | None = None,
+    parent_guard: _WindowsParentGuard | None = None,
+) -> None:
+    if os.name == "nt":
+        if source_fd is None or parent_guard is None or source.parent != destination.parent:
+            _raise("ARTIFACT_PATH_INVALID", "Windows replacement requires one retained parent guard")
+        _windows_move_file(
+            source,
+            destination,
+            replace=True,
+            source_fd=source_fd,
+            source_parent_guard=parent_guard,
+            destination_parent_guard=parent_guard,
+        )
+    else:
+        os.replace(source, destination)
+
+
+def _publish_new_private_file(
+    source: Path,
+    destination: Path,
+    *,
+    source_fd: int | None = None,
+    source_parent_guard: _WindowsParentGuard | None = None,
+    destination_parent_guard: _WindowsParentGuard | None = None,
+) -> None:
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(str(destination))
+    if os.name == "nt":
+        if source_fd is None or source_parent_guard is None or destination_parent_guard is None:
+            _raise("ARTIFACT_PATH_INVALID", "Windows publication requires retained parent guards")
+        _windows_move_file(
+            source,
+            destination,
+            replace=False,
+            source_fd=source_fd,
+            source_parent_guard=source_parent_guard,
+            destination_parent_guard=destination_parent_guard,
+        )
+    else:
+        os.link(source, destination, follow_symlinks=False)
+
+
 def _private_directory(path: Path) -> None:
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_dir():
             _raise("ARTIFACT_PATH_INVALID", "managed artifact root must be a real directory")
-        if path.stat().st_uid != os.getuid():
-            _raise("ARTIFACT_PATH_INVALID", "managed artifact root must be owned by the current user")
-        os.chmod(path, 0o700)
+        if os.name == "nt":
+            _windows_path_guard(
+                path,
+                directory=True,
+                protect=False,
+                code="ARTIFACT_PATH_INVALID",
+                message="managed artifact root must be owner-controlled",
+            )
+        else:
+            if path.stat().st_uid != os.getuid():
+                _raise("ARTIFACT_PATH_INVALID", "managed artifact root must be owned by the current user")
+            os.chmod(path, 0o700)
         return
     path.mkdir(parents=True, mode=0o700)
-    os.chmod(path, 0o700)
+    if os.name == "nt":
+        _windows_path_guard(
+            path,
+            directory=True,
+            protect=True,
+            code="ARTIFACT_PATH_INVALID",
+            message="managed artifact root could not be protected for the current user",
+        )
+    else:
+        os.chmod(path, 0o700)
 
 
 class ArtifactRegistry:
@@ -108,6 +628,12 @@ class ArtifactRegistry:
         supplied_root = Path(root).absolute()
         if supplied_root.is_symlink():
             _raise("ARTIFACT_PATH_INVALID", "managed artifact root cannot be a symlink")
+        if os.name == "nt":
+            try:
+                validate_windows_path_no_reparse(supplied_root)
+            except WindowsSecurityError as exc:
+                raise AdapterError("ARTIFACT_PATH_INVALID", "managed artifact root contains an unsafe Windows path") from exc
+            _private_directory(supplied_root)
         self.root = supplied_root.resolve(strict=False)
         _private_directory(self.root)
         self._registry_path = self.root / ".factlane-artifacts.json"
@@ -118,7 +644,13 @@ class ArtifactRegistry:
             return {}
         if self._registry_path.is_symlink() or not self._registry_path.is_file():
             _raise("ARTIFACT_REGISTRY_INVALID", "managed artifact registry is not a regular file")
-        if self._registry_path.stat().st_uid != os.getuid():
+        if os.name == "nt":
+            _validate_private_regular_file(
+                self._registry_path,
+                code="ARTIFACT_REGISTRY_INVALID",
+                message="managed artifact registry is not owner-controlled",
+            )
+        elif self._registry_path.stat().st_uid != os.getuid():
             _raise("ARTIFACT_REGISTRY_INVALID", "managed artifact registry is not owner-controlled")
         try:
             value = json.loads(self._registry_path.read_text(encoding="utf-8"))
@@ -131,17 +663,46 @@ class ArtifactRegistry:
     def _save(self, entries: dict[str, dict[str, Any]]) -> None:
         stage = self.root / f".factlane-artifacts-{uuid.uuid4()}.tmp"
         payload = canonical_json(entries).encode("utf-8")
-        fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd, parent_guard = _open_new_private_file(
+            stage,
+            os.O_WRONLY,
+            code="ARTIFACT_REGISTRY_INVALID",
+            message="managed artifact registry staging file is not owner-controlled",
+        )
+        fd_open = True
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(stage, self._registry_path)
-            os.chmod(self._registry_path, 0o600)
+            _write_private_bytes(fd, payload)
+            if os.name != "nt":
+                os.close(fd)
+                fd_open = False
+            if self._registry_path.exists() or self._registry_path.is_symlink():
+                _validate_private_regular_file(
+                    self._registry_path,
+                    code="ARTIFACT_REGISTRY_INVALID",
+                    message="managed artifact registry changed to an unsafe path",
+                )
+            if parent_guard is not None:
+                parent_guard.require_current()
+            _replace_private_file(
+                stage,
+                self._registry_path,
+                source_fd=fd if os.name == "nt" else None,
+                parent_guard=parent_guard,
+            )
+            _protect_created_private_file(
+                self._registry_path,
+                code="ARTIFACT_REGISTRY_INVALID",
+                message="managed artifact registry is not owner-controlled",
+            )
         finally:
-            if stage.exists():
-                stage.unlink()
+            if fd_open:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            _unlink_private_file(stage, parent_guard=parent_guard)
+            if parent_guard is not None:
+                parent_guard.close()
 
     def managed_path(self, filename: str) -> Path:
         if not isinstance(filename, str) or not filename or Path(filename).name != filename:
@@ -172,14 +733,16 @@ class ArtifactRegistry:
         if candidate.parent != self.root:
             _raise("ARTIFACT_PATH_INVALID", "only a managed artifact path can be registered")
         try:
-            info = candidate.lstat()
+            info = _validate_private_regular_file(
+                candidate,
+                code="ARTIFACT_PATH_INVALID",
+                message="managed artifact must be owned by the current user",
+                type_message="managed artifact must be a regular file",
+            )
         except FileNotFoundError as exc:
             raise AdapterError("ARTIFACT_NOT_FOUND", "managed artifact does not exist") from exc
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            _raise("ARTIFACT_PATH_INVALID", "managed artifact must be a regular file")
-        if info.st_uid != os.getuid():
-            _raise("ARTIFACT_PATH_INVALID", "managed artifact must be owned by the current user")
-        os.chmod(candidate, 0o600)
+        if os.name != "nt":
+            os.chmod(candidate, 0o600)
 
         with self._lock:
             entries = self._load()
@@ -212,13 +775,14 @@ class ArtifactRegistry:
                 _raise("ARTIFACT_NOT_REGISTERED", "artifact identity is not registered")
             path = self._path_from_entry(entry)
             try:
-                info = path.lstat()
+                info = _validate_private_regular_file(
+                    path,
+                    code="ARTIFACT_PATH_INVALID",
+                    message="registered artifact is no longer owner-controlled",
+                    type_message="registered artifact is no longer a regular managed file",
+                )
             except FileNotFoundError as exc:
                 raise AdapterError("ARTIFACT_NOT_FOUND", "registered artifact is missing") from exc
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                _raise("ARTIFACT_PATH_INVALID", "registered artifact is no longer a regular managed file")
-            if info.st_uid != os.getuid():
-                _raise("ARTIFACT_PATH_INVALID", "registered artifact is no longer owner-controlled")
             if info.st_size != entry.get("size_bytes"):
                 _raise("ARTIFACT_CHECKSUM_MISMATCH", "registered artifact size no longer matches its receipt")
             actual_digest = _sha256_file(path)
@@ -294,13 +858,14 @@ class ArtifactRegistry:
                 _raise("ARTIFACT_NOT_REGISTERED", "only a registered artifact identity can be deleted")
             path = self._path_from_entry(entry)
             try:
-                info = path.lstat()
+                info = _validate_private_regular_file(
+                    path,
+                    code="ARTIFACT_PATH_INVALID",
+                    message="registered artifact is no longer owner-controlled",
+                    type_message="registered artifact is no longer a regular managed file",
+                )
             except FileNotFoundError as exc:
                 raise AdapterError("ARTIFACT_NOT_FOUND", "registered artifact is missing") from exc
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                _raise("ARTIFACT_PATH_INVALID", "registered artifact is no longer a regular managed file")
-            if info.st_uid != os.getuid():
-                _raise("ARTIFACT_PATH_INVALID", "registered artifact is no longer owner-controlled")
             digest = _sha256_file(path)
             if digest != entry.get("sha256"):
                 _raise("ARTIFACT_CHECKSUM_MISMATCH", "registered artifact checksum no longer matches its receipt")
@@ -325,7 +890,10 @@ class ArtifactRegistry:
             before = self.get(artifact_id)
             kind = before.get("kind")
             if kind == "SQLITE_BACKUP":
-                if before.get("promoted_from_kind") != "RESTORE_UPLOAD":
+                if (
+                    before.get("promoted_from_kind") != "RESTORE_UPLOAD"
+                    and before.get("local_database_registration") is not True
+                ):
                     _raise("INVALID_ARTIFACT", "registered artifact is not a promoted restore upload")
                 path = self._path_from_entry(before)
                 verification = _fresh_backup_verification(path)
@@ -448,6 +1016,7 @@ def create_consistent_backup(
     registry: ArtifactRegistry,
     *,
     artifact_id: str | None = None,
+    metadata_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create and verify one SQLite-aware snapshot, including committed WAL state."""
 
@@ -459,55 +1028,85 @@ def create_consistent_backup(
     if destination.exists() or destination.is_symlink():
         _raise("ARTIFACT_ALREADY_EXISTS", "backup destination already exists")
 
-    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd, parent_guard = _open_new_private_file(
+        destination,
+        os.O_WRONLY,
+        code="ARTIFACT_PATH_INVALID",
+        message="backup destination could not be protected for the current user",
+    )
     os.close(fd)
     source_conn: sqlite3.Connection | None = None
     backup_conn: sqlite3.Connection | None = None
     metadata: dict[str, Any] = {}
     try:
-        source_conn = sqlite3.connect(_sqlite_uri(source), uri=True, timeout=5.0)
-        backup_conn = sqlite3.connect(destination, timeout=5.0)
-        source_conn.backup(backup_conn)
-        backup_conn.commit()
-        integrity = backup_conn.execute("PRAGMA integrity_check").fetchone()
-        if integrity is None or integrity[0] != "ok":
-            _raise("BACKUP_VALIDATION_FAILED", "backup integrity verification failed")
-        metadata = _backup_metadata(backup_conn)
-    except sqlite3.Error as exc:
-        if destination.exists() and not destination.is_symlink():
-            destination.unlink()
-        raise AdapterError("BACKUP_FAILED", "SQLite backup could not be completed") from exc
-    except Exception:
-        if destination.exists() and not destination.is_symlink():
-            destination.unlink()
-        raise
+        try:
+            source_conn = sqlite3.connect(_sqlite_uri(source), uri=True, timeout=5.0)
+            backup_conn = sqlite3.connect(destination, timeout=5.0)
+            source_conn.backup(backup_conn)
+            backup_conn.commit()
+            integrity = backup_conn.execute("PRAGMA integrity_check").fetchone()
+            if integrity is None or integrity[0] != "ok":
+                _raise("BACKUP_VALIDATION_FAILED", "backup integrity verification failed")
+            metadata = _backup_metadata(backup_conn)
+        except sqlite3.Error as exc:
+            _unlink_private_file(destination, parent_guard=parent_guard)
+            raise AdapterError("BACKUP_FAILED", "SQLite backup could not be completed") from exc
+        except Exception:
+            _unlink_private_file(destination, parent_guard=parent_guard)
+            raise
+        finally:
+            if backup_conn is not None:
+                backup_conn.close()
+            if source_conn is not None:
+                source_conn.close()
+
+        try:
+            if os.name == "nt":
+                if parent_guard is not None:
+                    parent_guard.require_current()
+                _validate_private_regular_file(
+                    destination,
+                    code="ARTIFACT_PATH_INVALID",
+                    message="backup destination is not owner-controlled",
+                )
+            else:
+                os.chmod(destination, 0o600)
+            verification = _fresh_backup_verification(destination)
+            for field in ("artifact_format", "sqlite_runtime_version", "storage_contract_version", "embedding_profile"):
+                if metadata.get(field) != verification.get(field):
+                    _raise("BACKUP_VALIDATION_FAILED", "freshly reopened backup metadata does not match the created snapshot")
+            metadata["verification"] = {
+                "fresh_reopen": verification["fresh_reopen"],
+                "readable": verification["readable"],
+                "integrity_check": verification["integrity_check"],
+                "verified_at": verification["verified_at"],
+            }
+            if metadata_extra is not None:
+                if not isinstance(metadata_extra, dict):
+                    _raise("INVALID_ARTIFACT", "backup metadata extension must be an object")
+                reserved = {
+                    "artifact_id",
+                    "kind",
+                    "relative_path",
+                    "size_bytes",
+                    "sha256",
+                    "registered_at",
+                }
+                if reserved.intersection(metadata_extra) or set(metadata).intersection(metadata_extra):
+                    _raise("INVALID_ARTIFACT", "backup metadata extension cannot replace verified receipt fields")
+                metadata.update(metadata_extra)
+            return registry.register(
+                destination,
+                kind="SQLITE_BACKUP",
+                artifact_id=artifact_id,
+                metadata=metadata,
+            )
+        except Exception:
+            _unlink_private_file(destination, parent_guard=parent_guard)
+            raise
     finally:
-        if backup_conn is not None:
-            backup_conn.close()
-        if source_conn is not None:
-            source_conn.close()
-    try:
-        os.chmod(destination, 0o600)
-        verification = _fresh_backup_verification(destination)
-        for field in ("artifact_format", "sqlite_runtime_version", "storage_contract_version", "embedding_profile"):
-            if metadata.get(field) != verification.get(field):
-                _raise("BACKUP_VALIDATION_FAILED", "freshly reopened backup metadata does not match the created snapshot")
-        metadata["verification"] = {
-            "fresh_reopen": verification["fresh_reopen"],
-            "readable": verification["readable"],
-            "integrity_check": verification["integrity_check"],
-            "verified_at": verification["verified_at"],
-        }
-        return registry.register(
-            destination,
-            kind="SQLITE_BACKUP",
-            artifact_id=artifact_id,
-            metadata=metadata,
-        )
-    except Exception:
-        if destination.exists() and not destination.is_symlink():
-            destination.unlink()
-        raise
+        if parent_guard is not None:
+            parent_guard.close()
 
 
 def _decode_json_field(value: Any, field: str) -> Any:
@@ -683,13 +1282,27 @@ def create_registered_logical_export(
     destination = registry.managed_path(f"export-{artifact_id}.json")
     if destination.exists() or destination.is_symlink():
         _raise("ARTIFACT_ALREADY_EXISTS", "logical export destination already exists")
-    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd, parent_guard = _open_new_private_file(
+        destination,
+        os.O_WRONLY,
+        code="ARTIFACT_PATH_INVALID",
+        message="logical export destination could not be protected for the current user",
+    )
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
             handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(destination, 0o600)
+            _flush_private_file(handle.fileno())
+        if os.name == "nt":
+            if parent_guard is not None:
+                parent_guard.require_current()
+            _validate_private_regular_file(
+                destination,
+                code="ARTIFACT_PATH_INVALID",
+                message="logical export destination is not owner-controlled",
+            )
+        else:
+            os.chmod(destination, 0o600)
         return registry.register(
             destination,
             kind="LOGICAL_EXPORT",
@@ -703,9 +1316,11 @@ def create_registered_logical_export(
             },
         )
     except Exception:
-        if destination.exists() and not destination.is_symlink():
-            destination.unlink()
+        _unlink_private_file(destination, parent_guard=parent_guard)
         raise
+    finally:
+        if parent_guard is not None:
+            parent_guard.close()
 
 
 def _strict_json(payload: bytes) -> Any:

@@ -12,6 +12,14 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
+from .webui_windows import WindowsWebUIError, write_owner_private_text_atomic
+from .windows_security import (
+    WindowsSecurityError,
+    current_user_sid,
+    ensure_owner_private_directory,
+    validate_owner_private_path,
+)
+
 
 PORT_MIN = 8765
 PORT_MAX = 8774
@@ -97,6 +105,17 @@ def _linux_boot_id() -> str:
     return value
 
 
+def _default_boot_id() -> str:
+    if os.name == "nt":
+        try:
+            from .webui_windows import windows_boot_id
+
+            return windows_boot_id()
+        except Exception as exc:
+            raise ServiceStateError("Windows boot identity is unavailable") from exc
+    return _linux_boot_id()
+
+
 class WebUIServiceState:
     """Persistent service-state primitives with injected host-side actions.
 
@@ -111,7 +130,7 @@ class WebUIServiceState:
         *,
         controller: Controller = _noop_controller,
         clock: Clock = time.monotonic,
-        boot_id: BootIdProvider = _linux_boot_id,
+        boot_id: BootIdProvider = _default_boot_id,
         listener: Listener | None = None,
     ) -> None:
         self._path = Path(state_path)
@@ -544,6 +563,12 @@ class WebUIServiceState:
         return changed
 
     def _ensure_private_parent(self) -> None:
+        if os.name == "nt":
+            try:
+                ensure_owner_private_directory(self._path.parent, owner_sid=current_user_sid())
+            except WindowsSecurityError as exc:
+                raise ServiceStateError("owner-private service state directory could not be secured") from exc
+            return
         self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             os.chmod(self._path.parent, 0o700)
@@ -553,6 +578,11 @@ class WebUIServiceState:
     def _load_state(self) -> _PersistentState:
         if not self._path.exists():
             return _PersistentState()
+        if os.name == "nt":
+            try:
+                validate_owner_private_path(self._path, owner_sid=current_user_sid(), directory=False)
+            except WindowsSecurityError as exc:
+                raise ServiceStateError("service state is not owner-private") from exc
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -571,13 +601,19 @@ class WebUIServiceState:
             raise ServiceStateError("service intent revision is invalid")
         if not isinstance(state.crash_attempts, int) or not 0 <= state.crash_attempts <= MAX_CRASH_RETRIES:
             raise ServiceStateError("service crash incident counter is invalid")
-        if self._path.stat().st_mode & 0o077:
+        if os.name != "nt" and self._path.stat().st_mode & 0o077:
             os.chmod(self._path, 0o600)
         return state
 
     def _write_state(self) -> None:
         self._ensure_private_parent()
         payload = json.dumps(asdict(self._state), sort_keys=True, separators=(",", ":")) + "\n"
+        if os.name == "nt":
+            try:
+                write_owner_private_text_atomic(str(self._path), payload, owner_sid=current_user_sid())
+            except WindowsWebUIError as exc:
+                raise ServiceStateError("owner-private service state could not be persisted safely") from exc
+            return
         fd, temp_name = tempfile.mkstemp(prefix=f".{self._path.name}.", dir=self._path.parent)
         temp_path = Path(temp_name)
         try:

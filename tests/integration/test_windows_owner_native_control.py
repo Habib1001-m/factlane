@@ -12,6 +12,7 @@ import pytest
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="native Windows Named Pipe qualification only")
 
+import factlane.webui_platform as webui_platform_module
 from factlane.owner_auth import OwnerAuthState
 from factlane.owner_native_control import WindowsOwnerNativeControlServer
 from factlane.owner_native_control import MAX_FRAME_BYTES
@@ -29,6 +30,17 @@ OWNER_UID = 1000
 
 class _Confirmation:
     def confirm(self, _request) -> bool:
+        return True
+
+
+class _DelayedConfirmation:
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+        self.calls = 0
+
+    def confirm(self, _request) -> bool:
+        self.calls += 1
+        time.sleep(self.delay)
         return True
 
 
@@ -55,9 +67,12 @@ def _pipe_name(label: str) -> str:
     return rf"\\.\pipe\factlane-owner-{label}-{os.getpid()}-{time.time_ns()}"
 
 
-def _start_server(*, service: _Service | None = None):
+def _start_server(*, service: _Service | None = None, confirmation=None):
     sid = current_user_sid()
-    auth = OwnerAuthState(owner_uid=OWNER_UID, native_confirmation=_Confirmation())
+    auth = OwnerAuthState(
+        owner_uid=OWNER_UID,
+        native_confirmation=_Confirmation() if confirmation is None else confirmation,
+    )
     server = WindowsOwnerNativeControlServer(
         pipe_name=_pipe_name("test"),
         owner_uid=OWNER_UID,
@@ -269,6 +284,238 @@ def test_windows_owner_named_pipe_response_timeout_is_bounded() -> None:
         assert elapsed < 1.0
     finally:
         _stop_server(server, thread)
+
+
+def test_windows_owner_named_pipe_regular_approval_allows_human_delay_beyond_short_timeout() -> None:
+    confirmation = _DelayedConfirmation(10.25)
+    server, thread, sid = _start_server(confirmation=confirmation)
+    try:
+        client = WindowsNativeLauncherClient(
+            server.pipe_name,
+            owner_sid=sid,
+            expected_server=server.process_identity,
+            timeout_seconds=2.0,
+        )
+        pending = client.begin_local_enrollment(device_label="FactLane local browser")
+        origin = "https://factlane-native-delay.test:8765"
+        preauth = server.auth_state.issue_preauth(origin=origin)
+        server.auth_state.claim_pending(
+            locator=pending.locator,
+            origin=origin,
+            preauth_secret=preauth,
+        )
+
+        started = time.monotonic()
+        assert client.approve_pending(locator=pending.locator) is None
+        elapsed = time.monotonic() - started
+
+        assert elapsed >= 10.0
+        assert elapsed < 20.0
+        assert confirmation.calls == 1
+    finally:
+        _stop_server(server, thread)
+
+
+def test_windows_owner_named_pipe_regular_approval_timeout_is_terminal_and_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    confirmation = _DelayedConfirmation(0.25)
+    server, thread, sid = _start_server(confirmation=confirmation)
+    monkeypatch.setattr(
+        webui_platform_module,
+        "_HUMAN_CONFIRMATION_RESPONSE_TIMEOUT_SECONDS",
+        0.05,
+    )
+    try:
+        client = WindowsNativeLauncherClient(
+            server.pipe_name,
+            owner_sid=sid,
+            expected_server=server.process_identity,
+            timeout_seconds=2.0,
+        )
+        pending = client.begin_local_enrollment(device_label="FactLane local browser")
+        origin = "https://factlane-native-timeout.test:8765"
+        preauth = server.auth_state.issue_preauth(origin=origin)
+        server.auth_state.claim_pending(
+            locator=pending.locator,
+            origin=origin,
+            preauth_secret=preauth,
+        )
+
+        started = time.monotonic()
+        with pytest.raises(WebUIPlatformError) as exc_info:
+            client.approve_pending(locator=pending.locator)
+        elapsed = time.monotonic() - started
+
+        assert exc_info.value.code == "CONTROL_UNAVAILABLE"
+        assert elapsed < 1.0
+        assert confirmation.calls == 1
+        time.sleep(0.3)
+        assert confirmation.calls == 1
+    finally:
+        _stop_server(server, thread)
+
+
+def test_windows_response_reader_rejects_successful_read_after_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeWin32File:
+        @staticmethod
+        def ReadFile(_handle, _length):
+            return 0, b"abcd"
+
+    class FakePyWinTypes:
+        class error(Exception):
+            pass
+
+    moments = iter([100.0, 100.2])
+    monkeypatch.setattr(webui_platform_module.time, "monotonic", lambda: next(moments))
+    monkeypatch.setattr(
+        WindowsNativeLauncherClient,
+        "_windows_pipe_modules",
+        staticmethod(lambda: (FakePyWinTypes, FakeWin32File, object())),
+    )
+
+    with pytest.raises(WebUIPlatformError) as exc_info:
+        WindowsNativeLauncherClient._read_pipe_exact(object(), 4, deadline=100.1)
+
+    assert exc_info.value.code == "CONTROL_UNAVAILABLE"
+
+
+def test_windows_exchange_shares_one_absolute_response_deadline_across_header_and_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = current_user_sid()
+    expected = process_identity(os.getpid())
+    client = WindowsNativeLauncherClient(
+        _pipe_name("shared-deadline"),
+        owner_sid=sid,
+        expected_server=expected,
+        timeout_seconds=2.0,
+    )
+    payload = json.dumps(
+        {"status": "OK", "service": {"state": "READY"}},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    reads = [struct.pack("!I", len(payload)), payload]
+    deadlines: list[float] = []
+    writes: list[bytes] = []
+
+    class FakeHandle:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def Close(self) -> None:
+            self.closed = True
+
+    handle = FakeHandle()
+
+    class FakeWin32File:
+        @staticmethod
+        def WriteFile(_handle, data: bytes):
+            writes.append(bytes(data))
+            return 0, None
+
+    class FakeWin32Pipe:
+        PIPE_READMODE_BYTE = 0x00000000
+        PIPE_NOWAIT = 0x00000001
+
+        @staticmethod
+        def SetNamedPipeHandleState(_handle, _mode, _max_collection_count, _collect_data_timeout):
+            return None
+
+    class FakePyWinTypes:
+        class error(Exception):
+            pass
+
+    def fake_read(_handle, _length: int, *, deadline: float) -> bytes:
+        deadlines.append(deadline)
+        return reads.pop(0)
+
+    monkeypatch.setattr(
+        WindowsNativeLauncherClient,
+        "_windows_pipe_modules",
+        staticmethod(lambda: (FakePyWinTypes, FakeWin32File, FakeWin32Pipe)),
+    )
+    monkeypatch.setattr(
+        WindowsNativeLauncherClient,
+        "_read_pipe_exact",
+        staticmethod(fake_read),
+    )
+    monkeypatch.setattr(client, "_open_pipe", lambda *_args: handle)
+    monkeypatch.setattr(client, "_validate_connected_server", lambda _handle, _pipe: None)
+    monkeypatch.setattr(webui_platform_module.time, "monotonic", lambda: 100.0)
+
+    assert client._exchange(
+        {"op": "SERVICE_STATUS"},
+        response_timeout_seconds=0.5,
+    ) == {"status": "OK", "service": {"state": "READY"}}
+
+    assert deadlines == [100.5, 100.5]
+    assert len(writes) == 1
+    assert handle.closed is True
+
+
+@pytest.mark.parametrize("winerror", [2, 231], ids=["missing", "busy"])
+def test_windows_pipe_missing_or_busy_stays_within_short_open_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    winerror: int,
+) -> None:
+    sid = current_user_sid()
+    expected = process_identity(os.getpid())
+    client = WindowsNativeLauncherClient(
+        _pipe_name(f"open-budget-{winerror}"),
+        owner_sid=sid,
+        expected_server=expected,
+        timeout_seconds=0.03,
+    )
+
+    class FakeError(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__(code)
+            self.winerror = code
+
+    class FakePyWinTypes:
+        error = FakeError
+
+    wait_budgets: list[int] = []
+
+    class FakeWin32Pipe:
+        @staticmethod
+        def WaitNamedPipe(_pipe_name: str, timeout_ms: int) -> None:
+            wait_budgets.append(timeout_ms)
+            raise FakeError(winerror)
+
+    class FakeWin32File:
+        GENERIC_READ = 1
+        GENERIC_WRITE = 2
+        OPEN_EXISTING = 3
+
+        @staticmethod
+        def CreateFile(*_args):
+            raise AssertionError("CreateFile must not run when WaitNamedPipe reports missing/busy")
+
+    class Clock:
+        def __init__(self) -> None:
+            self.value = 100.0
+
+        def __call__(self) -> float:
+            return self.value
+
+        def sleep(self, delay: float) -> None:
+            self.value += delay
+
+    clock = Clock()
+    monkeypatch.setattr(webui_platform_module.time, "monotonic", clock)
+    monkeypatch.setattr(webui_platform_module.time, "sleep", clock.sleep)
+
+    with pytest.raises(WebUIPlatformError) as exc_info:
+        client._open_pipe(FakePyWinTypes, FakeWin32File, FakeWin32Pipe)
+
+    assert exc_info.value.code == "CONTROL_UNAVAILABLE"
+    assert wait_budgets
+    assert all(1 <= budget <= 30 for budget in wait_budgets)
+    assert clock.value - 100.0 <= 0.031
 
 
 def test_windows_owner_named_pipe_rejects_invalid_json_and_oversized_frame() -> None:

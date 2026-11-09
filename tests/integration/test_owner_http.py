@@ -23,8 +23,11 @@ if sys.platform != "linux":
     )
 
 import factlane.owner_http as owner_http_module
+from factlane.adapter import MemoryAdapter, trusted_write_context_for_profile
+from factlane.embeddings import EmbeddingProfile
 from factlane.owner_auth import NativeConfirmationRequest, OwnerAuthState
 from factlane.contract import AdapterError
+from factlane.owner_control import OwnerControlService
 from factlane.owner_destructive import OwnerDestructiveError, PurgePreview, PurgeSuccess, PurgeTargetIdentity
 from factlane.owner_http import (
     DEFAULT_MAX_CONCURRENCY,
@@ -33,7 +36,9 @@ from factlane.owner_http import (
     REQUEST_TIMEOUT_SECONDS,
     OwnerHTTPServer,
 )
+from factlane.owner_overview import OwnerOverviewService
 from factlane.recovery import RecoveryScope
+from factlane.storage import SQLiteVecEngine
 
 
 OWNER_UID = 1000
@@ -56,15 +61,70 @@ class FakeNativeConfirmation:
 class RecordingOverview:
     def __init__(self) -> None:
         self.overview_calls: list[dict[str, object]] = []
+        self.discover_calls: list[dict[str, object]] = []
         self.search_calls: list[dict[str, object]] = []
 
     async def overview(self, **kwargs):
         self.overview_calls.append(kwargs)
         return {"status": "OK", "totals": {}}
 
+    async def discover(self, **kwargs):
+        self.discover_calls.append(kwargs)
+        return {"status": "OK", "scope": kwargs.get("scope"), "items": []}
+
     async def search(self, **kwargs):
         self.search_calls.append(kwargs)
-        return {"status": "OK", "scope": {"scope": kwargs["scope"]}, "items": []}
+        scope = kwargs.get("scope")
+        return {"status": "OK", "scope": None if scope is None else {"scope": scope}, "items": []}
+
+
+class RecordingSetup:
+    def __init__(self) -> None:
+        self.status_calls = 0
+        self.bind_calls: list[dict[str, str]] = []
+        self.handoff_calls: list[str] = []
+
+    def status(self) -> dict[str, object]:
+        self.status_calls += 1
+        return {
+            "status": "SETUP_REQUIRED",
+            "profiles": ["nomic-768"],
+            "suggested_host_id": "owner-a2native123",
+        }
+
+    def bind(self, *, db: str, profile: str, host_id: str, request_id: str) -> dict[str, object]:
+        self.bind_calls.append(
+            {"db": db, "profile": profile, "host_id": host_id, "request_id": request_id}
+        )
+        return {"status": "RESTARTING", "request_id": request_id}
+
+    def handoff_restart(self, request_id: str) -> bool:
+        self.handoff_calls.append(request_id)
+        return True
+
+
+class RecordingServiceControl:
+    def __init__(self) -> None:
+        self.status_calls = 0
+        self.stop_calls: list[str] = []
+
+    def status(self) -> dict[str, object]:
+        self.status_calls += 1
+        return {
+            "status": "READY",
+            "saved_endpoint": "https://owner.test:8765",
+            "stopped_boot_id": None,
+            "intent_revision": 4,
+        }
+
+    def stop(self, request_id: str) -> dict[str, object]:
+        self.stop_calls.append(request_id)
+        return {
+            "status": "STOPPED_UNTIL_REBOOT",
+            "saved_endpoint": "https://owner.test:8765",
+            "stopped_boot_id": "boot-test",
+            "intent_revision": 5,
+        }
 
 
 class RecordingControl:
@@ -72,6 +132,7 @@ class RecordingControl:
         self.inventory_calls: list[dict[str, object]] = []
         self.detail_calls: list[dict[str, object]] = []
         self.conflicts_calls: list[dict[str, object]] = []
+        self.activity_calls: list[dict[str, object]] = []
         self.calls: dict[str, list[dict[str, object]]] = {
             name: []
             for name in (
@@ -98,6 +159,10 @@ class RecordingControl:
     async def conflicts(self, **kwargs):
         self.conflicts_calls.append(kwargs)
         return {"status": "OK", "scope": {"scope": kwargs["scope"]}, "items": []}
+
+    async def activity(self, **kwargs):
+        self.activity_calls.append(kwargs)
+        return {"status": "OK", "items": [], "next_cursor": None}
 
     async def create_candidate(self, **kwargs):
         self.calls["create_candidate"].append(kwargs)
@@ -143,6 +208,9 @@ class RecordingOperations:
             for name in (
                 "housekeeping_preview",
                 "run_housekeeping",
+                "begin_housekeeping_job",
+                "housekeeping_job_status",
+                "cancel_housekeeping_job",
                 "agent_inventory",
                 "settings_snapshot",
                 "settings_preview",
@@ -158,6 +226,56 @@ class RecordingOperations:
     async def run_housekeeping(self, **kwargs):
         self.calls["run_housekeeping"].append(kwargs)
         return {"status": "OK"}
+
+    async def begin_housekeeping_job(self, **kwargs):
+        self.calls["begin_housekeeping_job"].append(kwargs)
+        job = {
+            "job_id": "00000000-0000-4000-8000-000000000321",
+            "operation_id": kwargs["request_id"],
+            "kind": "HOUSEKEEPING",
+            "phase": "QUEUED",
+            "scope": {"scope": kwargs["scope"], "project_id": kwargs.get("project_id")},
+            "max_records": kwargs["max_records"],
+            "required_free_bytes": kwargs["required_free_bytes"],
+            "preview_digest": kwargs["preview_digest"],
+            "progress": {"selected_records": 2, "compacted_records": 0, "cancellation_boundary": "BETWEEN_RECORDS"},
+            "cancel_requested": False,
+            "result": None,
+            "error": None,
+            "created_at": "2026-11-08T20:00:00Z",
+            "updated_at": "2026-11-08T20:00:00Z",
+        }
+        callback = kwargs.get("on_complete")
+        if callable(callback):
+            callback(
+                {
+                    **job,
+                    "phase": "SUCCEEDED",
+                    "progress": {**job["progress"], "compacted_records": 2},
+                    "result": {"outcome": "HOUSEKEEPING_COMPLETE_CAPACITY_REQUIREMENT_MET"},
+                }
+            )
+        return job
+
+    async def housekeeping_job_status(self, job_id):
+        self.calls["housekeeping_job_status"].append({"job_id": job_id})
+        return {
+            "job_id": job_id,
+            "kind": "HOUSEKEEPING",
+            "phase": "RUNNING",
+            "progress": {"selected_records": 2, "compacted_records": 1, "cancellation_boundary": "BETWEEN_RECORDS"},
+            "cancel_requested": False,
+        }
+
+    async def cancel_housekeeping_job(self, job_id):
+        self.calls["cancel_housekeeping_job"].append({"job_id": job_id})
+        return {
+            "job_id": job_id,
+            "kind": "HOUSEKEEPING",
+            "phase": "RUNNING",
+            "progress": {"selected_records": 2, "compacted_records": 1, "cancellation_boundary": "BETWEEN_RECORDS"},
+            "cancel_requested": True,
+        }
 
     async def agent_inventory(self, **kwargs):
         self.calls["agent_inventory"].append(kwargs)
@@ -405,6 +523,51 @@ class RecordingDatabase:
         self._record("list_artifacts")
         return [self.artifact_metadata(artifact_id) for artifact_id in sorted(self.artifacts)]
 
+    def database_status(self):
+        self._record("database_status")
+        return {
+            "status": "OK",
+            "database_identity": "db-test",
+            "compatibility": "COMPATIBLE",
+            "integrity_check": "ok",
+            "storage": {
+                "database_file_bytes": 4096,
+                "wal_file_bytes": 512,
+                "shm_file_bytes": 128,
+                "backup_count": 1,
+                "backup_total_bytes": 2048,
+                "artifact_total_bytes": 2048,
+                "filesystem_free_bytes": 8192,
+                "warning": None,
+            },
+        }
+
+    def list_jobs(
+        self,
+        *,
+        limit=100,
+        kind=None,
+        phase=None,
+        cursor=None,
+        occurred_after=None,
+        occurred_before=None,
+    ):
+        self._record(
+            "list_jobs",
+            limit=limit,
+            kind=kind,
+            phase=phase,
+            cursor=cursor,
+            occurred_after=occurred_after,
+            occurred_before=occurred_before,
+        )
+        items = [
+            dict(job)
+            for job in self.jobs.values()
+            if (kind is None or job.get("kind") == kind) and (phase is None or job.get("phase") == phase)
+        ]
+        return {"status": "OK", "filters": {"kind": kind, "phase": phase}, "items": items[:limit], "next_cursor": None}
+
     def artifact_metadata(self, artifact_id):
         artifact = self.artifacts[artifact_id]
         return {key: value for key, value in artifact.items() if not key.endswith("path")}
@@ -622,6 +785,27 @@ def running_server(tmp_path):
 
 
 @pytest.fixture
+def running_service_server(tmp_path):
+    confirmation = FakeNativeConfirmation()
+    auth = OwnerAuthState(owner_uid=OWNER_UID, native_confirmation=confirmation)
+    service = RecordingServiceControl()
+    server = OwnerHTTPServer(
+        socket_path=tmp_path / "service-private" / "owner-http.sock",
+        origin=ORIGIN,
+        auth_state=auth,
+        service_control=service,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server, auth, service
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.fixture
 def running_destructive_server(tmp_path):
     confirmation = FakeNativeConfirmation()
     auth = OwnerAuthState(owner_uid=OWNER_UID, native_confirmation=confirmation)
@@ -657,6 +841,27 @@ def running_database_server(tmp_path):
     thread.start()
     try:
         yield server, auth, database
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.fixture
+def running_setup_server(tmp_path):
+    confirmation = FakeNativeConfirmation()
+    auth = OwnerAuthState(owner_uid=OWNER_UID, native_confirmation=confirmation)
+    setup = RecordingSetup()
+    server = OwnerHTTPServer(
+        socket_path=tmp_path / "setup-private" / "owner-http.sock",
+        origin=ORIGIN,
+        auth_state=auth,
+        setup_service=setup,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server, auth, setup
     finally:
         server.shutdown()
         server.server_close()
@@ -714,6 +919,263 @@ def establish_primary_session(server: OwnerHTTPServer, auth: OwnerAuthState):
     result = json_payload(payload)
     cookies = response_cookies(response)
     return cookies["__Host-factlane-session"], str(result["csrf"])
+
+
+def test_service_status_and_stop_require_authenticated_same_origin_csrf_and_exact_envelopes(
+    running_service_server,
+) -> None:
+    server, auth, service = running_service_server
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/service/status",
+        body={},
+        headers={"Origin": ORIGIN},
+    )
+    assert response.status == 401
+    assert json_payload(payload)["code"] == "AUTH_COOKIE_INVALID"
+    assert service.status_calls == 0
+
+    session, csrf = establish_primary_session(server, auth)
+    cookies = {"__Host-factlane-session": session}
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/service/status",
+        body={},
+        headers={"Origin": ORIGIN},
+        cookies=cookies,
+    )
+    assert response.status == 403
+    assert json_payload(payload)["code"] == "CSRF_INVALID"
+    assert service.status_calls == 0
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/service/status",
+        body={"csrf": csrf},
+        headers={"Origin": "https://wrong.test"},
+        cookies=cookies,
+    )
+    assert response.status == 403
+    assert json_payload(payload)["code"] == "ORIGIN_DENIED"
+    assert service.status_calls == 0
+
+    headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
+    response, payload = request(
+        server,
+        "POST",
+        "/api/service/status",
+        body={"request_id": "not-allowed"},
+        headers=headers,
+        cookies=cookies,
+    )
+    assert response.status == 400
+    assert json_payload(payload)["code"] == "INVALID_ENVELOPE"
+    assert service.status_calls == 0
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/service/status",
+        body={},
+        headers=headers,
+        cookies=cookies,
+    )
+    assert response.status == 200
+    assert json_payload(payload) == {
+        "status": "OK",
+        "service": {
+            "status": "READY",
+            "saved_endpoint": "https://owner.test:8765",
+            "intent_revision": 4,
+            "stop_intent_active": False,
+        },
+    }
+    assert service.status_calls == 1
+
+    for body in ({}, {"request_id": "x" * 513}, {"request_id": "stop-1", "extra": True}):
+        response, payload = request(
+            server,
+            "POST",
+            "/api/service/stop",
+            body=body,
+            headers=headers,
+            cookies=cookies,
+        )
+        assert response.status == 400
+        assert json_payload(payload)["code"] == "INVALID_ENVELOPE"
+        assert service.stop_calls == []
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/service/stop",
+        body={"request_id": "stop-1"},
+        headers={"Origin": ORIGIN, "X-FactLane-CSRF": "forged"},
+        cookies=cookies,
+    )
+    assert response.status == 403
+    assert json_payload(payload)["code"] == "CSRF_INVALID"
+    assert service.stop_calls == []
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/service/stop",
+        body={"request_id": "stop-1"},
+        headers=headers,
+        cookies=cookies,
+    )
+    assert response.status == 200
+    assert json_payload(payload) == {
+        "status": "STOP_REQUESTED",
+        "request_id": "stop-1",
+        "stop_verified": False,
+        "service": {
+            "status": "STOPPED_UNTIL_REBOOT",
+            "saved_endpoint": "https://owner.test:8765",
+            "intent_revision": 5,
+            "stop_intent_active": True,
+        },
+    }
+    assert service.stop_calls == ["stop-1"]
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/operations/activity/owner",
+        body={"domain": "SERVICE", "operation": "STOP", "result": "SUCCEEDED"},
+        headers=headers,
+        cookies=cookies,
+    )
+    assert response.status == 200, payload
+    service_activity = json_payload(payload)["items"]
+    assert len(service_activity) == 1
+    assert service_activity[0]["correlation_reference"] == "stop-1"
+    assert service_activity[0]["detail"]["status"] == "STOPPED_UNTIL_REBOOT"
+
+    for path in ("/api/service/start", "/api/service/restart"):
+        response, payload = request(
+            server,
+            "POST",
+            path,
+            body={},
+            headers=headers,
+            cookies=cookies,
+        )
+        assert response.status == 404
+        assert json_payload(payload)["code"] == "NOT_FOUND"
+    assert service.stop_calls == ["stop-1"]
+
+    response, _ = request(
+        server,
+        "GET",
+        "/api/service/stop",
+        headers=headers,
+        cookies=cookies,
+    )
+    assert response.status in {404, 405}
+    assert service.stop_calls == ["stop-1"]
+
+
+def test_setup_routes_require_exact_origin_session_csrf_and_explicit_setup_service(
+    running_setup_server,
+    running_server,
+) -> None:
+    server, auth, setup = running_setup_server
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/setup/status",
+        body={},
+        headers={"Origin": ORIGIN},
+    )
+    assert response.status == 401
+    assert json_payload(payload)["code"] == "AUTH_COOKIE_INVALID"
+    assert setup.status_calls == 0
+
+    session, csrf = establish_primary_session(server, auth)
+    cookies = {"__Host-factlane-session": session}
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/setup/status",
+        body={},
+        headers={"Origin": ORIGIN},
+        cookies=cookies,
+    )
+    assert response.status == 403
+    assert json_payload(payload)["code"] == "CSRF_INVALID"
+    assert setup.status_calls == 0
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/setup/status",
+        body={"csrf": csrf},
+        headers={"Origin": "https://wrong.test"},
+        cookies=cookies,
+    )
+    assert response.status == 403
+    assert json_payload(payload)["code"] == "ORIGIN_DENIED"
+    assert setup.status_calls == 0
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/setup/status",
+        body={"csrf": csrf},
+        headers={"Origin": ORIGIN},
+        cookies=cookies,
+    )
+    assert response.status == 200
+    assert json_payload(payload)["status"] == "SETUP_REQUIRED"
+    assert setup.status_calls == 1
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/setup/bind",
+        body={
+            "db": r"C:\Users\Owner\FactLane\memory.db",
+            "profile": "nomic-768",
+            "host_id": "owner-a2native123",
+            "request_id": "setup-request-1",
+            "csrf": csrf,
+        },
+        headers={"Origin": ORIGIN},
+        cookies=cookies,
+    )
+    assert response.status == 202
+    assert json_payload(payload) == {"status": "RESTARTING", "request_id": "setup-request-1"}
+    assert setup.bind_calls == [
+        {
+            "db": r"C:\Users\Owner\FactLane\memory.db",
+            "profile": "nomic-768",
+            "host_id": "owner-a2native123",
+            "request_id": "setup-request-1",
+        }
+    ]
+    assert setup.handoff_calls == ["setup-request-1"]
+
+    normal_server, normal_auth, *_rest = running_server
+    normal_session, normal_csrf = establish_primary_session(normal_server, normal_auth)
+    response, payload = request(
+        normal_server,
+        "POST",
+        "/api/setup/status",
+        body={"csrf": normal_csrf},
+        headers={"Origin": ORIGIN},
+        cookies={"__Host-factlane-session": normal_session},
+    )
+    assert response.status == 404
+    assert json_payload(payload)["code"] == "NOT_FOUND"
 
 
 def mint_sensitive_grant(
@@ -1131,11 +1593,24 @@ def test_assets_health_and_csp_are_served_without_bootstrap_fallback(running_ser
     assert b"stateRenderers" in payload
     assert response.getheader("X-Content-Type-Options") == "nosniff"
 
+    response, payload = request(server, "GET", "/assets/conflicts.js")
+    assert response.status == 200
+    assert b"hydrateConflictMembers" in payload
+    assert response.getheader("Content-Type") == "text/javascript"
+
+    response, payload = request(server, "GET", "/assets/novice.js")
+    assert response.status == 200
+    assert b"downloadRedactedSupportPreview" in payload
+    assert response.getheader("Content-Type") == "text/javascript"
+    assert response.getheader("X-Content-Type-Options") == "nosniff"
+
     response, payload = request(server, "GET", "/health")
     assert response.status == 200
     assert json_payload(payload) == {"status": "OK"}
 
     response, _ = request(server, "POST", "/owner/bootstrap", body={}, headers={"Origin": ORIGIN})
+    assert response.status == 404
+    response, _ = request(server, "GET", "/assets/not-packaged.js")
     assert response.status == 404
     response, _ = request(server, "GET", "/assets/../owner_auth.py")
     assert response.status == 404
@@ -1168,6 +1643,188 @@ def test_exact_host_and_origin_are_enforced_and_forwarded_headers_are_ignored(ru
         headers={"Origin": ORIGIN, "X-Forwarded-Host": "forged.test", "X-Forwarded-For": "203.0.113.99"},
     )
     assert response.status == 200
+
+
+def test_explicit_public_origin_allowlist_preserves_raw_authority_binding_and_primary_local_approval(tmp_path) -> None:
+    public_origin = "https://panel.example.com"
+    public_host = "panel.example.com"
+    confirmation = FakeNativeConfirmation()
+    auth = OwnerAuthState(owner_uid=OWNER_UID, native_confirmation=confirmation)
+    server = OwnerHTTPServer(
+        socket_path=tmp_path / "public-origin-private" / "owner-http.sock",
+        origin=ORIGIN,
+        public_origins=(public_origin,),
+        auth_state=auth,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        response, _ = request(
+            server,
+            "GET",
+            "/health",
+            headers={"Host": public_host},
+        )
+        assert response.status == 200
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/preauth",
+            body={},
+            headers={"Host": public_host, "Origin": ORIGIN},
+        )
+        assert response.status == 403
+        assert json_payload(payload)["code"] == "ORIGIN_DENIED"
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/preauth",
+            body={},
+            headers={"Host": HOST, "Origin": public_origin},
+        )
+        assert response.status == 403
+        assert json_payload(payload)["code"] == "ORIGIN_DENIED"
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/preauth",
+            body={},
+            headers={
+                "Host": "forged.example",
+                "Origin": public_origin,
+                "X-Forwarded-Host": public_host,
+            },
+        )
+        assert response.status == 403
+        assert json_payload(payload)["code"] == "HOST_DENIED"
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/preauth",
+            body={},
+            headers={
+                "Host": public_host,
+                "Origin": "https://forged.example",
+                "X-Forwarded-Origin": public_origin,
+            },
+        )
+        assert response.status == 403
+        assert json_payload(payload)["code"] == "ORIGIN_DENIED"
+
+        primary_session, primary_csrf = establish_primary_session(server, auth)
+        primary_headers = {"Origin": ORIGIN, "X-FactLane-CSRF": primary_csrf}
+        primary_cookie = {"__Host-factlane-session": primary_session}
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/preauth",
+            body={},
+            headers={
+                "Host": public_host,
+                "Origin": public_origin,
+                "X-Forwarded-Host": "forged.example",
+                "X-Forwarded-For": "203.0.113.9",
+            },
+        )
+        assert response.status == 200, payload
+        remote_preauth = response_cookies(response)["__Host-factlane-preauth"]
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/enroll/remote",
+            body={"device_label": "Public-origin laptop"},
+            headers={"Host": public_host, "Origin": public_origin},
+            cookies={"__Host-factlane-preauth": remote_preauth},
+        )
+        assert response.status == 200, payload
+        locator = str(json_payload(payload)["locator"])
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/remote/preview",
+            body={"locator": locator},
+            headers=primary_headers,
+            cookies=primary_cookie,
+        )
+        assert response.status == 200, payload
+        preview = str(json_payload(payload)["preview"])
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/sensitive/challenge",
+            body={"preview": preview},
+            headers=primary_headers,
+            cookies=primary_cookie,
+        )
+        assert response.status == 200, payload
+        challenge_id = str(json_payload(payload)["challenge_id"])
+        auth.approve_sensitive_challenge(challenge_id=challenge_id, caller_uid=OWNER_UID)
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/sensitive/grant",
+            body={"challenge_id": challenge_id},
+            headers=primary_headers,
+            cookies=primary_cookie,
+        )
+        assert response.status == 200, payload
+        grant = str(json_payload(payload)["grant"])
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/remote/approve",
+            body={"locator": locator, "grant": grant},
+            headers=primary_headers,
+            cookies=primary_cookie,
+        )
+        assert response.status == 200, payload
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/connect/poll",
+            body={"locator": locator},
+            headers={"Host": public_host, "Origin": public_origin},
+            cookies={"__Host-factlane-preauth": remote_preauth},
+        )
+        assert response.status == 200, payload
+        remote_result = json_payload(payload)
+        assert remote_result["primary_local"] is False
+        remote_session = response_cookies(response)["__Host-factlane-session"]
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/session/resume",
+            body={},
+            headers={"Host": public_host, "Origin": public_origin},
+            cookies={"__Host-factlane-session": remote_session},
+        )
+        assert response.status == 200, payload
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/session/resume",
+            body={},
+            headers={"Origin": ORIGIN},
+            cookies={"__Host-factlane-session": remote_session},
+        )
+        assert response.status == 403
+        assert json_payload(payload)["code"] == "SESSION_ORIGIN_MISMATCH"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_local_connect_poll_sets_secure_host_only_auth_cookies_and_separate_csrf(running_server) -> None:
@@ -1210,6 +1867,10 @@ def test_local_connect_poll_sets_secure_host_only_auth_cookies_and_separate_csrf
     result = json_payload(payload)
     assert result["primary_local"] is True
     assert isinstance(result["csrf"], str) and result["csrf"]
+    assert result["idle_remaining_seconds"] == pytest.approx(1_800.0, abs=1.0)
+    assert result["absolute_remaining_seconds"] == pytest.approx(28_800.0, abs=1.0)
+    assert "expires_at" not in result
+    assert "absolute_expires_at" not in result
     cookie_headers = set_cookie_headers(response)
     session_header = next(value for value in cookie_headers if value.startswith("__Host-factlane-session="))
     assert "Secure" in session_header
@@ -1220,6 +1881,201 @@ def test_local_connect_poll_sets_secure_host_only_auth_cookies_and_separate_csrf
     assert result["csrf"] not in session_header
     session_secret = response_cookies(response)["__Host-factlane-session"]
     assert session_secret.encode("utf-8") not in payload
+
+
+def test_session_resume_rotates_csrf_without_minting_or_resetting_session(running_server) -> None:
+    server, auth, _, _, _, _ = running_server
+    session, old_csrf = establish_primary_session(server, auth)
+    cookie = {"__Host-factlane-session": session}
+
+    response, payload = request(
+        server,
+        "POST",
+        "/auth/session/resume",
+        body={},
+        headers={"Origin": "https://wrong.test"},
+        cookies=cookie,
+    )
+    assert response.status == 403
+    assert json_payload(payload)["code"] == "ORIGIN_DENIED"
+
+    response, payload = request(
+        server,
+        "POST",
+        "/auth/session/resume",
+        body={},
+        headers={"Origin": ORIGIN, "Host": "wrong.test"},
+        cookies=cookie,
+    )
+    assert response.status == 403
+    assert json_payload(payload)["code"] == "HOST_DENIED"
+
+    response, payload = request(server, "POST", "/auth/session/resume", body={}, headers={"Origin": ORIGIN})
+    assert response.status == 401
+    assert json_payload(payload)["code"] == "AUTH_COOKIE_INVALID"
+
+    sessions_before = set(auth._sessions)
+    response, payload = request(
+        server,
+        "POST",
+        "/auth/session/resume",
+        body={},
+        headers={"Origin": ORIGIN},
+        cookies=cookie,
+    )
+    assert response.status == 200, payload
+    result = json_payload(payload)
+    assert set(auth._sessions) == sessions_before
+    assert set_cookie_headers(response) == []
+    assert isinstance(result["csrf"], str) and result["csrf"] != old_csrf
+    assert result["idle_remaining_seconds"] == pytest.approx(1_800.0, abs=1.0)
+    assert result["absolute_remaining_seconds"] == pytest.approx(28_800.0, abs=1.0)
+    assert session.encode("utf-8") not in payload
+    new_csrf = str(result["csrf"])
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/read/overview",
+        body={"limit": 100, "request_id": "resume-old-csrf"},
+        headers={"Origin": ORIGIN, "X-FactLane-CSRF": old_csrf},
+        cookies=cookie,
+    )
+    assert response.status == 403
+    assert json_payload(payload)["code"] == "CSRF_INVALID"
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/read/overview",
+        body={"limit": 100, "request_id": "resume-new-csrf"},
+        headers={"Origin": ORIGIN, "X-FactLane-CSRF": new_csrf},
+        cookies=cookie,
+    )
+    assert response.status == 200, payload
+
+
+def test_explicit_capabilities_project_to_authenticated_session_and_block_unsupported_before_mutation(tmp_path) -> None:
+    confirmation = FakeNativeConfirmation()
+    auth = OwnerAuthState(owner_uid=OWNER_UID, native_confirmation=confirmation)
+    destructive = RecordingDestructive()
+    database = RecordingDatabase()
+    capabilities = {
+        "database_management": False,
+        "full_restore": False,
+        "permanent_purge": False,
+    }
+    server = OwnerHTTPServer(
+        socket_path=tmp_path / "cap-private" / "owner-http.sock",
+        origin=ORIGIN,
+        auth_state=auth,
+        destructive_service=destructive,
+        database_service=database,
+        capabilities=capabilities,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        pending = auth.begin_enrollment(caller_uid=OWNER_UID, source="local-launcher", device_label="Primary browser")
+        preauth = issue_preauth(server)
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/connect/claim",
+            body={"locator": pending.locator},
+            headers={"Origin": ORIGIN},
+            cookies={"__Host-factlane-preauth": preauth},
+        )
+        assert response.status == 200, payload
+        auth.approve_pending(locator=pending.locator, caller_uid=OWNER_UID)
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/connect/poll",
+            body={"locator": pending.locator},
+            headers={"Origin": ORIGIN},
+            cookies={"__Host-factlane-preauth": preauth},
+        )
+        assert response.status == 200, payload
+        result = json_payload(payload)
+        assert result["capabilities"] == capabilities
+        session = response_cookies(response)["__Host-factlane-session"]
+        csrf = str(result["csrf"])
+        headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
+        cookies = {"__Host-factlane-session": session}
+
+        response, payload = request(
+            server,
+            "POST",
+            "/api/write/purge/preview",
+            body={"operation_id": str(uuid.uuid4()), "targets": [purge_target_body()]},
+            headers=headers,
+            cookies=cookies,
+        )
+        assert response.status == 501
+        assert json_payload(payload) == {"status": "ERROR", "code": "UNSUPPORTED", "capability": "permanent_purge"}
+        assert destructive.preview_calls == []
+
+        response, payload = request(
+            server,
+            "POST",
+            "/api/database/backup/create",
+            body={},
+            headers=headers,
+            cookies=cookies,
+        )
+        assert response.status == 501
+        assert json_payload(payload) == {"status": "ERROR", "code": "UNSUPPORTED", "capability": "database_management"}
+        assert "begin_backup_job" not in database.calls
+
+        response, payload = request(
+            server,
+            "POST",
+            "/api/database/restore/upload",
+            body=b"x",
+            headers={**headers, "Content-Type": "application/octet-stream"},
+            cookies=cookies,
+        )
+        assert response.status == 501
+        assert json_payload(payload) == {"status": "ERROR", "code": "UNSUPPORTED", "capability": "full_restore"}
+        assert "begin_restore_upload" not in database.calls
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_supported_capability_with_missing_service_remains_service_unavailable(tmp_path) -> None:
+    confirmation = FakeNativeConfirmation()
+    auth = OwnerAuthState(owner_uid=OWNER_UID, native_confirmation=confirmation)
+    server = OwnerHTTPServer(
+        socket_path=tmp_path / "supported-private" / "owner-http.sock",
+        origin=ORIGIN,
+        auth_state=auth,
+        capabilities={
+            "database_management": True,
+            "full_restore": True,
+            "permanent_purge": True,
+        },
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        session, csrf = establish_primary_session(server, auth)
+        response, payload = request(
+            server,
+            "POST",
+            "/api/database/backup/create",
+            body={},
+            headers={"Origin": ORIGIN, "X-FactLane-CSRF": csrf},
+            cookies={"__Host-factlane-session": session},
+        )
+        assert response.status == 503
+        assert json_payload(payload)["code"] == "SERVICE_UNAVAILABLE"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_remote_enrollment_and_primary_approval_flow_use_browser_binding_and_sensitive_grant(running_server) -> None:
@@ -1253,34 +2109,24 @@ def test_remote_enrollment_and_primary_approval_flow_use_browser_binding_and_sen
     preview = str(json_payload(payload)["preview"])
     assert "Remote laptop" in preview
     assert locator in preview
-
-    response, payload = request(
-        server,
-        "POST",
-        "/auth/sensitive/challenge",
-        body={"preview": preview},
-        headers=auth_headers,
-        cookies=primary_cookie,
-    )
-    assert response.status == 200, payload
+    assert str(remote["verification_phrase"]) in preview
     challenge_id = str(json_payload(payload)["challenge_id"])
-    auth.approve_sensitive_challenge(challenge_id=challenge_id, caller_uid=OWNER_UID)
-
-    response, payload = request(
-        server,
-        "POST",
-        "/auth/sensitive/grant",
-        body={"challenge_id": challenge_id},
-        headers=auth_headers,
-        cookies=primary_cookie,
-    )
-    assert response.status == 200, payload
-    grant_secret = str(json_payload(payload)["grant"])
+    assert json_payload(payload)["verification_phrase"]
     response, payload = request(
         server,
         "POST",
         "/auth/remote/approve",
-        body={"locator": locator, "grant": grant_secret},
+        body={"locator": locator, "challenge_id": challenge_id},
+        headers=auth_headers,
+        cookies=primary_cookie,
+    )
+    assert response.status == 403, payload
+    auth.approve_sensitive_challenge(challenge_id=challenge_id, caller_uid=OWNER_UID)
+    response, payload = request(
+        server,
+        "POST",
+        "/auth/remote/approve",
+        body={"locator": locator, "challenge_id": challenge_id},
         headers=auth_headers,
         cookies=primary_cookie,
     )
@@ -1296,6 +2142,111 @@ def test_remote_enrollment_and_primary_approval_flow_use_browser_binding_and_sen
     )
     assert response.status == 200, payload
     assert json_payload(payload)["primary_local"] is False
+
+
+def test_owner_wide_discovery_and_search_require_auth_csrf_and_valid_optional_scope_before_service_call(running_server) -> None:
+    server, auth, overview, _, _, _ = running_server
+
+    response, _ = request(
+        server,
+        "POST",
+        "/api/read/discovery",
+        body={},
+        headers={"Origin": ORIGIN},
+    )
+    assert response.status == 401
+    assert overview.discover_calls == []
+
+    session, csrf = establish_primary_session(server, auth)
+    cookie = {"__Host-factlane-session": session}
+
+    response, _ = request(
+        server,
+        "POST",
+        "/api/read/discovery",
+        body={},
+        headers={"Origin": ORIGIN},
+        cookies=cookie,
+    )
+    assert response.status == 403
+    assert overview.discover_calls == []
+
+    response, _ = request(
+        server,
+        "POST",
+        "/api/read/discovery",
+        body={},
+        headers={"Origin": ORIGIN, "X-FactLane-CSRF": "forged"},
+        cookies=cookie,
+    )
+    assert response.status == 403
+    assert overview.discover_calls == []
+
+    response, _ = request(
+        server,
+        "POST",
+        "/api/read/discovery",
+        body={},
+        headers={"Origin": "https://wrong.test", "X-FactLane-CSRF": csrf},
+        cookies=cookie,
+    )
+    assert response.status == 403
+    assert overview.discover_calls == []
+
+    headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
+    response, payload = request(
+        server,
+        "POST",
+        "/api/read/discovery",
+        body={"project_id": "project-a"},
+        headers=headers,
+        cookies=cookie,
+    )
+    assert response.status == 400
+    assert json_payload(payload)["code"] == "INVALID_ENVELOPE"
+    assert overview.discover_calls == []
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/read/discovery",
+        body={"lifecycle_state": "CANDIDATE", "sort_order": "OLDEST", "limit": 25},
+        headers=headers,
+        cookies=cookie,
+    )
+    assert response.status == 200, payload
+    assert overview.discover_calls[-1]["scope"] is None
+    assert overview.discover_calls[-1]["project_id"] is None
+    assert overview.discover_calls[-1]["lifecycle_state"] == "CANDIDATE"
+    assert overview.discover_calls[-1]["sort_order"] == "OLDEST"
+    assert overview.discover_calls[-1]["limit"] == 25
+
+    search_calls_before = len(overview.search_calls)
+    response, payload = request(
+        server,
+        "POST",
+        "/api/read/search",
+        body={"query": "fact", "worktree_id": "worktree-a"},
+        headers=headers,
+        cookies=cookie,
+    )
+    assert response.status == 400
+    assert json_payload(payload)["code"] == "INVALID_ENVELOPE"
+    assert len(overview.search_calls) == search_calls_before
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/read/search",
+        body={"query": "fact", "sort_order": "NEWEST", "limit": 10},
+        headers=headers,
+        cookies=cookie,
+    )
+    assert response.status == 200, payload
+    assert overview.search_calls[-1]["scope"] is None
+    assert overview.search_calls[-1]["project_id"] is None
+    assert overview.search_calls[-1]["sort_order"] == "NEWEST"
+    assert overview.search_calls[-1]["limit"] == 10
 
 
 def test_authenticated_read_routes_require_csrf_and_exact_scope_before_service_call(running_server) -> None:
@@ -1576,6 +2527,200 @@ def test_create_candidate_and_batch_review_forward_exact_kwargs_and_enforce_boun
     assert len(control.calls["batch_review"]) == 1
 
 
+def test_nonprogrammer_owner_http_journey_discovers_cross_scope_candidate_and_promotes_without_manual_topology(
+    tmp_path,
+) -> None:
+    """Acceptance: discovery supplies scope/record proof behind the GUI; the human supplies none of it."""
+
+    profile = EmbeddingProfile(
+        profile_id="owner-usability-256",
+        provider_kind="OLLAMA_LOCAL",
+        base_model_identity="nomic-embed-text:latest",
+        model_digest="0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+        source_dimension=768,
+        output_dimension=256,
+        normalization_policy="OLLAMA_API_NORMALIZED_AFTER_DIMENSION_PROJECTION",
+        distance_metric="cosine",
+        projection_version="ollama-dimensions-v1",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+    )
+
+    class Provider:
+        def __init__(self) -> None:
+            self.profile = profile
+            self.document_calls = 0
+            self.query_calls = 0
+
+        def embed_documents(self, texts):
+            self.document_calls += len(texts)
+            return [[1.0] + [0.0] * 255 for _ in texts]
+
+        def embed_query(self, _text):
+            self.query_calls += 1
+            return [1.0] + [0.0] * 255
+
+        def provider_status(self):
+            return {"local_only": True}
+
+    engine = SQLiteVecEngine(str(tmp_path / "owner-usability.db"), profile)
+    adapter = MemoryAdapter(
+        engine,
+        Provider(),
+        trusted_write_context=trusted_write_context_for_profile(
+            "owner-current",
+            contributor_ref="owner-usability-acceptance",
+        ),
+    )
+    control = OwnerControlService(adapter)
+    overview = OwnerOverviewService(control)
+    auth = OwnerAuthState(owner_uid=OWNER_UID, native_confirmation=FakeNativeConfirmation())
+    server = OwnerHTTPServer(
+        socket_path=tmp_path / "usability-private" / "owner-http.sock",
+        origin=ORIGIN,
+        auth_state=auth,
+        overview_service=overview,
+        control_service=control,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    provenance_project = {
+        "source_class": "TEST",
+        "source_ref": "fixture:usability-project",
+        "source_hash": "a" * 64,
+        "review_ref": "review:usability-project",
+        "extraction_method": "owner-usability-acceptance",
+    }
+    provenance_global = {
+        "source_class": "TEST",
+        "source_ref": "fixture:usability-global",
+        "source_hash": "b" * 64,
+        "review_ref": "review:usability-global",
+        "extraction_method": "owner-usability-acceptance",
+    }
+    try:
+        async def prepare() -> dict[str, object]:
+            await engine.open()
+            project = await control.create_candidate(
+                fact="The project uses compact release notes.",
+                scope="PROJECT",
+                project_id="factlane-usability",
+                memory_type="PROJECT_LEARNED_FACT",
+                source_provenance=provenance_project,
+                freshness_policy={"kind": "manual"},
+                source_timestamp="2026-11-07T20:20:00Z",
+                idempotency_key="usability-create-project",
+                tags=["subject:usability-project"],
+            )
+            await control.create_candidate(
+                fact="The owner prefers a concise interface.",
+                scope="GLOBAL_USER",
+                memory_type="USER_FACT",
+                source_provenance=provenance_global,
+                freshness_policy={"kind": "manual"},
+                source_timestamp="2026-11-07T20:21:00Z",
+                idempotency_key="usability-create-global",
+                tags=["subject:usability-global"],
+            )
+            return project["results"][0]
+
+        project_created = asyncio.run(prepare())
+        thread.start()
+
+        session, csrf = establish_primary_session(server, auth)
+        cookies = {"__Host-factlane-session": session}
+        headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
+
+        response, payload = request(
+            server,
+            "POST",
+            "/api/read/discovery",
+            body={"limit": 50},
+            headers=headers,
+            cookies=cookies,
+        )
+        assert response.status == 200, payload
+        all_memory = json_payload(payload)
+        assert {item["scope"]["scope"] for item in all_memory["items"]} == {"PROJECT", "GLOBAL_USER"}
+        assert all("group_cas" not in item and "observed_group_token" not in item for item in all_memory["items"])
+
+        response, payload = request(
+            server,
+            "POST",
+            "/api/read/discovery",
+            body={"lifecycle_state": "CANDIDATE", "limit": 50},
+            headers=headers,
+            cookies=cookies,
+        )
+        assert response.status == 200, payload
+        queue = json_payload(payload)["items"]
+        target = next(item for item in queue if item["memory_id"] == project_created["memory_id"])
+
+        exact_scope = target["scope"]
+        response, payload = request(
+            server,
+            "POST",
+            "/api/read/detail",
+            body={**exact_scope, "memory_id": target["memory_id"]},
+            headers=headers,
+            cookies=cookies,
+        )
+        assert response.status == 200, payload
+        detail = json_payload(payload)
+        latest = detail["latest"]
+        group_token = detail["group_cas"]["observed_group_token"]
+
+        response, payload = request(
+            server,
+            "POST",
+            "/api/write/batch_review",
+            body={
+                **exact_scope,
+                "items": [{
+                    "action": "APPROVE",
+                    "memory_id": latest["memory_id"],
+                    "expected_record_id": latest["record_id"],
+                    "expected_revision": latest["revision"],
+                    "observed_group_token": group_token,
+                    "idempotency_key": "usability-promote-project",
+                    "verification": {
+                        "source_provenance": latest["source_provenance"],
+                        "freshness_policy": latest["freshness_policy"],
+                        "source_timestamp": "2026-11-07T20:30:00Z",
+                        "verified_by": "OWNER",
+                    },
+                }],
+                "request_id": "usability-promote",
+            },
+            headers=headers,
+            cookies=cookies,
+        )
+        assert response.status == 200, payload
+        review = json_payload(payload)
+        assert review["counts"]["applied"] == 1
+
+        response, payload = request(
+            server,
+            "POST",
+            "/api/read/discovery",
+            body={"limit": 50},
+            headers=headers,
+            cookies=cookies,
+        )
+        assert response.status == 200, payload
+        after = json_payload(payload)["items"]
+        promoted = next(item for item in after if item["memory_id"] == project_created["memory_id"])
+        assert promoted["lifecycle_state"] == "VALIDATED_CURRENT"
+    finally:
+        try:
+            if thread.is_alive():
+                server.shutdown()
+            server.server_close()
+            if thread.is_alive():
+                thread.join(timeout=2)
+        finally:
+            asyncio.run(engine.close())
+
+
 def test_governed_lifecycle_routes_are_explicit_and_resolve_forwards_exact_kwargs(running_server) -> None:
     server, auth, _, control, _, _ = running_server
     session, csrf = establish_primary_session(server, auth)
@@ -1663,7 +2808,7 @@ def test_governed_lifecycle_routes_are_explicit_and_resolve_forwards_exact_kwarg
 
 
 def test_operations_routes_forward_exact_kwargs_and_exclude_destructive_database_surfaces(running_server) -> None:
-    server, auth, _, _, operations, _ = running_server
+    server, auth, _, control, operations, _ = running_server
     session, csrf = establish_primary_session(server, auth)
     headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
     cookie = {"__Host-factlane-session": session}
@@ -1703,6 +2848,109 @@ def test_operations_routes_forward_exact_kwargs_and_exclude_destructive_database
         )
         assert response.status == 200, payload
         assert operations.calls[operation][-1] == {"request_id": f"{operation}-1"}
+
+    begin_body = {
+        **scoped,
+        "preview_digest": "a" * 64,
+        "request_id": "housekeeping-job-1",
+    }
+    response, payload = request(
+        server,
+        "POST",
+        "/api/operations/housekeeping/jobs/begin",
+        body=begin_body,
+        headers=headers,
+        cookies=cookie,
+    )
+    assert response.status == 202, payload
+    job = json_payload(payload)["job"]
+    job_id = job["job_id"]
+    begin_call = dict(operations.calls["begin_housekeeping_job"][-1])
+    assert callable(begin_call.pop("on_complete"))
+    assert begin_call == {
+        "scope": "PROJECT",
+        "project_id": "project-a",
+        "worktree_id": None,
+        "workflow_id": None,
+        "agent_id": None,
+        "max_records": 25,
+        "required_free_bytes": 4096,
+        "preview_digest": "a" * 64,
+        "request_id": "housekeeping-job-1",
+    }
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/operations/housekeeping/jobs/status",
+        body={"job_id": job_id},
+        headers=headers,
+        cookies=cookie,
+    )
+    assert response.status == 200, payload
+    assert json_payload(payload)["job"]["progress"]["cancellation_boundary"] == "BETWEEN_RECORDS"
+    assert operations.calls["housekeeping_job_status"][-1] == {"job_id": job_id}
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/operations/housekeeping/jobs/cancel",
+        body={"job_id": job_id, "request_id": "housekeeping-cancel-1"},
+        headers=headers,
+        cookies=cookie,
+    )
+    assert response.status == 200, payload
+    assert json_payload(payload)["job"]["cancel_requested"] is True
+    assert operations.calls["cancel_housekeeping_job"][-1] == {"job_id": job_id}
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/operations/activity/lifecycle",
+        body={
+            "scope": "PROJECT",
+            "project_id": "project-a",
+            "operation_kind": "REJECT",
+            "actor_class": "OWNER",
+            "result_outcome": "REJECTED",
+            "occurred_after": None,
+            "occurred_before": None,
+            "limit": 25,
+            "request_id": "activity-1",
+        },
+        headers=headers,
+        cookies=cookie,
+    )
+    assert response.status == 200, payload
+    assert control.activity_calls[-1] == {
+        "scope": "PROJECT",
+        "project_id": "project-a",
+        "worktree_id": None,
+        "workflow_id": None,
+        "agent_id": None,
+        "operation_kind": "REJECT",
+        "actor_class": "OWNER",
+        "result_outcome": "REJECTED",
+        "occurred_after": None,
+        "occurred_before": None,
+        "limit": 25,
+        "cursor": None,
+        "request_id": "activity-1",
+    }
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/operations/activity",
+        body={"domain": "HOUSEKEEPING", "operation": "RUN", "result": "SUCCEEDED", "limit": 25},
+        headers=headers,
+        cookies=cookie,
+    )
+    assert response.status == 200, payload
+    activity = json_payload(payload)
+    assert len(activity["items"]) == 1
+    assert activity["items"][0]["domain"] == "HOUSEKEEPING"
+    assert activity["items"][0]["correlation_reference"] == "ops-1"
 
     changes = {"request_timeout_seconds": 60}
     for operation in ("settings_preview", "settings_apply"):
@@ -2212,6 +3460,13 @@ def test_database_json_routes_are_strict_digest_bound_and_jobs_poll_without_acti
     assert response.status == 200, payload
     assert "relative_path" not in payload.decode("utf-8")
 
+    response, payload = request(server, "POST", "/api/database/status", body={}, headers=headers, cookies=cookies)
+    assert response.status == 200, payload
+    status = json_payload(payload)
+    assert status["database_identity"] == "db-test"
+    assert status["storage"]["backup_total_bytes"] == 2048
+    assert database.calls["database_status"][-1] == {}
+
     response, payload = request(
         server,
         "POST",
@@ -2252,6 +3507,26 @@ def test_database_json_routes_are_strict_digest_bound_and_jobs_poll_without_acti
     )
     assert response.status == 202, payload
     backup_job = json_payload(payload)["job"]
+
+    response, payload = request(
+        server,
+        "POST",
+        "/api/database/jobs/list",
+        body={"limit": 25, "kind": "BACKUP_CREATE"},
+        headers=headers,
+        cookies=cookies,
+    )
+    assert response.status == 200, payload
+    jobs = json_payload(payload)
+    assert jobs["items"][0]["job_id"] == backup_job["job_id"]
+    assert database.calls["list_jobs"][-1] == {
+        "limit": 25,
+        "kind": "BACKUP_CREATE",
+        "phase": None,
+        "cursor": None,
+        "occurred_after": None,
+        "occurred_before": None,
+    }
 
     response, payload = request(
         server,

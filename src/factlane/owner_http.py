@@ -10,17 +10,22 @@ import os
 import re
 import socket
 import socketserver
+import ssl
 import stat
 import threading
 import time
+import uuid
 from dataclasses import asdict
 from http.cookies import CookieError, SimpleCookie
+from http.client import HTTPException, HTTPResponse
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
 from .contract import AdapterError, ScopeContext, validate_scope
+from .owner_activity import OwnerActivityJournal
 from .owner_auth import AuthError, OwnerAuthState
 from .owner_destructive import (
     FreshGrantVerifier,
@@ -65,7 +70,9 @@ _ASSET_FILES = {
     "/index.html": "index.html",
     "/assets/app.css": "assets/app.css",
     "/assets/app.js": "assets/app.js",
+    "/assets/conflicts.js": "assets/conflicts.js",
     "/assets/factlane-mark.svg": "assets/factlane-mark.svg",
+    "/assets/novice.js": "assets/novice.js",
     "/assets/shell.js": "assets/shell.js",
     "/assets/views.js": "assets/views.js",
 }
@@ -74,6 +81,10 @@ _SCOPE_FIELDS = ("scope", "project_id", "worktree_id", "workflow_id", "agent_id"
 _ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _DOWNLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 _HEX_DIGEST_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_WINDOWS_OWNER_HOST_RE = re.compile(r"factlane-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.test")
+_HAS_UNIX_STREAM_SERVER = hasattr(socketserver, "UnixStreamServer")
+_OwnerUnixStreamServer = getattr(socketserver, "UnixStreamServer", socketserver.TCPServer)
+_OWNER_CAPABILITY_NAMES = ("database_management", "full_restore", "permanent_purge")
 _LOGICAL_EXPORT_LIFECYCLE_STATES = frozenset(
     {
         "CANDIDATE",
@@ -88,8 +99,19 @@ _LOGICAL_EXPORT_LIFECYCLE_STATES = frozenset(
 )
 
 
+def _normalize_owner_capabilities(capabilities: Mapping[str, bool] | None) -> Mapping[str, bool] | None:
+    if capabilities is None:
+        return None
+    normalized = dict(capabilities)
+    if set(normalized) != set(_OWNER_CAPABILITY_NAMES) or any(type(value) is not bool for value in normalized.values()):
+        raise ValueError("Owner capability projection must contain the exact supported capability booleans")
+    return MappingProxyType({name: normalized[name] for name in _OWNER_CAPABILITY_NAMES})
+
+
 class OwnerOverviewLike(Protocol):
     async def overview(self, *, limit: int = 100, cursor: str | None = None, request_id: str | None = None) -> dict[str, Any]: ...
+
+    async def discover(self, **kwargs: Any) -> dict[str, Any]: ...
 
     async def search(self, **kwargs: Any) -> dict[str, Any]: ...
 
@@ -100,6 +122,8 @@ class OwnerControlLike(Protocol):
     async def detail(self, **kwargs: Any) -> dict[str, Any]: ...
 
     async def conflicts(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    async def activity(self, **kwargs: Any) -> dict[str, Any]: ...
 
     async def create_candidate(self, **kwargs: Any) -> dict[str, Any]: ...
 
@@ -125,6 +149,12 @@ class OwnerOperationsLike(Protocol):
 
     async def run_housekeeping(self, **kwargs: Any) -> dict[str, Any]: ...
 
+    async def begin_housekeeping_job(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    async def housekeeping_job_status(self, job_id: str) -> dict[str, Any]: ...
+
+    async def cancel_housekeeping_job(self, job_id: str) -> dict[str, Any]: ...
+
     async def agent_inventory(self, *, request_id: str | None = None) -> dict[str, Any]: ...
 
     async def settings_snapshot(self, *, request_id: str | None = None) -> dict[str, Any]: ...
@@ -134,6 +164,12 @@ class OwnerOperationsLike(Protocol):
     async def settings_apply(self, changes: dict[str, Any], *, request_id: str | None = None) -> dict[str, Any]: ...
 
     async def support_report_preview(self, **kwargs: Any) -> dict[str, Any]: ...
+
+
+class OwnerServiceControlLike(Protocol):
+    def status(self) -> Any: ...
+
+    def stop(self, request_id: str) -> Any: ...
 
 
 class OwnerDestructiveLike(Protocol):
@@ -189,6 +225,19 @@ class OwnerDatabaseLike(Protocol):
 
     def list_artifacts(self) -> list[dict[str, Any]]: ...
 
+    def database_status(self) -> dict[str, Any]: ...
+
+    def list_jobs(
+        self,
+        *,
+        limit: int = 100,
+        kind: str | None = None,
+        phase: str | None = None,
+        cursor: str | None = None,
+        occurred_after: str | None = None,
+        occurred_before: str | None = None,
+    ) -> dict[str, Any]: ...
+
     def open_download(self, artifact_id: str) -> OwnerDownloadHandleLike: ...
 
     def preview_artifact_delete(self, artifact_id: str) -> dict[str, Any]: ...
@@ -236,6 +285,29 @@ class OwnerDatabaseLike(Protocol):
         *,
         authorize: Callable[[str], Any | Awaitable[Any]],
     ) -> dict[str, Any]: ...
+
+
+class OwnerSetupLike(Protocol):
+    def status(self) -> Mapping[str, Any]: ...
+
+    def bind(
+        self,
+        *,
+        db: str,
+        profile: str,
+        host_id: str,
+        request_id: str,
+    ) -> Mapping[str, Any]: ...
+
+    def handoff_restart(self, request_id: str) -> bool: ...
+
+
+class OwnerSetupError(RuntimeError):
+    def __init__(self, code: str, message: str, *, status: int = 400) -> None:
+        super().__init__(message)
+        self.code = code
+        self.safe_message = message
+        self.status = status
 
 
 class _ServiceRunnerTimeout(TimeoutError):
@@ -337,7 +409,7 @@ class _OwnerHTTPRequestHandler(BaseHTTPRequestHandler):
         return
 
 
-class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class OwnerHTTPServer(socketserver.ThreadingMixIn, _OwnerUnixStreamServer):
     """Browser-facing Owner HTTP service bound only to a private AF_UNIX socket.
 
     TLS termination and public/private-network policy live outside this process.
@@ -354,25 +426,39 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
         *,
         socket_path: str | os.PathLike[str],
         origin: str,
+        public_origins: tuple[str, ...] | list[str] = (),
         auth_state: OwnerAuthState,
         overview_service: OwnerOverviewLike | None = None,
         control_service: OwnerControlLike | None = None,
         operations_service: OwnerOperationsLike | None = None,
+        service_control: OwnerServiceControlLike | None = None,
         destructive_service: OwnerDestructiveLike | None = None,
         database_service: OwnerDatabaseLike | None = None,
+        setup_service: OwnerSetupLike | None = None,
+        capabilities: Mapping[str, bool] | None = None,
         webui_root: str | os.PathLike[str] | None = None,
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
         queue_size: int = DEFAULT_QUEUE_SIZE,
         request_timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
     ) -> None:
+        if not _HAS_UNIX_STREAM_SERVER:
+            raise OSError("AF_UNIX Owner HTTP transport is unavailable on this platform")
         self.socket_path = Path(socket_path)
         self.origin, self.host = self._validate_configured_origin(origin)
+        self.public_origins, self._origin_by_host = self._validate_origin_allowlist(
+            self.origin,
+            self.host,
+            public_origins,
+        )
         self.auth_state = auth_state
         self.overview_service = overview_service
         self.control_service = control_service
         self.operations_service = operations_service
+        self.service_control = service_control
         self.destructive_service = destructive_service
         self.database_service = database_service
+        self.setup_service = setup_service
+        self.capabilities = _normalize_owner_capabilities(capabilities)
         self.webui_root = (
             Path(webui_root).resolve()
             if webui_root is not None
@@ -397,12 +483,20 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
         self._serving_started = False
         self._services_configured = any(
             service is not None
-            for service in (overview_service, control_service, operations_service, destructive_service, database_service)
+            for service in (
+                overview_service,
+                control_service,
+                operations_service,
+                destructive_service,
+                database_service,
+                setup_service,
+            )
         )
         self._async_cleanups: list[Callable[[], Any]] = []
         self._purge_previews: dict[str, PurgePreview] = {}
         self._purge_preview_lock = threading.Lock()
         self._prepare_socket_path()
+        self.activity_journal = OwnerActivityJournal(self.socket_path.parent / "owner-activity.json")
         try:
             super().__init__(str(self.socket_path), _OwnerHTTPRequestHandler)
             os.chmod(self.socket_path, 0o600)
@@ -506,6 +600,27 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             raise ValueError("origin must be an exact HTTPS origin without path, query, or fragment")
         return origin, parsed.netloc
 
+    @classmethod
+    def _validate_origin_allowlist(
+        cls,
+        origin: str,
+        host: str,
+        public_origins: tuple[str, ...] | list[str],
+    ) -> tuple[tuple[str, ...], dict[str, str]]:
+        if not isinstance(public_origins, (tuple, list)) or len(public_origins) > 8:
+            raise ValueError("public_origins must be a bounded list of exact HTTPS origins")
+        normalized: list[str] = []
+        by_host = {host: origin}
+        for public_origin in public_origins:
+            exact, public_host = cls._validate_configured_origin(public_origin)
+            if exact == origin or exact in normalized:
+                raise ValueError("public_origins must not duplicate configured origins")
+            if public_host in by_host:
+                raise ValueError("public_origins must not reuse an allowed Host authority")
+            normalized.append(exact)
+            by_host[public_host] = exact
+        return tuple(normalized), by_host
+
     def _prepare_socket_path(self) -> None:
         parent = self.socket_path.parent
         if parent.exists():
@@ -608,12 +723,12 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
     def dispatch(self, handler: _OwnerHTTPRequestHandler, method: str) -> None:
         try:
             path = self._request_path(handler)
-            self._require_exact_host(handler)
+            request_origin = self._require_exact_host(handler)
             if method == "GET":
                 self._dispatch_get(handler, path)
                 return
             if method == "POST":
-                self._require_exact_origin(handler)
+                self._require_exact_origin(handler, request_origin)
                 if path in {"/api/database/import/upload", "/api/database/restore/upload"}:
                     self._dispatch_raw_database_upload(handler, path)
                     return
@@ -629,6 +744,12 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             self._adapter_error(handler, exc)
         except OwnerDestructiveError as exc:
             self._destructive_error(handler, exc)
+        except OwnerSetupError as exc:
+            self._json(
+                handler,
+                exc.status,
+                {"status": "ERROR", "code": exc.code, "message": exc.safe_message},
+            )
         except (TimeoutError, socket.timeout):
             self._json(handler, 408, {"status": "ERROR", "code": "REQUEST_TIMEOUT"})
         except (ValueError, TypeError):
@@ -668,7 +789,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
     def _dispatch_post(self, handler: _OwnerHTTPRequestHandler, path: str, body: dict[str, Any]) -> None:
         if path == "/auth/preauth":
             self._only_fields(body, set())
-            preauth = self.auth_state.issue_preauth(origin=self.origin)
+            preauth = self.auth_state.issue_preauth(origin=self._request_origin(handler))
             self._json(
                 handler,
                 200,
@@ -677,11 +798,63 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             )
             return
 
+        if path == "/api/service/status":
+            self._only_fields(body, {"csrf"})
+            self._authenticated(handler, body)
+            service = self._require_service_control()
+            self._json(
+                handler,
+                200,
+                {"status": "OK", "service": self._service_snapshot_payload(service.status())},
+            )
+            return
+
+        if path == "/api/service/stop":
+            self._only_fields(body, {"request_id", "csrf"})
+            self._authenticated(handler, body)
+            request_id = self._required_string(body, "request_id", 512)
+            service = self._require_service_control()
+            event_id = self.activity_journal.start(
+                domain="SERVICE",
+                operation="STOP",
+                correlation_reference=request_id,
+                target={"service": "Owner WebUI"},
+            )
+            try:
+                snapshot = self._service_snapshot_payload(service.stop(request_id))
+            except Exception as exc:
+                self.activity_journal.finish(
+                    event_id,
+                    result="FAILED",
+                    detail={"error_code": getattr(exc, "code", type(exc).__name__)},
+                )
+                raise
+            self.activity_journal.finish(
+                event_id,
+                result="SUCCEEDED",
+                detail={"status": snapshot.get("status")},
+            )
+            self._json(
+                handler,
+                200,
+                {
+                    "status": "STOP_REQUESTED",
+                    "request_id": request_id,
+                    "stop_verified": False,
+                    "service": snapshot,
+                },
+            )
+            return
+
         if path == "/auth/connect/claim":
             self._only_fields(body, {"locator"})
             locator = self._required_string(body, "locator", 512)
             preauth = self._required_cookie(handler, PREAUTH_COOKIE)
-            claim = self.auth_state.claim_pending(locator=locator, origin=self.origin, preauth_secret=preauth)
+            claim = self.auth_state.claim_pending(
+                locator=locator,
+                origin=self._request_origin(handler),
+                preauth_secret=preauth,
+            )
             self._json(handler, 200, {"status": "OK", **asdict(claim)})
             return
 
@@ -692,7 +865,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             claim = self.auth_state.begin_remote_enrollment(
                 source="AF_UNIX_BROWSER",
                 device_label=device_label,
-                origin=self.origin,
+                origin=self._request_origin(handler),
                 preauth_secret=preauth,
             )
             self._json(handler, 200, {"status": "OK", **asdict(claim)})
@@ -704,7 +877,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             preauth = self._required_cookie(handler, PREAUTH_COOKIE)
             credentials = self.auth_state.poll_pending(
                 locator=locator,
-                origin=self.origin,
+                origin=self._request_origin(handler),
                 preauth_secret=preauth,
             )
             if credentials is None:
@@ -717,16 +890,19 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             self._json(
                 handler,
                 200,
-                {
-                    "status": "OK",
-                    "csrf": credentials.csrf_secret,
-                    "expires_at": credentials.expires_at,
-                    "absolute_expires_at": credentials.absolute_expires_at,
-                    "auth_epoch": credentials.auth_epoch,
-                    "primary_local": credentials.primary_local,
-                },
+                self._browser_session_payload(credentials),
                 extra_header_items=headers,
             )
+            return
+
+        if path == "/auth/session/resume":
+            self._only_fields(body, set())
+            session_secret = self._required_cookie(handler, SESSION_COOKIE)
+            credentials = self.auth_state.resume_session(
+                session_secret=session_secret,
+                origin=self._request_origin(handler),
+            )
+            self._json(handler, 200, self._browser_session_payload(credentials))
             return
 
         if path == "/auth/logout":
@@ -745,12 +921,27 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             self._only_fields(body, {"locator", "csrf"})
             session_secret, _ = self._authenticated(handler, body)
             locator = self._required_string(body, "locator", 512)
+            origin = self._request_origin(handler)
             preview = self.auth_state.remote_enrollment_preview(
                 locator=locator,
                 session_secret=session_secret,
-                origin=self.origin,
+                origin=origin,
             )
-            self._json(handler, 200, {"status": "OK", "preview": preview})
+            challenge = self.auth_state.begin_sensitive_challenge(
+                session_secret=session_secret,
+                origin=origin,
+                preview=preview,
+            )
+            self._json(
+                handler,
+                200,
+                {
+                    "status": "OK",
+                    "preview": preview,
+                    "challenge_id": challenge.challenge_id,
+                    "verification_phrase": challenge.verification_phrase,
+                },
+            )
             return
 
         if path == "/auth/sensitive/challenge":
@@ -759,7 +950,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             preview = self._required_string(body, "preview", 16_384)
             challenge = self.auth_state.begin_sensitive_challenge(
                 session_secret=session_secret,
-                origin=self.origin,
+                origin=self._request_origin(handler),
                 preview=preview,
             )
             self._json(
@@ -780,24 +971,58 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             grant = self.auth_state.mint_sensitive_grant(
                 challenge_id=challenge_id,
                 session_secret=session_secret,
-                origin=self.origin,
+                origin=self._request_origin(handler),
             )
             self._json(handler, 200, {"status": "OK", "grant": grant.grant_secret, "expires_at": grant.expires_at})
             return
 
         if path == "/auth/remote/approve":
-            self._only_fields(body, {"locator", "grant", "csrf"})
+            self._only_fields(body, {"locator", "grant", "challenge_id", "csrf"})
             session_secret, csrf = self._authenticated(handler, body)
             locator = self._required_string(body, "locator", 512)
-            grant = self._required_string(body, "grant", 1024)
+            grant = self._optional_string(body, "grant", 1024)
+            challenge_id = self._optional_string(body, "challenge_id", 512)
+            if (grant is None) == (challenge_id is None):
+                raise _HTTPFailure(400, "INVALID_ENVELOPE")
+            if grant is None:
+                grant = self.auth_state.mint_sensitive_grant(
+                    challenge_id=challenge_id,
+                    session_secret=session_secret,
+                    origin=self._request_origin(handler),
+                ).grant_secret
             claim = self.auth_state.approve_remote_enrollment(
                 locator=locator,
                 session_secret=session_secret,
-                origin=self.origin,
+                origin=self._request_origin(handler),
                 csrf_secret=csrf,
                 grant_secret=grant,
             )
             self._json(handler, 200, {"status": "OK", **asdict(claim)})
+            return
+
+        if path == "/api/setup/status":
+            self._only_fields(body, {"csrf"})
+            self._authenticated(handler, body)
+            service = self._require_setup_service()
+            result = dict(service.status())
+            self._json(handler, 200, result)
+            return
+
+        if path == "/api/setup/bind":
+            self._only_fields(body, {"db", "profile", "host_id", "request_id", "csrf"})
+            self._authenticated(handler, body)
+            service = self._require_setup_service()
+            result = dict(
+                service.bind(
+                    db=self._required_string(body, "db", 4096),
+                    profile=self._required_string(body, "profile", 128),
+                    host_id=self._required_string(body, "host_id", 128),
+                    request_id=self._required_string(body, "request_id", 128),
+                )
+            )
+            self._json(handler, 202, result)
+            handler.wfile.flush()
+            service.handoff_restart(str(result.get("request_id", "")))
             return
 
         if path == "/api/read/overview":
@@ -1121,7 +1346,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
                 self.auth_state.consume_sensitive_grant(
                     grant_secret=grant_secret,
                     session_secret=session_secret,
-                    origin=self.origin,
+                    origin=self._request_origin(handler),
                     preview=preview,
                 )
 
@@ -1163,10 +1388,305 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             if path == "/api/operations/housekeeping_preview":
                 result = self._run(service.housekeeping_preview(**kwargs))
             elif path == "/api/operations/run_housekeeping":
-                result = self._run(service.run_housekeeping(**kwargs))
+                correlation = kwargs["request_id"] or str(uuid.uuid4())
+                kwargs["request_id"] = correlation
+                event_id = self.activity_journal.start(
+                    domain="HOUSEKEEPING",
+                    operation="RUN",
+                    correlation_reference=correlation,
+                    scope=scope.to_dict(),
+                    target={
+                        "max_records": kwargs["max_records"],
+                        "required_free_bytes": kwargs["required_free_bytes"],
+                    },
+                )
+                try:
+                    result = self._run(service.run_housekeeping(**kwargs))
+                except Exception as exc:
+                    self.activity_journal.finish(
+                        event_id,
+                        result="FAILED",
+                        detail={"error_code": getattr(exc, "code", type(exc).__name__)},
+                    )
+                    raise
+                outcome = str(result.get("outcome") or result.get("status") or "SUCCEEDED")
+                terminal = "BLOCKED" if outcome.startswith("BLOCKED") else "SUCCEEDED"
+                self.activity_journal.finish(
+                    event_id,
+                    result=terminal,
+                    detail={
+                        "outcome": outcome,
+                        "compacted_records": result.get("compacted_records"),
+                    },
+                )
             else:
                 result = self._run(service.support_report_preview(**kwargs))
             self._json(handler, 200, result)
+            return
+
+        if path == "/api/operations/housekeeping/jobs/begin":
+            self._only_fields(
+                body,
+                {*_SCOPE_FIELDS, "max_records", "required_free_bytes", "preview_digest", "request_id", "csrf"},
+            )
+            self._authenticated(handler, body)
+            service = self._require_operations_service()
+            scope = self._exact_scope(body)
+            correlation = self._optional_string(body, "request_id", 512) or str(uuid.uuid4())
+            preview_digest = self._required_string(body, "preview_digest", 64)
+            event_id = self.activity_journal.start(
+                domain="HOUSEKEEPING",
+                operation="JOB",
+                correlation_reference=correlation,
+                scope=scope.to_dict(),
+                target={
+                    "max_records": self._required_int(body, "max_records", minimum=1),
+                    "required_free_bytes": self._required_int(body, "required_free_bytes", minimum=0),
+                },
+            )
+
+            def complete(job: dict[str, Any]) -> None:
+                phase = str(job.get("phase") or "FAILED")
+                result = job.get("result") if isinstance(job.get("result"), dict) else {}
+                outcome = str(result.get("outcome") or phase)
+                terminal = (
+                    "FAILED"
+                    if phase == "FAILED"
+                    else "CANCELLED"
+                    if phase == "CANCELLED"
+                    else "BLOCKED"
+                    if outcome.startswith("BLOCKED")
+                    else "SUCCEEDED"
+                )
+                self.activity_journal.finish(
+                    event_id,
+                    result=terminal,
+                    detail={
+                        "outcome": outcome,
+                        "compacted_records": (job.get("progress") or {}).get("compacted_records"),
+                    },
+                )
+
+            try:
+                job = self._run(
+                    service.begin_housekeeping_job(
+                        **self._scope_kwargs(scope),
+                        max_records=self._required_int(body, "max_records", minimum=1),
+                        required_free_bytes=self._required_int(body, "required_free_bytes", minimum=0),
+                        preview_digest=preview_digest,
+                        request_id=correlation,
+                        on_complete=complete,
+                    )
+                )
+            except Exception as exc:
+                self.activity_journal.finish(
+                    event_id,
+                    result="FAILED",
+                    detail={"error_code": getattr(exc, "code", type(exc).__name__)},
+                )
+                raise
+            self._json(handler, 202, {"status": "ACCEPTED", "job": job})
+            return
+
+        if path == "/api/operations/housekeeping/jobs/status":
+            self._only_fields(body, {"job_id", "csrf"})
+            self._authenticated(handler, body, user_activity=False)
+            job = self._run(
+                self._require_operations_service().housekeeping_job_status(
+                    self._required_string(body, "job_id", 64)
+                )
+            )
+            self._json(handler, 200, {"status": "OK", "job": job})
+            return
+
+        if path == "/api/operations/housekeeping/jobs/cancel":
+            self._only_fields(body, {"job_id", "request_id", "csrf"})
+            self._authenticated(handler, body)
+            correlation = self._required_string(body, "request_id", 512)
+            job_id = self._required_string(body, "job_id", 64)
+            event_id = self.activity_journal.start(
+                domain="HOUSEKEEPING",
+                operation="CANCEL",
+                correlation_reference=correlation,
+                target={"job_id": job_id},
+            )
+            try:
+                job = self._run(self._require_operations_service().cancel_housekeeping_job(job_id))
+            except Exception as exc:
+                self.activity_journal.finish(
+                    event_id,
+                    result="FAILED",
+                    detail={"error_code": getattr(exc, "code", type(exc).__name__)},
+                )
+                raise
+            self.activity_journal.finish(
+                event_id,
+                result="SUCCEEDED",
+                detail={"job_phase": job.get("phase")},
+            )
+            self._json(handler, 200, {"status": "OK", "job": job})
+            return
+
+        if path == "/api/operations/activity/owner":
+            self._only_fields(
+                body,
+                {"domain", "operation", "result", "occurred_after", "occurred_before", "limit", "csrf"},
+            )
+            self._authenticated(handler, body, user_activity=False)
+            limit = body.get("limit", 100)
+            if isinstance(limit, bool) or not isinstance(limit, int):
+                raise _HTTPFailure(400, "INVALID_INTEGER")
+            result = self.activity_journal.list(
+                limit=limit,
+                domain=self._optional_string(body, "domain", 64),
+                operation=self._optional_string(body, "operation", 64),
+                result=self._optional_string(body, "result", 64),
+                occurred_after=self._optional_string(body, "occurred_after", 64),
+                occurred_before=self._optional_string(body, "occurred_before", 64),
+            )
+            self._json(handler, 200, result)
+            return
+
+        if path == "/api/operations/activity":
+            self._only_fields(
+                body,
+                {
+                    *_SCOPE_FIELDS,
+                    "domain",
+                    "operation",
+                    "actor",
+                    "result",
+                    "occurred_after",
+                    "occurred_before",
+                    "limit",
+                    "request_id",
+                    "csrf",
+                },
+            )
+            self._authenticated(handler, body, user_activity=False)
+            limit = body.get("limit", 100)
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+                raise _HTTPFailure(400, "INVALID_INTEGER")
+            domain = self._optional_string(body, "domain", 64)
+            if domain is not None and domain not in {"LIFECYCLE", "DATABASE", "SERVICE", "HOUSEKEEPING"}:
+                raise _HTTPFailure(400, "ACTIVITY_FILTER_INVALID")
+            operation = self._optional_string(body, "operation", 64)
+            actor = self._optional_string(body, "actor", 64)
+            result_filter = self._optional_string(body, "result", 128)
+            occurred_after = self._optional_string(body, "occurred_after", 64)
+            occurred_before = self._optional_string(body, "occurred_before", 64)
+            request_id = self._optional_string(body, "request_id", 512)
+            scope = self._exact_scope(body) if body.get("scope") is not None else None
+            rows: list[dict[str, Any]] = []
+            partial = False
+
+            if domain in {None, "LIFECYCLE"} and self.control_service is not None:
+                lifecycle = self._run(
+                    self.control_service.activity(
+                        **(self._scope_kwargs(scope) if scope is not None else {}),
+                        operation_kind=operation if domain == "LIFECYCLE" else None,
+                        actor_class=actor if domain == "LIFECYCLE" else None,
+                        result_outcome=result_filter if domain == "LIFECYCLE" else None,
+                        occurred_after=occurred_after,
+                        occurred_before=occurred_before,
+                        limit=100,
+                        cursor=None,
+                        request_id=request_id,
+                    )
+                )
+                rows.extend(lifecycle.get("items", []))
+                partial = partial or lifecycle.get("next_cursor") is not None
+
+            if domain in {None, "DATABASE"} and scope is None and self.database_service is not None:
+                jobs = self._require_database_service(capability=None).list_jobs(
+                    limit=100,
+                    kind=operation if domain == "DATABASE" else None,
+                    phase=result_filter if domain == "DATABASE" else None,
+                    cursor=None,
+                    occurred_after=occurred_after,
+                    occurred_before=occurred_before,
+                )
+                for job in jobs.get("items", []):
+                    error = job.get("error") if isinstance(job.get("error"), dict) else {}
+                    rows.append(
+                        {
+                            "domain": "DATABASE",
+                            "operation_id": job.get("job_id"),
+                            "correlation_reference": job.get("operation_id"),
+                            "operation": job.get("kind"),
+                            "actor": "OWNER",
+                            "scope": None,
+                            "target": {
+                                "job_id": job.get("job_id"),
+                                "artifact_id": job.get("artifact_id"),
+                            },
+                            "result": {
+                                "outcome": job.get("phase"),
+                                "error_code": error.get("code"),
+                            },
+                            "time": job.get("updated_at"),
+                        }
+                    )
+                partial = partial or jobs.get("next_cursor") is not None
+
+            if domain in {None, "SERVICE", "HOUSEKEEPING"}:
+                owner_events = self.activity_journal.list(
+                    limit=100,
+                    domain=domain if domain in {"SERVICE", "HOUSEKEEPING"} else None,
+                    operation=operation if domain in {"SERVICE", "HOUSEKEEPING"} else None,
+                    result=result_filter if domain in {"SERVICE", "HOUSEKEEPING"} else None,
+                    occurred_after=occurred_after,
+                    occurred_before=occurred_before,
+                )
+                for event in owner_events["items"]:
+                    if scope is not None and event.get("scope") != scope.to_dict():
+                        continue
+                    rows.append(
+                        {
+                            "domain": event["domain"],
+                            "operation_id": event["event_id"],
+                            "correlation_reference": event["correlation_reference"],
+                            "operation": event["operation"],
+                            "actor": event["actor"],
+                            "scope": event["scope"],
+                            "target": event["target"],
+                            "result": {
+                                "outcome": event["result"],
+                                **(event["detail"] or {}),
+                            },
+                            "time": event["time"],
+                        }
+                    )
+                partial = partial or bool(owner_events["truncated"])
+
+            if domain is None:
+                if operation is not None:
+                    rows = [row for row in rows if row.get("operation") == operation]
+                if actor is not None:
+                    rows = [row for row in rows if row.get("actor") == actor]
+                if result_filter is not None:
+                    rows = [row for row in rows if (row.get("result") or {}).get("outcome") == result_filter]
+            elif actor is not None and domain != "LIFECYCLE":
+                rows = [row for row in rows if row.get("actor") == actor]
+            rows.sort(key=lambda row: (str(row.get("time") or ""), str(row.get("operation_id") or "")), reverse=True)
+            self._json(
+                handler,
+                200,
+                {
+                    "status": "OK",
+                    "items": rows[:limit],
+                    "partial": partial or len(rows) > limit,
+                    "filters": {
+                        "domain": domain,
+                        "operation": operation,
+                        "actor": actor,
+                        "result": result_filter,
+                        "scope": scope.to_dict() if scope is not None else None,
+                        "occurred_after": occurred_after,
+                        "occurred_before": occurred_before,
+                    },
+                },
+            )
             return
 
         if path in {"/api/operations/agent_inventory", "/api/operations/settings_snapshot"}:
@@ -1178,6 +1698,46 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
                 result = self._run(service.agent_inventory(request_id=request_id))
             else:
                 result = self._run(service.settings_snapshot(request_id=request_id))
+            self._json(handler, 200, result)
+            return
+
+        if path == "/api/operations/activity/lifecycle":
+            self._only_fields(
+                body,
+                {
+                    *_SCOPE_FIELDS,
+                    "operation_kind",
+                    "actor_class",
+                    "result_outcome",
+                    "occurred_after",
+                    "occurred_before",
+                    "limit",
+                    "cursor",
+                    "request_id",
+                    "csrf",
+                },
+            )
+            self._authenticated(handler, body, user_activity=False)
+            limit = body.get("limit", 100)
+            if isinstance(limit, bool) or not isinstance(limit, int):
+                raise _HTTPFailure(400, "INVALID_INTEGER")
+            result = self._run(
+                self._require_control_service().activity(
+                    scope=body.get("scope"),
+                    project_id=body.get("project_id"),
+                    worktree_id=body.get("worktree_id"),
+                    workflow_id=body.get("workflow_id"),
+                    agent_id=body.get("agent_id"),
+                    operation_kind=self._optional_string(body, "operation_kind", 64),
+                    actor_class=self._optional_string(body, "actor_class", 64),
+                    result_outcome=self._optional_string(body, "result_outcome", 128),
+                    occurred_after=self._optional_string(body, "occurred_after", 64),
+                    occurred_before=self._optional_string(body, "occurred_before", 64),
+                    limit=limit,
+                    cursor=self._optional_string(body, "cursor", 1024),
+                    request_id=self._optional_string(body, "request_id", 512),
+                )
+            )
             self._json(handler, 200, result)
             return
 
@@ -1194,6 +1754,39 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             self._json(handler, 200, result)
             return
 
+        if path == "/api/read/discovery":
+            allowed = {
+                *_SCOPE_FIELDS,
+                "lifecycle_state",
+                "source_ref",
+                "created_after",
+                "created_before",
+                "sort_order",
+                "limit",
+                "cursor",
+                "request_id",
+                "csrf",
+            }
+            self._only_fields(body, allowed)
+            self._authenticated(handler, body)
+            scope = self._optional_exact_scope(body)
+            kwargs = self._scope_kwargs(scope)
+            kwargs.update(
+                {
+                    "lifecycle_state": body.get("lifecycle_state"),
+                    "source_ref": body.get("source_ref"),
+                    "created_after": body.get("created_after"),
+                    "created_before": body.get("created_before"),
+                    "sort_order": body.get("sort_order"),
+                    "limit": body.get("limit", 100),
+                    "cursor": body.get("cursor"),
+                    "request_id": body.get("request_id"),
+                }
+            )
+            result = self._run(self._require_overview_service().discover(**kwargs))
+            self._json(handler, 200, result)
+            return
+
         if path == "/api/read/search":
             allowed = {
                 *_SCOPE_FIELDS,
@@ -1203,6 +1796,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
                 "source_ref",
                 "created_after",
                 "created_before",
+                "sort_order",
                 "limit",
                 "cursor",
                 "request_id",
@@ -1210,7 +1804,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             }
             self._only_fields(body, allowed)
             self._authenticated(handler, body)
-            scope = self._exact_scope(body)
+            scope = self._optional_exact_scope(body)
             kwargs = self._scope_kwargs(scope)
             kwargs.update(
                 {
@@ -1220,6 +1814,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
                     "source_ref": body.get("source_ref"),
                     "created_after": body.get("created_after"),
                     "created_before": body.get("created_before"),
+                    "sort_order": body.get("sort_order"),
                     "limit": body.get("limit", 100),
                     "cursor": body.get("cursor"),
                     "request_id": body.get("request_id"),
@@ -1284,6 +1879,50 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             if not isinstance(artifacts, list):
                 raise _HTTPFailure(502, "DATABASE_RESPONSE_INVALID")
             self._json(handler, 200, {"status": "OK", "artifacts": artifacts})
+            return
+
+        if path == "/api/database/registrations/list":
+            self._only_fields(body, {"csrf"})
+            self._authenticated(handler, body, user_activity=False)
+            registrations = self._database_public_value(
+                self._require_database_service(capability="full_restore").list_registered_databases()
+            )
+            if not isinstance(registrations, list):
+                raise _HTTPFailure(502, "DATABASE_RESPONSE_INVALID")
+            self._json(handler, 200, {"status": "OK", "registrations": registrations})
+            return
+
+        if path == "/api/database/status":
+            self._only_fields(body, {"csrf"})
+            self._authenticated(handler, body, user_activity=False)
+            status = self._database_public_value(self._require_database_service().database_status())
+            if not isinstance(status, dict):
+                raise _HTTPFailure(502, "DATABASE_RESPONSE_INVALID")
+            self._json(handler, 200, status)
+            return
+
+        if path == "/api/database/jobs/list":
+            self._only_fields(
+                body,
+                {"limit", "kind", "phase", "cursor", "occurred_after", "occurred_before", "csrf"},
+            )
+            self._authenticated(handler, body, user_activity=False)
+            limit = body.get("limit", 100)
+            if isinstance(limit, bool) or not isinstance(limit, int):
+                raise _HTTPFailure(400, "INVALID_INTEGER")
+            result = self._database_public_value(
+                self._require_database_service(capability=None).list_jobs(
+                    limit=limit,
+                    kind=self._optional_string(body, "kind", 64),
+                    phase=self._optional_string(body, "phase", 64),
+                    cursor=self._optional_string(body, "cursor", 64),
+                    occurred_after=self._optional_string(body, "occurred_after", 64),
+                    occurred_before=self._optional_string(body, "occurred_before", 64),
+                )
+            )
+            if not isinstance(result, dict):
+                raise _HTTPFailure(502, "DATABASE_RESPONSE_INVALID")
+            self._json(handler, 200, result)
             return
 
         if path == "/api/database/artifacts/delete/preview":
@@ -1368,12 +2007,23 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             artifact_id = self._required_artifact_id(body, "artifact_id")
             operation_id = self._required_string(body, "operation_id", 64)
             trusted_origin_attested = self._required_bool(body, "trusted_origin_attested")
-            service = self._require_database_service()
+            service = self._require_database_service(capability="full_restore")
             job = service.begin_restore_preview_job(
                 artifact_id,
                 operation_id=operation_id,
                 trusted_origin_attested=trusted_origin_attested,
             )
+            self._queue_database_job(service, job)
+            self._json(handler, 202, {"status": "ACCEPTED", "job": self._database_public_value(job)})
+            return
+
+        if path == "/api/database/switch/preview":
+            self._only_fields(body, {"artifact_id", "operation_id", "csrf"})
+            self._authenticated(handler, body)
+            artifact_id = self._required_artifact_id(body, "artifact_id")
+            operation_id = self._required_string(body, "operation_id", 64)
+            service = self._require_database_service(capability="full_restore")
+            job = service.begin_database_switch_preview_job(artifact_id, operation_id=operation_id)
             self._queue_database_job(service, job)
             self._json(handler, 202, {"status": "ACCEPTED", "job": self._database_public_value(job)})
             return
@@ -1394,13 +2044,13 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             operation_id = self._required_string(body, "operation_id", 64)
             state_restoration_acknowledged = self._required_bool(body, "state_restoration_acknowledged")
             grant_secret = self._required_string(body, "grant_secret", 1024)
-            service = self._require_database_service()
+            service = self._require_database_service(capability="full_restore")
             job = service.begin_restore_commit_job(
                 artifact_id,
                 operation_id=operation_id,
                 state_restoration_acknowledged=state_restoration_acknowledged,
             )
-            origin = self.origin
+            origin = self._request_origin(handler)
 
             def authorize(preview: str) -> None:
                 self.auth_state.consume_sensitive_grant(
@@ -1414,11 +2064,34 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             self._json(handler, 202, {"status": "ACCEPTED", "job": self._database_public_value(job)})
             return
 
+        if path in {"/api/database/switch/commit", "/api/database/switch/retry"}:
+            self._only_fields(body, {"artifact_id", "operation_id", "grant_secret", "csrf"})
+            session_secret, _ = self._authenticated(handler, body)
+            artifact_id = self._required_artifact_id(body, "artifact_id")
+            operation_id = self._required_string(body, "operation_id", 64)
+            grant_secret = self._required_string(body, "grant_secret", 1024)
+            service = self._require_database_service(capability="full_restore")
+            job = service.begin_database_switch_commit_job(artifact_id, operation_id=operation_id)
+            origin = self._request_origin(handler)
+
+            def authorize_switch(preview: str) -> None:
+                self.auth_state.consume_sensitive_grant(
+                    grant_secret=grant_secret,
+                    session_secret=session_secret,
+                    origin=origin,
+                    preview=preview,
+                )
+
+            self._queue_restore_database_job(service, job, authorize=authorize_switch)
+            self._json(handler, 202, {"status": "ACCEPTED", "job": self._database_public_value(job)})
+            return
+
         if path == "/api/database/jobs/status":
             self._only_fields(body, {"job_id", "csrf"})
             self._authenticated(handler, body, user_activity=False)
+            self._require_any_capability(("database_management", "full_restore"))
             job = self._database_public_value(
-                self._require_database_service().job_status(self._required_string(body, "job_id", 64))
+                self._require_database_service(capability=None).job_status(self._required_string(body, "job_id", 64))
             )
             if not isinstance(job, dict):
                 raise _HTTPFailure(502, "DATABASE_RESPONSE_INVALID")
@@ -1426,6 +2099,21 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             return
 
         raise _HTTPFailure(404, "NOT_FOUND")
+
+    def _browser_session_payload(self, credentials: Any) -> dict[str, Any]:
+        payload = {
+            "status": "OK",
+            "csrf": credentials.csrf_secret,
+            "idle_remaining_seconds": credentials.idle_remaining_seconds,
+            "absolute_remaining_seconds": credentials.absolute_remaining_seconds,
+            "auth_epoch": credentials.auth_epoch,
+            "primary_local": credentials.primary_local,
+        }
+        if self.setup_service is not None:
+            payload["setup_required"] = True
+        if self.capabilities is not None:
+            payload["capabilities"] = dict(self.capabilities)
+        return payload
 
     def _run(self, awaitable: Awaitable[Any], *, timeout_seconds: float | None = None) -> Any:
         if self._async_runner is None:
@@ -1452,15 +2140,69 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             raise _HTTPFailure(503, "SERVICE_UNAVAILABLE")
         return self.operations_service
 
+    def _require_service_control(self) -> OwnerServiceControlLike:
+        if self.service_control is None:
+            raise _HTTPFailure(503, "SERVICE_CONTROL_UNAVAILABLE")
+        return self.service_control
+
+    @staticmethod
+    def _service_snapshot_payload(snapshot: Any) -> dict[str, Any]:
+        def value(name: str) -> Any:
+            if isinstance(snapshot, Mapping):
+                return snapshot.get(name)
+            return getattr(snapshot, name, None)
+
+        status = value("status")
+        status = getattr(status, "value", status)
+        saved_endpoint = value("saved_endpoint")
+        intent_revision = value("intent_revision")
+        stopped_boot_id = value("stopped_boot_id")
+        if not isinstance(status, str) or not status or len(status) > 64:
+            raise _HTTPFailure(502, "SERVICE_RESPONSE_INVALID")
+        if saved_endpoint is not None and (not isinstance(saved_endpoint, str) or len(saved_endpoint) > 2048):
+            raise _HTTPFailure(502, "SERVICE_RESPONSE_INVALID")
+        if isinstance(intent_revision, bool) or not isinstance(intent_revision, int) or intent_revision < 0:
+            raise _HTTPFailure(502, "SERVICE_RESPONSE_INVALID")
+        if stopped_boot_id is not None and (not isinstance(stopped_boot_id, str) or not stopped_boot_id):
+            raise _HTTPFailure(502, "SERVICE_RESPONSE_INVALID")
+        return {
+            "status": status,
+            "saved_endpoint": saved_endpoint,
+            "intent_revision": intent_revision,
+            "stop_intent_active": stopped_boot_id is not None,
+        }
+
+    def _require_capability(self, name: str) -> None:
+        if name not in _OWNER_CAPABILITY_NAMES:
+            raise RuntimeError("unknown Owner capability")
+        if self.capabilities is not None and self.capabilities[name] is not True:
+            raise _HTTPFailure(501, "UNSUPPORTED", {"capability": name})
+
+    def _require_any_capability(self, names: Sequence[str]) -> None:
+        if self.capabilities is None:
+            return
+        if not names or any(name not in _OWNER_CAPABILITY_NAMES for name in names):
+            raise RuntimeError("unknown Owner capability")
+        if not any(self.capabilities[name] is True for name in names):
+            raise _HTTPFailure(501, "UNSUPPORTED", {"capability": names[0]})
+
     def _require_destructive_service(self) -> OwnerDestructiveLike:
+        self._require_capability("permanent_purge")
         if self.destructive_service is None:
             raise _HTTPFailure(503, "SERVICE_UNAVAILABLE")
         return self.destructive_service
 
-    def _require_database_service(self) -> OwnerDatabaseLike:
+    def _require_database_service(self, *, capability: str | None = "database_management") -> OwnerDatabaseLike:
+        if capability is not None:
+            self._require_capability(capability)
         if self.database_service is None:
             raise _HTTPFailure(503, "SERVICE_UNAVAILABLE")
         return self.database_service
+
+    def _require_setup_service(self) -> OwnerSetupLike:
+        if self.setup_service is None:
+            raise _HTTPFailure(404, "NOT_FOUND")
+        return self.setup_service
 
     def _queue_database_job(self, service: OwnerDatabaseLike, job: dict[str, Any]) -> None:
         if not isinstance(job, dict):
@@ -1522,6 +2264,10 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
 
     def _dispatch_raw_database_upload(self, handler: _OwnerHTTPRequestHandler, path: str) -> None:
         self._authenticated(handler, {})
+        if path == "/api/database/restore/upload":
+            self._require_capability("full_restore")
+        elif path == "/api/database/import/upload":
+            self._require_capability("database_management")
         if handler.headers.get_all("Transfer-Encoding", failobj=[]):
             raise _HTTPFailure(400, "TRANSFER_ENCODING_DENIED")
         lengths = handler.headers.get_all("Content-Length", failobj=[])
@@ -1559,7 +2305,9 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
                 raise _HTTPFailure(400, "INVALID_CHECKSUM")
             expected_sha256 = candidate.lower()
 
-        service = self._require_database_service()
+        service = self._require_database_service(
+            capability="full_restore" if path == "/api/database/restore/upload" else "database_management"
+        )
         if path == "/api/database/import/upload":
             sink = service.begin_logical_import_upload(
                 declared_size=declared_size,
@@ -1673,7 +2421,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             raise _HTTPFailure(403, "CSRF_INVALID")
         self.auth_state.validate_session(
             session_secret=session,
-            origin=self.origin,
+            origin=self._request_origin(handler),
             csrf_secret=csrf,
             require_csrf=True,
             user_activity=user_activity,
@@ -1731,11 +2479,13 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
         }
 
     @staticmethod
-    def _scope_kwargs(scope: ScopeContext) -> dict[str, str | None]:
+    def _scope_kwargs(scope: ScopeContext | None) -> dict[str, str | None]:
+        if scope is None:
+            return {field: None for field in _SCOPE_FIELDS}
         return scope.to_dict()
 
     @staticmethod
-    def _exact_scope(body: dict[str, Any]) -> ScopeContext:
+    def _optional_exact_scope(body: dict[str, Any]) -> ScopeContext | None:
         values: dict[str, str | None] = {}
         for field in _SCOPE_FIELDS:
             value = body.get(field)
@@ -1744,7 +2494,9 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             values[field] = value
         scope = values["scope"]
         if scope is None:
-            raise AdapterError("INVALID_ENVELOPE", "scope is required for backend routes")
+            if any(values[field] is not None for field in _SCOPE_FIELDS[1:]):
+                raise AdapterError("INVALID_ENVELOPE", "scope identity filters require one exact scope")
+            return None
         return validate_scope(
             scope,
             values["project_id"],
@@ -1752,6 +2504,13 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             values["workflow_id"],
             values["agent_id"],
         )
+
+    @staticmethod
+    def _exact_scope(body: dict[str, Any]) -> ScopeContext:
+        scope = OwnerHTTPServer._optional_exact_scope(body)
+        if scope is None:
+            raise AdapterError("INVALID_ENVELOPE", "scope is required for backend routes")
+        return scope
 
     @staticmethod
     def _only_fields(body: dict[str, Any], allowed: set[str]) -> None:
@@ -1863,15 +2622,24 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
             raise _HTTPFailure(400, "URL_PARAMETERS_DENIED")
         return parsed.path
 
-    def _require_exact_host(self, handler: _OwnerHTTPRequestHandler) -> None:
+    def _request_origin(self, handler: _OwnerHTTPRequestHandler) -> str:
         values = handler.headers.get_all("Host", failobj=[])
-        if len(values) != 1 or values[0] != self.host:
+        if len(values) != 1:
             raise _HTTPFailure(403, "HOST_DENIED")
+        origin = self._origin_by_host.get(values[0])
+        if origin is None:
+            raise _HTTPFailure(403, "HOST_DENIED")
+        return origin
 
-    def _require_exact_origin(self, handler: _OwnerHTTPRequestHandler) -> None:
+    def _require_exact_host(self, handler: _OwnerHTTPRequestHandler) -> str:
+        return self._request_origin(handler)
+
+    def _require_exact_origin(self, handler: _OwnerHTTPRequestHandler, request_origin: str | None = None) -> str:
         values = handler.headers.get_all("Origin", failobj=[])
-        if len(values) != 1 or values[0] != self.origin:
+        expected = self._request_origin(handler) if request_origin is None else request_origin
+        if len(values) != 1 or values[0] != expected:
             raise _HTTPFailure(403, "ORIGIN_DENIED")
+        return expected
 
     @staticmethod
     def _read_json_body(handler: _OwnerHTTPRequestHandler) -> dict[str, Any]:
@@ -2048,3 +2816,243 @@ class _HTTPFailure(Exception):
         self.status = status
         self.code = code
         self.payload = payload or {}
+
+
+class WindowsOwnerHTTPServer(OwnerHTTPServer):
+    """Owner HTTP policy served directly over loopback TLS on native Windows."""
+
+    address_family = socket.AF_INET
+    socket_type = socket.SOCK_STREAM
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+    def __init__(
+        self,
+        *,
+        origin: str,
+        public_origins: tuple[str, ...] | list[str] = (),
+        tls_context: ssl.SSLContext,
+        auth_state: OwnerAuthState,
+        overview_service: OwnerOverviewLike | None = None,
+        control_service: OwnerControlLike | None = None,
+        operations_service: OwnerOperationsLike | None = None,
+        service_control: OwnerServiceControlLike | None = None,
+        destructive_service: OwnerDestructiveLike | None = None,
+        database_service: OwnerDatabaseLike | None = None,
+        setup_service: OwnerSetupLike | None = None,
+        capabilities: Mapping[str, bool] | None = None,
+        webui_root: str | os.PathLike[str] | None = None,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+        queue_size: int = DEFAULT_QUEUE_SIZE,
+        request_timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
+        if not isinstance(tls_context, ssl.SSLContext):
+            raise TypeError("tls_context must be an SSLContext")
+        if tls_context.protocol == ssl.PROTOCOL_TLS_CLIENT:
+            raise ValueError("tls_context must support server-side TLS")
+
+        self.origin, self.host, self.hostname, self.origin_port = self._validate_windows_origin(origin)
+        self.public_origins, self._origin_by_host = self._validate_origin_allowlist(
+            self.origin,
+            self.host,
+            public_origins,
+        )
+        self.auth_state = auth_state
+        self.overview_service = overview_service
+        self.control_service = control_service
+        self.operations_service = operations_service
+        self.service_control = service_control
+        self.destructive_service = destructive_service
+        self.database_service = database_service
+        self.setup_service = setup_service
+        self.capabilities = _normalize_owner_capabilities(capabilities)
+        self.webui_root = (
+            Path(webui_root).resolve()
+            if webui_root is not None
+            else Path(__file__).resolve().with_name("webui")
+        )
+        if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int) or not 1 <= max_concurrency <= 64:
+            raise ValueError("max_concurrency must be an integer from 1 through 64")
+        if isinstance(queue_size, bool) or not isinstance(queue_size, int) or not 1 <= queue_size <= 128:
+            raise ValueError("queue_size must be an integer from 1 through 128")
+        if (
+            isinstance(request_timeout_seconds, bool)
+            or not isinstance(request_timeout_seconds, (int, float))
+            or request_timeout_seconds <= 0
+            or request_timeout_seconds > REQUEST_TIMEOUT_SECONDS
+        ):
+            raise ValueError("request_timeout_seconds must be greater than zero and at most 10 seconds")
+
+        self.request_queue_size = queue_size
+        self.request_timeout_seconds = float(request_timeout_seconds)
+        self._worker_slots = threading.BoundedSemaphore(max_concurrency)
+        self._socket_identity: tuple[int, int] | None = None
+        self._async_runner: _AsyncServiceRunner | None = None
+        self._serving_started = False
+        self._services_configured = any(
+            service is not None
+            for service in (
+                overview_service,
+                control_service,
+                operations_service,
+                destructive_service,
+                database_service,
+                setup_service,
+            )
+        )
+        self._async_cleanups: list[Callable[[], Any]] = []
+        self._purge_previews: dict[str, PurgePreview] = {}
+        self._purge_preview_lock = threading.Lock()
+        self._tls_context = tls_context
+        self._previous_sni_callback = tls_context.sni_callback
+        self._installed_sni_callback: Callable[[ssl.SSLSocket, str | None, ssl.SSLContext], Any] | None = None
+
+        socketserver.TCPServer.__init__(
+            self,
+            ("127.0.0.1", self.origin_port),
+            _OwnerHTTPRequestHandler,
+            bind_and_activate=False,
+        )
+        try:
+            self.server_bind()
+            self.server_activate()
+            self._install_sni_guard()
+            self._async_runner = _AsyncServiceRunner(timeout_seconds=self.request_timeout_seconds)
+        except BaseException:
+            self._restore_sni_callback()
+            socketserver.TCPServer.server_close(self)
+            raise
+
+    @classmethod
+    def _validate_windows_origin(cls, origin: str) -> tuple[str, str, str, int]:
+        exact_origin, host = cls._validate_configured_origin(origin)
+        parsed = urlsplit(exact_origin)
+        hostname = parsed.hostname
+        port = parsed.port
+        if (
+            hostname is None
+            or port is None
+            or not 1 <= port <= 65535
+            or _WINDOWS_OWNER_HOST_RE.fullmatch(hostname) is None
+            or exact_origin != f"https://{hostname}:{port}"
+        ):
+            raise ValueError("origin must be one canonical factlane-<id>.test HTTPS origin with an explicit port")
+        return exact_origin, host, hostname, port
+
+    def server_bind(self) -> None:
+        if self.server_address != ("127.0.0.1", self.origin_port):
+            raise ValueError("Windows Owner HTTP must bind the exact loopback origin port")
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if exclusive is not None:
+            self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        socketserver.TCPServer.server_bind(self)
+        bound_host, bound_port = self.server_address[:2]
+        if bound_host != "127.0.0.1" or bound_port != self.origin_port:
+            raise OSError("Windows Owner HTTP listener did not bind the exact loopback origin port")
+
+    def _install_sni_guard(self) -> None:
+        expected_hostname = self.hostname
+        previous_callback = self._previous_sni_callback
+
+        def require_exact_sni(
+            tls_socket: ssl.SSLSocket,
+            server_name: str | None,
+            initial_context: ssl.SSLContext,
+        ) -> Any:
+            if server_name != expected_hostname:
+                return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+            if previous_callback is not None:
+                return previous_callback(tls_socket, server_name, initial_context)
+            return None
+
+        self._installed_sni_callback = require_exact_sni
+        self._tls_context.set_servername_callback(require_exact_sni)
+
+    def _restore_sni_callback(self) -> None:
+        installed = self._installed_sni_callback
+        if installed is not None and self._tls_context.sni_callback is installed:
+            self._tls_context.set_servername_callback(self._previous_sni_callback)
+        self._installed_sni_callback = None
+
+    def get_request(self) -> tuple[ssl.SSLSocket, Any]:
+        request, client_address = socketserver.TCPServer.get_request(self)
+        request.settimeout(self.request_timeout_seconds)
+        try:
+            tls_request = self._tls_context.wrap_socket(
+                request,
+                server_side=True,
+                do_handshake_on_connect=False,
+            )
+        except BaseException:
+            request.close()
+            raise
+        tls_request.settimeout(self.request_timeout_seconds)
+        return tls_request, client_address
+
+    def process_request(self, request: ssl.SSLSocket, client_address: Any) -> None:
+        if not self._worker_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            socketserver.ThreadingMixIn.process_request(self, request, client_address)
+        except BaseException:
+            self._worker_slots.release()
+            self.shutdown_request(request)
+            raise
+
+    def process_request_thread(self, request: ssl.SSLSocket, client_address: Any) -> None:
+        try:
+            try:
+                request.do_handshake()
+            except (OSError, ssl.SSLError):
+                self.shutdown_request(request)
+                return
+            socketserver.ThreadingMixIn.process_request_thread(self, request, client_address)
+        finally:
+            self._worker_slots.release()
+
+    def probe_ready(
+        self,
+        *,
+        trust_context: ssl.SSLContext,
+        timeout_seconds: float = 1.0,
+    ) -> bool:
+        """Verify the exact loopback TLS/SNI/Host transport and health route."""
+
+        if not isinstance(trust_context, ssl.SSLContext):
+            raise TypeError("trust_context must be an SSLContext")
+        if trust_context.verify_mode != ssl.CERT_REQUIRED or not trust_context.check_hostname:
+            raise ValueError("trust_context must require certificate and hostname verification")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+            or timeout_seconds > REQUEST_TIMEOUT_SECONDS
+        ):
+            raise ValueError("timeout_seconds must be greater than zero and at most 10 seconds")
+
+        timeout = float(timeout_seconds)
+        try:
+            with socket.create_connection(("127.0.0.1", self.origin_port), timeout=timeout) as raw:
+                raw.settimeout(timeout)
+                with trust_context.wrap_socket(raw, server_hostname=self.hostname) as tls_socket:
+                    tls_socket.settimeout(timeout)
+                    tls_socket.sendall(
+                        (
+                            "GET /health HTTP/1.1\r\n"
+                            f"Host: {self.host}\r\n"
+                            "Connection: close\r\n\r\n"
+                        ).encode("ascii")
+                    )
+                    response = HTTPResponse(tls_socket)
+                    response.begin()
+                    payload = response.read(MAX_BODY_BYTES)
+                    return response.status == 200 and payload == b'{"status":"OK"}'
+        except (HTTPException, OSError, ssl.SSLError):
+            return False
+
+    def server_close(self) -> None:
+        try:
+            super().server_close()
+        finally:
+            self._restore_sni_callback()

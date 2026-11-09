@@ -17,7 +17,7 @@
     "ollama": {
       "requirement": "Local loopback embedding runtime compatible with the /api/embed contract",
       "version": "0.22.1",
-      "reacquire_method": "Install a compatible local Ollama runtime and verify loopback-only API behavior."
+      "reacquire_method": "Install a compatible local Ollama runtime and verify FactLane's own Ollama HTTP request destinations remain loopback-only with proxy inheritance and redirects disabled."
     }
   },
   "dependencies": {

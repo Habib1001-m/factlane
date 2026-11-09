@@ -7,18 +7,32 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import stat
+import tempfile
 import threading
 from typing import Any, Awaitable, Callable, Mapping
 import uuid
 
-from .contract import AdapterError, LIFECYCLE_STATES, canonical_json, iso_now, validate_scope
+from .contract import AdapterError, LIFECYCLE_STATES, canonical_json, iso_now, parse_iso, validate_scope
 from .owner_database import (
     ArtifactRegistry,
     LOGICAL_IMPORT_MAX_BYTES,
+    _flush_private_file,
+    _open_new_private_file,
+    _open_windows_parent_guard,
+    _protect_created_private_file,
+    _publish_new_private_file,
+    _replace_private_file,
+    _unlink_private_file,
+    _validate_private_regular_file,
+    _write_private_bytes,
+    _windows_path_guard,
     create_consistent_backup,
     create_registered_logical_export,
 )
+from .windows_security import WindowsSecurityError, validate_windows_path_no_reparse
+from .storage import STORAGE_CONTRACT_VERSION, inspect_storage_contract_version
 
 
 FULL_RESTORE_UPLOAD_MAX_BYTES = 1024 * 1024 * 1024
@@ -171,15 +185,37 @@ def _private_directory(path: Path, *, label: str) -> None:
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_dir():
             _raise("DATABASE_SERVICE_PATH_INVALID", f"{label} must be a real directory, not a symlink")
-        if path.stat().st_uid != os.getuid():
-            _raise("DATABASE_SERVICE_PATH_INVALID", f"{label} must be owned by the current user")
-        os.chmod(path, 0o700)
+        if os.name == "nt":
+            _windows_path_guard(
+                path,
+                directory=True,
+                protect=False,
+                code="DATABASE_SERVICE_PATH_INVALID",
+                message=f"{label} must be owner-controlled",
+            )
+        else:
+            if path.stat().st_uid != os.getuid():
+                _raise("DATABASE_SERVICE_PATH_INVALID", f"{label} must be owned by the current user")
+            os.chmod(path, 0o700)
         return
     path.mkdir(parents=False, mode=0o700)
-    os.chmod(path, 0o700)
+    if os.name == "nt":
+        _windows_path_guard(
+            path,
+            directory=True,
+            protect=True,
+            code="DATABASE_SERVICE_PATH_INVALID",
+            message=f"{label} could not be protected for the current user",
+        )
+    else:
+        os.chmod(path, 0o700)
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        # Windows publication flushes the retained source handle before and after
+        # the handle-based rename. There is no portable directory-fsync equivalent.
+        return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
     fd = os.open(path, flags)
     try:
@@ -211,16 +247,25 @@ class UploadSink:
         self._bytes_written = 0
         self._digest = hashlib.sha256()
         self._state = "OPEN"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
-            self._fd: int | None = os.open(self._stage_path, flags, 0o600)
+            self._fd, self._parent_guard = _open_new_private_file(
+                self._stage_path,
+                flags,
+                code="UPLOAD_STAGE_INVALID",
+                message="upload staging file is not owner-controlled",
+            )
         except FileExistsError as exc:
             raise AdapterError("UPLOAD_STAGE_COLLISION", "server-generated upload staging identity collided") from exc
-        os.chmod(self._stage_path, 0o600)
         opened = os.fstat(self._fd)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid():
+        path_info = _validate_private_regular_file(
+            self._stage_path,
+            code="UPLOAD_STAGE_INVALID",
+            message="upload staging file is not owner-controlled",
+        )
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (path_info.st_dev, path_info.st_ino):
             self.abort()
             _raise("UPLOAD_STAGE_INVALID", "upload staging file is not owner-controlled")
         self._stage_identity = (opened.st_dev, opened.st_ino)
@@ -265,7 +310,7 @@ class UploadSink:
             _raise("UPLOAD_INCOMPLETE", "upload is incomplete for its declared byte size")
         digest = self._digest.hexdigest()
         try:
-            os.fsync(fd)
+            _flush_private_file(fd)
         except BaseException:
             self.abort()
             raise
@@ -274,15 +319,16 @@ class UploadSink:
             _raise("UPLOAD_CHECKSUM_MISMATCH", "upload checksum does not match the declared checksum")
 
         try:
-            current_stage = self._stage_path.lstat()
+            current_stage = _validate_private_regular_file(
+                self._stage_path,
+                code="UPLOAD_STAGE_INVALID",
+                message="upload staging path changed before sealing",
+            )
         except FileNotFoundError:
             self.abort()
             _raise("UPLOAD_STAGE_INVALID", "upload staging path disappeared before sealing")
         if (
-            stat.S_ISLNK(current_stage.st_mode)
-            or not stat.S_ISREG(current_stage.st_mode)
-            or current_stage.st_uid != os.getuid()
-            or (current_stage.st_dev, current_stage.st_ino) != self._stage_identity
+            (current_stage.st_dev, current_stage.st_ino) != self._stage_identity
         ):
             self.abort()
             _raise("UPLOAD_STAGE_INVALID", "upload staging path changed before sealing")
@@ -291,20 +337,38 @@ class UploadSink:
         destination = self._service._registry.managed_path(
             self._service._artifact_storage_filename(self.kind, artifact_id)
         )
-        linked = False
+        published = False
         registered = False
+        destination_parent_guard = None
         try:
-            os.link(self._stage_path, destination, follow_symlinks=False)
-            linked = True
-            linked_info = destination.lstat()
+            if os.name == "nt":
+                destination_parent_guard = _open_windows_parent_guard(
+                    destination,
+                    code="UPLOAD_STAGE_INVALID",
+                    message="upload publication parent is not owner-controlled",
+                )
+            _publish_new_private_file(
+                self._stage_path,
+                destination,
+                source_fd=fd if os.name == "nt" else None,
+                source_parent_guard=self._parent_guard,
+                destination_parent_guard=destination_parent_guard,
+            )
+            published = True
+            linked_info = _validate_private_regular_file(
+                destination,
+                code="UPLOAD_STAGE_INVALID",
+                message="upload staging identity changed during sealing",
+            )
             if (
-                stat.S_ISLNK(linked_info.st_mode)
-                or not stat.S_ISREG(linked_info.st_mode)
-                or linked_info.st_uid != os.getuid()
-                or (linked_info.st_dev, linked_info.st_ino) != self._stage_identity
+                (linked_info.st_dev, linked_info.st_ino) != self._stage_identity
             ):
                 _raise("UPLOAD_STAGE_INVALID", "upload staging identity changed during sealing")
-            os.chmod(destination, 0o600)
+            if os.name != "nt":
+                os.chmod(destination, 0o600)
+            else:
+                os.close(fd)
+                self._fd = None
             _fsync_directory(self._service._registry.root)
             self._service._registry.register(
                 destination,
@@ -317,26 +381,31 @@ class UploadSink:
             )
             registered = True
             metadata = self._service.artifact_metadata(artifact_id)
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
             self._fd = None
             self._state = "SEALED"
-            try:
-                self._stage_path.unlink()
-                _fsync_directory(self._service._staging_root)
-            except OSError:
-                pass
+            _unlink_private_file(
+                self._stage_path,
+                parent_guard=self._parent_guard,
+                expected_identity=self._stage_identity,
+            )
+            _fsync_directory(self._service._staging_root)
+            if self._parent_guard is not None:
+                self._parent_guard.close()
+                self._parent_guard = None
             return metadata
         except BaseException:
-            if linked and not registered:
-                try:
-                    destination.unlink()
-                except FileNotFoundError:
-                    pass
+            if published and not registered:
+                _unlink_private_file(destination, parent_guard=destination_parent_guard)
             self.abort()
             raise
+        finally:
+            if destination_parent_guard is not None:
+                destination_parent_guard.close()
 
     def abort(self) -> None:
         if self._state in {"ABORTED", "SEALED"}:
@@ -348,10 +417,14 @@ class UploadSink:
                 os.close(fd)
             except OSError:
                 pass
-        try:
-            self._stage_path.unlink()
-        except FileNotFoundError:
-            pass
+        _unlink_private_file(
+            self._stage_path,
+            parent_guard=self._parent_guard,
+            expected_identity=getattr(self, "_stage_identity", None),
+        )
+        if self._parent_guard is not None:
+            self._parent_guard.close()
+            self._parent_guard = None
         self._state = "ABORTED"
 
     def close(self) -> None:
@@ -418,6 +491,15 @@ class OwnerDatabaseService:
         supplied_root = Path(artifacts_root).absolute()
         if supplied_root.is_symlink():
             _raise("DATABASE_SERVICE_CONFIG_INVALID", "trusted artifacts_root cannot be a symlink")
+        if os.name == "nt":
+            try:
+                validate_windows_path_no_reparse(supplied_root)
+            except WindowsSecurityError as exc:
+                raise AdapterError(
+                    "DATABASE_SERVICE_CONFIG_INVALID",
+                    "trusted artifacts_root contains an unsafe Windows path",
+                ) from exc
+            _private_directory(supplied_root, label="trusted artifacts root")
         trusted_root = supplied_root.resolve(strict=False)
         if artifact_registry is not None:
             if not isinstance(artifact_registry, ArtifactRegistry) or artifact_registry.root != trusted_root:
@@ -574,6 +656,157 @@ class OwnerDatabaseService:
         assert isinstance(value, list)
         return value
 
+    def list_registered_databases(self) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in self.list_artifacts()
+            if item.get("kind") == "SQLITE_BACKUP" and item.get("local_database_registration") is True
+        ]
+
+    def database_status(self) -> dict[str, Any]:
+        if self._active_db_path is None:
+            _raise("DATABASE_STATUS_UNAVAILABLE", "active database status is not configured")
+        active = self._active_db_path
+        try:
+            info = _validate_private_regular_file(
+                active,
+                code="DATABASE_STATUS_UNAVAILABLE",
+                message="active database is not an owner-controlled regular file",
+            )
+        except FileNotFoundError as exc:
+            raise AdapterError("DATABASE_STATUS_UNAVAILABLE", "active database is unavailable") from exc
+        identity = hashlib.sha256(f"{info.st_dev}:{info.st_ino}".encode("ascii")).hexdigest()[:24]
+        artifacts = self.list_artifacts()
+        backups = [item for item in artifacts if item.get("kind") == "SQLITE_BACKUP"]
+        backup_bytes = sum(
+            int(item["size_bytes"])
+            for item in backups
+            if isinstance(item.get("size_bytes"), int) and not isinstance(item.get("size_bytes"), bool)
+        )
+        try:
+            free_bytes: int | None = int(self._free_space_provider(self._registry.root))
+        except OSError:
+            free_bytes = None
+        active_bytes = int(info.st_size)
+        storage = {
+            "database_file_bytes": active_bytes,
+            "wal_file_bytes": self._file_size(Path(str(active) + "-wal")),
+            "shm_file_bytes": self._file_size(Path(str(active) + "-shm")),
+            "backup_count": len(backups),
+            "backup_total_bytes": backup_bytes,
+            "artifact_total_bytes": sum(
+                int(item["size_bytes"])
+                for item in artifacts
+                if isinstance(item.get("size_bytes"), int) and not isinstance(item.get("size_bytes"), bool)
+            ),
+            "filesystem_free_bytes": free_bytes,
+        }
+        storage["warning"] = (
+            "CAPACITY_UNKNOWN"
+            if free_bytes is None
+            else "LOW_SPACE_FOR_FULL_BACKUP"
+            if free_bytes < active_bytes
+            else None
+        )
+        try:
+            contract = inspect_storage_contract_version(str(active))
+            with tempfile.TemporaryDirectory(prefix="factlane-db-health-") as td:
+                copied = Path(td) / "factlane.db"
+                shutil.copy2(active, copied)
+                for suffix in ("-wal", "-shm"):
+                    sidecar = Path(str(active) + suffix)
+                    if sidecar.exists():
+                        shutil.copy2(sidecar, Path(str(copied) + suffix))
+                connection = sqlite3.connect(f"file:{copied}?mode=ro", uri=True, timeout=5.0)
+                try:
+                    integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+                finally:
+                    connection.close()
+        except (AdapterError, OSError, sqlite3.Error) as exc:
+            return {
+                "status": "DEGRADED",
+                "database_identity": f"db-{identity}",
+                "compatibility": "UNKNOWN",
+                "integrity_check": "unavailable",
+                "storage": storage,
+                "failure": {
+                    "code": getattr(exc, "code", "DATABASE_STATUS_UNAVAILABLE"),
+                    "action": "Run FactLane database diagnostics before maintenance.",
+                },
+            }
+        producer = self._logical_export_producer or {}
+        compatibility = "COMPATIBLE" if contract == STORAGE_CONTRACT_VERSION and integrity == "ok" else "INCOMPATIBLE"
+        return {
+            "status": "OK" if compatibility == "COMPATIBLE" else "DEGRADED",
+            "database_identity": f"db-{identity}",
+            "storage_contract_version": contract,
+            "expected_storage_contract_version": STORAGE_CONTRACT_VERSION,
+            "embedding_profile_id": producer.get("embedding_profile_id"),
+            "factlane_version": producer.get("factlane_version"),
+            "compatibility": compatibility,
+            "integrity_check": integrity,
+            "storage": storage,
+        }
+
+    @staticmethod
+    def _file_size(path: Path) -> int:
+        try:
+            return int(path.stat().st_size)
+        except FileNotFoundError:
+            return 0
+        except OSError:
+            return 0
+
+    def list_jobs(
+        self,
+        *,
+        limit: int = 100,
+        kind: str | None = None,
+        phase: str | None = None,
+        cursor: str | None = None,
+        occurred_after: str | None = None,
+        occurred_before: str | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            _raise("JOB_FILTER_INVALID", "job history limit must be from 1 through 100")
+        if kind is not None and kind not in _JOB_KINDS:
+            _raise("JOB_FILTER_INVALID", "job history kind is unsupported")
+        if phase is not None and phase not in _JOB_PHASES:
+            _raise("JOB_FILTER_INVALID", "job history phase is unsupported")
+        after_time = parse_iso(occurred_after)
+        before_time = parse_iso(occurred_before)
+        if after_time is not None and before_time is not None and after_time > before_time:
+            _raise("JOB_FILTER_INVALID", "job history start time must not be after end time")
+        jobs = [
+            self._public_job_record(record)
+            for record in self._load_jobs().values()
+            if (kind is None or record.get("kind") == kind)
+            and (phase is None or record.get("phase") == phase)
+            and (after_time is None or parse_iso(str(record.get("updated_at")), required=True) >= after_time)
+            and (before_time is None or parse_iso(str(record.get("updated_at")), required=True) <= before_time)
+        ]
+        jobs.sort(key=lambda item: (str(item["updated_at"]), str(item["job_id"])), reverse=True)
+        start = 0
+        if cursor is not None:
+            _canonical_uuid(cursor, "cursor")
+            indexes = [index for index, item in enumerate(jobs) if item["job_id"] == cursor]
+            if len(indexes) != 1:
+                _raise("JOB_CURSOR_INVALID", "job history cursor is stale or invalid")
+            start = indexes[0] + 1
+        page = jobs[start : start + limit]
+        next_cursor = page[-1]["job_id"] if start + limit < len(jobs) and page else None
+        return {
+            "status": "OK",
+            "filters": {
+                "kind": kind,
+                "phase": phase,
+                "occurred_after": occurred_after,
+                "occurred_before": occurred_before,
+            },
+            "items": page,
+            "next_cursor": next_cursor,
+        }
+
     def artifact_metadata(self, artifact_id: str) -> dict[str, Any]:
         value = self._public_artifact_metadata(self._registry.metadata(artifact_id))
         assert isinstance(value, dict)
@@ -594,7 +827,12 @@ class OwnerDatabaseService:
             raise AdapterError("ARTIFACT_NOT_FOUND", "registered artifact could not be opened safely") from exc
         try:
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            path_info = _validate_private_regular_file(
+                path,
+                code="ARTIFACT_PATH_INVALID",
+                message="registered artifact is not an owner-controlled regular file",
+            )
+            if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != (path_info.st_dev, path_info.st_ino):
                 _raise("ARTIFACT_PATH_INVALID", "registered artifact is not an owner-controlled regular file")
             if info.st_size != entry.get("size_bytes"):
                 _raise("ARTIFACT_CHECKSUM_MISMATCH", "registered artifact size no longer matches its receipt")
@@ -791,14 +1029,17 @@ class OwnerDatabaseService:
         if not path.exists() and not path.is_symlink():
             return {}
         try:
-            info = path.lstat()
+            info = _validate_private_regular_file(
+                path,
+                code="JOB_LEDGER_INVALID",
+                message="database job ledger is not an owner-controlled regular file",
+            )
         except FileNotFoundError:
             return {}
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-            _raise("JOB_LEDGER_INVALID", "database job ledger is not an owner-controlled regular file")
         if info.st_size > _JOB_LEDGER_MAX_BYTES:
             _raise("JOB_LEDGER_INVALID", "database job ledger exceeds its bounded size")
-        os.chmod(path, 0o600)
+        if os.name != "nt":
+            os.chmod(path, 0o600)
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -928,25 +1169,50 @@ class OwnerDatabaseService:
         if len(raw) > _JOB_LEDGER_MAX_BYTES:
             _raise("JOB_LEDGER_LIMIT", "database job ledger exceeds its bounded size")
         stage = self._registry.root / f".{_JOB_LEDGER_NAME}.{self._new_uuid('job_ledger_write_id')}.tmp"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(stage, flags, 0o600)
+        fd, parent_guard = _open_new_private_file(
+            stage,
+            flags,
+            code="JOB_LEDGER_INVALID",
+            message="database job ledger staging file is not owner-controlled",
+        )
+        fd_open = True
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(raw)
-                handle.flush()
-                os.fsync(handle.fileno())
+            _write_private_bytes(fd, raw)
+            if os.name != "nt":
+                os.close(fd)
+                fd_open = False
             if self._job_ledger_path.exists() or self._job_ledger_path.is_symlink():
-                current = self._job_ledger_path.lstat()
-                if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid():
-                    _raise("JOB_LEDGER_INVALID", "database job ledger changed to an unsafe path")
-            os.replace(stage, self._job_ledger_path)
-            os.chmod(self._job_ledger_path, 0o600)
+                _validate_private_regular_file(
+                    self._job_ledger_path,
+                    code="JOB_LEDGER_INVALID",
+                    message="database job ledger changed to an unsafe path",
+                )
+            if parent_guard is not None:
+                parent_guard.require_current()
+            _replace_private_file(
+                stage,
+                self._job_ledger_path,
+                source_fd=fd if os.name == "nt" else None,
+                parent_guard=parent_guard,
+            )
+            _protect_created_private_file(
+                self._job_ledger_path,
+                code="JOB_LEDGER_INVALID",
+                message="database job ledger is not owner-controlled",
+            )
             _fsync_directory(self._registry.root)
         finally:
-            if stage.exists():
-                stage.unlink()
+            if fd_open:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            _unlink_private_file(stage, parent_guard=parent_guard)
+            if parent_guard is not None:
+                parent_guard.close()
 
     def _new_operation_id(self, operation_id: str | None) -> str:
         if operation_id is None:
@@ -1438,13 +1704,32 @@ class OwnerDatabaseService:
         artifact = self._registry.metadata(artifact_id)
         if artifact.get("kind") not in {"RESTORE_UPLOAD", "SQLITE_BACKUP"}:
             _raise("JOB_BINDING_INVALID", "restore preview requires a managed restore upload")
-        if artifact.get("kind") == "SQLITE_BACKUP" and artifact.get("promoted_from_kind") != "RESTORE_UPLOAD":
+        if (
+            artifact.get("kind") == "SQLITE_BACKUP"
+            and artifact.get("promoted_from_kind") != "RESTORE_UPLOAD"
+            and artifact.get("local_database_registration") is not True
+        ):
             _raise("JOB_BINDING_INVALID", "restore preview requires a promoted restore upload")
         return self._create_job(
             kind="RESTORE_PREVIEW",
             operation_id=operation_id,
             artifact=artifact,
             private_inputs={"trusted_origin_attested": trusted_origin_attested},
+        )
+
+    def begin_database_switch_preview_job(
+        self,
+        artifact_id: str,
+        *,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        artifact = self._registry.metadata(artifact_id)
+        if artifact.get("kind") != "SQLITE_BACKUP" or artifact.get("local_database_registration") is not True:
+            _raise("DATABASE_NOT_REGISTERED", "database switch requires a trusted local registration")
+        return self.begin_restore_preview_job(
+            artifact_id,
+            operation_id=operation_id,
+            trusted_origin_attested=True,
         )
 
     def begin_restore_commit_job(
@@ -1460,7 +1745,10 @@ class OwnerDatabaseService:
             _raise("RESTORE_ACK_REQUIRED", "restore commit requires explicit state-restoration acknowledgement")
         operation = _canonical_uuid(operation_id, "operation_id")
         artifact = self._registry.metadata(artifact_id)
-        if artifact.get("kind") != "SQLITE_BACKUP" or artifact.get("promoted_from_kind") != "RESTORE_UPLOAD":
+        if artifact.get("kind") != "SQLITE_BACKUP" or (
+            artifact.get("promoted_from_kind") != "RESTORE_UPLOAD"
+            and artifact.get("local_database_registration") is not True
+        ):
             _raise("JOB_BINDING_INVALID", "restore commit requires the promoted SQLITE_BACKUP artifact")
         with self._job_lock:
             jobs = self._load_jobs()
@@ -1511,6 +1799,21 @@ class OwnerDatabaseService:
                 "preview_job_id": preview_job["job_id"],
                 "state_restoration_acknowledged": True,
             },
+        )
+
+    def begin_database_switch_commit_job(
+        self,
+        artifact_id: str,
+        *,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        artifact = self._registry.metadata(artifact_id)
+        if artifact.get("kind") != "SQLITE_BACKUP" or artifact.get("local_database_registration") is not True:
+            _raise("DATABASE_NOT_REGISTERED", "database switch requires a trusted local registration")
+        return self.begin_restore_commit_job(
+            artifact_id,
+            operation_id=operation_id,
+            state_restoration_acknowledged=True,
         )
 
     def begin_logical_export_job(

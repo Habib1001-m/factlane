@@ -1,0 +1,18 @@
+{
+  "adapter_record_count": 1,
+  "backend_distribution": "mcp-memory-service==11.10.0",
+  "backend_vcs_commit": "e5155b937051db4fa99a384018c5ebd621d8c5ef",
+  "compressed_filename": "factlane-v0.1.4-storage-v2.sqlite3.gz",
+  "compressed_sha256": "ce4c0b9c418e60bd5254dabaccec280ea4ee0188d3fd0103e369324a54adcf5f",
+  "factlane_release": "v0.1.4",
+  "factlane_source_commit": "4b2cf5b",
+  "generation_note": "Generated locally from the exact FactLane v0.1.4 source commit with its exact reviewed mcp-memory-service VCS pin; deterministic fixture content uses fixed record/profile identities.",
+  "generator_python": "3.14.4",
+  "integrity_check": "ok",
+  "kind": "FACTLANE_FROZEN_STORAGE_V2_TEST_FIXTURE",
+  "quick_check": "ok",
+  "schema_version": 1,
+  "storage_contract_version": 2,
+  "uncompressed_sha256": "05767b29c9e144b99c68594e8e2031606656380d355744f99bcfb64d302ee637",
+  "uncompressed_size": 1228800
+}

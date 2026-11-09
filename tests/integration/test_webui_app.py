@@ -28,6 +28,7 @@ import fcntl
 
 from factlane.adapter import MemoryAdapter
 from factlane.contract import AdapterError, ScopeContext
+from factlane.owner_auth import NativeConfirmationRequest
 from factlane.owner_database import build_logical_export
 from factlane.owner_database_service import OwnerDatabaseService
 from factlane.owner_destructive import OwnerDestructiveOrchestrator, PurgeTargetIdentity
@@ -35,20 +36,40 @@ from factlane.maintenance_coordinator import MaintenanceCoordinatorError, Prepar
 from factlane.owner_operations import OwnerOperationsService
 from factlane.owner_overview import OwnerOverviewService
 from factlane.owner_control import OwnerControlService
+from factlane.owner_http import OwnerSetupError
 from factlane.owner_restore import FullRestoreService
 from factlane.recovery import MaintenanceLease, RecoveryScope, RecoveryTarget
 from factlane.runtime_control import PROTOCOL_VERSION, RuntimeControlRequest, RuntimeIdentity
 from factlane.storage import SQLiteVecEngine, STORAGE_CONTRACT_VERSION
+from factlane.windows_owner_purge import WindowsOwnerPurgeOperator
+from factlane.windows_owner_restore import WindowsOwnerRestoreOperator
 from factlane.webui_app import (
+    _LinuxSetupBindingService,
     _OwnerAdapterMaintenanceCoordinator,
+    _WindowsNativeConfirmation,
+    _build_maintenance,
+    _compose_database_authority,
     _configured_embedding_profile,
     _database_state_roots,
     _make_post_activation_verifier,
+    _owner_capabilities_for_spec,
+    _prepare_linux_managed_restart,
+    _validate_linux_setup_database_path,
+    _windows_process_start_provider,
     create_caddy_process,
     create_owner_runtime_backend,
 )
-from factlane.webui_runtime import BackendLaunchSpec, BackendMode, WebUIRuntimeConfig, caddy_command
+from factlane.webui_runtime import (
+    BackendLaunchSpec,
+    BackendMode,
+    BackendTransportKind,
+    PlatformKind,
+    WebUIRuntimeConfig,
+    caddy_command,
+    load_runtime_config,
+)
 from factlane.webui_service import WebUIServiceState
+from factlane.webui_windows import WindowsManagedConfig
 
 
 ORIGIN = "https://factlane-compose.test:8765"
@@ -196,6 +217,10 @@ class _ResumeDelegate:
 
     async def resume_running(self, _prepared, *, new_generation: int) -> ResumeReport:
         self.activation_calls.append(("resume_running", new_generation))
+        return self.report
+
+    async def resume_activating(self, _prepared, *, new_generation: int) -> ResumeReport:
+        self.activation_calls.append(("resume_activating", new_generation))
         return self.report
 
     def begin_activation(self, _prepared, *, new_generation: int):
@@ -518,6 +543,51 @@ def test_owner_resume_timeout_preserves_exact_delegate_stdio_report(monkeypatch:
     asyncio.run(run())
 
 
+def test_owner_resume_activating_preserves_stdio_truth_and_participant_failure() -> None:
+    async def run() -> None:
+        delegate_report = ResumeReport(
+            ("runtime-a",),
+            {"runtime-b": "UNREACHABLE"},
+            {"existing_participant": "DEGRADED"},
+        )
+        delegate = _ResumeDelegate(delegate_report)
+        participant = _FailingOwnerParticipant()
+        coordinator = _OwnerAdapterMaintenanceCoordinator(delegate, participant)  # type: ignore[arg-type]
+
+        report = await coordinator.resume_activating(object(), new_generation=4)
+
+        assert report.ready_instance_ids == ("runtime-a",)
+        assert report.failures == {"runtime-b": "UNREACHABLE"}
+        assert report.participant_failures == {
+            "existing_participant": "DEGRADED",
+            "owner_adapter": "OWNER_ADAPTER_REOPEN_FAILED",
+        }
+        assert delegate.activation_calls == [("resume_activating", 4)]
+        assert participant.reopen_calls == 1
+        assert participant.recovery_required_calls == 1
+
+    asyncio.run(run())
+
+
+def test_owner_resume_activating_success_preserves_delegate_report_without_fake_participant() -> None:
+    async def run() -> None:
+        delegate_report = ResumeReport(("runtime-a", "runtime-b"), {})
+        delegate = _ResumeDelegate(delegate_report)
+        participant = _PrepareParticipant(state="CLOSED")
+        coordinator = _OwnerAdapterMaintenanceCoordinator(delegate, participant)  # type: ignore[arg-type]
+
+        report = await coordinator.resume_activating(object(), new_generation=5)
+
+        assert report.ready_instance_ids == delegate_report.ready_instance_ids
+        assert report.failures == {}
+        assert report.participant_failures == {}
+        assert delegate.activation_calls == [("resume_activating", 5)]
+        assert participant.reopen_calls == 1
+        assert participant.state == "RUNNING"
+
+    asyncio.run(run())
+
+
 def test_owner_resume_external_cancellation_is_not_swallowed() -> None:
     async def run() -> None:
         delegate_report = ResumeReport(("runtime-a",), {"runtime-b": "UNREACHABLE"})
@@ -624,6 +694,60 @@ def _spec(tmp_path: Path, *, normal: bool = True) -> BackendLaunchSpec:
     )
 
 
+class _FakeRestartPlan:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.handoffs = 0
+
+    def handoff(self) -> None:
+        self.handoffs += 1
+        if self.fail:
+            raise RuntimeError("restart handoff failed")
+
+
+def _install_linux_setup_runtime_config(
+    tmp_path: Path,
+    spec: BackendLaunchSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    configured: bool = False,
+) -> Path:
+    config_path = tmp_path / "config" / "factlane" / "webui.json"
+    config_path.parent.mkdir(parents=True, mode=0o700)
+    os.chmod(config_path.parent, 0o700)
+    payload = {
+        "db": str(Path(spec.state_dir) / "memory.db") if configured else None,
+        "profile": "nomic-768" if configured else None,
+        "host_id": "owner-compose" if configured else None,
+        "origin": spec.expected_origin,
+        "backend_socket": spec.socket_path,
+        "caddy_path": str(tmp_path / "bin" / "caddy"),
+        "caddyfile": str(config_path.parent / "Caddyfile"),
+        "runtime_dir": spec.runtime_dir,
+        "state_dir": spec.state_dir,
+    }
+    config_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    os.chmod(config_path, 0o600)
+    monkeypatch.setattr("factlane.webui_app.default_runtime_config_path", lambda: config_path)
+    return config_path
+
+
+def _windows_spec(*, normal: bool = False) -> BackendLaunchSpec:
+    return BackendLaunchSpec(
+        db=r"C:\Users\Owner\AppData\Local\FactLane\memory.db" if normal else None,
+        profile="nomic-768" if normal else None,
+        host_id="owner-host-compose" if normal else None,
+        expected_origin=ORIGIN,
+        socket_path=None,
+        runtime_dir=r"C:\Users\Owner\AppData\Local\FactLane\runtime",
+        state_dir=r"C:\Users\Owner\AppData\Local\FactLane\state",
+        mode=BackendMode.NORMAL if normal else BackendMode.SETUP_SHELL,
+        normal_adapter_required=normal,
+        platform_kind=PlatformKind.WINDOWS,
+        backend_transport=BackendTransportKind.WINDOWS_HTTPS,
+    )
+
+
 def _recovery_spec(tmp_path: Path) -> BackendLaunchSpec:
     runtime_dir = tmp_path / "run" / "factlane"
     state_dir = tmp_path / "state" / "factlane"
@@ -685,6 +809,310 @@ def _service_state(tmp_path: Path) -> WebUIServiceState:
     )
 
 
+class _FakeWindowsHTTPServer:
+    def __init__(self, *, origin: str, tls_context: object, auth_state, **_kwargs) -> None:
+        self.origin = origin
+        self.tls_context = tls_context
+        self.auth_state = auth_state
+        self.setup_service = _kwargs.get("setup_service")
+        self.service_control = _kwargs.get("service_control")
+        self.service_loop_thread_alive = True
+        self.started = threading.Event()
+        self.stopped = threading.Event()
+        self.probe_result = True
+        self.probe_calls: list[tuple[object, float]] = []
+
+    def serve_forever(self, poll_interval: float = 0.05) -> None:
+        assert poll_interval == 0.05
+        self.started.set()
+        self.stopped.wait(2.0)
+
+    def probe_ready(self, *, trust_context: object, timeout_seconds: float) -> bool:
+        self.probe_calls.append((trust_context, timeout_seconds))
+        return self.probe_result
+
+    def shutdown(self) -> None:
+        self.stopped.set()
+
+    def server_close(self) -> None:
+        self.stopped.set()
+
+
+class _FakeWindowsNativeControlServer:
+    def __init__(
+        self,
+        *,
+        pipe_name: str,
+        owner_uid: int,
+        auth_state,
+        service_control,
+        owner_sid: str,
+        **_kwargs,
+    ) -> None:
+        self.pipe_name = pipe_name
+        self.owner_uid = owner_uid
+        self.auth_state = auth_state
+        self.service_control = service_control
+        self.owner_sid = owner_sid
+        self.started = threading.Event()
+        self.stopped = threading.Event()
+
+    def serve_forever(self, poll_interval: float = 0.05) -> None:
+        assert poll_interval == 0.05
+        self.started.set()
+        self.stopped.wait(2.0)
+
+    def shutdown(self) -> None:
+        self.stopped.set()
+
+    def server_close(self) -> None:
+        self.stopped.set()
+
+
+def test_windows_native_confirmation_uses_win32_confirmer_without_zenity(monkeypatch: pytest.MonkeyPatch) -> None:
+    messages: list[str] = []
+    monkeypatch.setattr(
+        "factlane.webui_app.windows_native_confirm",
+        lambda message: messages.append(message) or True,
+    )
+    confirmation = _WindowsNativeConfirmation()
+    request = NativeConfirmationRequest(
+        kind="SENSITIVE_ACTION",
+        verification_phrase="VERIFY-123",
+        auth_epoch=1,
+        caller_uid=0,
+        origin=ORIGIN,
+        preview="Delete one exact memory",
+    )
+
+    assert confirmation.confirm(request) is True
+    assert len(messages) == 1
+    assert "Action: SENSITIVE_ACTION" in messages[0]
+    assert "Verification phrase: VERIFY-123" in messages[0]
+    assert "Preview: Delete one exact memory" in messages[0]
+
+
+def test_windows_setup_composition_uses_sid_pipe_loaded_tls_and_exact_readiness_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = "S-1-5-21-100-200-300-1001"
+    pipe = r"\\.\pipe\factlane-owner-deadbeefdeadbeef"
+    material = object()
+    server_context = object()
+    client_context = object()
+    tls_loads: list[tuple[Path, str, str | None]] = []
+    spec = _windows_spec(normal=False)
+    config_path = r"C:\Users\Owner\AppData\Local\FactLane\config\webui.json"
+    browser_profile_dir = r"C:\Users\Owner\AppData\Local\FactLane\browser"
+    managed = WindowsManagedConfig(
+        installation_id="compose123",
+        origin=spec.expected_origin,
+        native_control_pipe=pipe,
+        runtime_dir=spec.runtime_dir,
+        state_dir=spec.state_dir,
+        browser_profile_dir=browser_profile_dir,
+    )
+
+    monkeypatch.setattr("factlane.webui_app.current_user_sid", lambda: sid)
+    monkeypatch.setattr(
+        "factlane.webui_app.windows_owner_paths",
+        lambda *, owner_sid: SimpleNamespace(
+            native_control_socket=pipe,
+            service_config_path=config_path,
+            browser_profile_dir=browser_profile_dir,
+        ),
+    )
+    monkeypatch.setattr(
+        "factlane.webui_app.load_windows_managed_config",
+        lambda path, *, owner_sid=None: managed,
+    )
+    monkeypatch.setattr(
+        "factlane.webui_app.load_windows_tls_material",
+        lambda root, hostname, *, owner_sid=None: tls_loads.append((Path(root), hostname, owner_sid)) or material,
+    )
+    monkeypatch.setattr("factlane.webui_app.build_windows_server_ssl_context", lambda exact: server_context if exact is material else None)
+    monkeypatch.setattr("factlane.webui_app.build_windows_client_ssl_context", lambda exact: client_context if exact is material else None)
+    monkeypatch.setattr("factlane.webui_app.WindowsOwnerHTTPServer", _FakeWindowsHTTPServer)
+    monkeypatch.setattr("factlane.webui_app.WindowsOwnerNativeControlServer", _FakeWindowsNativeControlServer)
+
+    backend = create_owner_runtime_backend(
+        spec,
+        _service_state(tmp_path),
+        owner_uid=777,
+    )
+    try:
+        assert backend.auth_state._owner_uid == 0
+        assert isinstance(backend.auth_state._native_confirmation, _WindowsNativeConfirmation)
+        assert isinstance(backend.http_server, _FakeWindowsHTTPServer)
+        assert backend.http_server.tls_context is server_context
+        assert backend.http_server.setup_service is not None
+        assert tls_loads == [(Path(spec.state_dir) / "tls", "factlane-compose.test", sid)]
+        assert isinstance(backend.native_server, _FakeWindowsNativeControlServer)
+        assert backend.native_server.pipe_name == pipe
+        assert backend.native_server.owner_uid == 0
+        assert backend.native_server.owner_sid == sid
+        assert backend.native_server.auth_state is backend.auth_state
+        assert backend.http_server.service_control is backend.native_server.service_control
+        assert backend.native_server.service_control.service_state is backend.service_state
+
+        backend.start()
+        assert backend.http_server.started.wait(1.0)
+        assert backend.native_server.started.wait(1.0)
+        backend.http_server.probe_result = False
+        assert backend.is_ready() is False
+        backend.http_server.probe_result = True
+        assert backend.is_ready() is True
+        assert backend.http_server.probe_calls[-1] == (client_context, 1.0)
+    finally:
+        backend.begin_drain()
+        assert backend.wait_stopped(2.0) is True
+
+
+def test_windows_capability_projection_matches_only_the_proven_normal_panel_contract(tmp_path: Path) -> None:
+    assert _owner_capabilities_for_spec(_windows_spec(normal=True)) == {
+        "database_management": True,
+        "full_restore": True,
+        "permanent_purge": True,
+    }
+    assert _owner_capabilities_for_spec(_windows_spec(normal=False)) == {
+        "database_management": False,
+        "full_restore": False,
+        "permanent_purge": False,
+    }
+    assert _owner_capabilities_for_spec(_spec(tmp_path)) is None
+
+
+def test_windows_maintenance_composition_uses_windows_registry_client_and_in_place_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = "S-1-5-21-100-200-300-1001"
+    created: dict[str, object] = {}
+
+    class FakeRegistry:
+        def __init__(self, runtime_root, **kwargs) -> None:
+            created["runtime_root"] = runtime_root
+            created["registry_kwargs"] = kwargs
+
+    class FakeBarrier:
+        def __init__(self, root, database_path) -> None:
+            created["barrier_root"] = root
+            self.database_path = database_path
+
+        def initialize(self, *, generation: int):
+            created["barrier_generation"] = generation
+            return object()
+
+    class FakeWindowsClient:
+        def __init__(self, registry, *, owner_sid: str) -> None:
+            created["client_registry"] = registry
+            created["client_sid"] = owner_sid
+
+        async def call(self, *_args, **_kwargs):
+            return {}
+
+    class FakeCoordinator:
+        def __init__(self, *, barrier, registry, call_runtime, exclusion_check) -> None:
+            self.barrier = barrier
+            self.registry = registry
+            self.call_runtime = call_runtime
+            self.exclusion_check = exclusion_check
+
+    class FakeLease:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeInPlace:
+        @classmethod
+        def acquire(cls, database_path):
+            created["in_place_path"] = database_path
+            lease = FakeLease()
+            lease.revalidate = lambda: created.setdefault("revalidated", True)
+            lease.release_unmutated = lambda: created.setdefault("released_unmutated", True)
+            lease.retain_fail_closed = lambda: created.setdefault("retained_fail_closed", True)
+            return lease
+
+    boot_provider = lambda: "windows-boot"
+    monkeypatch.setattr("factlane.webui_app.current_user_sid", lambda: sid)
+    monkeypatch.setattr("factlane.webui_app.windows_boot_id", boot_provider)
+    monkeypatch.setattr("factlane.webui_app.RuntimeRegistry", FakeRegistry)
+    monkeypatch.setattr("factlane.webui_app.MaintenanceBarrierStore", FakeBarrier)
+    monkeypatch.setattr("factlane.webui_app.WindowsRuntimeControlClient", FakeWindowsClient)
+    monkeypatch.setattr("factlane.webui_app.MaintenanceCoordinator", FakeCoordinator)
+    monkeypatch.setattr("factlane.webui_app.WindowsInPlaceMaintenanceLease", FakeInPlace)
+
+    spec = _windows_spec(normal=True)
+    registry, coordinator = _build_maintenance(spec, spec.db, owner_uid=999)
+
+    assert registry is coordinator.registry
+    assert created["registry_kwargs"] == {
+        "owner_uid": 0,
+        "boot_id_provider": boot_provider,
+        "process_start_provider": _windows_process_start_provider,
+    }
+    assert created["client_registry"] is registry
+    assert created["client_sid"] == sid
+    assert coordinator.exclusion_check(spec.db) is True
+    assert created["in_place_path"] == spec.db
+    assert created["revalidated"] is True
+    assert created["released_unmutated"] is True
+    assert "retained_fail_closed" not in created
+
+
+def test_windows_database_authority_selects_in_place_restore_and_panel_purge_operators(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("factlane.webui_app._runtime_control_client_for_spec", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr("factlane.webui_app._make_post_activation_verifier", lambda *_args, **_kwargs: (lambda **_kw: {}))
+    spec = _windows_spec(normal=True)
+    db = tmp_path / "memory.db"
+    spec = BackendLaunchSpec(
+        db=str(db),
+        profile=spec.profile,
+        host_id=spec.host_id,
+        expected_origin=spec.expected_origin,
+        socket_path=spec.socket_path,
+        runtime_dir=str(tmp_path / "runtime"),
+        state_dir=str(tmp_path / "state"),
+        mode=spec.mode,
+        normal_adapter_required=spec.normal_adapter_required,
+        platform_kind=spec.platform_kind,
+        backend_transport=spec.backend_transport,
+    )
+    Path(spec.runtime_dir).mkdir(parents=True)
+    Path(spec.state_dir).mkdir(parents=True)
+
+    class FakeRegistry:
+        pass
+
+    class FakeCoordinator:
+        pass
+
+    class FakeAuth:
+        def invalidate_all_sessions_after_maintenance(self) -> None:
+            return None
+
+    database, restore, destructive = _compose_database_authority(
+        spec=spec,
+        database_path=str(db),
+        profile_name="nomic-768",
+        auth_state=FakeAuth(),  # type: ignore[arg-type]
+        service_state=_service_state(tmp_path),
+        runtime_registry=FakeRegistry(),  # type: ignore[arg-type]
+        coordinator=FakeCoordinator(),
+        adapter_executor=None,
+    )
+
+    assert isinstance(database, OwnerDatabaseService)
+    assert restore._windows_restore_operator_factory is WindowsOwnerRestoreOperator
+    assert isinstance(destructive._recovery_operator, WindowsOwnerPurgeOperator)
+    assert destructive._post_close_target_resolver is not None
+
+
 def _runtime_config(tmp_path: Path) -> WebUIRuntimeConfig:
     runtime_dir = tmp_path / "run" / "factlane"
     state_dir = tmp_path / "state" / "factlane"
@@ -703,7 +1131,7 @@ def _runtime_config(tmp_path: Path) -> WebUIRuntimeConfig:
     )
 
 
-def test_caddy_process_requires_exact_argv_live_child_and_exact_origin_listener(
+def test_caddy_process_requires_exact_argv_live_child_and_loopback_listener(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -733,11 +1161,11 @@ def test_caddy_process_requires_exact_argv_live_child_and_exact_origin_listener(
     assert popen_calls == [(argv, False)]
     assert caddy.poll() is None
     assert caddy.is_ready() is False
-    assert connects[-1][0] == ("factlane-compose.test", 8765)
+    assert connects[-1][0] == ("127.0.0.1", 8765)
 
     listener_available = True
     assert caddy.is_ready() is True
-    assert connects[-1][0] == ("factlane-compose.test", 8765)
+    assert connects[-1][0] == ("127.0.0.1", 8765)
     assert closes == [True]
 
     process.returncode = 7
@@ -807,6 +1235,17 @@ def _post(server, path: str, body: dict[str, object], *, cookies: dict[str, str]
     return response.status, payload
 
 
+def _establish_owner_session(backend):
+    auth = backend.auth_state
+    preauth = auth.issue_preauth(origin=ORIGIN)
+    pending = auth.begin_enrollment(caller_uid=os.getuid(), source="test", device_label="Primary browser")
+    auth.claim_pending(locator=pending.locator, origin=ORIGIN, preauth_secret=preauth)
+    auth.approve_pending(locator=pending.locator, caller_uid=os.getuid())
+    credentials = auth.poll_pending(locator=pending.locator, origin=ORIGIN, preauth_secret=preauth)
+    assert credentials is not None
+    return credentials
+
+
 def test_normal_backend_binds_exact_runtime_authority_and_adapter_to_one_service_loop(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     service_state = _service_state(tmp_path)
@@ -844,6 +1283,7 @@ def test_normal_backend_binds_exact_runtime_authority_and_adapter_to_one_service
     assert backend.native_server.socket_path == Path(spec.runtime_dir) / "owner-control.sock"
     assert backend.native_server.auth_state is backend.auth_state
     assert backend.native_server.service_control.service_state is service_state
+    assert backend.http_server.setup_service is None
     assert isinstance(backend.http_server.control_service, OwnerControlService)
     assert isinstance(backend.http_server.overview_service, OwnerOverviewService)
     assert isinstance(backend.http_server.operations_service, OwnerOperationsService)
@@ -1042,8 +1482,12 @@ def test_owner_adapter_participant_drains_releases_exclusion_and_reopens_exact_l
     assert [event[0] for event in events] == ["close", "close", "close", "close"]
 
 
-def test_setup_shell_never_opens_database_and_keeps_owner_services_unconfigured(tmp_path: Path) -> None:
+def test_setup_shell_never_opens_database_and_keeps_owner_services_unconfigured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     spec = _spec(tmp_path, normal=False)
+    _install_linux_setup_runtime_config(tmp_path, spec, monkeypatch)
     service_state = _service_state(tmp_path)
 
     async def forbidden_adapter_factory(*_args, **_kwargs):
@@ -1065,17 +1509,24 @@ def test_setup_shell_never_opens_database_and_keeps_owner_services_unconfigured(
     assert backend.http_server.operations_service is None
     assert backend.http_server.destructive_service is None
     assert backend.http_server.database_service is None
+    assert backend.http_server.setup_service is not None
 
-    auth = backend.auth_state
-    preauth = auth.issue_preauth(origin=ORIGIN)
-    pending = auth.begin_enrollment(caller_uid=os.getuid(), source="test", device_label="Primary browser")
-    auth.claim_pending(locator=pending.locator, origin=ORIGIN, preauth_secret=preauth)
-    auth.approve_pending(locator=pending.locator, caller_uid=os.getuid())
-    credentials = auth.poll_pending(locator=pending.locator, origin=ORIGIN, preauth_secret=preauth)
-    assert credentials is not None
+    credentials = _establish_owner_session(backend)
 
     backend.start()
     try:
+        status, payload = _post(
+            backend.http_server,
+            "/api/setup/status",
+            {"csrf": credentials.csrf_secret},
+            cookies={"__Host-factlane-session": credentials.session_secret},
+        )
+        assert status == 200
+        assert payload["status"] == "SETUP_REQUIRED"
+        assert payload["suggested_db"] == str(Path(spec.state_dir) / "memory.db")
+        assert payload["suggested_host_id"] == "owner-compose"
+        assert "nomic-768" in payload["profiles"]
+
         status, payload = _post(
             backend.http_server,
             "/api/read/overview",
@@ -1087,6 +1538,490 @@ def test_setup_shell_never_opens_database_and_keeps_owner_services_unconfigured(
     finally:
         backend.begin_drain()
         assert backend.wait_stopped(2.0) is True
+
+
+def test_linux_setup_shell_rejects_already_configured_runtime_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _spec(tmp_path, normal=False)
+    _install_linux_setup_runtime_config(tmp_path, spec, monkeypatch, configured=True)
+
+    with pytest.raises(ValueError, match="must remain unbound"):
+        create_owner_runtime_backend(
+            spec,
+            _service_state(tmp_path),
+            native_confirmation=_Confirmation(approved=True),
+            owner_uid=os.getuid(),
+        )
+
+
+def test_linux_setup_bind_validates_existing_database_preserves_runtime_fields_and_handoffs_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _spec(tmp_path, normal=False)
+    config_path = _install_linux_setup_runtime_config(tmp_path, spec, monkeypatch)
+    baseline = load_runtime_config(config_path, owner_uid=os.getuid())
+    database = Path(spec.state_dir) / "memory.db"
+
+    async def provision() -> None:
+        profile = _configured_embedding_profile("nomic-768")
+        engine = SQLiteVecEngine(str(database), profile)
+        await engine.open()
+        await engine.close()
+        metadata = {
+            "metadata_revision": 2,
+            "store_key": profile.profile_id,
+            "semantic_identity": profile.semantic_identity(),
+            "compatibility_proof": {},
+            "runtime_provenance": {},
+            "runtime_fingerprint": "f" * 64,
+        }
+        conn = sqlite3.connect(database)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO adapter_meta(key,value) VALUES ('embedding_profile',?)",
+                (json.dumps(metadata, sort_keys=True, separators=(",", ":")),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    asyncio.run(provision())
+    database_before = database.read_bytes()
+    restart_plan = _FakeRestartPlan()
+    monkeypatch.setattr("factlane.webui_app._prepare_linux_managed_restart", lambda: restart_plan)
+
+    backend = create_owner_runtime_backend(
+        spec,
+        _service_state(tmp_path),
+        native_confirmation=_Confirmation(approved=True),
+        owner_uid=os.getuid(),
+    )
+    credentials = _establish_owner_session(backend)
+    backend.start()
+    try:
+        status, payload = _post(
+            backend.http_server,
+            "/api/setup/bind",
+            {
+                "db": str(database),
+                "profile": "nomic-768",
+                "host_id": "owner-compose",
+                "request_id": "linux-setup-1",
+                "csrf": credentials.csrf_secret,
+            },
+            cookies={"__Host-factlane-session": credentials.session_secret},
+        )
+        assert status == 202, payload
+        assert payload == {
+            "status": "CONFIG_PUBLISHED",
+            "restart": "REQUESTED",
+            "request_id": "linux-setup-1",
+        }
+        assert restart_plan.handoffs == 1
+        assert database.read_bytes() == database_before
+
+        observed = load_runtime_config(config_path, owner_uid=os.getuid())
+        assert observed.db == str(database)
+        assert observed.profile == "nomic-768"
+        assert observed.host_id == "owner-compose"
+        for field in (
+            "origin",
+            "backend_socket",
+            "caddy_path",
+            "caddyfile",
+            "runtime_dir",
+            "state_dir",
+            "platform_kind",
+            "backend_transport",
+        ):
+            assert getattr(observed, field) == getattr(baseline, field)
+
+        status, payload = _post(
+            backend.http_server,
+            "/api/setup/status",
+            {"csrf": credentials.csrf_secret},
+            cookies={"__Host-factlane-session": credentials.session_secret},
+        )
+        assert status == 200
+        assert payload["status"] == "CONFIG_PUBLISHED_RESTART_REQUESTED"
+        assert payload["binding"] == {
+            "db": str(database),
+            "profile": "nomic-768",
+            "host_id": "owner-compose",
+        }
+    finally:
+        backend.begin_drain()
+        assert backend.wait_stopped(2.0) is True
+
+
+def test_linux_setup_database_binding_rejects_group_or_other_writable_database(tmp_path: Path) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    database = parent / "memory.db"
+    database.write_bytes(b"sqlite")
+    os.chmod(database, 0o666)
+
+    with pytest.raises(OwnerSetupError) as raised:
+        _validate_linux_setup_database_path(str(database), owner_uid=os.getuid())
+
+    assert raised.value.code == "SETUP_DATABASE_PATH_INVALID"
+    assert "not writable by group or other users" in raised.value.safe_message
+
+
+def test_linux_setup_database_binding_rejects_group_or_other_writable_sidecar(tmp_path: Path) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    database = parent / "memory.db"
+    database.write_bytes(b"sqlite")
+    os.chmod(database, 0o600)
+    sidecar = Path(str(database) + "-wal")
+    sidecar.write_bytes(b"wal")
+    os.chmod(sidecar, 0o662)
+
+    with pytest.raises(OwnerSetupError) as raised:
+        _validate_linux_setup_database_path(str(database), owner_uid=os.getuid())
+
+    assert raised.value.code == "SETUP_DATABASE_PATH_INVALID"
+    assert "sidecars" in raised.value.safe_message
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_linux_setup_database_binding_rejects_writable_sidecar_when_main_database_is_absent(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    database = parent / "memory.db"
+    sidecar = Path(str(database) + suffix)
+    sidecar.write_bytes(b"sidecar")
+    os.chmod(sidecar, 0o662)
+
+    with pytest.raises(OwnerSetupError) as raised:
+        _validate_linux_setup_database_path(str(database), owner_uid=os.getuid())
+
+    assert raised.value.code == "SETUP_DATABASE_PATH_INVALID"
+    assert "sidecars" in raised.value.safe_message
+
+
+def test_linux_setup_database_binding_rejects_sidecar_symlink_when_main_database_is_absent(tmp_path: Path) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    database = parent / "memory.db"
+    target = parent / "untrusted-sidecar"
+    target.write_bytes(b"sidecar")
+    Path(str(database) + "-wal").symlink_to(target)
+
+    with pytest.raises(OwnerSetupError) as raised:
+        _validate_linux_setup_database_path(str(database), owner_uid=os.getuid())
+
+    assert raised.value.code == "SETUP_DATABASE_PATH_INVALID"
+    assert "sidecars" in raised.value.safe_message
+
+
+def test_linux_setup_database_binding_rejects_replaceable_direct_parent(tmp_path: Path) -> None:
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o700)
+    os.chmod(parent, 0o777)
+    database = parent / "memory.db"
+
+    with pytest.raises(OwnerSetupError) as raised:
+        _validate_linux_setup_database_path(str(database), owner_uid=os.getuid())
+
+    assert raised.value.code == "SETUP_DATABASE_PATH_INVALID"
+    assert "database parent" in raised.value.safe_message
+
+
+def test_linux_setup_existing_database_profile_mismatch_fails_before_restart_or_config_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _spec(tmp_path, normal=False)
+    config_path = _install_linux_setup_runtime_config(tmp_path, spec, monkeypatch)
+    baseline_bytes = config_path.read_bytes()
+    database = Path(spec.state_dir) / "memory.db"
+
+    async def provision() -> None:
+        profile = _configured_embedding_profile("nomic-768")
+        engine = SQLiteVecEngine(str(database), profile)
+        await engine.open()
+        await engine.close()
+        metadata = {
+            "metadata_revision": 2,
+            "store_key": profile.profile_id,
+            "semantic_identity": profile.semantic_identity(),
+            "compatibility_proof": {},
+            "runtime_provenance": {},
+            "runtime_fingerprint": "f" * 64,
+        }
+        conn = sqlite3.connect(database)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO adapter_meta(key,value) VALUES ('embedding_profile',?)",
+                (json.dumps(metadata, sort_keys=True, separators=(",", ":")),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    asyncio.run(provision())
+    database_before = database.read_bytes()
+    monkeypatch.setattr(
+        "factlane.webui_app._prepare_linux_managed_restart",
+        lambda: pytest.fail("restart must not be prepared for an incompatible database/profile"),
+    )
+    backend = create_owner_runtime_backend(
+        spec,
+        _service_state(tmp_path),
+        native_confirmation=_Confirmation(approved=True),
+        owner_uid=os.getuid(),
+    )
+    credentials = _establish_owner_session(backend)
+    backend.start()
+    try:
+        status, payload = _post(
+            backend.http_server,
+            "/api/setup/bind",
+            {
+                "db": str(database),
+                "profile": "nomic-512",
+                "host_id": "owner-compose",
+                "request_id": "linux-setup-mismatch",
+                "csrf": credentials.csrf_secret,
+            },
+            cookies={"__Host-factlane-session": credentials.session_secret},
+        )
+        assert status == 409, payload
+        assert payload == {
+            "status": "ERROR",
+            "code": "SETUP_DATABASE_PROFILE_MISMATCH",
+            "message": "selected embedding profile does not match the existing database binding",
+        }
+        assert config_path.read_bytes() == baseline_bytes
+        assert database.read_bytes() == database_before
+    finally:
+        backend.begin_drain()
+        assert backend.wait_stopped(2.0) is True
+
+
+def test_linux_setup_v2_database_requires_explicit_migration_without_mutating_config_or_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _spec(tmp_path, normal=False)
+    config_path = _install_linux_setup_runtime_config(tmp_path, spec, monkeypatch)
+    baseline_bytes = config_path.read_bytes()
+    database = Path(spec.state_dir) / "memory.db"
+    conn = sqlite3.connect(database)
+    try:
+        conn.execute("CREATE TABLE adapter_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO adapter_meta VALUES ('contract_version','2')")
+        conn.commit()
+    finally:
+        conn.close()
+    database_before = database.read_bytes()
+    monkeypatch.setattr(
+        "factlane.webui_app._prepare_linux_managed_restart",
+        lambda: pytest.fail("restart must not be prepared before explicit storage migration"),
+    )
+    backend = create_owner_runtime_backend(
+        spec,
+        _service_state(tmp_path),
+        native_confirmation=_Confirmation(approved=True),
+        owner_uid=os.getuid(),
+    )
+    credentials = _establish_owner_session(backend)
+    backend.start()
+    try:
+        status, payload = _post(
+            backend.http_server,
+            "/api/setup/bind",
+            {
+                "db": str(database),
+                "profile": "nomic-768",
+                "host_id": "owner-compose",
+                "request_id": "linux-setup-v2",
+                "csrf": credentials.csrf_secret,
+            },
+            cookies={"__Host-factlane-session": credentials.session_secret},
+        )
+        assert status == 409, payload
+        assert payload == {
+            "status": "ERROR",
+            "code": "SETUP_DATABASE_MIGRATION_REQUIRED",
+            "message": "selected database uses storage v2 and must be migrated before Linux setup can bind it",
+        }
+        assert config_path.read_bytes() == baseline_bytes
+        assert database.read_bytes() == database_before
+    finally:
+        backend.begin_drain()
+        assert backend.wait_stopped(2.0) is True
+
+
+def test_linux_setup_restart_preflight_failure_leaves_config_unmodified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _spec(tmp_path, normal=False)
+    config_path = _install_linux_setup_runtime_config(tmp_path, spec, monkeypatch)
+    baseline_bytes = config_path.read_bytes()
+
+    def unavailable_restart():
+        raise OwnerSetupError(
+            "LINUX_RESTART_UNAVAILABLE",
+            "managed Linux WebUI restart is unavailable",
+            status=503,
+        )
+
+    monkeypatch.setattr("factlane.webui_app._prepare_linux_managed_restart", unavailable_restart)
+    backend = create_owner_runtime_backend(
+        spec,
+        _service_state(tmp_path),
+        native_confirmation=_Confirmation(approved=True),
+        owner_uid=os.getuid(),
+    )
+    credentials = _establish_owner_session(backend)
+    backend.start()
+    try:
+        status, payload = _post(
+            backend.http_server,
+            "/api/setup/bind",
+            {
+                "db": str(Path(spec.state_dir) / "memory.db"),
+                "profile": "nomic-768",
+                "host_id": "owner-compose",
+                "request_id": "linux-setup-no-restart",
+                "csrf": credentials.csrf_secret,
+            },
+            cookies={"__Host-factlane-session": credentials.session_secret},
+        )
+        assert status == 503
+        assert payload == {"status": "ERROR", "code": "LINUX_RESTART_UNAVAILABLE", "message": "managed Linux WebUI restart is unavailable"}
+        assert config_path.read_bytes() == baseline_bytes
+    finally:
+        backend.begin_drain()
+        assert backend.wait_stopped(2.0) is True
+
+
+def test_linux_setup_readback_mismatch_restores_baseline_and_never_handoffs_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _spec(tmp_path, normal=False)
+    config_path = _install_linux_setup_runtime_config(tmp_path, spec, monkeypatch)
+    baseline = load_runtime_config(config_path, owner_uid=os.getuid())
+    baseline_bytes = config_path.read_bytes()
+    restart_plan = _FakeRestartPlan()
+    writes = 0
+
+    def writer(path: str, content: str) -> None:
+        nonlocal writes
+        writes += 1
+        payload = json.loads(content)
+        if writes == 1:
+            payload["origin"] = "https://factlane-drift.test:8765"
+            content = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        Path(path).write_text(content, encoding="utf-8")
+        os.chmod(path, 0o600)
+
+    service = _LinuxSetupBindingService(
+        config_path=str(config_path),
+        baseline_config=baseline,
+        owner_uid=os.getuid(),
+        supported_profiles={"nomic-768"},
+        config_writer=writer,
+        restart_preparer=lambda: restart_plan,
+    )
+
+    with pytest.raises(OwnerSetupError) as raised:
+        service.bind(
+            db=str(Path(spec.state_dir) / "memory.db"),
+            profile="nomic-768",
+            host_id="owner-compose",
+            request_id="linux-setup-readback",
+        )
+    assert raised.value.code == "LINUX_CONFIG_PUBLICATION_FAILED"
+    assert writes == 2
+    assert config_path.read_bytes() == baseline_bytes
+    assert restart_plan.handoffs == 0
+
+
+def test_linux_setup_post_response_restart_failure_keeps_published_config_truthful(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _spec(tmp_path, normal=False)
+    config_path = _install_linux_setup_runtime_config(tmp_path, spec, monkeypatch)
+    restart_plan = _FakeRestartPlan(fail=True)
+    monkeypatch.setattr("factlane.webui_app._prepare_linux_managed_restart", lambda: restart_plan)
+    backend = create_owner_runtime_backend(
+        spec,
+        _service_state(tmp_path),
+        native_confirmation=_Confirmation(approved=True),
+        owner_uid=os.getuid(),
+    )
+    credentials = _establish_owner_session(backend)
+    backend.start()
+    try:
+        status, payload = _post(
+            backend.http_server,
+            "/api/setup/bind",
+            {
+                "db": str(Path(spec.state_dir) / "memory.db"),
+                "profile": "nomic-768",
+                "host_id": "owner-compose",
+                "request_id": "linux-setup-handoff-fail",
+                "csrf": credentials.csrf_secret,
+            },
+            cookies={"__Host-factlane-session": credentials.session_secret},
+        )
+        assert status == 202
+        assert payload["status"] == "CONFIG_PUBLISHED"
+        assert restart_plan.handoffs == 1
+        assert load_runtime_config(config_path, owner_uid=os.getuid()).memory_configured is True
+
+        status, payload = _post(
+            backend.http_server,
+            "/api/setup/status",
+            {"csrf": credentials.csrf_secret},
+            cookies={"__Host-factlane-session": credentials.session_secret},
+        )
+        assert status == 200
+        assert payload["status"] == "CONFIG_PUBLISHED_RESTART_REQUIRED"
+        assert payload["restart_error"] == "LINUX_RESTART_HANDOFF_FAILED"
+    finally:
+        backend.begin_drain()
+        assert backend.wait_stopped(2.0) is True
+
+
+def test_linux_restart_preflight_and_handoff_use_exact_fixed_user_systemd_argv(tmp_path: Path) -> None:
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(systemctl, 0o700)
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv: tuple[str, ...]) -> tuple[int, str]:
+        calls.append(argv)
+        if "is-active" in argv:
+            return 0, "active\n"
+        if "is-enabled" in argv:
+            return 0, "enabled\n"
+        return 0, ""
+
+    plan = _prepare_linux_managed_restart(
+        systemctl_resolver=lambda name: str(systemctl) if name == "systemctl" else None,
+        runner=runner,
+    )
+    plan.handoff()
+
+    assert calls == [
+        (str(systemctl), "--user", "is-active", "factlane-webui.service"),
+        (str(systemctl), "--user", "is-enabled", "factlane-webui.service"),
+        (str(systemctl), "--user", "restart", "--no-block", "factlane-webui.service"),
+    ]
 
 
 def test_normal_backend_composes_database_restore_and_destructive_with_one_shared_registry(tmp_path: Path) -> None:

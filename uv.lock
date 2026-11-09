@@ -669,6 +669,7 @@ name = "factlane"
 version = "0.1.7"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography", marker = "sys_platform == 'win32'" },
     { name = "mcp" },
     { name = "mcp-memory-service" },
     { name = "pydantic" },
@@ -685,6 +686,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", marker = "sys_platform == 'win32'", specifier = "==50.0.1" },
     { name = "mcp", specifier = "==1.30.0" },
     { name = "mcp-memory-service", specifier = "==11.10.0" },
     { name = "pydantic", specifier = "==2.13.5" },

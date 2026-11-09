@@ -19,6 +19,7 @@ if sys.platform != "linux":
     )
 
 import factlane.webui_app as webui_app
+import factlane.webui_platform as webui_platform_module
 from factlane.owner_auth import NativeConfirmationRequest, OwnerAuthState, PendingEnrollment
 from factlane.owner_native_control import OwnerNativeControlServer
 from factlane.webui_install import (
@@ -39,11 +40,19 @@ from factlane.webui_platform import (
     ZenitySetupConsentProvider,
     build_default_setup_executor,
     build_default_setup_request,
+    build_webui_doctor_report,
     default_owner_paths,
     detect_lingering_required,
 )
 from factlane.webui_service import ServiceStatus, WebUIServiceState
-from factlane.webui_runtime import RuntimeOutcome, RuntimeOutcomeState, WebUIRuntimeConfig
+from factlane.webui_runtime import (
+    BackendTransportKind,
+    PlatformKind,
+    RuntimeOutcome,
+    RuntimeOutcomeState,
+    WebUIRuntimeConfig,
+)
+from factlane.webui_windows import WindowsManagedConfig
 
 
 class _Confirmation:
@@ -139,6 +148,221 @@ def test_default_owner_paths_use_home_fallbacks_and_standard_user_runtime(tmp_pa
     assert paths.state_dir == str(home / ".local" / "state" / "factlane")
 
 
+def test_doctor_configured_report_exposes_only_read_only_onboarding_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, _config = _write_runtime_config(tmp_path)
+    database = tmp_path / "memory.db"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "db": str(database),
+            "profile": "nomic-768",
+            "host_id": "owner-panel-host",
+        }
+    )
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    config_path.chmod(0o600)
+
+    executable = tmp_path / "bin" / "factlane"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher = tmp_path / "data" / "applications" / "FactLane Owner Panel.desktop"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("[Desktop Entry]\n", encoding="utf-8")
+    skill_root = tmp_path / "skill" / "using-factlane"
+    skill_root.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Using FactLane\n", encoding="utf-8")
+    monkeypatch.setattr(
+        webui_platform_module,
+        "_discover_packaged_skill_root",
+        lambda: skill_root,
+    )
+
+    observations: list[str] = []
+
+    class ReadOnlyManager:
+        def observe(self) -> SystemdUnitObservation:
+            observations.append("observe")
+            return SystemdUnitObservation(
+                active=True,
+                enabled=True,
+                active_state="active",
+                enabled_state="enabled",
+            )
+
+        def start(self) -> None:
+            pytest.fail("doctor must never start the managed service")
+
+    def snapshot() -> dict[str, bytes]:
+        return {
+            str(path.relative_to(tmp_path)): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    report = build_webui_doctor_report(
+        environ={
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
+            "XDG_STATE_HOME": str(tmp_path / "state"),
+            "XDG_DATA_HOME": str(tmp_path / "data"),
+        },
+        home=str(tmp_path / "home"),
+        owner_uid=os.getuid(),
+        factlane_executable=str(executable),
+        python_executable=sys.executable,
+        service_manager=ReadOnlyManager(),
+    )
+    after = snapshot()
+
+    assert before == after
+    assert observations == ["observe"]
+    assert report["status"] == "OK"
+    assert report["mode"] == "READ_ONLY"
+    assert report["factlane"]["executable"] == {
+        "state": "RESOLVED",
+        "path": str(executable),
+        "present": True,
+    }
+    assert report["factlane"]["interpreter"]["state"] == "RESOLVED"
+    assert report["managed_binding"] == {
+        "state": "CONFIGURED",
+        "db": str(database),
+        "profile": "nomic-768",
+    }
+    assert report["skill"] == {
+        "state": "PRESENT",
+        "root": str(skill_root),
+        "present": True,
+    }
+    assert report["panel_launcher"] == {
+        "state": "PRESENT",
+        "path": str(launcher),
+        "present": True,
+    }
+    assert report["service"]["state"] == "ACTIVE"
+    assert report["service"]["open_command"] == ["factlane", "open", "webui"]
+    assert report["mcp"]["host_id"] == {
+        "state": "EXPLICIT_REQUIRED",
+        "value": None,
+    }
+    assert report["mcp"]["scope"] == {
+        "state": "EXPLICIT_PER_REQUEST",
+        "value": None,
+    }
+    recipe = report["mcp"]["launch_recipe"]["argv"]
+    assert recipe == [
+        str(executable),
+        "--db",
+        str(database),
+        "--profile",
+        "nomic-768",
+        "--host-id",
+        "<MCP_HOST_ID>",
+        "--write-profile",
+        "read-only",
+    ]
+    assert "owner-panel-host" not in json.dumps(report["mcp"])
+    assert report["next_actions"][0]["id"] == "OPEN_OWNER_PANEL"
+
+
+def test_doctor_unconfigured_report_uses_supported_profiles_and_creates_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        webui_platform_module,
+        "_discover_packaged_skill_root",
+        lambda: None,
+    )
+    observations: list[str] = []
+
+    class ReadOnlyManager:
+        def observe(self) -> SystemdUnitObservation:
+            observations.append("observe")
+            return SystemdUnitObservation(
+                active=False,
+                enabled=False,
+                active_state="inactive",
+                enabled_state="disabled",
+            )
+
+        def start(self) -> None:
+            pytest.fail("doctor must never start the managed service")
+
+    config_root = tmp_path / "config"
+    runtime_root = tmp_path / "runtime"
+    state_root = tmp_path / "state"
+    data_root = tmp_path / "data"
+    report = build_webui_doctor_report(
+        environ={
+            "XDG_CONFIG_HOME": str(config_root),
+            "XDG_RUNTIME_DIR": str(runtime_root),
+            "XDG_STATE_HOME": str(state_root),
+            "XDG_DATA_HOME": str(data_root),
+        },
+        home=str(tmp_path / "home"),
+        owner_uid=os.getuid(),
+        factlane_executable=str(tmp_path / "missing-factlane"),
+        python_executable=sys.executable,
+        service_manager=ReadOnlyManager(),
+    )
+
+    assert observations == ["observe"]
+    assert report["managed_binding"] == {
+        "state": "UNCONFIGURED",
+        "db": None,
+        "profile": None,
+        "supported_profiles": sorted(webui_platform_module.PROFILE_DEFINITIONS),
+    }
+    assert report["panel_launcher"] == {
+        "state": "ABSENT",
+        "path": str(data_root / "applications" / "FactLane Owner Panel.desktop"),
+        "present": False,
+    }
+    assert report["skill"] == {"state": "UNKNOWN", "root": None, "present": False}
+    assert report["service"]["state"] == "INACTIVE"
+    assert report["mcp"]["launch_recipe"]["argv"] == [
+        "factlane",
+        "--db",
+        "<DB_PATH>",
+        "--profile",
+        "<PROFILE>",
+        "--host-id",
+        "<MCP_HOST_ID>",
+        "--write-profile",
+        "read-only",
+    ]
+    assert report["next_actions"][0]["id"] == "CONFIGURE_OWNER_PANEL_MEMORY"
+    assert not config_root.exists()
+    assert not runtime_root.exists()
+    assert not state_root.exists()
+    assert not data_root.exists()
+
+
+def test_doctor_resolves_relative_console_script_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "venv" / "bin" / "factlane"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["venv/bin/factlane", "doctor", "webui"])
+    monkeypatch.setattr(webui_platform_module.shutil, "which", lambda _name: None)
+
+    identity = webui_platform_module._doctor_executable_identity(None)
+
+    assert identity == {
+        "state": "RESOLVED",
+        "path": str(executable.resolve()),
+        "present": True,
+    }
+
+
 def test_first_run_setup_request_uses_owner_paths_and_absent_memory_trio(tmp_path: Path) -> None:
     config = tmp_path / "config"
     runtime = tmp_path / "runtime"
@@ -149,6 +373,7 @@ def test_first_run_setup_request_uses_owner_paths_and_absent_memory_trio(tmp_pat
             "XDG_CONFIG_HOME": str(config),
             "XDG_RUNTIME_DIR": str(runtime),
             "XDG_STATE_HOME": str(state),
+            "XDG_DATA_HOME": str(tmp_path / "data"),
         },
         home=str(tmp_path / "home"),
         owner_uid=1000,
@@ -163,6 +388,9 @@ def test_first_run_setup_request_uses_owner_paths_and_absent_memory_trio(tmp_pat
     assert request.owner_config_home == str(config)
     assert request.runtime_dir == str(runtime / "factlane")
     assert request.state_dir == str(state / "factlane")
+    assert request.launcher_path == str(
+        tmp_path / "data" / "applications" / "FactLane Owner Panel.desktop"
+    )
     assert request.lingering_required is True
     assert (request.db, request.profile, request.host_id) == (None, None, None)
     assert not config.exists()
@@ -227,7 +455,7 @@ def test_zenity_setup_consent_uses_one_fixed_argv_review_and_never_auto_consents
         systemd=True,
         caddy_path="/usr/bin/caddy",
         zenity_path="/usr/bin/zenity",
-        browser=BrowserInstall(family="chromium", executable="/usr/bin/chromium"),
+        browser=BrowserInstall(family="firefox", executable="/usr/bin/firefox"),
         euid=1000,
     )
     provider = ZenitySetupConsentProvider(
@@ -254,7 +482,7 @@ def test_zenity_setup_consent_uses_one_fixed_argv_review_and_never_auto_consents
         "--cancel-label=Cancel",
     )
     text_arg = next(arg for arg in argv if arg.startswith("--text="))
-    assert "exact local hostname mapping" in text_arg
+    assert "isolated FactLane Firefox profile" in text_arg
     assert "isolated FactLane browser profile" in text_arg
     assert "user lingering" in text_arg
     assert all(token not in argv for token in ("sudo", "pkexec", "certutil"))
@@ -352,7 +580,7 @@ def test_lingering_detection_missing_or_failed_probe_requires_change_conservativ
     )
 
 
-def test_default_setup_executor_composes_existing_safe_backend_and_preserves_privilege_blocker(
+def test_default_setup_executor_fails_closed_when_required_linux_setup_tooling_is_missing(
     tmp_path: Path,
 ) -> None:
     request = build_default_setup_request(
@@ -373,7 +601,7 @@ def test_default_setup_executor_composes_existing_safe_backend_and_preserves_pri
         systemd=True,
         caddy_path="/usr/bin/caddy",
         zenity_path="/usr/bin/zenity",
-        browser=BrowserInstall(family="chromium", executable="/usr/bin/chromium"),
+        browser=BrowserInstall(family="firefox", executable="/usr/bin/firefox"),
         euid=1000,
     )
     consent = SetupConsent(
@@ -390,16 +618,78 @@ def test_default_setup_executor_composes_existing_safe_backend_and_preserves_pri
         which=lambda name: "/usr/bin/systemctl" if name == "systemctl" else None,
         command_runner=lambda argv: commands.append(argv) or 0,
         service_state_reader=lambda: state_reads.append(True)
-        or pytest.fail("state reader must not run before privilege boundary"),
+        or pytest.fail("state reader must not run when setup tooling is unavailable"),
     )
 
     result = executor(receipt, consent)
 
-    assert result.status is InstallerStepStatus.NEEDS_PRIVILEGED_INSTALLER
+    assert result.status is InstallerStepStatus.FAILED
     assert result.endpoint_state is EndpointState.PROPOSED
     assert result.completed_operations == ()
+    assert result.detail == "required Linux managed-setup system tooling is unavailable"
     assert commands == []
     assert state_reads == []
+
+
+def test_default_setup_executor_reloads_service_state_for_each_activation_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = build_default_setup_request(
+        environ={
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
+            "XDG_STATE_HOME": str(tmp_path / "state"),
+        },
+        home=str(tmp_path / "home"),
+        owner_uid=os.getuid(),
+        installing_user="alice",
+        factlane_executable="/usr/bin/factlane",
+        installation_id_factory=lambda: "freshstate123",
+        lingering_detector=lambda _user: False,
+    )
+    environment = InstallEnvironment(
+        system="Linux",
+        systemd=True,
+        caddy_path="/usr/bin/caddy",
+        zenity_path="/usr/bin/zenity",
+        browser=BrowserInstall(family="firefox", executable="/usr/bin/firefox"),
+        euid=os.getuid(),
+    )
+    captured: dict[str, object] = {}
+
+    class Backend:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("factlane.webui_platform.ProductionLinuxInstallerBackend", Backend)
+    factory_calls: list[str] = []
+
+    class State:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def snapshot(self) -> int:
+            return self.value
+
+    def service_state_factory(path: str) -> State:
+        factory_calls.append(path)
+        return State(len(factory_calls))
+
+    build_default_setup_executor(
+        request,
+        environment,
+        which=lambda name: (
+            f"/usr/bin/{name}" if name in {"systemctl", "certutil"} else None
+        ),
+        service_state_factory=service_state_factory,
+    )
+    reader = captured["service_state_reader"]
+    assert callable(reader)
+    assert reader() == 1
+    assert reader() == 2
+    expected_state_path = str(Path(request.state_dir) / "webui-service.json")
+    assert factory_calls == [expected_state_path, expected_state_path]
 
 
 def test_native_launcher_client_round_trips_worker4_same_uid_socket(tmp_path: Path) -> None:
@@ -460,6 +750,55 @@ def test_native_launcher_client_round_trips_worker4_same_uid_socket(tmp_path: Pa
         thread.join(timeout=2)
 
 
+def test_native_launcher_regular_approval_uses_exact_request_and_human_confirmation_response_timeout() -> None:
+    response = json.dumps(
+        {"status": "OK", "locator": "locator-approval"},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    framed = struct.pack("!I", len(response)) + response
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.timeouts: list[float] = []
+            self.sent: list[bytes] = []
+            self.remaining = framed
+
+        def settimeout(self, timeout: float) -> None:
+            self.timeouts.append(timeout)
+
+        def connect(self, _path: str) -> None:
+            return None
+
+        def sendall(self, payload: bytes) -> None:
+            self.sent.append(payload)
+
+        def recv(self, length: int) -> bytes:
+            chunk, self.remaining = self.remaining[:length], self.remaining[length:]
+            return chunk
+
+        def close(self) -> None:
+            return None
+
+    sock = FakeSocket()
+    client = NativeLauncherClient(
+        "/unused/owner-control.sock",
+        owner_uid=os.getuid(),
+        timeout_seconds=3.0,
+        socket_factory=lambda _family, _kind: sock,
+    )
+    client._validate_socket_path = lambda: None  # type: ignore[method-assign]
+    client._validate_server_peer = lambda _sock: None  # type: ignore[method-assign]
+
+    assert client.approve_pending(locator="locator-approval") is None
+    assert sock.timeouts == [3.0, 125.0]
+    assert len(sock.sent) == 1
+    length = struct.unpack("!I", sock.sent[0][:4])[0]
+    assert json.loads(sock.sent[0][4 : 4 + length]) == {
+        "op": "APPROVE_PENDING",
+        "locator": "locator-approval",
+    }
+
+
 def test_native_launcher_sensitive_op_uses_exact_request_and_only_widens_response_timeout() -> None:
     response = json.dumps(
         {"status": "OK", "state": "SENSITIVE_APPROVED"},
@@ -500,9 +839,7 @@ def test_native_launcher_sensitive_op_uses_exact_request_and_only_widens_respons
     client._validate_server_peer = lambda _sock: None  # type: ignore[method-assign]
 
     assert client.approve_pending_sensitive() is None
-    assert sock.timeouts[0] == 3.0
-    assert sock.timeouts[1] >= 125.0
-    assert len(sock.timeouts) == 2
+    assert sock.timeouts == [3.0, 125.0]
     assert len(sock.sent) == 1
     length = struct.unpack("!I", sock.sent[0][:4])[0]
     assert json.loads(sock.sent[0][4 : 4 + length]) == {"op": "APPROVE_PENDING_SENSITIVE"}
@@ -611,6 +948,21 @@ def test_native_launcher_sensitive_timeout_never_retries_and_normal_ops_keep_sho
         def close(self) -> None:
             return None
 
+    regular_sock = TimeoutSocket()
+    regular_client = NativeLauncherClient(
+        "/unused/owner-control.sock",
+        owner_uid=os.getuid(),
+        timeout_seconds=4.0,
+        socket_factory=lambda _family, _kind: regular_sock,
+    )
+    regular_client._validate_socket_path = lambda: None  # type: ignore[method-assign]
+    regular_client._validate_server_peer = lambda _sock: None  # type: ignore[method-assign]
+    with pytest.raises(WebUIPlatformError) as regular_exc:
+        regular_client.approve_pending(locator="locator-timeout")
+    assert regular_exc.value.code == "CONTROL_UNAVAILABLE"
+    assert regular_sock.sent == 1
+    assert regular_sock.timeouts == [4.0, 125.0]
+
     sensitive_sock = TimeoutSocket()
     sensitive_client = NativeLauncherClient(
         "/unused/owner-control.sock",
@@ -624,8 +976,71 @@ def test_native_launcher_sensitive_timeout_never_retries_and_normal_ops_keep_sho
         sensitive_client.approve_pending_sensitive()
     assert exc_info.value.code == "CONTROL_UNAVAILABLE"
     assert sensitive_sock.sent == 1
-    assert sensitive_sock.timeouts[0] == 4.0
-    assert sensitive_sock.timeouts[1] >= 125.0
+    assert sensitive_sock.timeouts == [4.0, 125.0]
+
+
+def test_native_launcher_all_ordinary_ops_keep_short_response_timeout() -> None:
+    cases = [
+        ("status", {}, "SERVICE_STATUS", {"status": "OK", "service": {"state": "READY"}}),
+        ("start", {"request_id": "req-start"}, "SERVICE_START", {"status": "OK", "service": {"state": "STARTING"}}),
+        ("stop", {"request_id": "req-stop"}, "SERVICE_STOP", {"status": "OK", "service": {"state": "STOPPED"}}),
+        ("restart", {"request_id": "req-restart"}, "SERVICE_RESTART", {"status": "OK", "service": {"state": "STARTING"}}),
+        (
+            "begin_local_enrollment",
+            {"device_label": "FactLane local browser"},
+            "BEGIN_LOCAL_ENROLLMENT",
+            {
+                "status": "OK",
+                "locator": "ordinary-locator",
+                "verification_phrase": "amber cedar river willow zephyr",
+                "expires_at": 12345.0,
+            },
+        ),
+    ]
+
+    for method_name, kwargs, expected_op, response in cases:
+        payload = json.dumps(response, separators=(",", ":")).encode("utf-8")
+        framed = struct.pack("!I", len(payload)) + payload
+
+        class OrdinarySocket:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+                self.sent: list[bytes] = []
+                self.remaining = framed
+
+            def settimeout(self, timeout: float) -> None:
+                self.timeouts.append(timeout)
+
+            def connect(self, _path: str) -> None:
+                return None
+
+            def sendall(self, data: bytes) -> None:
+                self.sent.append(data)
+
+            def recv(self, length: int) -> bytes:
+                chunk, self.remaining = self.remaining[:length], self.remaining[length:]
+                return chunk
+
+            def close(self) -> None:
+                return None
+
+        sock = OrdinarySocket()
+        client = NativeLauncherClient(
+            "/unused/owner-control.sock",
+            owner_uid=os.getuid(),
+            timeout_seconds=4.0,
+            socket_factory=lambda _family, _kind, sock=sock: sock,
+        )
+        client._validate_socket_path = lambda: None  # type: ignore[method-assign]
+        client._validate_server_peer = lambda _sock: None  # type: ignore[method-assign]
+
+        getattr(client, method_name)(**kwargs)
+
+        assert sock.timeouts == [4.0], method_name
+        assert len(sock.sent) == 1, method_name
+        request_length = struct.unpack("!I", sock.sent[0][:4])[0]
+        request = json.loads(sock.sent[0][4 : 4 + request_length])
+        assert request["op"] == expected_op, method_name
 
 
 def test_native_launcher_client_rejects_non_private_socket_before_connect(tmp_path: Path) -> None:
@@ -1150,6 +1565,99 @@ def test_serve_existing_config_loads_production_app_composition(
     assert calls["process_factory"] is webui_app.create_caddy_process
 
 
+def test_windows_serve_composes_backend_owned_https_and_ensures_tls_before_runtime_on_linux_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = default_owner_paths(
+        environ={
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
+            "XDG_STATE_HOME": str(tmp_path / "state"),
+        },
+        home=str(tmp_path / "home"),
+        owner_uid=os.getuid(),
+    )
+    managed = WindowsManagedConfig(
+        installation_id="winserve123",
+        origin="https://factlane-winserve123.test:8765",
+        native_control_pipe=r"\\.\pipe\factlane-owner-test123",
+        runtime_dir=r"C:\Users\Owner\AppData\Local\FactLane\runtime",
+        state_dir=r"C:\Users\Owner\AppData\Local\FactLane\state",
+        browser_profile_dir=r"C:\Users\Owner\AppData\Local\FactLane\browser",
+    )
+    service_state = object()
+    calls: dict[str, object] = {}
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        webui_platform_module,
+        "load_windows_managed_config",
+        lambda path: calls.setdefault("managed_config_path", path) and managed,
+    )
+
+    def ensure_tls(root, hostname):
+        events.append("ensure_tls")
+        calls["tls_root"] = root
+        calls["tls_hostname"] = hostname
+        return object()
+
+    monkeypatch.setattr(webui_platform_module, "ensure_windows_tls_material", ensure_tls)
+
+    class FakeRunner:
+        def __init__(
+            self,
+            config,
+            exact_service_state,
+            *,
+            backend_factory,
+            process_factory,
+            external_gateway_required,
+        ):
+            events.append("runner_init")
+            calls["config"] = config
+            calls["service_state"] = exact_service_state
+            calls["backend_factory"] = backend_factory
+            calls["process_factory"] = process_factory
+            calls["external_gateway_required"] = external_gateway_required
+
+        def run(self):
+            events.append("runner_run")
+            return RuntimeOutcome(RuntimeOutcomeState.STOPPED)
+
+    def service_state_factory(path):
+        calls["service_state_path"] = path
+        return service_state
+
+    controller = ProductionWebUIController(
+        paths=paths,
+        platform_system="Windows",
+        runtime_runner_factory=FakeRunner,
+        service_state_factory=service_state_factory,
+    )
+
+    result = controller._serve_windows()
+
+    assert result == {"status": "OK", "state": "STOPPED"}
+    config = calls["config"]
+    assert isinstance(config, WebUIRuntimeConfig)
+    assert config.platform_kind is PlatformKind.WINDOWS
+    assert config.backend_transport is BackendTransportKind.WINDOWS_HTTPS
+    assert config.backend_socket is None
+    assert config.caddy_path is None
+    assert config.caddyfile is None
+    assert config.origin == managed.origin
+    assert config.runtime_dir == managed.runtime_dir
+    assert config.state_dir == managed.state_dir
+    assert calls["backend_factory"] is webui_app.create_owner_runtime_backend
+    assert calls["process_factory"] is None
+    assert calls["external_gateway_required"] is False
+    assert calls["service_state"] is service_state
+    assert calls["tls_root"] == Path(managed.state_dir) / "tls"
+    assert calls["tls_hostname"] == "factlane-winserve123.test"
+    assert events == ["ensure_tls", "runner_init", "runner_run"]
+
+
 def test_active_service_mutations_use_native_while_status_is_offline(
     tmp_path: Path,
 ) -> None:
@@ -1373,6 +1881,56 @@ def test_open_fails_closed_on_non_retryable_native_approval_error(tmp_path: Path
     ]
 
 
+def test_open_does_not_retry_ambiguous_native_approval_transport_timeout(tmp_path: Path) -> None:
+    approvals: list[str] = []
+
+    class Client:
+        def status(self):
+            return {
+                "status": "READY",
+                "saved_endpoint": "https://factlane-test123.test:8765",
+            }
+
+        def approve_pending_sensitive(self):
+            raise WebUIPlatformError(
+                "SENSITIVE_CHALLENGE_NONE",
+                "no pending sensitive challenge",
+            )
+
+        def begin_local_enrollment(self, *, device_label: str):
+            assert device_label == "FactLane local browser"
+            return PendingEnrollment(
+                locator="locator-timeout",
+                verification_phrase="amber cedar river willow zephyr",
+                expires_at=1_000_000_000_000.0,
+            )
+
+        def approve_pending(self, *, locator: str):
+            approvals.append(locator)
+            raise WebUIPlatformError(
+                "CONTROL_UNAVAILABLE",
+                "native control response timed out",
+            )
+
+    controller = ProductionWebUIController(
+        paths=default_owner_paths(
+            environ={"XDG_RUNTIME_DIR": str(tmp_path / "runtime")},
+            home=str(tmp_path / "home"),
+            owner_uid=1000,
+        ),
+        owner_uid=1000,
+        service_state_factory=lambda _path: pytest.fail("state not used"),
+        control_client_factory=lambda _path, _uid: Client(),
+        browser_launcher=lambda _url: True,
+    )
+
+    result = controller.dispatch("open")
+
+    assert result["status"] == "ERROR"
+    assert result["error_code"] == "CONTROL_UNAVAILABLE"
+    assert approvals == ["locator-timeout"]
+
+
 def test_open_without_isolated_profile_launcher_fails_closed_after_safe_locator_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1406,7 +1964,7 @@ def test_open_without_isolated_profile_launcher_fails_closed_after_safe_locator_
 
     monkeypatch.setattr(
         "factlane.webui_platform._resolve_production_browser_launcher",
-        lambda: (_ for _ in ()).throw(
+        lambda **_kwargs: (_ for _ in ()).throw(
             WebUIPlatformError(
                 "BROWSER_LAUNCH_UNAVAILABLE",
                 "isolated launcher unavailable",

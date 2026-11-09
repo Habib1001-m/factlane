@@ -8,7 +8,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Protocol
 from urllib.parse import urlsplit
 
@@ -22,7 +22,7 @@ MAX_CONFIG_BYTES = 64 * 1024
 _PORT_MIN = 8765
 _PORT_MAX = 8774
 _HOST_RE = re.compile(r"factlane-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.test")
-_CONFIG_FIELDS = frozenset(
+_LEGACY_LINUX_CONFIG_FIELDS = frozenset(
     {
         "db",
         "profile",
@@ -35,7 +35,11 @@ _CONFIG_FIELDS = frozenset(
         "state_dir",
     }
 )
+_PLATFORM_CONFIG_FIELDS = frozenset({"platform_kind", "backend_transport"})
+_EXPLICIT_CONFIG_FIELDS = _LEGACY_LINUX_CONFIG_FIELDS | _PLATFORM_CONFIG_FIELDS
+_OPTIONAL_CONFIG_FIELDS = frozenset({"public_origins"})
 _MEMORY_SELECTION_FIELDS = frozenset({"db", "profile", "host_id"})
+_MAX_PUBLIC_ORIGINS = 8
 
 
 class RuntimeConfigError(ValueError):
@@ -50,6 +54,16 @@ class BackendMode(str, Enum):
     NORMAL = "NORMAL"
     SETUP_SHELL = "SETUP_SHELL"
     RECOVERY_SHELL = "RECOVERY_SHELL"
+
+
+class PlatformKind(str, Enum):
+    LINUX = "LINUX"
+    WINDOWS = "WINDOWS"
+
+
+class BackendTransportKind(str, Enum):
+    AF_UNIX = "AF_UNIX"
+    WINDOWS_HTTPS = "WINDOWS_HTTPS"
 
 
 class RuntimeOutcomeState(str, Enum):
@@ -67,27 +81,33 @@ class WebUIRuntimeConfig:
     profile: str | None
     host_id: str | None
     origin: str
-    backend_socket: str
-    caddy_path: str
-    caddyfile: str
+    backend_socket: str | None
+    caddy_path: str | None
+    caddyfile: str | None
     runtime_dir: str
     state_dir: str
+    public_origins: tuple[str, ...] = ()
+    platform_kind: PlatformKind | str = PlatformKind.LINUX
+    backend_transport: BackendTransportKind | str = BackendTransportKind.AF_UNIX
 
     def __post_init__(self) -> None:
+        try:
+            platform_kind = PlatformKind(self.platform_kind)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeConfigError("platform_kind is unsupported") from exc
+        try:
+            backend_transport = BackendTransportKind(self.backend_transport)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeConfigError("backend_transport is unsupported") from exc
+        object.__setattr__(self, "platform_kind", platform_kind)
+        object.__setattr__(self, "backend_transport", backend_transport)
+
         configured_values = (self.db, self.profile, self.host_id)
         configured_count = sum(value is not None for value in configured_values)
         if configured_count not in {0, 3}:
             raise RuntimeConfigError(
                 "db, profile, and host_id must be all configured or all null"
             )
-        for value, label in (
-            (self.backend_socket, "backend_socket"),
-            (self.caddy_path, "caddy_path"),
-            (self.caddyfile, "caddyfile"),
-            (self.runtime_dir, "runtime_dir"),
-            (self.state_dir, "state_dir"),
-        ):
-            _validate_absolute_posix_path(value, label)
         if self.memory_configured:
             assert self.db is not None
             assert self.profile is not None
@@ -99,7 +119,6 @@ class WebUIRuntimeConfig:
                 raise RuntimeConfigError(
                     "db, profile, and host_id must be strings when configured"
                 )
-            _validate_absolute_posix_path(self.db, "db")
             if not self.profile or any(ord(ch) < 32 for ch in self.profile):
                 raise RuntimeConfigError("profile must be a non-empty text identifier")
             if (
@@ -111,14 +130,56 @@ class WebUIRuntimeConfig:
                     "host_id must be a non-empty stable identifier without whitespace"
                 )
         _validate_origin(self.origin)
-        runtime = PurePosixPath(self.runtime_dir)
-        backend = PurePosixPath(self.backend_socket)
-        try:
-            backend.relative_to(runtime)
-        except ValueError as exc:
-            raise RuntimeConfigError("backend_socket must be inside runtime_dir") from exc
-        if backend == runtime:
-            raise RuntimeConfigError("backend_socket must name a socket path inside runtime_dir")
+        if not isinstance(self.public_origins, (tuple, list)):
+            raise RuntimeConfigError("public_origins must be a bounded list of exact HTTPS origins")
+        public_origins = tuple(self.public_origins)
+        if len(public_origins) > _MAX_PUBLIC_ORIGINS:
+            raise RuntimeConfigError("public_origins exceeds the configured origin limit")
+        if len(set(public_origins)) != len(public_origins):
+            raise RuntimeConfigError("public_origins must not contain duplicates")
+        for public_origin in public_origins:
+            _validate_public_origin(public_origin)
+            if public_origin == self.origin:
+                raise RuntimeConfigError("public_origins must not repeat the saved local origin")
+        object.__setattr__(self, "public_origins", public_origins)
+        if platform_kind is PlatformKind.LINUX:
+            if backend_transport is not BackendTransportKind.AF_UNIX:
+                raise RuntimeConfigError("Linux runtime requires AF_UNIX backend transport")
+            for value, label in (
+                (self.backend_socket, "backend_socket"),
+                (self.caddy_path, "caddy_path"),
+                (self.caddyfile, "caddyfile"),
+                (self.runtime_dir, "runtime_dir"),
+                (self.state_dir, "state_dir"),
+            ):
+                if not isinstance(value, str):
+                    raise RuntimeConfigError(f"{label} must be a string")
+                _validate_absolute_posix_path(value, label)
+            if self.memory_configured:
+                assert self.db is not None
+                _validate_absolute_posix_path(self.db, "db")
+            assert self.backend_socket is not None
+            runtime = PurePosixPath(self.runtime_dir)
+            backend = PurePosixPath(self.backend_socket)
+            try:
+                backend.relative_to(runtime)
+            except ValueError as exc:
+                raise RuntimeConfigError("backend_socket must be inside runtime_dir") from exc
+            if backend == runtime:
+                raise RuntimeConfigError("backend_socket must name a socket path inside runtime_dir")
+            return
+
+        if backend_transport is not BackendTransportKind.WINDOWS_HTTPS:
+            raise RuntimeConfigError("Windows runtime requires WINDOWS_HTTPS backend transport")
+        if self.backend_socket is not None or self.caddy_path is not None or self.caddyfile is not None:
+            raise RuntimeConfigError(
+                "Windows backend-owned HTTPS transport must not configure backend_socket or Caddy paths"
+            )
+        _validate_absolute_windows_local_path(self.runtime_dir, "runtime_dir")
+        _validate_absolute_windows_local_path(self.state_dir, "state_dir")
+        if self.memory_configured:
+            assert self.db is not None
+            _validate_absolute_windows_local_path(self.db, "db")
 
     @property
     def memory_configured(self) -> bool:
@@ -131,11 +192,14 @@ class BackendLaunchSpec:
     profile: str | None
     host_id: str | None
     expected_origin: str
-    socket_path: str
+    socket_path: str | None
     runtime_dir: str
     state_dir: str
     mode: BackendMode
     normal_adapter_required: bool
+    public_origins: tuple[str, ...] = ()
+    platform_kind: PlatformKind = PlatformKind.LINUX
+    backend_transport: BackendTransportKind = BackendTransportKind.AF_UNIX
 
 
 @dataclass(frozen=True)
@@ -256,15 +320,16 @@ def load_runtime_config(
     if not isinstance(payload, dict):
         raise RuntimeConfigError("runtime config must be one JSON object")
     received = set(payload)
-    unknown = received - _CONFIG_FIELDS
-    missing = _CONFIG_FIELDS - received
+    # Absence of the platform fields is the exact pre-portability serialized
+    # Linux schema. This is a schema-version rule, never host-OS inference.
+    explicit_platform = bool(received & _PLATFORM_CONFIG_FIELDS)
+    expected_fields = _EXPLICIT_CONFIG_FIELDS if explicit_platform else _LEGACY_LINUX_CONFIG_FIELDS
+    unknown = received - expected_fields - _OPTIONAL_CONFIG_FIELDS
+    missing = expected_fields - received
     if unknown:
         raise RuntimeConfigError(f"runtime config contains unknown fields: {', '.join(sorted(unknown))}")
     if missing:
         raise RuntimeConfigError(f"runtime config is missing required fields: {', '.join(sorted(missing))}")
-    transport_fields = _CONFIG_FIELDS - _MEMORY_SELECTION_FIELDS
-    if any(not isinstance(payload[field], str) for field in transport_fields):
-        raise RuntimeConfigError("every transport runtime config field must be a string")
     if any(
         payload[field] is not None and not isinstance(payload[field], str)
         for field in _MEMORY_SELECTION_FIELDS
@@ -272,12 +337,49 @@ def load_runtime_config(
         raise RuntimeConfigError(
             "db, profile, and host_id must be strings when configured or null when absent"
         )
+    if "public_origins" in payload:
+        raw_public_origins = payload["public_origins"]
+        if (
+            not isinstance(raw_public_origins, list)
+            or len(raw_public_origins) > _MAX_PUBLIC_ORIGINS
+            or any(not isinstance(item, str) for item in raw_public_origins)
+        ):
+            raise RuntimeConfigError("public_origins must be a bounded list of exact HTTPS origins")
+        payload["public_origins"] = tuple(raw_public_origins)
+    if not explicit_platform:
+        transport_fields = _LEGACY_LINUX_CONFIG_FIELDS - _MEMORY_SELECTION_FIELDS
+        if any(not isinstance(payload[field], str) for field in transport_fields):
+            raise RuntimeConfigError("every transport runtime config field must be a string")
+        return WebUIRuntimeConfig(**payload)
+
+    if any(not isinstance(payload[field], str) for field in _PLATFORM_CONFIG_FIELDS):
+        raise RuntimeConfigError("platform_kind and backend_transport must be strings")
+    if not isinstance(payload["origin"], str) or not isinstance(payload["runtime_dir"], str) or not isinstance(payload["state_dir"], str):
+        raise RuntimeConfigError("origin, runtime_dir, and state_dir must be strings")
+    platform_kind = payload["platform_kind"]
+    if platform_kind == PlatformKind.LINUX.value:
+        for field in ("backend_socket", "caddy_path", "caddyfile"):
+            if not isinstance(payload[field], str):
+                raise RuntimeConfigError("Linux transport runtime config fields must be strings")
+    elif platform_kind == PlatformKind.WINDOWS.value:
+        for field in ("backend_socket", "caddy_path", "caddyfile"):
+            if payload[field] is not None:
+                raise RuntimeConfigError("Windows backend-owned transport fields must be null")
+    else:
+        raise RuntimeConfigError("platform_kind is unsupported")
     return WebUIRuntimeConfig(**payload)
 
 
 def caddy_command(config: WebUIRuntimeConfig) -> tuple[str, ...]:
     """Return the exact argv used by a process factory; no shell string is produced."""
 
+    if (
+        config.platform_kind is not PlatformKind.LINUX
+        or config.backend_transport is not BackendTransportKind.AF_UNIX
+        or config.caddy_path is None
+        or config.caddyfile is None
+    ):
+        raise RuntimeConfigError("Caddy command is available only for Linux AF_UNIX runtime config")
     return (
         config.caddy_path,
         "run",
@@ -289,11 +391,12 @@ def caddy_command(config: WebUIRuntimeConfig) -> tuple[str, ...]:
 
 
 class WebUIRuntimeRunner:
-    """Supervise the private Owner HTTP backend and the local Caddy gateway.
+    """Supervise the Owner backend and, when configured, an external local gateway.
 
-    All host/process effects are injected. The backend launch contract contains an
-    AF_UNIX socket path and no TCP bind address. Shell modes explicitly state that
-    normal adapter/provider initialization is not required.
+    Linux production continues to require the external Caddy gateway. A platform
+    whose backend owns the local HTTPS transport may set external_gateway_required
+    to False; this changes only lifecycle supervision and does not implement that
+    platform's backend transport.
     """
 
     def __init__(
@@ -302,7 +405,8 @@ class WebUIRuntimeRunner:
         service_state: WebUIServiceState,
         *,
         backend_factory: BackendFactory,
-        process_factory: ProcessFactory,
+        process_factory: ProcessFactory | None,
+        external_gateway_required: bool = True,
         clock: Clock = time.monotonic,
         sleep: Sleep = time.sleep,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
@@ -313,6 +417,9 @@ class WebUIRuntimeRunner:
         self.service_state = service_state
         self._backend_factory = backend_factory
         self._process_factory = process_factory
+        self._external_gateway_required = bool(external_gateway_required)
+        if self._external_gateway_required and self._process_factory is None:
+            raise ValueError("process_factory is required when the external gateway is enabled")
         self._clock = clock
         self._sleep = sleep
         self._poll_interval = poll_interval
@@ -351,12 +458,17 @@ class WebUIRuntimeRunner:
             state_dir=self.config.state_dir,
             mode=effective_mode,
             normal_adapter_required=effective_mode is BackendMode.NORMAL,
+            public_origins=self.config.public_origins,
+            platform_kind=self.config.platform_kind,
+            backend_transport=self.config.backend_transport,
         )
         self._mode = effective_mode
         try:
             self._backend = self._backend_factory(spec, self.service_state)
             self._backend.start()
-            self._caddy = self._process_factory(self.config, caddy_command(self.config))
+            if self._external_gateway_required:
+                assert self._process_factory is not None
+                self._caddy = self._process_factory(self.config, caddy_command(self.config))
         except Exception as exc:
             return self._unexpected_failure(f"runtime launch failed: {type(exc).__name__}")
 
@@ -367,7 +479,11 @@ class WebUIRuntimeRunner:
                 return RuntimeOutcome(RuntimeOutcomeState.STOPPED)
             if not self._components_alive():
                 return self._unexpected_failure("runtime component exited during readiness")
-            if self._backend.is_ready() and self._caddy is not None and self._caddy.is_ready():
+            gateway_ready = (
+                not self._external_gateway_required
+                or (self._caddy is not None and self._caddy.is_ready())
+            )
+            if self._backend.is_ready() and gateway_ready:
                 try:
                     self.service_state.claim_endpoint(self.config.origin)
                 except EndpointUnavailable as exc:
@@ -389,7 +505,9 @@ class WebUIRuntimeRunner:
             self._sleep(min(self._poll_interval, deadline - now))
 
     def supervise_once(self) -> RuntimeOutcome:
-        if self._backend is None or self._caddy is None or self._mode is None:
+        if self._backend is None or self._mode is None:
+            raise RuntimeStateError("WebUI runtime is not active")
+        if self._external_gateway_required and self._caddy is None:
             raise RuntimeStateError("WebUI runtime is not active")
         if self.service_state.snapshot().status is ServiceStatus.STOPPED_UNTIL_REBOOT:
             self.stop()
@@ -497,12 +615,11 @@ class WebUIRuntimeRunner:
         return RuntimeOutcome(RuntimeOutcomeState.FAILED, detail=detail)
 
     def _components_alive(self) -> bool:
-        return (
-            self._backend is not None
-            and self._backend.is_alive()
-            and self._caddy is not None
-            and self._caddy.poll() is None
-        )
+        if self._backend is None or not self._backend.is_alive():
+            return False
+        if not self._external_gateway_required:
+            return True
+        return self._caddy is not None and self._caddy.poll() is None
 
     def _wait_for_retry(self, retry_at: float | None, should_stop: StopPredicate) -> bool:
         if retry_at is None:
@@ -541,6 +658,29 @@ def _validate_absolute_posix_path(value: str, label: str) -> None:
         raise RuntimeConfigError(f"{label} must not contain parent traversal")
 
 
+def _validate_absolute_windows_local_path(value: str, label: str) -> None:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise RuntimeConfigError(f"{label} must be an absolute local-drive Windows path")
+    if any(ch in value for ch in ("\n", "\r")):
+        raise RuntimeConfigError(f"{label} must not contain line breaks")
+    if "/" in value or value.startswith("\\\\") or value.startswith(("\\?\\", "\\.\\")):
+        raise RuntimeConfigError(f"{label} must be an absolute local-drive Windows path")
+    path = PureWindowsPath(value)
+    drive = path.drive
+    if (
+        not path.is_absolute()
+        or len(drive) != 2
+        or drive[1] != ":"
+        or not drive[0].isalpha()
+        or ".." in path.parts
+        or str(path) != value
+    ):
+        raise RuntimeConfigError(f"{label} must be a canonical absolute local-drive Windows path")
+    for part in path.parts[1:]:
+        if part in {".", ".."} or ":" in part or part.endswith((" ", ".")):
+            raise RuntimeConfigError(f"{label} contains an unsafe Windows path component")
+
+
 def _validate_origin(origin: str) -> None:
     if not isinstance(origin, str):
         raise RuntimeConfigError("origin must be a string")
@@ -564,3 +704,28 @@ def _validate_origin(origin: str) -> None:
         raise RuntimeConfigError("origin must be one exact FactLane HTTPS .test origin on the saved port range")
     if origin != f"https://{parsed.hostname}:{port}":
         raise RuntimeConfigError("origin must use the canonical exact FactLane HTTPS origin form")
+
+
+def _validate_public_origin(origin: str) -> None:
+    if not isinstance(origin, str) or not origin or len(origin) > 2048:
+        raise RuntimeConfigError("public origin must be a bounded HTTPS origin")
+    try:
+        parsed = urlsplit(origin)
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeConfigError("public origin contains an invalid port") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.hostname != parsed.hostname.lower()
+        or any(ord(ch) < 33 or ord(ch) > 126 for ch in parsed.netloc)
+    ):
+        raise RuntimeConfigError("public origin must be one exact canonical HTTPS origin")
+    expected = f"https://{parsed.hostname}" + (f":{port}" if port is not None else "")
+    if origin != expected:
+        raise RuntimeConfigError("public origin must use canonical HTTPS origin form")

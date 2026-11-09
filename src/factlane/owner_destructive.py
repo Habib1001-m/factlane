@@ -21,6 +21,15 @@ from .recovery import (
     RecoveryTarget,
 )
 from .runtime_control import RuntimeIdentity
+from .windows_security import (
+    WindowsSecurityError,
+    current_user_sid,
+    ensure_owner_private_directory,
+    owner_only_security_attributes,
+    validate_owner_only_kernel_object,
+    validate_owner_private_path,
+    validate_windows_path_no_reparse,
+)
 
 
 _PURGE_KIND = "FACTLANE_OWNER_PERMANENT_PURGE_V1"
@@ -374,6 +383,21 @@ def _service_snapshot_mapping(service_state: Any) -> dict[str, Any] | None:
 
 
 def _ensure_private_directory(path: Path) -> None:
+    if os.name == "nt":
+        try:
+            owner_sid = current_user_sid()
+            validate_windows_path_no_reparse(path)
+            if path.exists() or path.is_symlink():
+                validate_owner_private_path(path, owner_sid=owner_sid, directory=True)
+            else:
+                ensure_owner_private_directory(path, owner_sid=owner_sid)
+                validate_owner_private_path(path, owner_sid=owner_sid, directory=True)
+        except (OSError, WindowsSecurityError) as exc:
+            raise OwnerDestructiveError(
+                "PURGE_STATE_INVALID",
+                "purge state root must be protected owner-private Windows state",
+            ) from exc
+        return
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_dir():
             raise OwnerDestructiveError("PURGE_STATE_INVALID", "purge state root must be a real directory")
@@ -384,10 +408,439 @@ def _ensure_private_directory(path: Path) -> None:
     os.chmod(path, 0o700)
 
 
+def _windows_private_file_exists(path: Path, *, code: str) -> bool:
+    try:
+        owner_sid = current_user_sid()
+        validate_windows_path_no_reparse(path)
+        if not path.exists():
+            return False
+        validate_owner_private_path(path, owner_sid=owner_sid, directory=False)
+        return True
+    except (OSError, WindowsSecurityError) as exc:
+        raise OwnerDestructiveError(
+            code,
+            "purge state file is not a trusted owner-private Windows regular file",
+        ) from exc
+
+
+def _windows_file_identity(handle: Any, expected_path: Path) -> tuple[int, int, int]:
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import win32con
+        import win32file
+    except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows purge state file identity verification is unavailable",
+        ) from exc
+
+    try:
+        info = win32file.GetFileInformationByHandle(handle)
+        attributes = int(info[0])
+        directory_flag = int(getattr(win32con, "FILE_ATTRIBUTE_DIRECTORY", 0x10))
+        reparse_flag = int(getattr(win32con, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        if attributes & (directory_flag | reparse_flag):
+            raise OwnerDestructiveError(
+                "PURGE_STATE_INVALID",
+                "Windows purge state file handle is not a trusted real file",
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_final = kernel32.GetFinalPathNameByHandleW
+        get_final.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+        get_final.restype = wintypes.DWORD
+        raw_handle = int(handle)
+        required = int(get_final(raw_handle, None, 0, 0))
+        if required <= 0 or required > 32768:
+            raise OwnerDestructiveError(
+                "PURGE_STATE_INVALID",
+                "Windows purge state file identity could not be resolved",
+            )
+        buffer = ctypes.create_unicode_buffer(required + 1)
+        written = int(get_final(raw_handle, buffer, len(buffer), 0))
+        if written <= 0 or written >= len(buffer):
+            raise OwnerDestructiveError(
+                "PURGE_STATE_INVALID",
+                "Windows purge state file identity could not be read",
+            )
+        final_path = buffer.value
+        if final_path.startswith("\\\\?\\UNC\\"):
+            final_path = "\\\\" + final_path[8:]
+        elif final_path.startswith("\\\\?\\"):
+            final_path = final_path[4:]
+        expected_key = os.path.normcase(os.path.normpath(os.path.abspath(str(expected_path))))
+        observed_key = os.path.normcase(os.path.normpath(os.path.abspath(final_path)))
+        if observed_key != expected_key:
+            raise OwnerDestructiveError(
+                "PURGE_STATE_INVALID",
+                "Windows purge state file path changed identity",
+            )
+        return int(info[4]), int(info[8]), int(info[9])
+    except OwnerDestructiveError:
+        raise
+    except Exception as exc:
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows purge state file identity could not be verified",
+        ) from exc
+
+
+def _open_windows_private_file(path: Path) -> tuple[Any, tuple[int, int, int]]:
+    try:
+        import win32con
+        import win32file
+    except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows owner-private purge state creation is unavailable",
+        ) from exc
+
+    handle = None
+    try:
+        owner_sid = current_user_sid()
+        validate_windows_path_no_reparse(path)
+        handle = win32file.CreateFile(
+            str(path),
+            int(win32con.GENERIC_WRITE)
+            | int(getattr(win32con, "FILE_READ_ATTRIBUTES", 0x80))
+            | int(getattr(win32con, "DELETE", 0x00010000)),
+            0,
+            owner_only_security_attributes(owner_sid),
+            win32con.CREATE_NEW,
+            int(win32con.FILE_ATTRIBUTE_NORMAL) | int(getattr(win32con, "FILE_FLAG_OPEN_REPARSE_POINT", 0x00200000)),
+            None,
+        )
+        identity = _windows_file_identity(handle, path)
+        validate_owner_only_kernel_object(handle, owner_sid)
+        result = handle
+        handle = None
+        return result, identity
+    except Exception as exc:
+        if getattr(exc, "winerror", None) in {80, 183}:
+            raise FileExistsError(str(path)) from exc
+        if isinstance(exc, OwnerDestructiveError):
+            raise
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows owner-private purge state file could not be created",
+        ) from exc
+    finally:
+        if handle is not None:
+            handle.Close()
+
+
+def _windows_write_handle(handle: Any, data: bytes) -> None:
+    try:
+        import win32file
+
+        error_code, written = win32file.WriteFile(handle, data)
+        if int(error_code) != 0 or int(written) != len(data):
+            raise OSError("Windows purge state write was incomplete")
+    except Exception as exc:
+        if isinstance(exc, OwnerDestructiveError):
+            raise
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows purge state staging file could not be written",
+        ) from exc
+
+
+def _windows_flush_handle(handle: Any) -> None:
+    try:
+        import win32file
+
+        win32file.FlushFileBuffers(handle)
+    except Exception as exc:
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows purge state staging file could not be flushed durably",
+        ) from exc
+
+
+def _windows_delete_handle_on_close(handle: Any) -> None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _FileDispositionInfo(ctypes.Structure):
+            _fields_ = [("DeleteFile", wintypes.BOOL)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        set_info = kernel32.SetFileInformationByHandle
+        set_info.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        set_info.restype = wintypes.BOOL
+        disposition = _FileDispositionInfo(DeleteFile=True)
+        if not set_info(
+            wintypes.HANDLE(int(handle)),
+            4,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            raise OSError(ctypes.get_last_error(), "Windows purge state cleanup failed")
+    except Exception as exc:
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows purge state staging file could not be retired safely",
+        ) from exc
+
+
+def _windows_parent_identity(handle: Any, expected_path: Path) -> tuple[int, int, int]:
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import win32con
+        import win32file
+    except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows purge state parent verification is unavailable",
+        ) from exc
+
+    try:
+        info = win32file.GetFileInformationByHandle(handle)
+        attributes = int(info[0])
+        directory_flag = int(getattr(win32con, "FILE_ATTRIBUTE_DIRECTORY", 0x10))
+        reparse_flag = int(getattr(win32con, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        if not attributes & directory_flag or attributes & reparse_flag:
+            raise OwnerDestructiveError(
+                "PURGE_STATE_INVALID",
+                "Windows purge state parent handle is not a trusted real directory",
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_final = kernel32.GetFinalPathNameByHandleW
+        get_final.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+        get_final.restype = wintypes.DWORD
+        raw_handle = int(handle)
+        required = int(get_final(raw_handle, None, 0, 0))
+        if required <= 0 or required > 32768:
+            raise OwnerDestructiveError(
+                "PURGE_STATE_INVALID",
+                "Windows purge state parent identity could not be resolved",
+            )
+        buffer = ctypes.create_unicode_buffer(required + 1)
+        written = int(get_final(raw_handle, buffer, len(buffer), 0))
+        if written <= 0 or written >= len(buffer):
+            raise OwnerDestructiveError(
+                "PURGE_STATE_INVALID",
+                "Windows purge state parent identity could not be read",
+            )
+        final_path = buffer.value
+        if final_path.startswith("\\\\?\\UNC\\"):
+            final_path = "\\\\" + final_path[8:]
+        elif final_path.startswith("\\\\?\\"):
+            final_path = final_path[4:]
+        expected_key = os.path.normcase(os.path.normpath(os.path.abspath(str(expected_path))))
+        observed_key = os.path.normcase(os.path.normpath(os.path.abspath(final_path)))
+        if observed_key != expected_key:
+            raise OwnerDestructiveError(
+                "PURGE_STATE_INVALID",
+                "Windows purge state parent path changed identity",
+            )
+        return int(info[4]), int(info[8]), int(info[9])
+    except OwnerDestructiveError:
+        raise
+    except Exception as exc:
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows purge state parent identity could not be verified",
+        ) from exc
+
+
+def _open_windows_pinned_parent(path: Path) -> tuple[Any, tuple[int, int, int]]:
+    try:
+        import win32con
+        import win32file
+    except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows purge state parent pinning is unavailable",
+        ) from exc
+    handle = None
+    try:
+        owner_sid = current_user_sid()
+        validate_windows_path_no_reparse(path)
+        validate_owner_private_path(path, owner_sid=owner_sid, directory=True)
+        handle = win32file.CreateFile(
+            str(path),
+            int(getattr(win32con, "FILE_READ_ATTRIBUTES", 0x80)),
+            int(win32con.FILE_SHARE_READ) | int(win32con.FILE_SHARE_WRITE),
+            None,
+            win32con.OPEN_EXISTING,
+            int(getattr(win32con, "FILE_FLAG_BACKUP_SEMANTICS", 0x02000000))
+            | int(getattr(win32con, "FILE_FLAG_OPEN_REPARSE_POINT", 0x00200000)),
+            None,
+        )
+        identity = _windows_parent_identity(handle, path)
+        validate_owner_private_path(path, owner_sid=owner_sid, directory=True)
+        result = handle
+        handle = None
+        return result, identity
+    except OwnerDestructiveError:
+        raise
+    except (OSError, WindowsSecurityError) as exc:
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows purge state parent could not be pinned safely",
+        ) from exc
+    except Exception as exc:
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows purge state parent could not be pinned safely",
+        ) from exc
+    finally:
+        if handle is not None:
+            handle.Close()
+
+
+def _verify_windows_pinned_parent(path: Path, handle: Any, identity: tuple[int, int, int]) -> None:
+    try:
+        owner_sid = current_user_sid()
+        validate_windows_path_no_reparse(path)
+        observed = _windows_parent_identity(handle, path)
+        if observed != identity:
+            raise OwnerDestructiveError(
+                "PURGE_STATE_INVALID",
+                "Windows purge state parent identity changed during publication",
+            )
+        validate_owner_private_path(path, owner_sid=owner_sid, directory=True)
+    except OwnerDestructiveError:
+        raise
+    except (OSError, WindowsSecurityError) as exc:
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows purge state parent changed during publication",
+        ) from exc
+
+
+def _windows_rename_handle_replace_relative(source_handle: Any, parent_handle: Any, destination: Path) -> None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows durable purge state publication is unavailable",
+        ) from exc
+
+    class _IoStatusBlockStatus(ctypes.Union):
+        _fields_ = [("Status", wintypes.LONG), ("Pointer", wintypes.LPVOID)]
+
+    class _IoStatusBlock(ctypes.Structure):
+        _fields_ = [("u", _IoStatusBlockStatus), ("Information", ctypes.c_size_t)]
+
+    class _FileRenameInformationHeader(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", ctypes.c_ubyte),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+        ]
+
+    leaf_name = destination.name
+    if not leaf_name or "\\" in leaf_name or "/" in leaf_name:
+        raise OwnerDestructiveError("PURGE_STATE_INVALID", "Windows purge state destination leaf is invalid")
+    encoded = leaf_name.encode("utf-16-le")
+    filename_offset = _FileRenameInformationHeader.FileNameLength.offset + ctypes.sizeof(wintypes.DWORD)
+    buffer = ctypes.create_string_buffer(filename_offset + len(encoded) + ctypes.sizeof(wintypes.WCHAR))
+    header = _FileRenameInformationHeader.from_buffer(buffer)
+    header.ReplaceIfExists = 1
+    header.RootDirectory = wintypes.HANDLE(int(parent_handle))
+    header.FileNameLength = len(encoded)
+    ctypes.memmove(ctypes.addressof(buffer) + filename_offset, encoded, len(encoded))
+    io_status = _IoStatusBlock()
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    nt_set = ntdll.NtSetInformationFile
+    nt_set.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        ctypes.c_int,
+    ]
+    nt_set.restype = wintypes.LONG
+    status = int(
+        nt_set(
+            wintypes.HANDLE(int(source_handle)),
+            ctypes.byref(io_status),
+            ctypes.byref(buffer),
+            filename_offset + len(encoded),
+            10,
+        )
+    )
+    if status >= 0:
+        return
+    rtl_status_to_dos = ntdll.RtlNtStatusToDosError
+    rtl_status_to_dos.argtypes = [wintypes.LONG]
+    rtl_status_to_dos.restype = wintypes.ULONG
+    error = int(rtl_status_to_dos(status))
+    try:
+        raise OSError(error, "Windows rooted purge state rename failed")
+    except OSError as exc:
+        raise OwnerDestructiveError(
+            "PURGE_STATE_INVALID",
+            "Windows purge state file could not be published durably",
+        ) from exc
+
+
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     _ensure_private_directory(path.parent)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     encoded = (_canonical_json(payload) + "\n").encode("utf-8")
+    if os.name == "nt":
+        parent_handle, parent_identity = _open_windows_pinned_parent(path.parent)
+        source_handle: Any | None = None
+        source_identity: tuple[int, int, int] | None = None
+        published = False
+        try:
+            if path.exists() or path.is_symlink():
+                _windows_private_file_exists(path, code="PURGE_STATE_INVALID")
+            source_handle, source_identity = _open_windows_private_file(temporary)
+            _windows_write_handle(source_handle, encoded)
+            _windows_flush_handle(source_handle)
+            if _windows_file_identity(source_handle, temporary) != source_identity:
+                raise OwnerDestructiveError(
+                    "PURGE_STATE_INVALID",
+                    "Windows purge state staging file changed identity before publication",
+                )
+            try:
+                validate_owner_only_kernel_object(source_handle, current_user_sid())
+            except WindowsSecurityError as exc:
+                raise OwnerDestructiveError(
+                    "PURGE_STATE_INVALID",
+                    "Windows purge state staging file lost owner-private custody",
+                ) from exc
+            _verify_windows_pinned_parent(path.parent, parent_handle, parent_identity)
+            if path.exists() or path.is_symlink():
+                _windows_private_file_exists(path, code="PURGE_STATE_INVALID")
+            else:
+                validate_windows_path_no_reparse(path)
+            _windows_rename_handle_replace_relative(source_handle, parent_handle, path)
+            published = True
+            _windows_flush_handle(source_handle)
+            if _windows_file_identity(source_handle, path) != source_identity:
+                raise OwnerDestructiveError(
+                    "PURGE_STATE_INVALID",
+                    "Windows purge state published file does not match the retained staging handle",
+                )
+            try:
+                validate_owner_only_kernel_object(source_handle, current_user_sid())
+            except WindowsSecurityError as exc:
+                raise OwnerDestructiveError(
+                    "PURGE_STATE_INVALID",
+                    "Windows purge state published file lost owner-private custody",
+                ) from exc
+            _verify_windows_pinned_parent(path.parent, parent_handle, parent_identity)
+        finally:
+            if source_handle is not None and not published:
+                try:
+                    _windows_delete_handle_on_close(source_handle)
+                except OwnerDestructiveError:
+                    pass
+            parent_handle.Close()
+            if source_handle is not None:
+                source_handle.Close()
+        return
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -576,7 +1029,10 @@ class OwnerDestructiveOrchestrator:
     def _read_journal(self, operation_id: str) -> dict[str, Any] | None:
         operation_id = _canonical_operation_id(operation_id)
         path = self._journal_path(operation_id)
-        if not path.exists():
+        if os.name == "nt":
+            if not _windows_private_file_exists(path, code="PURGE_RECOVERY_STATE_MISMATCH"):
+                return None
+        elif not path.exists():
             return None
         payload = self._read_json_file(path, code="PURGE_RECOVERY_STATE_MISMATCH")
         allowed = {
@@ -905,7 +1361,9 @@ class OwnerDestructiveOrchestrator:
         if getattr(snapshot, "state", None) != "RUNNING":
             return None
         result = self._journal_recovery_result(journal)
-        if not Path(result.receipt_path).is_file() or not Path(result.state_path).is_file():
+        if not self._recovery_evidence_is_file(Path(result.receipt_path)) or not self._recovery_evidence_is_file(
+            Path(result.state_path)
+        ):
             return None
         return result
 
@@ -927,9 +1385,13 @@ class OwnerDestructiveOrchestrator:
     @staticmethod
     def _read_json_file(path: Path, *, code: str) -> dict[str, Any]:
         try:
-            info = path.lstat()
-            if path.is_symlink() or not path.is_file() or info.st_uid != os.getuid() or info.st_mode & 0o077:
-                raise OwnerDestructiveError(code, "purge state file is not a trusted owner-private regular file")
+            if os.name == "nt":
+                if not _windows_private_file_exists(path, code=code):
+                    raise OwnerDestructiveError(code, "purge state file is unavailable")
+            else:
+                info = path.lstat()
+                if path.is_symlink() or not path.is_file() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                    raise OwnerDestructiveError(code, "purge state file is not a trusted owner-private regular file")
             value = json.loads(path.read_text(encoding="utf-8"))
         except OwnerDestructiveError:
             raise
@@ -941,7 +1403,10 @@ class OwnerDestructiveOrchestrator:
 
     def _load_completed(self, preview: PurgePreview) -> PurgeSuccess | None:
         _, _, result_path = self._paths(preview.operation_id)
-        if not result_path.exists():
+        if os.name == "nt":
+            if not _windows_private_file_exists(result_path, code="PURGE_RESULT_INVALID"):
+                return None
+        elif not result_path.exists():
             return None
         payload = self._read_json_file(result_path, code="PURGE_RESULT_INVALID")
         required = {
@@ -981,7 +1446,7 @@ class OwnerDestructiveOrchestrator:
         state_path = payload.get("state_path")
         if not isinstance(receipt_path, str) or not isinstance(state_path, str):
             raise OwnerDestructiveError("PURGE_RESULT_INVALID", "persisted purge result paths are malformed")
-        if not Path(receipt_path).is_file() or not Path(state_path).is_file():
+        if not self._recovery_evidence_is_file(Path(receipt_path)) or not self._recovery_evidence_is_file(Path(state_path)):
             raise OwnerDestructiveError("PURGE_RESULT_INVALID", "persisted purge result is missing recovery evidence")
         return PurgeSuccess(
             operation_id=preview.operation_id,
@@ -1000,12 +1465,22 @@ class OwnerDestructiveOrchestrator:
 
     def _discard_journal(self, operation_id: str) -> None:
         path = self._journal_path(operation_id)
+        if os.name == "nt":
+            if _windows_private_file_exists(path, code="PURGE_RECOVERY_STATE_MISMATCH"):
+                path.unlink()
+            return
         if path.exists() and not path.is_symlink():
             path.unlink()
 
     @staticmethod
-    def _recovery_state_is_postcommit(state_path: Path) -> bool:
-        if not state_path.exists():
+    def _recovery_evidence_is_file(path: Path) -> bool:
+        if os.name == "nt":
+            return _windows_private_file_exists(path, code="PURGE_RECOVERY_STATE_MISMATCH")
+        return path.is_file()
+
+    @classmethod
+    def _recovery_state_is_postcommit(cls, state_path: Path) -> bool:
+        if not cls._recovery_evidence_is_file(state_path):
             return False
         try:
             payload = json.loads(state_path.read_text(encoding="utf-8"))
@@ -1195,6 +1670,9 @@ class OwnerDestructiveOrchestrator:
             raise OwnerDestructiveError("PURGE_DRAIN_DEADLINE_INVALID", "drain_deadline must be a positive absolute timestamp")
 
         receipt_path, recovery_state_path, _ = self._paths(preview.operation_id)
+        if os.name == "nt":
+            self._recovery_evidence_is_file(receipt_path)
+            self._recovery_evidence_is_file(recovery_state_path)
         journal = self._load_journal(preview)
 
         if journal is not None and journal.get("phase") == "PREMUTATION_RECOVERY_REQUIRED":
@@ -1227,7 +1705,9 @@ class OwnerDestructiveOrchestrator:
             )
             if getattr(snapshot, "state", None) == "RUNNING":
                 recovery_result = self._journal_recovery_result(journal)
-                if not Path(recovery_result.receipt_path).is_file() or not Path(recovery_result.state_path).is_file():
+                if not self._recovery_evidence_is_file(
+                    Path(recovery_result.receipt_path)
+                ) or not self._recovery_evidence_is_file(Path(recovery_result.state_path)):
                     raise OwnerDestructiveError(
                         "PURGE_RECOVERY_STATE_MISMATCH",
                         "activation-ready purge evidence is missing",
@@ -1409,6 +1889,15 @@ class OwnerDestructiveOrchestrator:
                 new_generation = int(active_journal["new_generation"])
                 device = active_journal.get("activation_device")
                 inode = active_journal.get("activation_inode")
+                if os.name == "nt" and (
+                    not self._recovery_evidence_is_file(Path(_result.receipt_path))
+                    or not self._recovery_evidence_is_file(Path(_result.state_path))
+                ):
+                    raise OwnerDestructiveError(
+                        "PURGE_RECOVERY_STATE_MISMATCH",
+                        "activation-ready purge evidence is not trusted owner-private Windows state",
+                        recovery_required=True,
+                    )
                 try:
                     self._coordinator.publish_running(prepared, new_generation=new_generation)
                 except BaseException as exc:
@@ -1470,6 +1959,18 @@ class OwnerDestructiveOrchestrator:
             raise OwnerDestructiveError(
                 "PURGE_RECOVERY_REQUIRED",
                 "purge operator did not return a final verified receipt; normal access remains blocked",
+                recovery_required=True,
+            )
+
+        if os.name == "nt" and (
+            not self._recovery_evidence_is_file(Path(recovery_result.receipt_path))
+            or not self._recovery_evidence_is_file(Path(recovery_result.state_path))
+        ):
+            self._write_journal(preview, phase="RECOVERY_REQUIRED")
+            await self._mark_recovery_required(preview.operation_id)
+            raise OwnerDestructiveError(
+                "PURGE_RECOVERY_REQUIRED",
+                "verified purge evidence is not trusted owner-private Windows state; normal access remains blocked",
                 recovery_required=True,
             )
 

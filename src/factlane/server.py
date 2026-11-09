@@ -34,9 +34,20 @@ from .runtime_control import (
     RuntimeIdentity,
     RuntimeLifecycleController,
     RuntimeRegistry,
+    WindowsRuntimeControlServer,
     current_boot_id,
     process_start_ticks,
+    windows_runtime_pipe_name,
 )
+from .windows_maintenance import WindowsMaintenanceError, WindowsRuntimeDBLease
+from .windows_security import (
+    WindowsSecurityError,
+    current_user_sid,
+    ensure_owner_private_directory as ensure_windows_owner_private_directory,
+    process_identity as windows_process_identity,
+    validate_windows_path_no_reparse,
+)
+from .webui_windows import WindowsWebUIError, windows_boot_id, windows_owner_paths
 
 STDIO_TRANSPORT = "stdio"
 
@@ -66,11 +77,7 @@ def _default_lease_probe(adapter: Any) -> bool:
     if bool(getattr(engine, "_closed", False)):
         return False
     if hasattr(engine, "_maintenance_lease_handle"):
-        if getattr(engine, "_maintenance_lease_handle") is not None:
-            return True
-        if os.name != "nt":
-            return False
-        return getattr(engine, "conn", None) is not None and getattr(engine, "storage", None) is not None
+        return getattr(engine, "_maintenance_lease_handle") is not None
     return getattr(engine, "conn", None) is not None or getattr(engine, "storage", None) is not None
 
 
@@ -194,7 +201,7 @@ class _RuntimeSession:
         registry: RuntimeRegistry,
         barrier: MaintenanceBarrierStore,
         controller: RuntimeLifecycleController,
-        control_server: RuntimeControlServer,
+        control_server: Any,
     ) -> None:
         self.holder = holder
         self.registry = registry
@@ -247,6 +254,24 @@ class _RuntimeSession:
             pass
 
 
+def _windows_process_start_provider(pid: int) -> int | None:
+    try:
+        return windows_process_identity(pid).creation_time_us
+    except WindowsSecurityError:
+        return None
+
+
+def _windows_owner_namespace() -> tuple[str, Any]:
+    try:
+        owner_sid = current_user_sid()
+        paths = windows_owner_paths(owner_sid=owner_sid)
+        for raw in (paths.root_dir, paths.runtime_dir, paths.state_dir):
+            ensure_windows_owner_private_directory(raw, owner_sid=owner_sid)
+        return owner_sid, paths
+    except (WindowsSecurityError, WindowsWebUIError) as exc:
+        raise AdapterError("BACKEND_UNAVAILABLE", "native Windows runtime custody is unavailable") from exc
+
+
 def _build_runtime_session(
     config: _AdapterLaunchConfig,
     *,
@@ -256,12 +281,45 @@ def _build_runtime_session(
     lease_probe: LeaseProbe = _default_lease_probe,
     holder: _ReopenableAdapterHolder | None = None,
 ) -> _RuntimeSession:
-    db_path = os.path.realpath(os.path.abspath(config.db_path))
-    info = os.stat(db_path)
     root = Path(runtime_root).absolute()
-    registry = RuntimeRegistry(root, owner_uid=os.getuid())
     durable_root = Path(barrier_root).absolute() if barrier_root is not None else root / "maintenance"
-    barrier = MaintenanceBarrierStore(durable_root, db_path)
+    owner_sid: str | None = None
+    windows_process = None
+    windows_boot: str | None = None
+    if os.name == "nt":
+        try:
+            owner_sid = current_user_sid()
+            windows_process = windows_process_identity(os.getpid())
+            windows_boot = windows_boot_id()
+            validate_windows_path_no_reparse(config.db_path)
+            ensure_windows_owner_private_directory(root, owner_sid=owner_sid)
+            ensure_windows_owner_private_directory(durable_root, owner_sid=owner_sid)
+        except (WindowsSecurityError, WindowsWebUIError) as exc:
+            raise AdapterError("BACKEND_UNAVAILABLE", "native Windows runtime path custody is unavailable") from exc
+        db_path = os.path.realpath(os.path.abspath(config.db_path))
+        if not os.path.exists(db_path):
+            anchor: WindowsRuntimeDBLease | None = None
+            try:
+                anchor = WindowsRuntimeDBLease.open(db_path)
+            except WindowsMaintenanceError as exc:
+                code = "MAINTENANCE_IN_PROGRESS" if exc.code == "MAINTENANCE_IN_PROGRESS" else "BACKEND_UNAVAILABLE"
+                raise AdapterError(code, "database maintenance coordination is unavailable") from exc
+            finally:
+                if anchor is not None:
+                    anchor.close()
+        info = os.stat(db_path)
+        registry = RuntimeRegistry(
+            root,
+            owner_uid=0,
+            boot_id_provider=windows_boot_id,
+            process_start_provider=_windows_process_start_provider,
+        )
+        barrier = MaintenanceBarrierStore(durable_root, db_path)
+    else:
+        db_path = os.path.realpath(os.path.abspath(config.db_path))
+        info = os.stat(db_path)
+        registry = RuntimeRegistry(root, owner_uid=os.getuid())
+        barrier = MaintenanceBarrierStore(durable_root, db_path)
     snapshot = barrier.initialize(generation=1)
     if (snapshot.device, snapshot.inode) != (info.st_dev, info.st_ino):
         raise AdapterError(
@@ -269,21 +327,31 @@ def _build_runtime_session(
             "database inode changed outside the governed maintenance barrier",
         )
     instance_id = str(uuid.uuid4())
-    start_ticks = process_start_ticks(os.getpid())
-    if start_ticks is None:
-        raise RuntimeError("current process start identity is unavailable")
+    if os.name == "nt":
+        assert owner_sid is not None
+        assert windows_process is not None
+        assert windows_boot is not None
+        start_ticks = windows_process.creation_time_us
+        boot_id = windows_boot
+        control_socket_path = windows_runtime_pipe_name(instance_id)
+    else:
+        start_ticks = process_start_ticks(os.getpid())
+        if start_ticks is None:
+            raise RuntimeError("current process start identity is unavailable")
+        boot_id = current_boot_id()
+        control_socket_path = str(root / f"{uuid.UUID(instance_id).hex[:16]}.sock")
     identity = RuntimeIdentity(
         protocol_version=PROTOCOL_VERSION,
         instance_id=instance_id,
-        owner_uid=os.getuid(),
+        owner_uid=registry.owner_uid,
         pid=os.getpid(),
         process_start_ticks=start_ticks,
-        boot_id=current_boot_id(),
+        boot_id=boot_id,
         database_path=db_path,
         device=snapshot.device if snapshot.device else info.st_dev,
         inode=snapshot.inode if snapshot.inode else info.st_ino,
         generation=snapshot.generation,
-        control_socket_path=str(root / f"{uuid.UUID(instance_id).hex[:16]}.sock"),
+        control_socket_path=control_socket_path,
         lifecycle_state="PARKED",
     )
     adapter_holder = holder or _ReopenableAdapterHolder(
@@ -300,7 +368,16 @@ def _build_runtime_session(
         lease_is_open=adapter_holder.lease_is_open,
     )
     adapter_holder.bind_controller(controller)
-    control_server = RuntimeControlServer(identity=identity, registry=registry, controller=controller)
+    if os.name == "nt":
+        assert owner_sid is not None
+        control_server = WindowsRuntimeControlServer(
+            identity=identity,
+            registry=registry,
+            controller=controller,
+            owner_sid=owner_sid,
+        )
+    else:
+        control_server = RuntimeControlServer(identity=identity, registry=registry, controller=controller)
     return _RuntimeSession(
         holder=adapter_holder,
         registry=registry,
@@ -311,7 +388,12 @@ def _build_runtime_session(
 
 
 def _default_runtime_root(db_path: str) -> Path | None:
-    """Return the private per-database runtime root when this Linux session supports it."""
+    """Return the private per-database runtime root for the current supported platform."""
+    if os.name == "nt":
+        _owner_sid, paths = _windows_owner_namespace()
+        canonical = os.path.realpath(os.path.abspath(db_path))
+        database_key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        return Path(paths.runtime_dir) / database_key
     if os.name != "posix" or not hasattr(socket, "SO_PEERCRED") or not os.path.isfile(db_path):
         return None
     uid = os.getuid()
@@ -330,6 +412,11 @@ def _default_runtime_root(db_path: str) -> Path | None:
 
 def _default_barrier_root(db_path: str) -> Path:
     """Derive durable per-user maintenance state independently of the ephemeral runtime directory."""
+    if os.name == "nt":
+        _owner_sid, paths = _windows_owner_namespace()
+        canonical = os.path.realpath(os.path.abspath(db_path))
+        database_key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+        return Path(paths.state_dir) / "maintenance" / database_key
     configured = os.environ.get("XDG_STATE_HOME")
     base = Path(configured).expanduser() if configured else Path.home() / ".local" / "state"
     canonical = os.path.realpath(os.path.abspath(db_path))

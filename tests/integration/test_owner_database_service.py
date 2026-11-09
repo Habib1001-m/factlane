@@ -20,12 +20,14 @@ if sys.platform != "linux":
     )
 
 from factlane.contract import AdapterError
+from factlane.embeddings import EmbeddingProfile
 from factlane.owner_database import LOGICAL_IMPORT_MAX_BYTES, ArtifactRegistry, create_consistent_backup
 from factlane.owner_database_service import (
     FULL_RESTORE_UPLOAD_MAX_BYTES,
     DOWNLOAD_READ_MAX_BYTES,
     OwnerDatabaseService,
 )
+from factlane.storage import SQLiteVecEngine
 
 
 def _mode(path: Path) -> int:
@@ -47,6 +49,28 @@ def _active_database(path: Path) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _factlane_active_database(path: Path) -> None:
+    async def create() -> None:
+        profile = EmbeddingProfile(
+            profile_id="owner-database-service-256",
+            provider_kind="OLLAMA_LOCAL",
+            base_model_identity="nomic-embed-text:latest",
+            model_digest="0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+            source_dimension=768,
+            output_dimension=256,
+            normalization_policy="OLLAMA_API_NORMALIZED_AFTER_DIMENSION_PROJECTION",
+            distance_metric="cosine",
+            projection_version="ollama-dimensions-v1",
+            document_prefix="search_document: ",
+            query_prefix="search_query: ",
+        )
+        engine = SQLiteVecEngine(str(path), profile)
+        await engine.open()
+        await engine.close()
+
+    asyncio.run(create())
 
 
 def _restore_sqlite_bytes(tmp_path: Path) -> bytes:
@@ -322,6 +346,96 @@ def test_completed_artifacts_survive_service_restart_and_jobs_are_durable_privat
     assert restarted.job_status(job["job_id"]) == result
     assert len(restarted.list_artifacts()) == 1
     assert restarted.list_artifacts()[0]["artifact_id"] == result["result"]["artifact_id"]
+
+
+def test_database_status_and_job_history_are_path_free_bounded_and_filterable(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    active = tmp_path / "active.sqlite3"
+    _factlane_active_database(active)
+    service = OwnerDatabaseService(
+        root,
+        active_db_path=active,
+        logical_export_producer={
+            "factlane_version": "0.1.7",
+            "storage_contract_version": 3,
+            "embedding_profile_id": "nomic-768",
+        },
+    )
+    first = service.begin_backup_job()
+    second = service.begin_backup_job()
+    first_result = asyncio.run(service.run_job(first["job_id"]))
+    second_result = asyncio.run(service.run_job(second["job_id"]))
+
+    status = service.database_status()
+    assert status["status"] == "OK"
+    assert status["compatibility"] == "COMPATIBLE"
+    assert status["integrity_check"] == "ok"
+    assert status["storage_contract_version"] == 3
+    assert status["embedding_profile_id"] == "nomic-768"
+    assert status["database_identity"].startswith("db-")
+    assert "active.sqlite3" not in repr(status)
+    assert "tmp" not in repr(status)
+    assert status["storage"]["backup_count"] == 2
+    assert status["storage"]["backup_total_bytes"] == sum(
+        item["size_bytes"] for item in service.list_artifacts()
+    )
+
+    page = service.list_jobs(limit=1, kind="BACKUP_CREATE", phase="SUCCEEDED")
+    assert len(page["items"]) == 1
+    assert page["next_cursor"] == page["items"][0]["job_id"]
+    assert page["items"][0]["job_id"] in {first_result["job_id"], second_result["job_id"]}
+    next_page = service.list_jobs(
+        limit=1,
+        kind="BACKUP_CREATE",
+        phase="SUCCEEDED",
+        cursor=page["next_cursor"],
+    )
+    assert len(next_page["items"]) == 1
+    assert next_page["items"][0]["job_id"] != page["items"][0]["job_id"]
+    assert next_page["next_cursor"] is None
+    assert str(active) not in repr(page)
+
+
+def test_degraded_database_status_retains_known_capacity_and_actionable_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import factlane.owner_database_service as database_module
+
+    root = tmp_path / "artifacts"
+    active = tmp_path / "active.sqlite3"
+    _factlane_active_database(active)
+    service = OwnerDatabaseService(
+        root,
+        active_db_path=active,
+        free_space_provider=lambda _path: 987654,
+    )
+
+    def fail_contract(_path: str) -> int:
+        raise AdapterError("CONTRACT_UNREADABLE", "private diagnostic detail")
+
+    monkeypatch.setattr(
+        database_module,
+        "inspect_storage_contract_version",
+        fail_contract,
+    )
+
+    status = service.database_status()
+
+    assert status["status"] == "DEGRADED"
+    assert status["compatibility"] == "UNKNOWN"
+    assert status["integrity_check"] == "unavailable"
+    assert status["failure"] == {
+        "code": "CONTRACT_UNREADABLE",
+        "action": "Run FactLane database diagnostics before maintenance.",
+    }
+    assert status["storage"]["database_file_bytes"] == active.stat().st_size
+    assert status["storage"]["filesystem_free_bytes"] == 987654
+    assert status["storage"]["backup_count"] == 0
+    assert status["storage"]["backup_total_bytes"] == 0
+    assert status["storage"]["artifact_total_bytes"] == 0
+    assert str(active) not in repr(status)
+    assert "private diagnostic detail" not in repr(status)
 
 
 def test_backup_create_job_awaits_injected_hook_with_exact_trusted_inputs(tmp_path: Path) -> None:
@@ -653,6 +767,74 @@ def test_restore_commit_restart_retry_requires_fresh_runtime_authorize_and_reuse
     serialized = ledger_path.read_text(encoding="utf-8")
     assert "fresh-retry-grant-never-persist" not in serialized
     assert "authorize" not in serialized
+
+
+def test_registered_database_switch_requires_local_registration_and_reuses_restore_authority(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    source = tmp_path / "registered.sqlite3"
+    _active_database(source)
+    registry = ArtifactRegistry(root)
+    registered = create_consistent_backup(
+        source,
+        registry,
+        artifact_id="registered-db",
+        metadata_extra={"local_database_registration": True},
+    )
+    ordinary = create_consistent_backup(source, registry, artifact_id="ordinary-backup")
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def preview_hook(binding: dict[str, object]) -> dict[str, object]:
+        calls.append(("preview", dict(binding)))
+        return {
+            "status": "READY",
+            "operation": "FULL_RESTORE",
+            "artifact_id": binding["artifact_id"],
+            "artifact_sha256": binding["artifact_sha256"],
+            "artifact_size_bytes": binding["artifact_size_bytes"],
+            "trusted_origin_attested": binding["trusted_origin_attested"],
+            "authorization_preview": f"switch:{binding['operation_id']}",
+        }
+
+    async def apply_hook(binding, preview, authorize):
+        authorize(preview["authorization_preview"])
+        calls.append(("apply", dict(binding)))
+        return _verified_restore_result(binding)
+
+    service = OwnerDatabaseService(
+        root,
+        artifact_registry=registry,
+        restore_preview=preview_hook,
+        restore_apply=apply_hook,
+    )
+    assert service.list_registered_databases() == [
+        {key: value for key, value in registered.items() if key != "relative_path"}
+    ]
+    with pytest.raises(AdapterError, match="trusted local registration") as raised:
+        service.begin_database_switch_preview_job(ordinary["artifact_id"], operation_id=str(uuid.uuid4()))
+    assert raised.value.code == "DATABASE_NOT_REGISTERED"
+
+    operation_id = str(uuid.uuid4())
+    preview_job = service.begin_database_switch_preview_job(
+        registered["artifact_id"],
+        operation_id=operation_id,
+    )
+    preview = asyncio.run(service.run_job(preview_job["job_id"]))
+    assert preview["phase"] == "SUCCEEDED"
+    assert calls[0][1]["trusted_origin_attested"] is True
+    commit_job = service.begin_database_switch_commit_job(
+        registered["artifact_id"],
+        operation_id=operation_id,
+    )
+    authorization: list[str] = []
+    result = asyncio.run(
+        service.run_restore_job(commit_job["job_id"], authorize=lambda value: authorization.append(value))
+    )
+    assert result["phase"] == "SUCCEEDED"
+    assert authorization == [preview["result"]["authorization_preview"]]
+    assert calls[-1][0] == "apply"
+    with pytest.raises(AdapterError, match="trusted local registration") as raised:
+        service.begin_database_switch_commit_job(ordinary["artifact_id"], operation_id=operation_id)
+    assert raised.value.code == "DATABASE_NOT_REGISTERED"
 
 
 def test_verified_restore_result_is_projected_before_generic_job_persistence(tmp_path: Path) -> None:

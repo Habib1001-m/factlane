@@ -180,7 +180,12 @@ class MemoryStoreRequest(ScopeFields, total=False):
 class MemoryUpdateRequest(ScopeFields, total=False):
     memory_id: Required[Annotated[str, Field(description="UUID returned by memory_get or memory_search.")]]
     expected_record_id: NotRequired[
-        Annotated[str, Field(description="Exact parent record UUID; required when promoting a CANDIDATE with REVERIFY.")]
+        Annotated[
+            str,
+            Field(
+                description="Exact parent record UUID; required when promoting a CANDIDATE with REVERIFY and for Owner-only REVOKE/REJECT."
+            ),
+        ]
     ]
     expected_revision: Required[Annotated[int, Field(ge=1, description="Current revision from memory_get; required for CAS protection.")]]
     mode: Required[UpdateModeValue]
@@ -316,7 +321,7 @@ def render_tool_help(tool_name: str | None = None) -> str:
         "Writes require trusted launcher authorization; normal agent profiles are Candidate-only. "
         "Store a bounded fact with source_provenance, freshness_policy, and idempotency_key; update "
         "with current expected_revision, idempotency_key, and a Rev3 mode. Owner-only REVOKE/REJECT additionally require "
-        "the observed_group_token and bounded reason_code returned/defined by governed review surfaces.",
+        "expected_record_id, the observed_group_token, and bounded reason_code returned/defined by governed review surfaces.",
         "Governed FactLane errors return the normal MCP result shape with status=BLOCKED, a stable error_code, "
         "a safe message, empty results, and audit.retryable. Unexpected internal exceptions remain transport errors.",
         "Never guess an enum or field name: inspect live MCP schema or this help.",

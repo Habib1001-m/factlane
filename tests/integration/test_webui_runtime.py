@@ -14,7 +14,9 @@ if sys.platform != "linux":
     )
 
 from factlane.webui_runtime import (
+    BackendTransportKind,
     BackendMode,
+    PlatformKind,
     RuntimeConfigError,
     RuntimeOutcomeState,
     WebUIRuntimeConfig,
@@ -125,6 +127,29 @@ def _write_config(
     return path
 
 
+def _windows_payload(*, memory_configured: bool = True) -> dict[str, object]:
+    return {
+        "db": r"C:\Users\Owner\AppData\Local\FactLane\memory.db" if memory_configured else None,
+        "profile": "nomic-768" if memory_configured else None,
+        "host_id": "owner-host-win" if memory_configured else None,
+        "origin": "https://factlane-a1b2c3.test:8767",
+        "backend_socket": None,
+        "caddy_path": None,
+        "caddyfile": None,
+        "runtime_dir": r"C:\Users\Owner\AppData\Local\FactLane\runtime",
+        "state_dir": r"C:\Users\Owner\AppData\Local\FactLane\state",
+        "platform_kind": "WINDOWS",
+        "backend_transport": "WINDOWS_HTTPS",
+    }
+
+
+def _write_windows_config(tmp_path: Path, *, payload: dict[str, object] | None = None) -> Path:
+    path = tmp_path / "windows-webui.json"
+    path.write_text(json.dumps(_windows_payload() if payload is None else payload), encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
 def _service(tmp_path: Path, clock: _Clock) -> WebUIServiceState:
     return WebUIServiceState(
         tmp_path / "service-state" / "webui.json",
@@ -183,6 +208,131 @@ def test_config_loader_accepts_only_exact_owner_private_regular_json(tmp_path: P
 
     with pytest.raises(RuntimeConfigError, match="unknown"):
         load_runtime_config(_write_config(tmp_path, extra={"surprise": True}))
+
+
+def test_config_loader_accepts_bounded_public_origin_allowlist_and_runner_threads_it(tmp_path: Path) -> None:
+    public_origins = [
+        "https://panel.example.com",
+        "https://owner.example.net:9443",
+    ]
+    config = load_runtime_config(
+        _write_config(tmp_path, extra={"public_origins": public_origins})
+    )
+    assert config.public_origins == tuple(public_origins)
+
+    clock = _Clock()
+    backend = _Backend()
+    backend.clock = clock
+    service_state = _service(tmp_path, clock)
+    backend_specs = []
+    runner = WebUIRuntimeRunner(
+        config,
+        service_state,
+        backend_factory=lambda spec, exact_service_state: (
+            pytest.fail("runner passed a different service-state instance")
+            if exact_service_state is not service_state
+            else backend_specs.append(spec) or backend
+        ),
+        process_factory=None,
+        external_gateway_required=False,
+        clock=clock,
+        sleep=clock.sleep,
+        poll_interval=1.0,
+    )
+
+    assert runner.start().state is RuntimeOutcomeState.READY
+    assert backend_specs[0].public_origins == tuple(public_origins)
+    assert runner.service_state.snapshot().saved_endpoint == config.origin
+    assert runner.stop() is True
+
+
+@pytest.mark.parametrize(
+    "public_origins",
+    [
+        ["http://panel.example.com"],
+        ["https://panel.example.com/path"],
+        ["https://Panel.example.com"],
+        ["https://factlane-a1b2c3.test:8767"],
+        ["https://panel.example.com", "https://panel.example.com"],
+        [f"https://panel-{index}.example.com" for index in range(9)],
+    ],
+)
+def test_config_loader_rejects_unbounded_or_noncanonical_public_origins(
+    tmp_path: Path,
+    public_origins: list[str],
+) -> None:
+    with pytest.raises(RuntimeConfigError, match="public_origins|public origin"):
+        load_runtime_config(
+            _write_config(tmp_path, extra={"public_origins": public_origins})
+        )
+
+
+def test_legacy_linux_config_schema_remains_explicitly_linux_af_unix_without_host_inference(tmp_path: Path) -> None:
+    config = load_runtime_config(_write_config(tmp_path))
+
+    assert config.platform_kind is PlatformKind.LINUX
+    assert config.backend_transport is BackendTransportKind.AF_UNIX
+    assert config.public_origins == ()
+
+
+def test_windows_native_config_constructs_and_loads_with_backend_owned_https_on_linux_host(tmp_path: Path) -> None:
+    payload = _windows_payload()
+    direct = WebUIRuntimeConfig(**payload)  # type: ignore[arg-type]
+    loaded = load_runtime_config(_write_windows_config(tmp_path, payload=payload))
+
+    for config in (direct, loaded):
+        assert config.platform_kind is PlatformKind.WINDOWS
+        assert config.backend_transport is BackendTransportKind.WINDOWS_HTTPS
+        assert config.db == r"C:\Users\Owner\AppData\Local\FactLane\memory.db"
+        assert config.runtime_dir == r"C:\Users\Owner\AppData\Local\FactLane\runtime"
+        assert config.state_dir == r"C:\Users\Owner\AppData\Local\FactLane\state"
+        assert config.backend_socket is None
+        assert config.caddy_path is None
+        assert config.caddyfile is None
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("db", r"\\wsl.localhost\Ubuntu-22.04\home\owner\memory.db"),
+        ("db", r"\\server\share\memory.db"),
+        ("db", r"relative\memory.db"),
+        ("db", r"C:\FactLane\..\memory.db"),
+        ("db", "C:/FactLane/memory.db"),
+        ("db", "/home/owner/memory.db"),
+        ("runtime_dir", r"\\server\share\runtime"),
+        ("runtime_dir", r"C:\FactLane\..\runtime"),
+        ("state_dir", r"state\FactLane"),
+        ("state_dir", "C:/FactLane/state"),
+    ],
+)
+def test_windows_native_config_rejects_wsl_unc_relative_parent_and_mixed_paths(
+    tmp_path: Path,
+    field: str,
+    invalid: str,
+) -> None:
+    payload = _windows_payload()
+    payload[field] = invalid
+
+    with pytest.raises(RuntimeConfigError, match="Windows path"):
+        load_runtime_config(_write_windows_config(tmp_path, payload=payload))
+
+
+def test_windows_native_config_requires_explicit_complete_platform_transport_contract(tmp_path: Path) -> None:
+    missing_transport = _windows_payload()
+    missing_transport.pop("backend_transport")
+    with pytest.raises(RuntimeConfigError, match="missing required fields"):
+        load_runtime_config(_write_windows_config(tmp_path, payload=missing_transport))
+
+    fake_unix = _windows_payload()
+    fake_unix["backend_transport"] = "AF_UNIX"
+    with pytest.raises(RuntimeConfigError, match="WINDOWS_HTTPS"):
+        load_runtime_config(_write_windows_config(tmp_path, payload=fake_unix))
+
+    fake_socket = _windows_payload()
+    fake_socket["backend_socket"] = r"C:\FactLane\owner-http.sock"
+    with pytest.raises(RuntimeConfigError, match="must be null"):
+        load_runtime_config(_write_windows_config(tmp_path, payload=fake_socket))
 
 
 def test_config_loader_accepts_absent_memory_selection_as_one_null_trio(tmp_path: Path) -> None:
@@ -297,6 +447,78 @@ def test_runner_launches_unix_backend_and_exact_caddy_argv_then_marks_ready(tmp_
     assert runner.service_state.snapshot().status is ServiceStatus.READY
     assert runner.service_state.snapshot().saved_endpoint == "https://factlane-a1b2c3.test:8767"
     assert process.poll() is None
+
+
+def test_runner_can_supervise_backend_owned_transport_without_external_gateway(tmp_path: Path) -> None:
+    clock = _Clock()
+    backend = _Backend()
+    backend.clock = clock
+    config = load_runtime_config(_write_config(tmp_path))
+    service_state = _service(tmp_path, clock)
+    backend_specs = []
+
+    def backend_factory(spec, exact_service_state):
+        assert exact_service_state is service_state
+        backend_specs.append(spec)
+        return backend
+
+    runner = WebUIRuntimeRunner(
+        config,
+        service_state,
+        backend_factory=backend_factory,
+        process_factory=None,
+        external_gateway_required=False,
+        clock=clock,
+        sleep=clock.sleep,
+        poll_interval=1.0,
+    )
+
+    outcome = runner.start()
+
+    assert outcome.state is RuntimeOutcomeState.READY
+    assert backend.start_calls == 1
+    assert len(backend_specs) == 1
+    assert runner.service_state.snapshot().saved_endpoint == config.origin
+    assert runner.stop() is True
+    assert backend.drain_calls == 1
+
+
+def test_runner_launches_windows_backend_owned_https_without_caddy_or_fake_unix_socket(tmp_path: Path) -> None:
+    clock = _Clock()
+    backend = _Backend()
+    backend.clock = clock
+    config = load_runtime_config(_write_windows_config(tmp_path))
+    service_state = _service(tmp_path, clock)
+    backend_specs = []
+
+    runner = WebUIRuntimeRunner(
+        config,
+        service_state,
+        backend_factory=lambda spec, exact_service_state: (
+            pytest.fail("runner passed a different service-state instance")
+            if exact_service_state is not service_state
+            else backend_specs.append(spec) or backend
+        ),
+        process_factory=None,
+        external_gateway_required=False,
+        clock=clock,
+        sleep=clock.sleep,
+        poll_interval=1.0,
+    )
+
+    outcome = runner.start()
+
+    assert outcome.state is RuntimeOutcomeState.READY
+    assert len(backend_specs) == 1
+    spec = backend_specs[0]
+    assert spec.platform_kind is PlatformKind.WINDOWS
+    assert spec.backend_transport is BackendTransportKind.WINDOWS_HTTPS
+    assert spec.socket_path is None
+    assert spec.runtime_dir == config.runtime_dir
+    assert spec.state_dir == config.state_dir
+    assert spec.expected_origin == config.origin
+    assert spec.normal_adapter_required is True
+    assert runner.stop() is True
 
 
 def test_runner_rejects_config_saved_endpoint_mismatch_before_launch(tmp_path: Path) -> None:

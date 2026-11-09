@@ -628,6 +628,22 @@ def _cleanup_new_lease_anchor(db_path: str, handle: Any, *, created: bool) -> No
 
 def _acquire_runtime_maintenance_lease(db_path: str) -> Any:
     """Hold a shared lease while a normal runtime engine is attached to one DB."""
+    if os.name == "nt":
+        from .windows_maintenance import WindowsMaintenanceError, WindowsRuntimeDBLease
+
+        try:
+            return WindowsRuntimeDBLease.open(db_path)
+        except WindowsMaintenanceError as exc:
+            if exc.code == "MAINTENANCE_IN_PROGRESS":
+                raise AdapterError(
+                    "MAINTENANCE_IN_PROGRESS",
+                    "database maintenance is in progress; retry after maintenance completes",
+                ) from exc
+            raise AdapterError(
+                "BACKEND_UNAVAILABLE",
+                "database maintenance coordination is unavailable",
+            ) from exc
+
     try:
         import fcntl
     except ImportError:
@@ -678,6 +694,9 @@ def _acquire_runtime_maintenance_lease(db_path: str) -> Any:
 
 def _release_runtime_maintenance_lease(handle: Any) -> None:
     if handle is None:
+        return
+    if os.name == "nt":
+        handle.close()
         return
     try:
         import fcntl
@@ -4284,6 +4303,8 @@ class SQLiteVecEngine:
         *,
         max_records: int,
         required_free_bytes: int,
+        progress_callback: Callable[[int, int], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Compact a bounded set of eligible superseded records under pressure."""
         if isinstance(max_records, bool) or not isinstance(max_records, int) or max_records < 1:
@@ -4392,9 +4413,17 @@ class SQLiteVecEngine:
             )
 
         compacted = 0
+        cancelled = False
+        if progress_callback is not None:
+            progress_callback(compacted, len(selected))
         for record_id in selected:
+            if cancel_requested is not None and cancel_requested():
+                cancelled = True
+                break
             if await self.compact_superseded_record(record_id):
                 compacted += 1
+            if progress_callback is not None:
+                progress_callback(compacted, len(selected))
 
         after = await self.status(scope)
         after_health = await self._housekeeping_health(scope)
@@ -4403,6 +4432,16 @@ class SQLiteVecEngine:
                 "BLOCKED_POST_MAINTENANCE_HEALTH",
                 "REPAIR_POST_MAINTENANCE_HEALTH_BEFORE_MEMORY_MUTATION",
                 mutation="BOUNDED_COMPACTION",
+                selected_records=len(selected),
+                compacted_records=compacted,
+                after=after,
+                health_after=after_health,
+            )
+        if cancelled:
+            return report(
+                "HOUSEKEEPING_CANCELLED",
+                "REVIEW_REMAINING_ELIGIBLE_RECORDS_BEFORE_RETRY",
+                mutation="BOUNDED_COMPACTION" if compacted else "NONE",
                 selected_records=len(selected),
                 compacted_records=compacted,
                 after=after,

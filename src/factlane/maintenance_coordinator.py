@@ -20,6 +20,16 @@ from .runtime_control import (
     RuntimeRegistry,
     validate_response,
 )
+from .windows_maintenance import WindowsBarrierGuard, WindowsMaintenanceError
+from .windows_security import (
+    WindowsSecurityError,
+    current_user_sid,
+    ensure_owner_private_directory,
+    owner_only_security_attributes,
+    validate_owner_only_kernel_object,
+    validate_owner_private_path,
+    validate_windows_path_no_reparse,
+)
 
 
 _RUNTIME_RESUME_TIMEOUT_SECONDS = 5.0
@@ -44,6 +54,15 @@ def _canonical_uuid(value: str, field: str) -> str:
 
 
 def _ensure_private_directory(path: Path) -> None:
+    if os.name == "nt":
+        try:
+            ensure_owner_private_directory(path, owner_sid=current_user_sid())
+        except WindowsSecurityError as exc:
+            raise MaintenanceCoordinatorError(
+                "BARRIER_UNAVAILABLE",
+                "maintenance state directory cannot be protected",
+            ) from exc
+        return
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         os.chmod(path, 0o700)
@@ -51,23 +70,86 @@ def _ensure_private_directory(path: Path) -> None:
         raise MaintenanceCoordinatorError("BARRIER_UNAVAILABLE", "maintenance state directory cannot be protected") from exc
 
 
+def _open_windows_private_file(path: Path, *, owner_sid: str) -> int:
+    try:
+        validate_windows_path_no_reparse(path)
+        import msvcrt
+        import win32api
+        import win32con
+        import win32file
+
+        handle = None
+        raw_handle: int | None = None
+        try:
+            handle = win32file.CreateFile(
+                str(path),
+                win32con.GENERIC_WRITE,
+                0,
+                owner_only_security_attributes(owner_sid),
+                win32con.CREATE_NEW,
+                win32con.FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+            validate_owner_only_kernel_object(handle, owner_sid)
+            raw_handle = int(handle.Detach())
+            handle = None
+            fd = msvcrt.open_osfhandle(raw_handle, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+            raw_handle = None
+            return fd
+        finally:
+            if handle is not None:
+                handle.Close()
+            if raw_handle is not None:
+                try:
+                    win32api.CloseHandle(raw_handle)
+                except Exception:
+                    pass
+    except MaintenanceCoordinatorError:
+        raise
+    except (ImportError, OSError, WindowsSecurityError, ValueError) as exc:
+        raise MaintenanceCoordinatorError(
+            "BARRIER_UNAVAILABLE",
+            "maintenance barrier state could not be persisted",
+        ) from exc
+    except Exception as exc:
+        raise MaintenanceCoordinatorError(
+            "BARRIER_UNAVAILABLE",
+            "maintenance barrier state could not be persisted",
+        ) from exc
+
+
 def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
     _ensure_private_directory(path.parent)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    owner_sid: str | None = None
     try:
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        if os.name == "nt":
+            owner_sid = current_user_sid()
+            validate_windows_path_no_reparse(path)
+            if path.exists():
+                validate_owner_private_path(path, owner_sid=owner_sid, directory=False)
+            fd = _open_windows_private_file(temporary, owner_sid=owner_sid)
+        else:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if owner_sid is not None:
+                validate_owner_private_path(temporary, owner_sid=owner_sid, directory=False)
             os.replace(temporary, path)
-            os.chmod(path, 0o600)
+            if owner_sid is not None:
+                validate_owner_private_path(path, owner_sid=owner_sid, directory=False)
+            else:
+                os.chmod(path, 0o600)
         finally:
             if temporary.exists():
                 temporary.unlink()
-    except OSError as exc:
+    except MaintenanceCoordinatorError:
+        raise
+    except (OSError, WindowsSecurityError) as exc:
         raise MaintenanceCoordinatorError("BARRIER_UNAVAILABLE", "maintenance barrier state could not be persisted") from exc
 
 
@@ -83,6 +165,22 @@ class MaintenanceBarrierStore:
 
     @contextmanager
     def guard(self) -> Iterator[None]:
+        if os.name == "nt":
+            try:
+                with WindowsBarrierGuard.acquire(self.lock_path) as guard:
+                    guard.revalidate()
+                    yield
+                return
+            except WindowsMaintenanceError as exc:
+                if exc.code == "BARRIER_BUSY":
+                    raise MaintenanceCoordinatorError(
+                        "BARRIER_BUSY",
+                        "maintenance barrier guard is currently owned by another lifecycle operation",
+                    ) from exc
+                raise MaintenanceCoordinatorError(
+                    "BARRIER_UNAVAILABLE",
+                    "maintenance barrier guard is unavailable",
+                ) from exc
         try:
             import fcntl
         except ImportError as exc:
@@ -141,6 +239,14 @@ class MaintenanceBarrierStore:
             return snapshot
 
     def read_locked(self) -> BarrierSnapshot:
+        if os.name == "nt" and self.state_path.exists():
+            try:
+                validate_owner_private_path(self.state_path, owner_sid=current_user_sid(), directory=False)
+            except WindowsSecurityError as exc:
+                raise MaintenanceCoordinatorError(
+                    "INVALID_BARRIER_STATE",
+                    "maintenance barrier state is not owner-private",
+                ) from exc
         try:
             raw = json.loads(self.state_path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:

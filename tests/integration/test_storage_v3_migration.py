@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
 import os
 import shutil
 import sqlite3
 import stat
+import subprocess
+import sys
 import urllib.parse
 from pathlib import Path
 
@@ -18,6 +21,8 @@ from factlane.contract import AdapterError
 from factlane.embeddings import EmbeddingProfile
 from factlane.storage import STORAGE_CONTRACT_VERSION, SQLiteVecEngine, inspect_storage_contract_version
 from factlane.storage_migration import migrate_storage_v3, restore_pre_v3_backup
+
+native_windows = pytest.mark.skipif(os.name != "nt", reason="native Windows storage migration qualification only")
 
 
 def _profile() -> EmbeddingProfile:
@@ -40,17 +45,86 @@ def _digest(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
 
 
-def _assert_windows_maintenance_hold_no_mutation(db: Path, backup: Path) -> None:
-    """Windows qualifies the unsupported maintenance boundary, not POSIX migration execution."""
-    before = _digest(db)
-    with pytest.raises(AdapterError) as exc_info:
-        migrate_storage_v3(str(db), str(backup))
-    assert exc_info.value.code == "MIGRATION_HOLD"
-    assert "POSIX fcntl/flock" in exc_info.value.safe_message
-    assert _digest(db) == before
-    assert not backup.exists()
-    assert not Path(str(backup) + ".factlane-v3-backup.json").exists()
-    assert inspect_storage_contract_version(str(db)) == 2
+def _copy_frozen_v014_v2_fixture(tmp_path: Path) -> Path:
+    fixtures = Path(__file__).parents[1] / "fixtures"
+    compressed = fixtures / "factlane-v0.1.4-storage-v2.sqlite3.gz"
+    manifest_path = fixtures / "factlane-v0.1.4-storage-v2.fixture.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest == {
+        **manifest,
+        "kind": "FACTLANE_FROZEN_STORAGE_V2_TEST_FIXTURE",
+        "schema_version": 1,
+        "factlane_release": "v0.1.4",
+        "factlane_source_commit": "4b2cf5b",
+        "backend_distribution": "mcp-memory-service==11.10.0",
+        "backend_vcs_commit": "e5155b937051db4fa99a384018c5ebd621d8c5ef",
+        "storage_contract_version": 2,
+        "adapter_record_count": 1,
+        "quick_check": "ok",
+        "integrity_check": "ok",
+        "uncompressed_sha256": "05767b29c9e144b99c68594e8e2031606656380d355744f99bcfb64d302ee637",
+        "compressed_sha256": "ce4c0b9c418e60bd5254dabaccec280ea4ee0188d3fd0103e369324a54adcf5f",
+        "compressed_filename": compressed.name,
+    }
+    assert _digest(compressed) == manifest["compressed_sha256"]
+    target = tmp_path / "factlane-v0.1.4-storage-v2.sqlite3"
+    with gzip.open(compressed, "rb") as source, target.open("xb") as destination:
+        shutil.copyfileobj(source, destination)
+    assert target.stat().st_size == int(manifest["uncompressed_size"])
+    assert _digest(target) == manifest["uncompressed_sha256"]
+    connection = sqlite3.connect(target)
+    try:
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert connection.execute("SELECT value FROM adapter_meta WHERE key='contract_version'").fetchone() == ("2",)
+        assert connection.execute("SELECT COUNT(*) FROM adapter_records").fetchone() == (1,)
+    finally:
+        connection.close()
+    return target
+
+
+def _migration_artifact_dir(tmp_path: Path) -> Path:
+    if os.name != "nt":
+        return tmp_path
+    from factlane.windows_security import current_user_sid, ensure_owner_private_directory
+
+    private = tmp_path / "migration-artifacts"
+    ensure_owner_private_directory(private, owner_sid=current_user_sid())
+    return private
+
+
+def _run_windows_crash_checkpoint(
+    db: Path,
+    backup: Path,
+    *,
+    operation: str,
+    checkpoint: str,
+) -> subprocess.CompletedProcess[str]:
+    code = (
+        "import os,sys\n"
+        "import factlane.storage_migration as m\n"
+        "wanted=sys.argv[3]\n"
+        "def checkpoint(name):\n"
+        "    if name == wanted:\n"
+        "        os._exit(77)\n"
+        "m._windows_migration_checkpoint=checkpoint\n"
+        "import factlane.windows_maintenance as w\n"
+        "def raw_checkpoint(written,total):\n"
+        "    if wanted in {'mid_raw_restore','mid_raw_promotion'} and written > 0 and written < total:\n"
+        "        os._exit(77)\n"
+        "w._MIGRATION_RAW_COPY_FAULT_HOOK=raw_checkpoint\n"
+        "if sys.argv[4] == 'migrate':\n"
+        "    m.migrate_storage_v3(sys.argv[1],sys.argv[2])\n"
+        "else:\n"
+        "    m.restore_pre_v3_backup(sys.argv[1],sys.argv[2])\n"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code, str(db), str(backup), checkpoint, operation],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
 
 
 def _seed_contract_only(path: Path, version: int) -> None:
@@ -187,6 +261,63 @@ def _seed_full_v2(path: Path, *, duplicate_revision: bool = False) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _write_post_migration_candidate(path: Path) -> None:
+    async def write_candidate() -> None:
+        engine = SQLiteVecEngine(str(path), _profile())
+        await engine.open()
+        try:
+            # The fixture already pins the exact stored profile used by this
+            # test. Provider compatibility is orthogonal to this rollback
+            # ordering regression, so exercise the real governed write path
+            # after marking that already-pinned profile compatible.
+            engine.embedding_compatibility_state = "COMPATIBLE"
+            engine.embedding_compatibility_reason = None
+            record = {
+                "record_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "memory_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "revision": 1,
+                "parent_record_id": None,
+                "scope": "PROJECT",
+                "project_id": "p1",
+                "worktree_id": None,
+                "workflow_id": None,
+                "agent_id": None,
+                "memory_type": "PROJECT_LEARNED_FACT",
+                "fact": "This write happened after migration.",
+                "source_provenance": {
+                    "source_class": "TEST",
+                    "source_ref": "post-migration",
+                    "source_hash": "c" * 64,
+                    "review_ref": "post-migration",
+                    "extraction_method": "fixture",
+                },
+                "source_timestamp": "2026-11-06T19:00:00Z",
+                "created_at": "2026-11-06T19:00:00Z",
+                "last_verified_at": "2026-11-06T19:00:00Z",
+                "verified_by": "OWNER",
+                "authority_role": "PROJECT_CURRENT",
+                "contribution_origin": {"contributor_class": "OWNER", "contributor_ref": "post-migration"},
+                "freshness_policy": {"kind": "manual"},
+                "supersedes": [],
+                "contradiction_key": "post-migration",
+                "contradiction_state": "NONE",
+                "confidence": 1.0,
+                "tags": [],
+                "lifecycle_state": "CANDIDATE",
+                "native_content_hash": "c" * 64,
+                "payload_fingerprint": "d" * 64,
+                "idempotency_key": "post-migration-write-1",
+                "embedding_profile_id": _profile().profile_id,
+                "embedding_model_digest": _profile().model_digest,
+                "embedding_output_dimension": _profile().output_dimension,
+            }
+            await engine.write_record(record, [0.0, 1.0] + [0.0] * 254)
+        finally:
+            await engine.close()
+
+    asyncio.run(write_candidate())
 
 
 def test_fresh_runtime_creates_storage_v3_schema() -> None:
@@ -409,11 +540,8 @@ def test_v3_preflight_rejects_weakened_lifecycle_table_check_before_backend(tmp_
 
 def test_explicit_v2_to_v3_migration_creates_verified_backup_and_restores(tmp_path: Path) -> None:
     db = tmp_path / "migrate.db"
-    backup = tmp_path / "migrate.pre-v3.db"
+    backup = _migration_artifact_dir(tmp_path) / "migrate.pre-v3.db"
     _seed_full_v2(db)
-    if os.name == "nt":
-        _assert_windows_maintenance_hold_no_mutation(db, backup)
-        return
     result = migrate_storage_v3(str(db), str(backup))
     assert result["status"] == "OK"
     assert result["from_contract"] == 2
@@ -451,6 +579,544 @@ def test_explicit_v2_to_v3_migration_creates_verified_backup_and_restores(tmp_pa
         assert conn.execute("SELECT COUNT(*) FROM memories WHERE content_hash=?", ("a" * 64,)).fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_frozen_v014_v2_fixture_migrates_and_rolls_back_exactly(tmp_path: Path) -> None:
+    db = _copy_frozen_v014_v2_fixture(tmp_path)
+    backup = _migration_artifact_dir(tmp_path) / "frozen-v014.pre-v3.db"
+
+    result = migrate_storage_v3(str(db), str(backup))
+    assert result["status"] == "OK"
+    assert result["from_contract"] == 2
+    assert result["to_contract"] == 3
+    assert inspect_storage_contract_version(str(db)) == 3
+    backup_sha = _digest(backup)
+    assert result["backup_sha256"] == backup_sha
+    assert inspect_storage_contract_version(str(backup)) == 2
+
+    restored = restore_pre_v3_backup(str(db), str(backup))
+    assert restored["status"] == "OK"
+    assert restored["restored_contract"] == 2
+    assert inspect_storage_contract_version(str(db)) == 2
+    assert _digest(db) == backup_sha
+    engine = SQLiteVecEngine(str(db), _profile())
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+    assert exc_info.value.code == "MIGRATION_REQUIRED"
+
+
+@native_windows
+@pytest.mark.parametrize(
+    ("checkpoint", "expected_contract", "expected_journal"),
+    [
+        ("after_backup_manifest", 2, "wal"),
+        # These checkpoints now occur only on the owner-private staged copy;
+        # the active database family remains exact v2/WAL until durable
+        # rollback intent exists and raw in-place promotion begins.
+        ("after_transition_to_mutation", 2, "wal"),
+        ("after_v3_commit", 2, "wal"),
+    ],
+)
+def test_windows_migration_hard_crash_resumes_verified_artifacts(
+    tmp_path: Path,
+    checkpoint: str,
+    expected_contract: int,
+    expected_journal: str,
+) -> None:
+    db = tmp_path / f"{checkpoint}.db"
+    backup = _migration_artifact_dir(tmp_path) / f"{checkpoint}.pre-v3.db"
+    _seed_full_v2(db)
+
+    crashed = _run_windows_crash_checkpoint(
+        db,
+        backup,
+        operation="migrate",
+        checkpoint=checkpoint,
+    )
+    assert crashed.returncode == 77, (crashed.stdout, crashed.stderr)
+    assert backup.is_file()
+    assert Path(str(backup) + ".factlane-v3-backup.json").is_file()
+    assert inspect_storage_contract_version(str(db)) == expected_contract
+    probe = sqlite3.connect(db)
+    try:
+        assert probe.execute("PRAGMA journal_mode").fetchone() == (expected_journal,)
+    finally:
+        probe.close()
+
+    resumed = migrate_storage_v3(str(db), str(backup))
+    assert resumed["status"] == "OK"
+    assert resumed["resumed"] is True
+    assert inspect_storage_contract_version(str(db)) == 3
+    probe = sqlite3.connect(db)
+    try:
+        assert probe.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert probe.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        assert probe.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    finally:
+        probe.close()
+
+
+@native_windows
+def test_windows_migration_publishes_verified_rollback_intent_before_raw_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from factlane.windows_maintenance import WindowsMigrationArtifactCustody, WindowsStagedMigrationLease
+
+    db = tmp_path / "intent-before-promotion.db"
+    backup = _migration_artifact_dir(tmp_path) / "intent-before-promotion.pre-v3.db"
+    _seed_full_v2(db)
+    intent = migration_module._windows_rollback_intent_path(db)
+    original = WindowsStagedMigrationLease.promote_frozen_stage
+    observed: list[dict[str, object]] = []
+
+    def checked_promote(self, **kwargs):
+        assert intent.is_file()
+        with WindowsMigrationArtifactCustody.open_existing(intent) as guard:
+            receipt = guard.read_exact()
+            payload = json.loads(bytes(receipt["data"]).decode("utf-8"))
+            assert payload["kind"] == "FACTLANE_PRE_V3_ROLLBACK_INTENT"
+            assert payload["target_file_id"] == self.identity.file_id.hex()
+            observed.append(payload)
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(WindowsStagedMigrationLease, "promote_frozen_stage", checked_promote)
+    result = migrate_storage_v3(str(db), str(backup))
+    assert result["status"] == "OK"
+    assert len(observed) == 1
+    assert not intent.exists()
+    assert inspect_storage_contract_version(str(db)) == 3
+
+
+@native_windows
+def test_windows_migration_mid_raw_promotion_crash_restores_exact_v2_then_retries(
+    tmp_path: Path,
+) -> None:
+    from factlane.windows_maintenance import WindowsStagedMigrationLease
+
+    db = tmp_path / "mid-raw-promotion.db"
+    backup = _migration_artifact_dir(tmp_path) / "mid-raw-promotion.pre-v3.db"
+    _seed_full_v2(db)
+    initial = WindowsStagedMigrationLease.acquire(db)
+    original_file_id = initial.identity.file_id
+    initial.release_unmutated()
+
+    crashed = _run_windows_crash_checkpoint(
+        db,
+        backup,
+        operation="migrate",
+        checkpoint="mid_raw_promotion",
+    )
+    assert crashed.returncode == 77, (crashed.stdout, crashed.stderr)
+    intent = migration_module._windows_rollback_intent_path(db)
+    assert intent.is_file()
+    assert backup.is_file()
+    assert Path(str(backup) + ".factlane-v3-backup.json").is_file()
+
+    resumed = migrate_storage_v3(str(db), str(backup))
+    assert resumed["status"] == "OK"
+    assert resumed["resumed"] is True
+    assert not intent.exists()
+    assert inspect_storage_contract_version(str(db)) == 3
+    final = WindowsStagedMigrationLease.acquire(db)
+    try:
+        assert final.identity.file_id == original_file_id
+    finally:
+        final.release_unmutated()
+
+
+@native_windows
+def test_windows_restore_hard_crash_after_raw_exact_restore_is_resumable_without_byte_change(tmp_path: Path) -> None:
+    db = tmp_path / "raw-restore-crash.db"
+    backup = _migration_artifact_dir(tmp_path) / "raw-restore-crash.pre-v3.db"
+    _seed_full_v2(db)
+    migrated = migrate_storage_v3(str(db), str(backup))
+    backup_sha = str(migrated["backup_sha256"])
+
+    crashed = _run_windows_crash_checkpoint(
+        db,
+        backup,
+        operation="restore",
+        checkpoint="after_exact_restore",
+    )
+    assert crashed.returncode == 77, (crashed.stdout, crashed.stderr)
+    assert _digest(db) == backup_sha
+    assert inspect_storage_contract_version(str(db)) == 2
+    assert not Path(str(db) + "-wal").exists()
+    assert not Path(str(db) + "-shm").exists()
+
+    restored = restore_pre_v3_backup(str(db), str(backup))
+    assert restored["status"] == "OK"
+    assert restored["restored_contract"] == 2
+    assert _digest(db) == backup_sha
+    engine = SQLiteVecEngine(str(db), _profile())
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+    assert exc_info.value.code == "MIGRATION_REQUIRED"
+
+
+@native_windows
+def test_windows_restore_hard_crash_mid_raw_copy_retries_without_sqlite_and_consumes_intent(tmp_path: Path) -> None:
+    db = tmp_path / "mid-raw-restore-crash.db"
+    artifacts = _migration_artifact_dir(tmp_path)
+    backup = artifacts / "mid-raw-restore-crash.pre-v3.db"
+    blocked_backup = artifacts / "blocked-while-rollback-pending.pre-v3.db"
+    _seed_full_v2(db)
+    migrated = migrate_storage_v3(str(db), str(backup))
+    backup_sha = str(migrated["backup_sha256"])
+    assert backup.stat().st_size > 1024 * 1024
+
+    crashed = _run_windows_crash_checkpoint(
+        db,
+        backup,
+        operation="restore",
+        checkpoint="mid_raw_restore",
+    )
+    assert crashed.returncode == 77, (crashed.stdout, crashed.stderr)
+    intent = migration_module._windows_rollback_intent_path(db)
+    assert intent.is_file()
+
+    with pytest.raises(AdapterError) as blocked:
+        migrate_storage_v3(str(db), str(blocked_backup))
+    assert blocked.value.code == "MIGRATION_HOLD"
+    assert "unresolved exact-rollback intent" in blocked.value.safe_message
+
+    restored = restore_pre_v3_backup(str(db), str(backup))
+    assert restored["status"] == "OK"
+    assert restored["restored_contract"] == 2
+    assert _digest(db) == backup_sha
+    assert not intent.exists()
+    assert not Path(str(db) + "-wal").exists()
+    assert not Path(str(db) + "-shm").exists()
+    engine = SQLiteVecEngine(str(db), _profile())
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+    assert exc_info.value.code == "MIGRATION_REQUIRED"
+
+
+@native_windows
+def test_windows_successful_rollback_consumes_intent_and_old_backup_cannot_overwrite_later_v3(tmp_path: Path) -> None:
+    db = tmp_path / "one-shot-intent.db"
+    artifacts = _migration_artifact_dir(tmp_path)
+    old_backup = artifacts / "old.pre-v3.db"
+    new_backup = artifacts / "new.pre-v3.db"
+    _seed_full_v2(db)
+
+    migrate_storage_v3(str(db), str(old_backup))
+    restore_pre_v3_backup(str(db), str(old_backup))
+    intent = migration_module._windows_rollback_intent_path(db)
+    assert not intent.exists()
+
+    remigrated = migrate_storage_v3(str(db), str(new_backup))
+    assert remigrated["status"] == "OK"
+    _write_post_migration_candidate(db)
+    before = {
+        suffix: _digest(Path(str(db) + suffix))
+        for suffix in ("", "-wal", "-shm")
+    }
+
+    with pytest.raises(AdapterError) as exc_info:
+        restore_pre_v3_backup(str(db), str(old_backup))
+    assert exc_info.value.code == "ROLLBACK_HOLD"
+    assert "not bound to the requested pre-v3 backup" in exc_info.value.safe_message
+    assert {
+        suffix: _digest(Path(str(db) + suffix))
+        for suffix in ("", "-wal", "-shm")
+    } == before
+
+
+@native_windows
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "after_manifest_publication",
+        "after_schema_transaction",
+        "after_contract_version_write",
+        "after_sidecar_cleanup",
+        "after_migration_post_verification",
+    ],
+)
+def test_windows_migration_canonical_hard_crash_boundaries_resume_without_preopen(
+    tmp_path: Path,
+    checkpoint: str,
+) -> None:
+    db = tmp_path / f"canonical-{checkpoint}.db"
+    backup = _migration_artifact_dir(tmp_path) / f"canonical-{checkpoint}.pre-v3.db"
+    _seed_full_v2(db)
+
+    crashed = _run_windows_crash_checkpoint(
+        db,
+        backup,
+        operation="migrate",
+        checkpoint=checkpoint,
+    )
+    assert crashed.returncode == 77, (crashed.stdout, crashed.stderr)
+    assert backup.is_file()
+    assert Path(str(backup) + ".factlane-v3-backup.json").is_file()
+
+    # Resume directly: no inspection may open/recover the live SQLite target first.
+    resumed = migrate_storage_v3(str(db), str(backup))
+    assert resumed["status"] == "OK"
+    assert resumed["resumed"] is True
+    assert inspect_storage_contract_version(str(db)) == 3
+    probe = sqlite3.connect(db)
+    try:
+        assert probe.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert probe.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        assert probe.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    finally:
+        probe.close()
+
+
+@native_windows
+def test_windows_crash_after_backup_publication_preserves_usable_v2_and_holds_incomplete_artifacts(tmp_path: Path) -> None:
+    db = tmp_path / "backup-publication.db"
+    backup = _migration_artifact_dir(tmp_path) / "backup-publication.pre-v3.db"
+    _seed_full_v2(db)
+
+    crashed = _run_windows_crash_checkpoint(
+        db,
+        backup,
+        operation="migrate",
+        checkpoint="after_backup_publication",
+    )
+    assert crashed.returncode == 77, (crashed.stdout, crashed.stderr)
+    assert backup.is_file()
+    assert not Path(str(backup) + ".factlane-v3-backup.json").exists()
+    assert inspect_storage_contract_version(str(db)) == 2
+    probe = sqlite3.connect(db)
+    try:
+        assert probe.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        assert probe.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    finally:
+        probe.close()
+    with pytest.raises(AdapterError) as held:
+        migrate_storage_v3(str(db), str(backup))
+    assert held.value.code == "BACKUP_INVALID"
+
+
+@native_windows
+@pytest.mark.parametrize("checkpoint", ["after_sidecar_cleanup", "after_rollback_intent_publication", "after_restore_post_verification"])
+def test_windows_restore_canonical_hard_crash_boundaries_retry_exactly(
+    tmp_path: Path,
+    checkpoint: str,
+) -> None:
+    db = tmp_path / f"restore-{checkpoint}.db"
+    backup = _migration_artifact_dir(tmp_path) / f"restore-{checkpoint}.pre-v3.db"
+    _seed_full_v2(db)
+    migrated = migrate_storage_v3(str(db), str(backup))
+    backup_sha = str(migrated["backup_sha256"])
+
+    crashed = _run_windows_crash_checkpoint(
+        db,
+        backup,
+        operation="restore",
+        checkpoint=checkpoint,
+    )
+    assert crashed.returncode == 77, (crashed.stdout, crashed.stderr)
+
+    restored = restore_pre_v3_backup(str(db), str(backup))
+    assert restored["status"] == "OK"
+    assert _digest(db) == backup_sha
+    assert inspect_storage_contract_version(str(db)) == 2
+    assert not migration_module._windows_rollback_intent_path(db).exists()
+
+
+@native_windows
+def test_windows_backup_and_manifest_read_custody_denies_same_user_external_write_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = tmp_path / "artifact-custody.db"
+    backup = _migration_artifact_dir(tmp_path) / "artifact-custody.pre-v3.db"
+    manifest = Path(str(backup) + ".factlane-v3-backup.json")
+    _seed_full_v2(db)
+    before = {
+        suffix: _digest(Path(str(db) + suffix))
+        for suffix in ("", "-wal", "-shm")
+    }
+    attempted = False
+
+    def checkpoint(name: str) -> None:
+        nonlocal attempted
+        if name != "after_backup_manifest":
+            return
+        attempted = True
+        for artifact in (backup, manifest):
+            contender = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; f=open(sys.argv[1],'r+b',buffering=0); f.write(b'X'); f.close()",
+                    str(artifact),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            assert contender.returncode != 0
+            assert "PermissionError" in contender.stderr or "WinError 32" in contender.stderr
+        raise migration_module.MigrationHold("MIGRATION_HOLD", "injected stop after restrictive artifact custody")
+
+    monkeypatch.setattr(migration_module, "_windows_migration_checkpoint", checkpoint)
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "MIGRATION_HOLD"
+    assert attempted is True
+    assert {
+        suffix: _digest(Path(str(db) + suffix))
+        for suffix in ("", "-wal", "-shm")
+    } == before
+
+
+@native_windows
+def test_windows_resume_rejects_tampered_manifest_before_source_mutation(tmp_path: Path) -> None:
+    db = tmp_path / "tampered-manifest.db"
+    backup = _migration_artifact_dir(tmp_path) / "tampered-manifest.pre-v3.db"
+    _seed_full_v2(db)
+
+    crashed = _run_windows_crash_checkpoint(
+        db,
+        backup,
+        operation="migrate",
+        checkpoint="after_backup_manifest",
+    )
+    assert crashed.returncode == 77, (crashed.stdout, crashed.stderr)
+    manifest = Path(str(backup) + ".factlane-v3-backup.json")
+    assert manifest.is_file()
+    manifest.write_bytes(b'{"kind":"TAMPERED"}\n')
+    before = {
+        suffix: _digest(Path(str(db) + suffix))
+        for suffix in ("", "-wal", "-shm")
+    }
+
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "BACKUP_INVALID"
+    assert {
+        suffix: _digest(Path(str(db) + suffix))
+        for suffix in ("", "-wal", "-shm")
+    } == before
+    assert inspect_storage_contract_version(str(db)) == 2
+
+
+@native_windows
+def test_windows_resume_rejects_same_path_target_replacement_before_mutation(tmp_path: Path) -> None:
+    db = tmp_path / "replaced-target.db"
+    replacement = tmp_path / "replacement-v2.db"
+    backup = _migration_artifact_dir(tmp_path) / "replaced-target.pre-v3.db"
+    _seed_full_v2(db)
+
+    crashed = _run_windows_crash_checkpoint(
+        db,
+        backup,
+        operation="migrate",
+        checkpoint="after_backup_manifest",
+    )
+    assert crashed.returncode == 77, (crashed.stdout, crashed.stderr)
+    _seed_full_v2(replacement)
+    os.replace(replacement, db)
+    before = {
+        suffix: _digest(Path(str(db) + suffix))
+        for suffix in ("", "-wal", "-shm")
+    }
+
+    with pytest.raises(AdapterError) as exc_info:
+        migrate_storage_v3(str(db), str(backup))
+    assert exc_info.value.code == "ROLLBACK_HOLD"
+    assert "different database file identity" in exc_info.value.safe_message
+    assert {
+        suffix: _digest(Path(str(db) + suffix))
+        for suffix in ("", "-wal", "-shm")
+    } == before
+    assert inspect_storage_contract_version(str(db)) == 2
+
+
+@native_windows
+def test_windows_exact_restored_bytes_with_unexpected_sidecar_hold_without_mutation(tmp_path: Path) -> None:
+    db = tmp_path / "exact-with-sidecar.db"
+    backup = _migration_artifact_dir(tmp_path) / "exact-with-sidecar.pre-v3.db"
+    _seed_full_v2(db)
+    migrated = migrate_storage_v3(str(db), str(backup))
+    backup_sha = str(migrated["backup_sha256"])
+
+    backup_bytes = backup.read_bytes()
+    with db.open("r+b", buffering=0) as stream:
+        stream.write(backup_bytes)
+        stream.truncate(len(backup_bytes))
+        stream.flush()
+        os.fsync(stream.fileno())
+    wal = Path(str(db) + "-wal")
+    wal.write_bytes(b"unexpected-sidecar-state")
+    before = {
+        "db": _digest(db),
+        "wal": _digest(wal),
+        "shm": _digest(Path(str(db) + "-shm")),
+    }
+    assert before["db"] == backup_sha
+
+    with pytest.raises(AdapterError) as exc_info:
+        restore_pre_v3_backup(str(db), str(backup))
+    assert exc_info.value.code == "ROLLBACK_HOLD"
+    assert "WAL/SHM" in exc_info.value.safe_message
+    assert {
+        "db": _digest(db),
+        "wal": _digest(wal),
+        "shm": _digest(Path(str(db) + "-shm")),
+    } == before
+
+
+@native_windows
+def test_windows_restore_rejects_same_file_id_later_v3_write_without_mutation(tmp_path: Path) -> None:
+    db = tmp_path / "later-v3-write.db"
+    backup = _migration_artifact_dir(tmp_path) / "later-v3-write.pre-v3.db"
+    _seed_full_v2(db)
+    migrate_storage_v3(str(db), str(backup))
+    _write_post_migration_candidate(db)
+    before = {
+        suffix: _digest(Path(str(db) + suffix))
+        for suffix in ("", "-wal", "-shm")
+    }
+
+    with pytest.raises(AdapterError) as exc_info:
+        restore_pre_v3_backup(str(db), str(backup))
+    assert exc_info.value.code == "ROLLBACK_HOLD"
+    assert "accepted changes after migration" in exc_info.value.safe_message
+    assert {
+        suffix: _digest(Path(str(db) + suffix))
+        for suffix in ("", "-wal", "-shm")
+    } == before
+
+
+@native_windows
+def test_windows_restore_rejects_same_file_id_binding_tamper_without_mutation(tmp_path: Path) -> None:
+    db = tmp_path / "binding-tamper.db"
+    backup = _migration_artifact_dir(tmp_path) / "binding-tamper.pre-v3.db"
+    _seed_full_v2(db)
+    migrate_storage_v3(str(db), str(backup))
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "UPDATE adapter_meta SET value=? WHERE key=?",
+            ('{"tampered":true}', migration_module._WINDOWS_MIGRATION_BINDING_KEY),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    before = {
+        suffix: _digest(Path(str(db) + suffix))
+        for suffix in ("", "-wal", "-shm")
+    }
+
+    with pytest.raises(AdapterError) as exc_info:
+        restore_pre_v3_backup(str(db), str(backup))
+    assert exc_info.value.code == "ROLLBACK_HOLD"
+    assert "not bound to the requested pre-v3 backup" in exc_info.value.safe_message
+    assert {
+        suffix: _digest(Path(str(db) + suffix))
+        for suffix in ("", "-wal", "-shm")
+    } == before
 
 
 @pytest.mark.skipif(os.name == "nt", reason="secure migration execution is POSIX-only")
@@ -975,9 +1641,6 @@ def test_migration_refuses_materialized_v2_without_profile_binding_before_backup
         conn.commit()
     finally:
         conn.close()
-    if os.name == "nt":
-        _assert_windows_maintenance_hold_no_mutation(db, backup)
-        return
     with pytest.raises(AdapterError) as exc_info:
         migrate_storage_v3(str(db), str(backup))
     assert exc_info.value.code == "PROFILE_MISMATCH"
@@ -995,9 +1658,6 @@ def test_migration_refuses_incomplete_pinned_native_schema_before_backup(tmp_pat
         conn.commit()
     finally:
         conn.close()
-    if os.name == "nt":
-        _assert_windows_maintenance_hold_no_mutation(db, backup)
-        return
     with pytest.raises(AdapterError) as exc_info:
         migrate_storage_v3(str(db), str(backup))
     assert exc_info.value.code == "SCHEMA_MISMATCH"
@@ -1015,9 +1675,6 @@ def test_migration_refuses_unknown_v2_table_before_backup(tmp_path: Path) -> Non
         conn.commit()
     finally:
         conn.close()
-    if os.name == "nt":
-        _assert_windows_maintenance_hold_no_mutation(db, backup)
-        return
     with pytest.raises(AdapterError) as exc_info:
         migrate_storage_v3(str(db), str(backup))
     assert exc_info.value.code == "SCHEMA_MISMATCH"
@@ -1027,7 +1684,7 @@ def test_migration_refuses_unknown_v2_table_before_backup(tmp_path: Path) -> Non
 
 def test_migration_schema_failure_rolls_back_transaction_and_keeps_verified_backup(tmp_path: Path, monkeypatch) -> None:
     db = tmp_path / "crash-atomic.db"
-    backup = tmp_path / "crash-atomic.pre-v3.db"
+    backup = _migration_artifact_dir(tmp_path) / "crash-atomic.pre-v3.db"
     _seed_full_v2(db)
     original = migration_module._create_v3_governance_schema
 
@@ -1035,9 +1692,6 @@ def test_migration_schema_failure_rolls_back_transaction_and_keeps_verified_back
         original(conn)
         raise RuntimeError("injected-after-v3-schema")
 
-    if os.name == "nt":
-        _assert_windows_maintenance_hold_no_mutation(db, backup)
-        return
     monkeypatch.setattr(migration_module, "_create_v3_governance_schema", fail_after_schema)
     with pytest.raises(RuntimeError, match="injected-after-v3-schema"):
         migrate_storage_v3(str(db), str(backup))

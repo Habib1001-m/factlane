@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import inspect
 import math
 import re
+import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -131,6 +134,8 @@ class OwnerOperationsService:
         self._maintenance_gate = owner_control._maintenance_gate
         self._runtime_observer = runtime_observer
         self._config = config_adapter
+        self._housekeeping_jobs: dict[str, dict[str, Any]] = {}
+        self._housekeeping_tasks: dict[str, asyncio.Task[Any]] = {}
 
     def _rebind_owner_adapter(self) -> None:
         if self._maintenance_gate.state != OwnerAdapterMaintenanceGate.REOPENING:
@@ -252,7 +257,7 @@ class OwnerOperationsService:
                 }
             )
 
-        return {
+        preview = {
             "status": "PREVIEW",
             "request_id": self._request_id(request_id),
             "scope": scope_context.to_dict(),
@@ -270,7 +275,44 @@ class OwnerOperationsService:
             "blockers": blockers,
             "capacity": capacity,
             "capacity_requirement_met": capacity_met,
+            "reclaim_estimate": {
+                "observation": "UNKNOWN",
+                "bytes": None,
+                "reason": "physical reclaim depends on SQLite page and file layout",
+            },
         }
+        preview["preview_digest"] = hashlib.sha256(
+            canonical_json(
+                {
+                    "scope": preview["scope"],
+                    "max_records": preview["max_records"],
+                    "required_free_bytes": preview["required_free_bytes"],
+                    "eligibility": {
+                        "compaction_ready": {
+                            "observation": ready.get("observation"),
+                            "value": ready.get("value"),
+                        },
+                        "compaction_blocked_partial": {
+                            "observation": blocked.get("observation"),
+                            "value": blocked.get("value"),
+                        },
+                        "selected_upper_bound": preview["eligibility"]["selected_upper_bound"],
+                        "validated_current": preview["eligibility"]["validated_current"],
+                    },
+                    "blockers": [
+                        {"code": item.get("code"), "count": item.get("count")}
+                        for item in preview["blockers"]
+                    ],
+                    "capacity": {
+                        "observation": capacity.get("observation"),
+                        "filesystem_free_bytes": capacity.get("filesystem_free_bytes"),
+                    },
+                    "capacity_requirement_met": preview["capacity_requirement_met"],
+                    "reclaim_estimate": preview["reclaim_estimate"],
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        return preview
 
     @owner_adapter_request
     async def run_housekeeping(
@@ -284,6 +326,8 @@ class OwnerOperationsService:
         workflow_id: str | None = None,
         agent_id: str | None = None,
         request_id: str | None = None,
+        progress_callback: Any = None,
+        cancel_requested: Any = None,
     ) -> dict[str, Any]:
         page_limit, free_requirement = self._housekeeping_inputs(max_records, required_free_bytes)
         scope_context = self._scope(scope, project_id, worktree_id, workflow_id, agent_id)
@@ -291,6 +335,8 @@ class OwnerOperationsService:
             scope_context,
             max_records=page_limit,
             required_free_bytes=free_requirement,
+            progress_callback=progress_callback,
+            cancel_requested=cancel_requested,
         )
         return {
             "status": "OK",
@@ -298,6 +344,177 @@ class OwnerOperationsService:
             "scope": scope_context.to_dict(),
             **outcome,
         }
+
+    @staticmethod
+    def _public_housekeeping_job(job: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "job_id": job["job_id"],
+            "operation_id": job["operation_id"],
+            "kind": "HOUSEKEEPING",
+            "phase": job["phase"],
+            "scope": job["scope"],
+            "max_records": job["max_records"],
+            "required_free_bytes": job["required_free_bytes"],
+            "preview_digest": job["preview_digest"],
+            "progress": dict(job["progress"]),
+            "cancel_requested": bool(job["cancel_requested"]),
+            "result": job.get("result"),
+            "error": job.get("error"),
+            "created_at": job["created_at"],
+            "updated_at": job["updated_at"],
+        }
+
+    def _prune_housekeeping_jobs(self) -> None:
+        terminal = [
+            item
+            for item in self._housekeeping_jobs.values()
+            if item["phase"] in {"SUCCEEDED", "FAILED", "CANCELLED"}
+        ]
+        terminal.sort(key=lambda item: (item["updated_at"], item["job_id"]))
+        while len(self._housekeeping_jobs) >= 128 and terminal:
+            victim = terminal.pop(0)
+            self._housekeeping_jobs.pop(victim["job_id"], None)
+            self._housekeeping_tasks.pop(victim["job_id"], None)
+        if len(self._housekeeping_jobs) >= 128:
+            raise AdapterError("HOUSEKEEPING_JOB_LIMIT", "too many housekeeping jobs are active")
+
+    async def begin_housekeeping_job(
+        self,
+        *,
+        scope: str,
+        max_records: int,
+        required_free_bytes: int,
+        preview_digest: str,
+        project_id: str | None = None,
+        worktree_id: str | None = None,
+        workflow_id: str | None = None,
+        agent_id: str | None = None,
+        request_id: str | None = None,
+        on_complete: Any = None,
+    ) -> dict[str, Any]:
+        preview = await self.housekeeping_preview(
+            scope=scope,
+            project_id=project_id,
+            worktree_id=worktree_id,
+            workflow_id=workflow_id,
+            agent_id=agent_id,
+            max_records=max_records,
+            required_free_bytes=required_free_bytes,
+            request_id=request_id,
+        )
+        if preview_digest != preview["preview_digest"]:
+            raise AdapterError("HOUSEKEEPING_PREVIEW_STALE", "housekeeping preview changed before job start")
+        self._prune_housekeeping_jobs()
+        job_id = str(uuid.uuid4())
+        operation_id = self._request_id(request_id)
+        now = iso_now()
+        job = {
+            "job_id": job_id,
+            "operation_id": operation_id,
+            "phase": "QUEUED",
+            "scope": preview["scope"],
+            "max_records": preview["max_records"],
+            "required_free_bytes": preview["required_free_bytes"],
+            "preview_digest": preview_digest,
+            "progress": {
+                "selected_records": preview["eligibility"]["selected_upper_bound"],
+                "compacted_records": 0,
+                "cancellation_boundary": "BETWEEN_RECORDS",
+                "reclaim_estimate": preview["reclaim_estimate"],
+            },
+            "cancel_requested": False,
+            "result": None,
+            "error": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        self._housekeeping_jobs[job_id] = job
+        self._housekeeping_tasks[job_id] = asyncio.create_task(
+            self._execute_housekeeping_job(
+                job_id,
+                scope=scope,
+                project_id=project_id,
+                worktree_id=worktree_id,
+                workflow_id=workflow_id,
+                agent_id=agent_id,
+                on_complete=on_complete,
+            )
+        )
+        return self._public_housekeeping_job(job)
+
+    async def _execute_housekeeping_job(
+        self,
+        job_id: str,
+        *,
+        scope: str,
+        project_id: str | None,
+        worktree_id: str | None,
+        workflow_id: str | None,
+        agent_id: str | None,
+        on_complete: Any,
+    ) -> None:
+        job = self._housekeeping_jobs[job_id]
+        job["phase"] = "RUNNING"
+        job["updated_at"] = iso_now()
+
+        def progress(compacted: int, selected: int) -> None:
+            job["progress"]["selected_records"] = selected
+            job["progress"]["compacted_records"] = compacted
+            job["updated_at"] = iso_now()
+
+        try:
+            result = await self.run_housekeeping(
+                scope=scope,
+                project_id=project_id,
+                worktree_id=worktree_id,
+                workflow_id=workflow_id,
+                agent_id=agent_id,
+                max_records=job["max_records"],
+                required_free_bytes=job["required_free_bytes"],
+                request_id=job["operation_id"],
+                progress_callback=progress,
+                cancel_requested=lambda: bool(job["cancel_requested"]),
+            )
+            phase = "CANCELLED" if result.get("outcome") == "HOUSEKEEPING_CANCELLED" else "SUCCEEDED"
+            job["result"] = result
+        except Exception as exc:
+            phase = "FAILED"
+            job["error"] = {
+                "code": getattr(exc, "code", type(exc).__name__),
+                "message": str(exc),
+            }
+        completion = {**self._public_housekeeping_job(job), "phase": phase}
+        if callable(on_complete):
+            try:
+                callback_result = on_complete(completion)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
+            except Exception as exc:
+                phase = "FAILED"
+                job["error"] = {
+                    "code": getattr(exc, "code", "ACTIVITY_JOURNAL_WRITE_FAILED"),
+                    "message": str(exc),
+                }
+        job["phase"] = phase
+        job["updated_at"] = iso_now()
+
+    async def housekeeping_job_status(self, job_id: str) -> dict[str, Any]:
+        try:
+            normalized = str(uuid.UUID(job_id))
+        except (ValueError, AttributeError) as exc:
+            raise AdapterError("HOUSEKEEPING_JOB_INVALID", "housekeeping job identity is invalid") from exc
+        job = self._housekeeping_jobs.get(normalized)
+        if job is None:
+            raise AdapterError("HOUSEKEEPING_JOB_NOT_FOUND", "housekeeping job was not found")
+        return self._public_housekeeping_job(job)
+
+    async def cancel_housekeeping_job(self, job_id: str) -> dict[str, Any]:
+        job = await self.housekeeping_job_status(job_id)
+        live = self._housekeeping_jobs[job["job_id"]]
+        if live["phase"] in {"QUEUED", "RUNNING"}:
+            live["cancel_requested"] = True
+            live["updated_at"] = iso_now()
+        return self._public_housekeeping_job(live)
 
     @staticmethod
     def _permission_list(value: Any, field: str) -> list[str]:
