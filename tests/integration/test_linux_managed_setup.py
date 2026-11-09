@@ -764,6 +764,20 @@ def test_caddy_rollback_removes_exact_runtime_certificate_state_and_empty_locks(
         target.chmod(0o600)
     locks = caddy_state / "locks"
     locks.mkdir(mode=0o700)
+    last_clean = caddy_state / "last_clean.json"
+    last_clean.write_text(
+        json.dumps(
+            {
+                "tls": {
+                    "timestamp": "2026-11-09T20:03:35.963871443+02:00",
+                    "instance_id": "6a1e14dc-7997-4fdf-a373-f1804ff7001b",
+                }
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    last_clean.chmod(0o600)
 
     retry = ProductionLinuxInstallerBackend(
         systemctl_path="/usr/bin/systemctl",
@@ -773,6 +787,64 @@ def test_caddy_rollback_removes_exact_runtime_certificate_state_and_empty_locks(
     result = retry.rollback_setup(plan=receipt.plan, completed_operations=())
     assert result.status is InstallerStepStatus.APPLIED
     assert not caddy_state.exists()
+
+
+def test_caddy_rollback_rejects_foreign_last_clean_marker(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal_op = receipt.operations[0]
+    caddy_op = next(op for op in receipt.operations if op.kind == "BOOTSTRAP_CADDY_CA")
+    _, pem = _root_pem(tmp_path)
+    caddy_state = Path(receipt.plan.caddy_state_dir)
+
+    class Process:
+        stopped = False
+
+        def poll(self):
+            return 0 if self.stopped else None
+
+        def terminate(self):
+            self.stopped = True
+
+        def wait(self, timeout: float):
+            assert timeout == 2.0
+            return 0
+
+        def kill(self):
+            self.stopped = True
+
+    def factory(_argv: tuple[str, ...]):
+        target = caddy_state / "pki" / "authorities" / "local" / "root.crt"
+        target.parent.mkdir(parents=True)
+        target.write_text(pem, encoding="ascii")
+        target.chmod(0o600)
+        return Process()
+
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        caddy_path="/usr/bin/caddy",
+        owner_uid=os.getuid(),
+        caddy_bootstrap_process_factory=factory,
+    )
+    assert backend.apply_operation(journal_op, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    assert backend.apply_operation(caddy_op, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    marker = caddy_state / "last_clean.json"
+    marker.write_text(
+        '{"tls":{"timestamp":"not-rfc3339","instance_id":"6a1e14dc-7997-4fdf-a373-f1804ff7001b"}}',
+        encoding="utf-8",
+    )
+    marker.chmod(0o600)
+
+    retry = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+    )
+    assert retry.apply_operation(journal_op, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    result = retry.rollback_setup(plan=receipt.plan, completed_operations=())
+    assert result.status is InstallerStepStatus.RECOVERY_REQUIRED
+    assert marker.is_file()
+    assert _journal_payload(request)["phase"] == "RECOVERY_REQUIRED"
 
 
 def test_caddy_rollback_rejects_foreign_runtime_certificate_state(

@@ -37,6 +37,7 @@ from .maintenance_coordinator import (
     MaintenanceCoordinator,
     MaintenanceCoordinatorError,
     ResumeReport,
+    initialize_barrier_for_startup,
 )
 from .owner_auth import NativeConfirmation, NativeConfirmationRequest, OwnerAuthState
 from .owner_control import OwnerAdapterMaintenanceGate, OwnerControlService
@@ -2004,7 +2005,7 @@ def _build_maintenance(
     else:
         registry = RuntimeRegistry(runtime_root, owner_uid=owner_uid)
     barrier = MaintenanceBarrierStore(barrier_root, database_path)
-    barrier.initialize(generation=1)
+    initialize_barrier_for_startup(barrier, generation=1)
     runtime_client = _runtime_control_client_for_spec(spec, registry, owner_sid=owner_sid)
     coordinator = MaintenanceCoordinator(
         barrier=barrier,

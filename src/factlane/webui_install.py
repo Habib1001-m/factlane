@@ -12,6 +12,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from http.client import HTTPException, HTTPResponse
@@ -3637,6 +3638,9 @@ def _remove_owned_caddy_state_tree(
                 raise LinuxSetupRecoveryRequired("Caddy bootstrap state has foreign bytes")
             child.unlink()
             continue
+        if child.name == "last_clean.json":
+            _remove_owned_caddy_last_clean_marker(child, owner_uid=owner_uid)
+            continue
         raise LinuxSetupRecoveryRequired(
             "Caddy state contains unrelated top-level content; rollback will not remove it"
         )
@@ -3755,6 +3759,39 @@ def _remove_owned_caddy_state_tree(
             )
         locks.rmdir()
     path.rmdir()
+
+
+def _remove_owned_caddy_last_clean_marker(path: Path, *, owner_uid: int) -> None:
+    """Remove only Caddy's bounded storage-cleaning marker from setup-created state."""
+
+    info = _require_owner_private_regular_file(path, owner_uid=owner_uid)
+    if info.st_size > 1024:
+        raise LinuxSetupRecoveryRequired("Caddy last-clean marker exceeds the bounded schema")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LinuxSetupRecoveryRequired("Caddy last-clean marker is malformed") from exc
+    if not isinstance(payload, dict) or set(payload) != {"tls"}:
+        raise LinuxSetupRecoveryRequired("Caddy last-clean marker has foreign top-level fields")
+    tls = payload.get("tls")
+    if not isinstance(tls, dict) or set(tls) != {"timestamp", "instance_id"}:
+        raise LinuxSetupRecoveryRequired("Caddy last-clean marker has foreign TLS fields")
+    timestamp = tls.get("timestamp")
+    instance_id = tls.get("instance_id")
+    if not isinstance(timestamp, str) or re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
+        timestamp,
+    ) is None:
+        raise LinuxSetupRecoveryRequired("Caddy last-clean marker timestamp is invalid")
+    if not isinstance(instance_id, str):
+        raise LinuxSetupRecoveryRequired("Caddy last-clean marker instance identity is invalid")
+    try:
+        parsed = uuid.UUID(instance_id)
+    except ValueError as exc:
+        raise LinuxSetupRecoveryRequired("Caddy last-clean marker instance identity is invalid") from exc
+    if str(parsed) != instance_id.lower():
+        raise LinuxSetupRecoveryRequired("Caddy last-clean marker instance identity is non-canonical")
+    path.unlink()
 
 
 def _parse_linux_setup_journal(path: Path, *, owner_uid: int) -> dict[str, object]:

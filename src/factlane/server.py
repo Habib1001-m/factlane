@@ -17,7 +17,7 @@ from mcp.server.fastmcp import FastMCP
 from .adapter import PROFILE_DEFINITIONS, MemoryAdapter, trusted_write_context_for_profile
 from .contract import AdapterError, validate_identifier
 from .gateway import HostBinding, MemoryGateway, TrustedContextBinding
-from .maintenance_coordinator import MaintenanceBarrierStore
+from .maintenance_coordinator import MaintenanceBarrierStore, initialize_barrier_for_startup
 from .public_contract import (
     MemoryGetRequest,
     MemorySearchRequest,
@@ -320,7 +320,7 @@ def _build_runtime_session(
         info = os.stat(db_path)
         registry = RuntimeRegistry(root, owner_uid=os.getuid())
         barrier = MaintenanceBarrierStore(durable_root, db_path)
-    snapshot = barrier.initialize(generation=1)
+    snapshot = initialize_barrier_for_startup(barrier, generation=1)
     if (snapshot.device, snapshot.inode) != (info.st_dev, info.st_ino):
         raise AdapterError(
             "DATABASE_IDENTITY_MISMATCH",

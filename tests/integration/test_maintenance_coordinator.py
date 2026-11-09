@@ -22,6 +22,7 @@ from factlane.maintenance_coordinator import (
     MaintenanceCoordinatorError,
     PreparedMaintenance,
     ResumeReport,
+    initialize_barrier_for_startup,
 )
 from factlane.runtime_control import PROTOCOL_VERSION, RuntimeControlRequest, RuntimeIdentity, RuntimeRegistry
 
@@ -131,6 +132,91 @@ def test_barrier_guard_contention_fails_busy_instead_of_blocking_same_process(tm
         thread.join(timeout=0.2)
         assert result == ["BARRIER_BUSY"]
     thread.join(timeout=1)
+
+
+def test_startup_barrier_initialization_retries_only_transient_busy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "memory.db"
+    db_path.touch()
+    store = MaintenanceBarrierStore(tmp_path / "barrier", str(db_path))
+    original = store.initialize
+    calls = 0
+    now = 0.0
+    sleeps: list[float] = []
+
+    def flaky_initialize(*, generation: int):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise MaintenanceCoordinatorError("BARRIER_BUSY", "transient startup contention")
+        return original(generation=generation)
+
+    def clock() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    monkeypatch.setattr(store, "initialize", flaky_initialize)
+    snapshot = initialize_barrier_for_startup(
+        store,
+        generation=1,
+        busy_timeout_seconds=0.1,
+        poll_seconds=0.01,
+        clock=clock,
+        sleep=sleep,
+    )
+
+    assert snapshot.state == "RUNNING"
+    assert calls == 3
+    assert sleeps == [0.01, 0.01]
+
+
+def test_startup_barrier_initialization_preserves_non_busy_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "memory.db"
+    db_path.touch()
+    store = MaintenanceBarrierStore(tmp_path / "barrier", str(db_path))
+
+    def unavailable(*, generation: int):
+        del generation
+        raise MaintenanceCoordinatorError("BARRIER_UNAVAILABLE", "unsafe barrier")
+
+    monkeypatch.setattr(store, "initialize", unavailable)
+    with pytest.raises(MaintenanceCoordinatorError) as exc_info:
+        initialize_barrier_for_startup(store, generation=1)
+    assert exc_info.value.code == "BARRIER_UNAVAILABLE"
+
+
+def test_startup_barrier_initialization_busy_timeout_remains_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "memory.db"
+    db_path.touch()
+    store = MaintenanceBarrierStore(tmp_path / "barrier", str(db_path))
+    now = 0.0
+
+    def busy(*, generation: int):
+        del generation
+        raise MaintenanceCoordinatorError("BARRIER_BUSY", "still busy")
+
+    def clock() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(store, "initialize", busy)
+    with pytest.raises(MaintenanceCoordinatorError) as exc_info:
+        initialize_barrier_for_startup(
+            store,
+            generation=1,
+            busy_timeout_seconds=0.02,
+            poll_seconds=0.01,
+            clock=clock,
+            sleep=sleep,
+        )
+    assert exc_info.value.code == "BARRIER_BUSY"
+    assert now == pytest.approx(0.02)
 
 
 def test_coordinator_prepares_all_live_runtimes_then_resumes_initially_open_set(tmp_path: Path) -> None:

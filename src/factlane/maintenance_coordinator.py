@@ -33,6 +33,8 @@ from .windows_security import (
 
 
 _RUNTIME_RESUME_TIMEOUT_SECONDS = 5.0
+_STARTUP_BARRIER_BUSY_TIMEOUT_SECONDS = 2.0
+_STARTUP_BARRIER_BUSY_POLL_SECONDS = 0.01
 
 
 class MaintenanceCoordinatorError(RuntimeControlError):
@@ -40,6 +42,39 @@ class MaintenanceCoordinatorError(RuntimeControlError):
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(code, message)
+
+
+def initialize_barrier_for_startup(
+    barrier: MaintenanceBarrierStore,
+    *,
+    generation: int,
+    busy_timeout_seconds: float = _STARTUP_BARRIER_BUSY_TIMEOUT_SECONDS,
+    poll_seconds: float = _STARTUP_BARRIER_BUSY_POLL_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> BarrierSnapshot:
+    """Initialize/read the durable barrier while tolerating only transient guard contention.
+
+    Lifecycle operations keep their existing non-blocking fail-closed guard semantics.  This
+    helper is only for process startup, where several legitimate runtimes can race to read or
+    create the same short-lived barrier state before their lifecycle controllers attach.
+    """
+
+    if busy_timeout_seconds < 0:
+        raise ValueError("busy_timeout_seconds must be non-negative")
+    if poll_seconds <= 0:
+        raise ValueError("poll_seconds must be positive")
+    deadline = clock() + busy_timeout_seconds
+    while True:
+        try:
+            return barrier.initialize(generation=generation)
+        except MaintenanceCoordinatorError as exc:
+            if exc.code != "BARRIER_BUSY":
+                raise
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise
+            sleep(min(poll_seconds, remaining))
 
 
 def _canonical_uuid(value: str, field: str) -> str:
