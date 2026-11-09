@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -694,6 +696,118 @@ def test_file_rollback_restores_exact_preexisting_bytes_and_foreign_change_holds
     held = backend2.rollback_setup(plan=receipt.plan, completed_operations=(config.kind,))
     assert held.status is InstallerStepStatus.RECOVERY_REQUIRED
     assert target.read_text(encoding="utf-8") == "foreign-change\n"
+
+
+def test_endpoint_managed_file_allows_same_backend_candidate_rebind_and_rolls_back(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda _argv: 0,
+    )
+    journal = receipt.operations[0]
+    assert backend.apply_operation(journal, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    first = next(op for op in receipt.operations if op.kind == "WRITE_SERVICE_CONFIG")
+    assert ":8765" in first.desired_state
+    second = replace(first, desired_state=first.desired_state.replace(":8765", ":8766"))
+
+    assert backend.apply_operation(first, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    assert backend.apply_operation(second, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    target = Path(first.target)
+    assert target.read_text(encoding="utf-8") == second.desired_state
+    ownership = _journal_payload(request)["ownership"]
+    assert isinstance(ownership, dict)
+    record = ownership["files"][str(target)]
+    assert record["before_exists"] is False
+    assert record["before_sha256"] is None
+    assert record["intended_sha256"] == sha256(second.desired_state.encode()).hexdigest()
+    assert record["managed_sha256"] == sha256(second.desired_state.encode()).hexdigest()
+
+    rolled = backend.rollback_setup(plan=receipt.plan, completed_operations=(first.kind, second.kind))
+    assert rolled.status is InstallerStepStatus.APPLIED
+    assert not target.exists()
+
+
+def test_endpoint_managed_file_candidate_rebind_is_not_inherited_by_fresh_backend(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal = receipt.operations[0]
+    first = next(op for op in receipt.operations if op.kind == "WRITE_SERVICE_CONFIG")
+    second = replace(first, desired_state=first.desired_state.replace(":8765", ":8766"))
+    initial = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda _argv: 0,
+    )
+    assert initial.apply_operation(journal, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    assert initial.apply_operation(first, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+
+    retry = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda _argv: 0,
+    )
+    assert retry.apply_operation(journal, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    held = retry.apply_operation(second, plan=receipt.plan)
+    assert held.status is InstallerStepStatus.RECOVERY_REQUIRED
+    assert held.detail == "managed file desired bytes changed across setup retry"
+    assert Path(first.target).read_text(encoding="utf-8") == first.desired_state
+
+
+def test_endpoint_managed_file_same_backend_rebind_rejects_foreign_current_bytes(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda _argv: 0,
+    )
+    journal = receipt.operations[0]
+    first = next(op for op in receipt.operations if op.kind == "WRITE_SERVICE_CONFIG")
+    second = replace(first, desired_state=first.desired_state.replace(":8765", ":8766"))
+    assert backend.apply_operation(journal, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    assert backend.apply_operation(first, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    target = Path(first.target)
+    target.write_text("foreign-current-bytes\n", encoding="utf-8")
+    target.chmod(0o600)
+
+    held = backend.apply_operation(second, plan=receipt.plan)
+    assert held.status is InstallerStepStatus.RECOVERY_REQUIRED
+    assert held.detail == (
+        "managed endpoint candidate bytes are not the exact prior same-attempt write"
+    )
+    assert target.read_text(encoding="utf-8") == "foreign-current-bytes\n"
+
+
+def test_non_endpoint_managed_file_desired_change_remains_recovery_required(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda _argv: 0,
+    )
+    journal = receipt.operations[0]
+    unit = next(op for op in receipt.operations if op.kind == "INSTALL_USER_UNIT")
+    changed = replace(unit, desired_state=unit.desired_state + "# drift\n")
+    assert backend.apply_operation(journal, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    assert backend.apply_operation(unit, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    held = backend.apply_operation(changed, plan=receipt.plan)
+    assert held.status is InstallerStepStatus.RECOVERY_REQUIRED
+    assert held.detail == "managed file desired bytes changed across setup retry"
 
 
 def test_service_enable_nonzero_partial_success_is_durable_and_rollback_survives_retry(

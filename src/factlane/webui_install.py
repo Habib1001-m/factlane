@@ -1214,6 +1214,7 @@ class ProductionLinuxInstallerBackend:
         self._poll_interval = poll_interval
         self._journal_path: Path | None = None
         self._attempt_file_targets: set[str] = set()
+        self._attempt_endpoint_file_targets: set[str] = set()
         self._attempt_linger_changed = False
         self._attempt_service_enable_changed = False
         self._attempt_profile_created = False
@@ -1728,6 +1729,10 @@ class ProductionLinuxInstallerBackend:
                     should_write = self._prepare_managed_file_write(
                         Path(operation.target),
                         desired_state=operation.desired_state,
+                        allow_same_attempt_endpoint_rebind=(
+                            operation.kind in {"WRITE_SERVICE_CONFIG", "WRITE_CADDY_CONFIG"}
+                            and operation.target in self._attempt_endpoint_file_targets
+                        ),
                     )
                     if not should_write:
                         return InstallerStepResult(
@@ -1744,6 +1749,8 @@ class ProductionLinuxInstallerBackend:
                         Path(operation.target),
                         desired_state=operation.desired_state,
                     )
+                    if operation.kind in {"WRITE_SERVICE_CONFIG", "WRITE_CADDY_CONFIG"}:
+                        self._attempt_endpoint_file_targets.add(operation.target)
             except LinuxSetupRecoveryRequired as exc:
                 return InstallerStepResult(
                     status=InstallerStepStatus.RECOVERY_REQUIRED,
@@ -2286,7 +2293,13 @@ class ProductionLinuxInstallerBackend:
             operation=operation.kind,
         )
 
-    def _prepare_managed_file_write(self, path: Path, *, desired_state: str) -> bool:
+    def _prepare_managed_file_write(
+        self,
+        path: Path,
+        *,
+        desired_state: str,
+        allow_same_attempt_endpoint_rebind: bool = False,
+    ) -> bool:
         if self._journal_path is None:
             return True
         journal = _parse_linux_setup_journal(self._journal_path, owner_uid=self._owner_uid)
@@ -2340,7 +2353,25 @@ class ProductionLinuxInstallerBackend:
         intended_sha = record.get("intended_sha256")
         managed_sha = record.get("managed_sha256")
         if intended_sha != desired_sha:
-            raise LinuxSetupRecoveryRequired("managed file desired bytes changed across setup retry")
+            if not allow_same_attempt_endpoint_rebind:
+                raise LinuxSetupRecoveryRequired("managed file desired bytes changed across setup retry")
+            if (
+                info is None
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or not isinstance(intended_sha, str)
+                or managed_sha != intended_sha
+                or current_sha != managed_sha
+            ):
+                raise LinuxSetupRecoveryRequired(
+                    "managed endpoint candidate bytes are not the exact prior same-attempt write"
+                )
+            record["intended_sha256"] = desired_sha
+            _update_linux_setup_journal(
+                self._journal_path,
+                owner_uid=self._owner_uid,
+                ownership_updates={"files": files},
+            )
+            intended_sha = desired_sha
         before_exists = record.get("before_exists") is True
         if info is not None and current_sha == desired_sha and stat.S_IMODE(info.st_mode) == 0o600:
             if managed_sha is None:
