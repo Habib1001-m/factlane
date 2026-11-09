@@ -231,6 +231,42 @@ def _install_test_root(plan, pem: str) -> Path:
     return root
 
 
+def _populate_caddy_bootstrap_ready_state(state: Path, hostname: str, pem: str) -> None:
+    pki = state / "pki" / "authorities" / "local"
+    pki.mkdir(parents=True, exist_ok=True)
+    for directory in (state / "pki", state / "pki" / "authorities", pki):
+        directory.chmod(0o700)
+    for name, content in {
+        "root.crt": pem,
+        "root.key": "root-key",
+        "intermediate.crt": "intermediate-cert",
+        "intermediate.key": "intermediate-key",
+    }.items():
+        target = pki / name
+        target.write_text(content, encoding="ascii")
+        target.chmod(0o600)
+    leaf = state / "certificates" / "local" / hostname
+    leaf.mkdir(parents=True, exist_ok=True)
+    for directory in (state / "certificates", state / "certificates" / "local", leaf):
+        directory.chmod(0o700)
+    for name, content in {
+        f"{hostname}.crt": "leaf-cert",
+        f"{hostname}.key": "leaf-key",
+    }.items():
+        target = leaf / name
+        target.write_text(content, encoding="ascii")
+        target.chmod(0o600)
+    metadata = leaf / f"{hostname}.json"
+    metadata.write_text(
+        json.dumps({"sans": [hostname], "issuer_data": None}),
+        encoding="utf-8",
+    )
+    metadata.chmod(0o600)
+    locks = state / "locks"
+    locks.mkdir(mode=0o700, exist_ok=True)
+    locks.chmod(0o700)
+
+
 def _nss_read_runner(profile: Path, pem: str, state: dict[str, bool]):
     def read(argv: tuple[str, ...]) -> tuple[int, str]:
         if "is-enabled" in argv:
@@ -384,10 +420,16 @@ def test_caddy_ca_bootstrap_is_unclaimed_and_stops_before_return(tmp_path: Path)
 
     def factory(argv: tuple[str, ...]):
         argv_seen.append(argv)
-        target = state / "pki" / "authorities" / "local" / "root.crt"
-        target.parent.mkdir(parents=True)
-        target.write_text(pem, encoding="ascii")
-        target.chmod(0o600)
+        bootstrap_config = state / ".factlane-ca-bootstrap.Caddyfile"
+        bootstrap_text = bootstrap_config.read_text(encoding="utf-8")
+        assert "    persist_config off\n" in bootstrap_text
+        assert "    storage_check off\n" in bootstrap_text
+        assert "    storage_clean_interval off\n" in bootstrap_text
+        _populate_caddy_bootstrap_ready_state(
+            state,
+            "factlane-linuxsetup123.test",
+            pem,
+        )
         return process
 
     receipt = bootstrap_linux_caddy_root(
@@ -406,6 +448,181 @@ def test_caddy_ca_bootstrap_is_unclaimed_and_stops_before_return(tmp_path: Path)
     ]
     assert not (state / ".factlane-ca-bootstrap.Caddyfile").exists()
     assert root.read_text(encoding="ascii") == pem
+
+
+def test_caddy_ca_bootstrap_waits_beyond_root_until_storage_is_complete(tmp_path: Path) -> None:
+    state = tmp_path / "caddy"
+    _, pem = _root_pem(tmp_path)
+    now = [0.0]
+    completed = [False]
+
+    class Process:
+        stopped = False
+
+        def poll(self):
+            return 0 if self.stopped else None
+
+        def terminate(self):
+            assert completed[0] is True
+            self.stopped = True
+
+        def wait(self, timeout: float):
+            assert timeout == 2.0
+            return 0
+
+        def kill(self):
+            self.stopped = True
+
+    process = Process()
+
+    def factory(_argv: tuple[str, ...]):
+        pki = state / "pki" / "authorities" / "local"
+        pki.mkdir(parents=True)
+        for directory in (state / "pki", state / "pki" / "authorities", pki):
+            directory.chmod(0o700)
+        root = pki / "root.crt"
+        root.write_text(pem, encoding="ascii")
+        root.chmod(0o600)
+        return process
+
+    def sleep(delay: float) -> None:
+        assert completed[0] is False
+        now[0] += delay
+        _populate_caddy_bootstrap_ready_state(
+            state,
+            "factlane-linuxsetup123.test",
+            pem,
+        )
+        completed[0] = True
+
+    receipt = bootstrap_linux_caddy_root(
+        caddy_path="/usr/bin/caddy",
+        caddy_state_dir=state,
+        hostname="factlane-linuxsetup123.test",
+        owner_uid=os.getuid(),
+        process_factory=factory,
+        clock=lambda: now[0],
+        sleep=sleep,
+        timeout=1.0,
+    )
+
+    assert receipt.status == "CREATED"
+    assert completed[0] is True
+    assert process.stopped is True
+
+
+def test_caddy_ca_bootstrap_waits_for_atomic_temp_to_disappear(tmp_path: Path) -> None:
+    state = tmp_path / "caddy"
+    _, pem = _root_pem(tmp_path)
+    now = [0.0]
+    orphan_removed = [False]
+
+    class Process:
+        stopped = False
+
+        def poll(self):
+            return 0 if self.stopped else None
+
+        def terminate(self):
+            assert orphan_removed[0] is True
+            self.stopped = True
+
+        def wait(self, timeout: float):
+            assert timeout == 2.0
+            return 0
+
+        def kill(self):
+            self.stopped = True
+
+    process = Process()
+
+    def factory(_argv: tuple[str, ...]):
+        _populate_caddy_bootstrap_ready_state(
+            state,
+            "factlane-linuxsetup123.test",
+            pem,
+        )
+        orphan = state / "certificates" / "local" / "factlane-linuxsetup123.test" / "1234567890"
+        orphan.write_bytes(b"partial")
+        orphan.chmod(0o600)
+        return process
+
+    def sleep(delay: float) -> None:
+        now[0] += delay
+        orphan = state / "certificates" / "local" / "factlane-linuxsetup123.test" / "1234567890"
+        orphan.unlink()
+        orphan_removed[0] = True
+
+    receipt = bootstrap_linux_caddy_root(
+        caddy_path="/usr/bin/caddy",
+        caddy_state_dir=state,
+        hostname="factlane-linuxsetup123.test",
+        owner_uid=os.getuid(),
+        process_factory=factory,
+        clock=lambda: now[0],
+        sleep=sleep,
+        timeout=1.0,
+    )
+
+    assert receipt.status == "CREATED"
+    assert orphan_removed[0] is True
+    assert process.stopped is True
+
+
+def test_setup_owned_existing_root_only_state_resumes_bootstrap_until_complete(tmp_path: Path) -> None:
+    state = tmp_path / "caddy"
+    state.mkdir(mode=0o700)
+    state.chmod(0o700)
+    _, pem = _root_pem(tmp_path)
+    pki = state / "pki" / "authorities" / "local"
+    pki.mkdir(parents=True)
+    for directory in (state / "pki", state / "pki" / "authorities", pki):
+        directory.chmod(0o700)
+    root = pki / "root.crt"
+    root.write_text(pem, encoding="ascii")
+    root.chmod(0o600)
+    calls = [0]
+
+    class Process:
+        stopped = False
+
+        def poll(self):
+            return 0 if self.stopped else None
+
+        def terminate(self):
+            self.stopped = True
+
+        def wait(self, timeout: float):
+            assert timeout == 2.0
+            return 0
+
+        def kill(self):
+            self.stopped = True
+
+    process = Process()
+
+    def factory(_argv: tuple[str, ...]):
+        calls[0] += 1
+        _populate_caddy_bootstrap_ready_state(
+            state,
+            "factlane-linuxsetup123.test",
+            pem,
+        )
+        return process
+
+    receipt = bootstrap_linux_caddy_root(
+        caddy_path="/usr/bin/caddy",
+        caddy_state_dir=state,
+        hostname="factlane-linuxsetup123.test",
+        owner_uid=os.getuid(),
+        process_factory=factory,
+        require_complete_existing_state=True,
+    )
+
+    assert calls == [1]
+    assert receipt.status == "CREATED"
+    assert receipt.caddy_state_created is False
+    assert process.stopped is True
 
 
 def test_linux_firefox_launcher_is_shell_free_and_uses_only_managed_profile(tmp_path: Path) -> None:
@@ -623,10 +840,11 @@ def test_caddy_create_intent_recovers_empty_unreceipted_directory_and_durable_ro
     process = Process()
 
     def factory(_argv: tuple[str, ...]):
-        target = caddy_state / "pki" / "authorities" / "local" / "root.crt"
-        target.parent.mkdir(parents=True)
-        target.write_text(pem, encoding="ascii")
-        target.chmod(0o600)
+        _populate_caddy_bootstrap_ready_state(
+            caddy_state,
+            "factlane-linuxsetup123.test",
+            pem,
+        )
         return process
 
     retry = ProductionLinuxInstallerBackend(
@@ -681,10 +899,11 @@ def test_caddy_rollback_preserves_unrelated_state_and_requires_recovery(
             self.stopped = True
 
     def factory(_argv: tuple[str, ...]):
-        target = caddy_state / "pki" / "authorities" / "local" / "root.crt"
-        target.parent.mkdir(parents=True)
-        target.write_text(pem, encoding="ascii")
-        target.chmod(0o600)
+        _populate_caddy_bootstrap_ready_state(
+            caddy_state,
+            "factlane-linuxsetup123.test",
+            pem,
+        )
         return Process()
 
     backend = ProductionLinuxInstallerBackend(
@@ -738,10 +957,11 @@ def test_caddy_rollback_removes_exact_runtime_certificate_state_and_empty_locks(
             self.stopped = True
 
     def factory(_argv: tuple[str, ...]):
-        target = caddy_state / "pki" / "authorities" / "local" / "root.crt"
-        target.parent.mkdir(parents=True)
-        target.write_text(pem, encoding="ascii")
-        target.chmod(0o600)
+        _populate_caddy_bootstrap_ready_state(
+            caddy_state,
+            "factlane-linuxsetup123.test",
+            pem,
+        )
         return Process()
 
     backend = ProductionLinuxInstallerBackend(
@@ -755,7 +975,7 @@ def test_caddy_rollback_removes_exact_runtime_certificate_state_and_empty_locks(
 
     hostname = receipt.plan.hostname
     leaf = caddy_state / "certificates" / "local" / hostname
-    leaf.mkdir(parents=True, mode=0o700)
+    leaf.mkdir(parents=True, mode=0o700, exist_ok=True)
     for directory in (caddy_state / "certificates", caddy_state / "certificates" / "local", leaf):
         directory.chmod(0o700)
     for suffix in ("crt", "key", "json"):
@@ -763,7 +983,7 @@ def test_caddy_rollback_removes_exact_runtime_certificate_state_and_empty_locks(
         target.write_text(f"managed-{suffix}", encoding="utf-8")
         target.chmod(0o600)
     locks = caddy_state / "locks"
-    locks.mkdir(mode=0o700)
+    locks.mkdir(mode=0o700, exist_ok=True)
     last_clean = caddy_state / "last_clean.json"
     last_clean.write_text(
         json.dumps(
@@ -815,10 +1035,11 @@ def test_caddy_rollback_rejects_foreign_last_clean_marker(tmp_path: Path) -> Non
             self.stopped = True
 
     def factory(_argv: tuple[str, ...]):
-        target = caddy_state / "pki" / "authorities" / "local" / "root.crt"
-        target.parent.mkdir(parents=True)
-        target.write_text(pem, encoding="ascii")
-        target.chmod(0o600)
+        _populate_caddy_bootstrap_ready_state(
+            caddy_state,
+            "factlane-linuxsetup123.test",
+            pem,
+        )
         return Process()
 
     backend = ProductionLinuxInstallerBackend(
@@ -875,10 +1096,11 @@ def test_caddy_rollback_rejects_foreign_runtime_certificate_state(
             self.stopped = True
 
     def factory(_argv: tuple[str, ...]):
-        target = caddy_state / "pki" / "authorities" / "local" / "root.crt"
-        target.parent.mkdir(parents=True)
-        target.write_text(pem, encoding="ascii")
-        target.chmod(0o600)
+        _populate_caddy_bootstrap_ready_state(
+            caddy_state,
+            "factlane-linuxsetup123.test",
+            pem,
+        )
         return Process()
 
     backend = ProductionLinuxInstallerBackend(
@@ -891,7 +1113,7 @@ def test_caddy_rollback_rejects_foreign_runtime_certificate_state(
     assert backend.apply_operation(caddy_op, plan=receipt.plan).status is InstallerStepStatus.APPLIED
 
     leaf = caddy_state / "certificates" / "local" / receipt.plan.hostname
-    leaf.mkdir(parents=True, mode=0o700)
+    leaf.mkdir(parents=True, mode=0o700, exist_ok=True)
     for directory in (caddy_state / "certificates", caddy_state / "certificates" / "local", leaf):
         directory.chmod(0o700)
     foreign = leaf / "foreign.pem"

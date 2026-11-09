@@ -1494,6 +1494,7 @@ class ProductionLinuxInstallerBackend:
                     clock=self._clock,
                     sleep=self._sleep,
                     timeout=self._activation_timeout,
+                    require_complete_existing_state=(caddy_preexisting is False),
                 )
                 _update_linux_setup_journal(
                     self._journal_path,
@@ -4273,8 +4274,11 @@ def _render_caddy_ca_bootstrap_config(*, hostname: str, caddy_state_dir: str) ->
     return (
         "{\n"
         "    admin off\n"
+        "    persist_config off\n"
         "    auto_https disable_redirects\n"
         "    skip_install_trust\n"
+        "    storage_check off\n"
+        "    storage_clean_interval off\n"
         f"    storage file_system {_caddy_token(caddy_state_dir)}\n"
         "}\n\n"
         f"https://{hostname}:0 {{\n"
@@ -4285,6 +4289,112 @@ def _render_caddy_ca_bootstrap_config(*, hostname: str, caddy_state_dir: str) ->
         "    respond 503\n"
         "}\n"
     )
+
+
+def _caddy_bootstrap_storage_ready(
+    state_dir: Path,
+    *,
+    hostname: str,
+    owner_uid: int,
+) -> str | None:
+    """Return the local-root fingerprint only after Caddy's initial storage writes are complete.
+
+    The public root is written before the CA key/intermediate material and before the exact
+    leaf certificate acquisition has finished. Stopping Caddy at root.crt readiness can
+    interrupt CertMagic's atomic FileStorage.Store() and strand a numeric temp file. The
+    bootstrap is ready only after the exact startup storage graph is complete, issuance locks
+    are gone, and no atomic temp remains.
+    """
+
+    _validate_hostname(hostname)
+    allowed_dirs = {
+        Path("pki"),
+        Path("pki/authorities"),
+        Path("pki/authorities/local"),
+        Path("locks"),
+        Path("certificates"),
+        Path("certificates/local"),
+        Path("certificates/local") / hostname,
+    }
+    allowed_files = {
+        Path(".factlane-ca-bootstrap.Caddyfile"),
+        Path("pki/authorities/local/root.crt"),
+        Path("pki/authorities/local/root.key"),
+        Path("pki/authorities/local/intermediate.crt"),
+        Path("pki/authorities/local/intermediate.key"),
+        Path("certificates/local") / hostname / f"{hostname}.crt",
+        Path("certificates/local") / hostname / f"{hostname}.key",
+        Path("certificates/local") / hostname / f"{hostname}.json",
+    }
+    expected_lock = Path("locks") / f"issue_cert_{hostname}.lock"
+
+    try:
+        _require_owner_private_directory(state_dir, owner_uid=owner_uid)
+        current = list(state_dir.rglob("*"))
+    except FileNotFoundError:
+        return None
+
+    for path in current:
+        try:
+            relative = path.relative_to(state_dir)
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            if relative not in allowed_dirs:
+                raise LinuxSetupRecoveryRequired(
+                    "Caddy bootstrap created an unexpected storage directory"
+                )
+            _require_owner_private_directory(path, owner_uid=owner_uid)
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise LinuxSetupRecoveryRequired(
+                "Caddy bootstrap storage contains foreign non-regular state"
+            )
+        if relative in allowed_files:
+            _require_owner_private_regular_file(path, owner_uid=owner_uid)
+            if info.st_size <= 0:
+                return None
+            continue
+        if relative == expected_lock:
+            _require_owner_private_regular_file(path, owner_uid=owner_uid)
+            continue
+        if re.fullmatch(r"\d{1,10}", path.name):
+            _require_owner_private_regular_file(path, owner_uid=owner_uid)
+            return None
+        raise LinuxSetupRecoveryRequired(
+            "Caddy bootstrap created unexpected storage content"
+        )
+
+    for relative in allowed_files - {Path(".factlane-ca-bootstrap.Caddyfile")}:
+        path = state_dir / relative
+        try:
+            info = _require_owner_private_regular_file(path, owner_uid=owner_uid)
+        except FileNotFoundError:
+            return None
+        if info.st_size <= 0:
+            return None
+
+    locks = state_dir / "locks"
+    try:
+        _require_owner_private_directory(locks, owner_uid=owner_uid)
+        if any(locks.iterdir()):
+            return None
+    except FileNotFoundError:
+        return None
+
+    metadata_path = state_dir / "certificates" / "local" / hostname / f"{hostname}.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict) or metadata.get("sans") != [hostname]:
+        raise LinuxSetupRecoveryRequired(
+            "Caddy bootstrap leaf-certificate metadata is invalid"
+        )
+
+    root_path = state_dir / "pki" / "authorities" / "local" / "root.crt"
+    return _root_certificate_fingerprint(root_path, owner_uid=owner_uid)
 
 
 def _spawn_caddy_bootstrap(argv: tuple[str, ...]) -> subprocess.Popen[bytes]:
@@ -4307,6 +4417,7 @@ def bootstrap_linux_caddy_root(
     clock: InstallClock = time.monotonic,
     sleep: InstallSleep = time.sleep,
     timeout: float = 10.0,
+    require_complete_existing_state: bool = False,
 ) -> LinuxCaddyBootstrapReceipt:
     _validate_absolute_path(caddy_path, "Caddy executable")
     _validate_hostname(hostname)
@@ -4329,6 +4440,12 @@ def bootstrap_linux_caddy_root(
         fingerprint = _root_certificate_fingerprint(root_path, owner_uid=owner_uid)
     except FileNotFoundError:
         fingerprint = None
+    if fingerprint is not None and require_complete_existing_state:
+        fingerprint = _caddy_bootstrap_storage_ready(
+            state_dir,
+            hostname=hostname,
+            owner_uid=owner_uid,
+        )
     if fingerprint is not None:
         return LinuxCaddyBootstrapReceipt(
             status="REUSED",
@@ -4356,18 +4473,20 @@ def bootstrap_linux_caddy_root(
         process = factory(argv)
         deadline = clock() + timeout
         while True:
-            try:
-                fingerprint = _root_certificate_fingerprint(root_path, owner_uid=owner_uid)
+            fingerprint = _caddy_bootstrap_storage_ready(
+                state_dir,
+                hostname=hostname,
+                owner_uid=owner_uid,
+            )
+            if fingerprint is not None:
                 bootstrap_completed = True
                 break
-            except FileNotFoundError:
-                pass
             poll = getattr(process, "poll", None)
             if not callable(poll) or poll() is not None:
-                raise LinuxSetupRecoveryRequired("Caddy CA bootstrap exited before materializing the public root")
+                raise LinuxSetupRecoveryRequired("Caddy CA bootstrap exited before complete storage readiness")
             now = clock()
             if now >= deadline:
-                raise LinuxSetupRecoveryRequired("Caddy CA bootstrap timed out before public-root readiness")
+                raise LinuxSetupRecoveryRequired("Caddy CA bootstrap timed out before complete storage readiness")
             sleep(min(0.05, deadline - now))
     finally:
         if process is not None:
