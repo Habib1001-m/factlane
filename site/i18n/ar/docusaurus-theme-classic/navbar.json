@@ -28,7 +28,7 @@
     "description": "Navbar item with label GitHub"
   },
   "item.label.Get started": {
-    "message": "الإعداد اليدوي",
+    "message": "البدء السريع",
     "description": "Navbar item with label Get started"
   }
 }

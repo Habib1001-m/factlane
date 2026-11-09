@@ -361,8 +361,8 @@ Firefox profile and local HTTPS material; do not disable certificate validation,
 Firefox profile, add browser bypass flags, or substitute WSL/UNC database paths.
 
 After connection, the primary navigation is **Overview**, **Memories**, **Review**, **Conflicts**,
-**Database**, **Agents**, **Activity**, and **Session & settings**. **Activity** exposes filterable local
-operation/lifecycle history. Local redacted Diagnostics are available from **Session & settings**;
+**Database**, **Agents**, **Activity**, and **Settings**. **Activity** exposes filterable local
+operation/lifecycle history. Local redacted Diagnostics are available from **Settings**;
 neither surface implies external upload.
 
 **Memories** defaults to Owner-wide read-only discovery across the scopes owned by the selected local
@@ -387,6 +387,17 @@ The Database view exposes capability-gated
 database operations including explicit backup artifacts, logical export/import, restore preview and
 jobs, plus destructive operations where the current platform advertises them. Imported facts remain
 Candidates until governed review.
+
+An advanced Owner can also register another compatible local database for later governed switching:
+
+```text
+factlane register database <path>
+```
+
+Registration validates the local path and current storage/profile compatibility and creates managed
+custody for the registered database; it does not switch the active database by itself and it does not
+expose an arbitrary browser-supplied path. The Owner Panel database switch consumes an explicitly
+registered compatible local database through the same authenticated, previewed maintenance boundary.
 
 Full database restore and permanent purge require a fresh exact preview plus separate native
 sensitive-action approval before commit. For restore, acknowledge that the active database state

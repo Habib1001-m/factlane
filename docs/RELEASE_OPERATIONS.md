@@ -428,6 +428,42 @@ python3.11 -m venv .venv
 .venv/bin/python -m pip install "./${SDIST_NAME}"
 ```
 
+### Native Windows PowerShell equivalents
+
+For a native Windows x64/AMD64 release check, use the same manifest values rather than translating
+them from memory. A tagged source checkout can verify the exact commit/tree in PowerShell:
+
+```powershell
+$ReleaseTag = '<annotated tag>'
+$ReleaseCommit = '<release commit>'
+$ReleaseTree = '<release tree>'
+git clone --branch $ReleaseTag --depth 1 https://github.com/Habib1001-m/factlane.git
+Set-Location factlane
+if ((git rev-parse HEAD).Trim() -ne $ReleaseCommit) { throw 'release commit mismatch' }
+if ((git rev-parse 'HEAD^{tree}').Trim() -ne $ReleaseTree) { throw 'release tree mismatch' }
+uv sync --frozen
+uv run python -c "import sqlite3; print(sqlite3.sqlite_version)"
+uv run factlane --help-tools
+```
+
+For a downloaded wheel, compare the exact SHA-256 before creating a fresh environment, and invoke
+the Windows executables from that environment explicitly:
+
+```powershell
+$WheelName = '<wheel filename>'
+$WheelSha256 = '<wheel SHA-256>'
+if ((Get-FileHash -Algorithm SHA256 $WheelName).Hash.ToLowerInvariant() -ne $WheelSha256.ToLowerInvariant()) { throw 'wheel SHA-256 mismatch' }
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install ".\$WheelName"
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -c "import sqlite3; print(sqlite3.sqlite_version)"
+.\.venv\Scripts\factlane.exe --help
+.\.venv\Scripts\factlane.exe --help-tools
+```
+
+These commands verify package/source identity and runtime compatibility; they do not authorize a
+database migration or prove that a managed service or MCP host has already been rebound to those bytes.
+
 The portable `using-factlane` Skill is shipped with the package, but package installation does
 not register the Skill with an MCP host automatically.
 

@@ -63,7 +63,7 @@ The documented local profile requires:
 
 - CPython **3.11+**;
 - a CPython-linked SQLite runtime **3.42.0+**;
-- [`uv`](https://docs.astral.sh/uv/);
+- [`uv`](https://docs.astral.sh/uv/) for source-checkout/lockfile installation and development workflows; a published-wheel install does not require `uv`;
 - local [Ollama](https://ollama.com/) with a supported embedding model;
 - a compatible MCP host that can launch a local stdio command.
 

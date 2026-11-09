@@ -106,7 +106,7 @@ later mutations. The WebUI is not an HTTP MCP transport and does not add a sixth
 
 The managed Owner Panel is a separate platform lifecycle driven through the main `factlane` CLI.
 Its current top-level views are **Overview**, **Memories**, **Review**, **Conflicts**, **Database**,
-**Agents**, **Activity**, and **Session & settings**. **Memories** can use authenticated Owner-wide read-only
+**Agents**, **Activity**, and **Settings**. **Memories** can use authenticated Owner-wide read-only
 discovery across the selected database, and **Review** uses the same bounded discovery surface for an
 Owner-wide Candidate queue. Every returned item retains its exact scope identity; selecting an item
 returns to exact-scope record detail before any mutation. Owner-wide discovery does not broaden the

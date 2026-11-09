@@ -23,7 +23,10 @@ below remains v0.1.6 until a separately authorized release records a new immutab
   Owner-wide Candidate queue while preserving exact-scope mutation proof. Candidate approval uses a
   local date/time control with explicit browser timezone; record/revision/Group-CAS details remain
   internal to the normal review flow. Activity provides filterable local operation/lifecycle history;
-  local redacted Diagnostics live under Session & settings.
+  local redacted Diagnostics live under Settings.
+- Adds explicit Owner-panel Candidate creation plus bounded same-scope batch review with a precommit
+  item/scope/revision preview and per-item outcomes, while keeping mutation authority tied to each
+  selected record's current proof.
 - Adds `factlane launch webui` as the normal status/start/open composition after setup. Successful
   setup installs a non-terminal Linux `.desktop` launcher or current-user Windows Start Menu shortcut
   that reuses the same trusted launch flow.

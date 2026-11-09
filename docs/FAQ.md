@@ -79,10 +79,10 @@ session and CSRF protection. The managed panel has a platform-owned local connec
 flow. Neither surface turns FactLane into an HTTP MCP server.
 
 In the current unreleased development source, the managed panel includes Database, Agents,
-**Activity**, and **Session & settings** alongside memory/review/conflict views. Memories opens Owner-wide by default,
+**Activity**, and **Settings** alongside memory/review/conflict views. Memories opens Owner-wide by default,
 and Review is an Owner-wide Candidate queue; those are read-only discovery conveniences, while
 mutations remain exact-scope operations on the selected record. Activity provides filterable local
-operation/lifecycle history; local redacted Diagnostics are available under Session & settings. Database operations are explicit
+operation/lifecycle history; local redacted Diagnostics are available under Settings. Database operations are explicit
 and capability-gated; full restore and permanent purge require additional preview/approval steps.
 
 After managed setup, `factlane launch webui` is the normal command to open the panel: it checks the

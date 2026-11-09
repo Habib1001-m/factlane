@@ -60,10 +60,10 @@ remote administration.
 
 The managed Owner Panel is a separate platform-owned lifecycle driven by the main `factlane` CLI.
 Its current primary navigation is **Overview**, **Memories**, **Review**, **Conflicts**, **Database**,
-**Agents**, **Activity**, and **Session & settings**. Owner-wide Memories/Review discovery is authenticated,
+**Agents**, **Activity**, and **Settings**. Owner-wide Memories/Review discovery is authenticated,
 read-only, and bounded to the selected local database; each result carries exact scope identity and
 mutation still refreshes exact record/revision/Group-CAS proof. **Activity** exposes the governed,
-filterable local operation/lifecycle history; local redacted Diagnostics live under **Session & settings**.
+filterable local operation/lifecycle history; local redacted Diagnostics live under **Settings**.
 Neither surface is an external telemetry/upload channel. On Native Windows x64/AMD64, the managed path uses a
 dedicated Firefox profile and local HTTPS with owner-private trust material rather than the direct
 loopback bootstrap URL. It does not fall back to Edge/Chrome, install a system trust root, modify the
