@@ -22,7 +22,7 @@ from typing import Callable, Protocol
 from urllib.parse import urlsplit
 
 from .webui_runtime import WebUIRuntimeConfig
-from .webui_service import ServiceSnapshot, ServiceStatus
+from .webui_service import ServiceSnapshot, ServiceStatus, service_state_file_guard
 from .webui_windows import (
     WINDOWS_TASK_NAME,
     WindowsBrowserInstall,
@@ -979,6 +979,14 @@ def apply_webui_setup(
         )
 
     def recovery_without_rollback(detail: str) -> SetupApplyResult:
+        seal_recovery = getattr(backend, "mark_recovery_required", None)
+        if callable(seal_recovery):
+            sealed = seal_recovery(plan=plan, detail=detail)
+            if sealed.status is not InstallerStepStatus.APPLIED:
+                detail = (
+                    f"{detail}; durable recovery state could not be sealed: "
+                    f"{sealed.detail or sealed.status.value}"
+                )
         return SetupApplyResult(
             status=InstallerStepStatus.RECOVERY_REQUIRED,
             endpoint_state=EndpointState.PROPOSED,
@@ -1160,6 +1168,120 @@ ServiceStateReader = Callable[[], ServiceSnapshot]
 ActivationProbe = Callable[[str], ManagedServiceActivationResult]
 InstallClock = Callable[[], float]
 InstallSleep = Callable[[float], None]
+_ServiceGovernanceToken = tuple[int, int, str | None, str | None, str | None]
+
+
+def _service_governance_token(raw: bytes | None) -> _ServiceGovernanceToken:
+    if raw is None:
+        return (0, 0, None, None, None)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LinuxSetupRecoveryRequired("managed service state is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise LinuxSetupRecoveryRequired("managed service state is not an object")
+    revision = payload.get("intent_revision")
+    governance_revision = payload.get("governance_revision", 0)
+    stopped_boot_id = payload.get("stopped_boot_id")
+    maintenance_operation_id = payload.get("maintenance_operation_id")
+    status = payload.get("status")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise LinuxSetupRecoveryRequired("managed service intent revision is invalid")
+    if (
+        isinstance(governance_revision, bool)
+        or not isinstance(governance_revision, int)
+        or governance_revision < 0
+    ):
+        raise LinuxSetupRecoveryRequired("managed service governance revision is invalid")
+    if stopped_boot_id is not None and not isinstance(stopped_boot_id, str):
+        raise LinuxSetupRecoveryRequired("managed service stop marker is invalid")
+    if maintenance_operation_id is not None and not isinstance(maintenance_operation_id, str):
+        raise LinuxSetupRecoveryRequired("managed service maintenance owner is invalid")
+    if not isinstance(status, str):
+        raise LinuxSetupRecoveryRequired("managed service status is invalid")
+    protected_status = (
+        status
+        if status
+        in {
+            ServiceStatus.STOPPED_UNTIL_REBOOT.value,
+            ServiceStatus.MAINTENANCE.value,
+            ServiceStatus.RECOVERY_REQUIRED.value,
+        }
+        else None
+    )
+    return (
+        revision,
+        governance_revision,
+        stopped_boot_id,
+        maintenance_operation_id,
+        protected_status,
+    )
+
+
+def _snapshot_governance_token(snapshot: ServiceSnapshot) -> _ServiceGovernanceToken:
+    protected_status = (
+        snapshot.status.value
+        if snapshot.status
+        in {
+            ServiceStatus.STOPPED_UNTIL_REBOOT,
+            ServiceStatus.MAINTENANCE,
+            ServiceStatus.RECOVERY_REQUIRED,
+        }
+        else None
+    )
+    return (
+        snapshot.intent_revision,
+        snapshot.governance_revision,
+        snapshot.stopped_boot_id,
+        snapshot.maintenance_operation_id,
+        protected_status,
+    )
+
+
+def _reconciled_service_governance_baseline(
+    prepared: _ServiceGovernanceToken,
+    reconciled: _ServiceGovernanceToken,
+) -> _ServiceGovernanceToken:
+    """Accept only an unchanged baseline or exact stale-boot stop reconciliation.
+
+    Reconstructing WebUIServiceState may legitimately clear a STOPPED_UNTIL_REBOOT
+    marker from a previous boot.  That transition advances governance exactly once
+    without creating Owner intent.  Any intent revision change, maintenance/recovery
+    transition, or other governance drift belongs to the Owner/runtime and must not
+    be silently adopted as setup's candidate baseline.
+    """
+
+    if reconciled == prepared:
+        return reconciled
+    (
+        prepared_intent,
+        prepared_governance,
+        prepared_stopped_boot,
+        prepared_maintenance,
+        prepared_status,
+    ) = prepared
+    (
+        reconciled_intent,
+        reconciled_governance,
+        reconciled_stopped_boot,
+        reconciled_maintenance,
+        reconciled_status,
+    ) = reconciled
+    stale_boot_stop_reconciled = (
+        prepared_stopped_boot is not None
+        and prepared_maintenance is None
+        and prepared_status == ServiceStatus.STOPPED_UNTIL_REBOOT.value
+        and reconciled_intent == prepared_intent
+        and reconciled_governance == prepared_governance + 1
+        and reconciled_stopped_boot is None
+        and reconciled_maintenance is None
+        and reconciled_status is None
+    )
+    if stale_boot_stop_reconciled:
+        return reconciled
+    raise LinuxSetupRecoveryRequired(
+        "governed service state changed before candidate activation baseline"
+    )
 
 
 class ProductionLinuxInstallerBackend:
@@ -1221,6 +1343,9 @@ class ProductionLinuxInstallerBackend:
         self._attempt_profile_created_files: set[str] = set()
         self._attempt_trust_imported = False
         self._attempt_caddy_state_created = False
+        self._activation_state_path: Path | None = None
+        self._activation_service_governance: _ServiceGovernanceToken | None = None
+        self._activation_state_custody_ready = False
 
     def apply_operation(
         self,
@@ -1236,9 +1361,9 @@ class ProductionLinuxInstallerBackend:
                     owner_uid=self._owner_uid,
                 )
                 self._journal_path = Path(operation.target)
-                if journal.get("phase") == "RECOVERY_REQUIRED":
+                if journal.get("phase") in {"ACTIVATING", "RECOVERY_REQUIRED"}:
                     raise LinuxSetupRecoveryRequired(
-                        "provisional setup journal is already in RECOVERY_REQUIRED"
+                        "provisional setup journal requires explicit recovery before retry"
                     )
                 if journal.get("phase") == "CLAIMED":
                     journal["phase"] = "PROVISIONAL"
@@ -2419,7 +2544,10 @@ class ProductionLinuxInstallerBackend:
         )
         self._attempt_file_targets.add(str(path))
 
-    def _prepare_dynamic_managed_file(self, path: Path) -> None:
+    def _prepare_dynamic_managed_file(
+        self,
+        path: Path,
+    ) -> tuple[_ServiceGovernanceToken, bool]:
         if self._journal_path is None:
             return
         journal = _parse_linux_setup_journal(self._journal_path, owner_uid=self._owner_uid)
@@ -2469,11 +2597,17 @@ class ProductionLinuxInstallerBackend:
                     raise LinuxSetupRecoveryRequired("dynamic managed file disappeared outside setup")
             else:
                 allowed = {value for value in (before_sha, managed_sha) if isinstance(value, str)}
-                if allowed and current_sha not in allowed:
+                if current_sha not in allowed:
                     raise LinuxSetupRecoveryRequired("dynamic managed file changed outside setup")
         self._attempt_file_targets.add(key)
+        return _service_governance_token(current_bytes), current_bytes is not None
 
-    def _mark_dynamic_managed_file(self, path: Path) -> None:
+    def _mark_dynamic_managed_file(
+        self,
+        path: Path,
+        *,
+        expected_governance: _ServiceGovernanceToken | None = None,
+    ) -> None:
         if self._journal_path is None:
             return
         journal = _parse_linux_setup_journal(self._journal_path, owner_uid=self._owner_uid)
@@ -2486,9 +2620,22 @@ class ProductionLinuxInstallerBackend:
         if not isinstance(record, dict):
             raise LinuxSetupRecoveryRequired("dynamic managed file has no durable rollback record")
         try:
-            managed_sha = _sha256_regular_owner_file(path, owner_uid=self._owner_uid)
+            _require_owner_private_regular_file(path, owner_uid=self._owner_uid)
+            current_bytes = path.read_bytes()
         except FileNotFoundError:
+            current_bytes = None
+        current_governance = _service_governance_token(current_bytes)
+        if (
+            expected_governance is not None
+            and current_governance != expected_governance
+        ):
+            raise LinuxSetupRecoveryRequired(
+                "governed service state changed outside the setup attempt"
+            )
+        if current_bytes is None:
             managed_sha = None
+        else:
+            managed_sha = hashlib.sha256(current_bytes).hexdigest()
         record["managed_sha256"] = managed_sha
         _update_linux_setup_journal(
             self._journal_path,
@@ -2518,6 +2665,36 @@ class ProductionLinuxInstallerBackend:
         return InstallerStepResult(
             status=InstallerStepStatus.APPLIED,
             operation="FINALIZE_SETUP",
+        )
+
+    def mark_recovery_required(
+        self,
+        *,
+        plan: SetupPlan,
+        detail: str,
+    ) -> InstallerStepResult:
+        del plan, detail
+        if self._journal_path is None:
+            return InstallerStepResult(
+                status=InstallerStepStatus.RECOVERY_REQUIRED,
+                operation="MARK_RECOVERY_REQUIRED",
+                detail="provisional setup journal is unavailable for durable recovery",
+            )
+        try:
+            _update_linux_setup_journal(
+                self._journal_path,
+                owner_uid=self._owner_uid,
+                phase="RECOVERY_REQUIRED",
+            )
+        except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+            return InstallerStepResult(
+                status=InstallerStepStatus.RECOVERY_REQUIRED,
+                operation="MARK_RECOVERY_REQUIRED",
+                detail=f"recovery journal could not be persisted: {type(exc).__name__}",
+            )
+        return InstallerStepResult(
+            status=InstallerStepStatus.APPLIED,
+            operation="MARK_RECOVERY_REQUIRED",
         )
 
     def rollback_setup(
@@ -2811,15 +2988,25 @@ class ProductionLinuxInstallerBackend:
             order = ownership.get("file_order")
             if not isinstance(files, dict) or not isinstance(order, list):
                 raise LinuxSetupRecoveryRequired("setup journal rollback file ownership is invalid")
+            service_state_path = self._journal_path.parent / "webui-service.json"
             for key in reversed(order):
                 record = files.get(key)
                 if not isinstance(record, dict):
                     raise LinuxSetupRecoveryRequired("setup journal rollback file record is invalid")
-                _restore_managed_file_from_record(
-                    Path(key),
-                    record,
-                    owner_uid=self._owner_uid,
-                )
+                managed_path = Path(key)
+                if managed_path == service_state_path:
+                    with service_state_file_guard(managed_path):
+                        _restore_managed_file_from_record(
+                            managed_path,
+                            record,
+                            owner_uid=self._owner_uid,
+                        )
+                else:
+                    _restore_managed_file_from_record(
+                        managed_path,
+                        record,
+                        owner_uid=self._owner_uid,
+                    )
 
             linger_preexisting = ownership.get("linger_preexisting")
             linger_intent = ownership.get("linger_change_intent") is True
@@ -2938,16 +3125,47 @@ class ProductionLinuxInstallerBackend:
         )
 
     def activate_candidate(self, *, plan: SetupPlan) -> ManagedServiceActivationResult:
+        self._activation_state_path = None
+        self._activation_service_governance = None
+        self._activation_state_custody_ready = False
         state_path: Path | None = None
         if self._journal_path is not None:
+            state_path = self._journal_path.parent / "webui-service.json"
+            self._activation_state_path = state_path
             try:
                 _update_linux_setup_journal(
                     self._journal_path,
                     owner_uid=self._owner_uid,
                     phase="ACTIVATING",
                 )
-                state_path = self._journal_path.parent / "webui-service.json"
-                self._prepare_dynamic_managed_file(state_path)
+                (
+                    self._activation_service_governance,
+                    state_preexisting,
+                ) = self._prepare_dynamic_managed_file(state_path)
+                if state_preexisting and self._service_state_reader is not None:
+                    reconciled = self._service_state_reader()
+                    self._activation_service_governance = _reconciled_service_governance_baseline(
+                        self._activation_service_governance,
+                        _snapshot_governance_token(reconciled),
+                    )
+                    if (
+                        reconciled.status
+                        in {
+                            ServiceStatus.STOPPED_UNTIL_REBOOT,
+                            ServiceStatus.MAINTENANCE,
+                            ServiceStatus.RECOVERY_REQUIRED,
+                        }
+                        or reconciled.maintenance_operation_id is not None
+                    ):
+                        self._activation_state_custody_ready = True
+                        return ManagedServiceActivationResult(
+                            status=ManagedServiceActivationStatus.FAILED,
+                            saved_endpoint=reconciled.saved_endpoint,
+                            detail=(
+                                "governed service state blocks candidate activation"
+                            ),
+                        )
+                self._activation_state_custody_ready = True
             except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
                 return ManagedServiceActivationResult(
                     status=ManagedServiceActivationStatus.FAILED,
@@ -2958,8 +3176,17 @@ class ProductionLinuxInstallerBackend:
             if state_path is None:
                 return result
             try:
-                self._mark_dynamic_managed_file(state_path)
+                if not self._activation_state_custody_ready:
+                    raise LinuxSetupRecoveryRequired(
+                        "service-state rollback custody is not stable"
+                    )
+                with service_state_file_guard(state_path):
+                    self._mark_dynamic_managed_file(
+                        state_path,
+                        expected_governance=self._activation_service_governance,
+                    )
             except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+                self._activation_state_custody_ready = False
                 return ManagedServiceActivationResult(
                     status=ManagedServiceActivationStatus.FAILED,
                     detail=f"service-state rollback ownership became ambiguous: {exc}",
@@ -2972,7 +3199,25 @@ class ProductionLinuxInstallerBackend:
             "start",
             WEBUI_SERVICE_NAME,
         )
-        start_code = self._command_runner(start_argv)
+        if state_path is not None:
+            try:
+                with service_state_file_guard(state_path):
+                    current_governance, _ = self._read_service_state_governance(state_path)
+                    if current_governance != self._activation_service_governance:
+                        self._activation_state_custody_ready = False
+                        return ManagedServiceActivationResult(
+                            status=ManagedServiceActivationStatus.FAILED,
+                            detail="governed service state changed before candidate start",
+                        )
+                    start_code = self._command_runner(start_argv)
+            except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+                self._activation_state_custody_ready = False
+                return ManagedServiceActivationResult(
+                    status=ManagedServiceActivationStatus.FAILED,
+                    detail=f"candidate start governance could not be proven: {exc}",
+                )
+        else:
+            start_code = self._command_runner(start_argv)
         if start_code != 0:
             probed = self._probe_activation(plan.origin)
             if probed is not None and probed.status is ManagedServiceActivationStatus.PORT_CONFLICT:
@@ -3044,27 +3289,79 @@ class ProductionLinuxInstallerBackend:
             "stop",
             WEBUI_SERVICE_NAME,
         )
+        if self._journal_path is not None:
+            state_path = self._journal_path.parent / "webui-service.json"
+            if str(state_path) in self._attempt_file_targets:
+                if (
+                    self._activation_state_path == state_path
+                    and not self._activation_state_custody_ready
+                ):
+                    return InstallerStepResult(
+                        status=InstallerStepStatus.RECOVERY_REQUIRED,
+                        operation="STOP_MANAGED_SERVICE",
+                        detail=(
+                            "managed service stopped, but governed service-state "
+                            "custody changed outside setup; rollback was not authorized"
+                        ),
+                    )
+                try:
+                    with service_state_file_guard(state_path):
+                        expected_governance = (
+                            self._activation_service_governance
+                            if self._activation_state_path == state_path
+                            else None
+                        )
+                        current_governance, _ = self._read_service_state_governance(state_path)
+                        if (
+                            expected_governance is not None
+                            and current_governance != expected_governance
+                        ):
+                            raise LinuxSetupRecoveryRequired(
+                                "governed service state changed outside the setup attempt"
+                            )
+                        if self._command_runner(argv) != 0:
+                            return InstallerStepResult(
+                                status=InstallerStepStatus.FAILED,
+                                operation="STOP_MANAGED_SERVICE",
+                                detail="managed service stop command failed",
+                            )
+                        self._mark_dynamic_managed_file(
+                            state_path,
+                            expected_governance=expected_governance,
+                        )
+                except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
+                    if self._activation_state_path == state_path:
+                        self._activation_state_custody_ready = False
+                    return InstallerStepResult(
+                        status=InstallerStepStatus.RECOVERY_REQUIRED,
+                        operation="STOP_MANAGED_SERVICE",
+                        detail=f"stopped service state could not be bound for rollback: {exc}",
+                    )
+                return InstallerStepResult(
+                    status=InstallerStepStatus.APPLIED,
+                    operation="STOP_MANAGED_SERVICE",
+                )
         if self._command_runner(argv) != 0:
             return InstallerStepResult(
                 status=InstallerStepStatus.FAILED,
                 operation="STOP_MANAGED_SERVICE",
                 detail="managed service stop command failed",
             )
-        if self._journal_path is not None:
-            state_path = self._journal_path.parent / "webui-service.json"
-            if str(state_path) in self._attempt_file_targets:
-                try:
-                    self._mark_dynamic_managed_file(state_path)
-                except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
-                    return InstallerStepResult(
-                        status=InstallerStepStatus.RECOVERY_REQUIRED,
-                        operation="STOP_MANAGED_SERVICE",
-                        detail=f"stopped service state could not be bound for rollback: {exc}",
-                    )
         return InstallerStepResult(
             status=InstallerStepStatus.APPLIED,
             operation="STOP_MANAGED_SERVICE",
         )
+
+    def _read_service_state_governance(
+        self,
+        state_path: Path,
+    ) -> tuple[_ServiceGovernanceToken, bool]:
+        try:
+            _require_owner_private_regular_file(state_path, owner_uid=self._owner_uid)
+            current_bytes = state_path.read_bytes()
+        except FileNotFoundError:
+            current_bytes = None
+        return _service_governance_token(current_bytes), current_bytes is not None
 
     def _probe_activation(self, origin: str) -> ManagedServiceActivationResult | None:
         if self._activation_probe is None:
@@ -4388,10 +4685,19 @@ def _caddy_bootstrap_storage_ready(
                 return None
             continue
         if relative == expected_lock:
-            _require_owner_private_regular_file(path, owner_uid=owner_uid)
+            try:
+                _require_owner_private_regular_file(path, owner_uid=owner_uid)
+            except FileNotFoundError:
+                return None
             continue
         if re.fullmatch(r"\d{1,10}", path.name):
-            _require_owner_private_regular_file(path, owner_uid=owner_uid)
+            try:
+                _require_owner_private_regular_file(path, owner_uid=owner_uid)
+            except FileNotFoundError:
+                # Caddy atomically creates/removes numeric storage temps while
+                # bootstrap is converging.  Disappearance after the first lstat
+                # means only that readiness must be re-probed.
+                return None
             return None
         raise LinuxSetupRecoveryRequired(
             "Caddy bootstrap created unexpected storage content"

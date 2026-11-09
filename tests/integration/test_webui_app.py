@@ -41,6 +41,10 @@ from factlane.owner_restore import FullRestoreService
 from factlane.recovery import MaintenanceLease, RecoveryScope, RecoveryTarget
 from factlane.runtime_control import PROTOCOL_VERSION, RuntimeControlRequest, RuntimeIdentity
 from factlane.storage import SQLiteVecEngine, STORAGE_CONTRACT_VERSION
+from factlane.webui_install import (
+    ManagedServiceActivationResult,
+    ManagedServiceActivationStatus,
+)
 from factlane.windows_owner_purge import WindowsOwnerPurgeOperator
 from factlane.windows_owner_restore import WindowsOwnerRestoreOperator
 from factlane.webui_app import (
@@ -1131,7 +1135,7 @@ def _runtime_config(tmp_path: Path) -> WebUIRuntimeConfig:
     )
 
 
-def test_caddy_process_requires_exact_argv_live_child_and_loopback_listener(
+def test_caddy_process_requires_exact_argv_live_child_and_exact_managed_https_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1139,39 +1143,62 @@ def test_caddy_process_requires_exact_argv_live_child_and_loopback_listener(
     argv = caddy_command(config)
     process = _FakePopen()
     popen_calls: list[tuple[tuple[str, ...], bool]] = []
-    connects: list[tuple[tuple[str, int], float]] = []
-    closes: list[bool] = []
-    listener_available = False
+    probes: list[tuple[str, str, float]] = []
+    probe_status = ManagedServiceActivationStatus.PENDING
 
     def fake_popen(received_argv, *, shell):
         popen_calls.append((tuple(received_argv), shell))
         return process
 
-    def fake_connect(address, timeout):
-        connects.append((address, timeout))
-        if not listener_available:
-            raise ConnectionRefusedError("listener not ready")
-        return _FakeTCPConnection(closes)
+    def fake_probe(origin, *, root_cert_path, timeout_seconds):
+        probes.append((origin, os.fspath(root_cert_path), timeout_seconds))
+        return ManagedServiceActivationResult(status=probe_status)
 
     monkeypatch.setattr("factlane.webui_app.subprocess.Popen", fake_popen)
-    monkeypatch.setattr("factlane.webui_app.socket.create_connection", fake_connect)
+    monkeypatch.setattr("factlane.webui_app.probe_linux_managed_https", fake_probe)
 
     caddy = create_caddy_process(config, argv)
 
     assert popen_calls == [(argv, False)]
     assert caddy.poll() is None
     assert caddy.is_ready() is False
-    assert connects[-1][0] == ("127.0.0.1", 8765)
+    assert probes[-1] == (
+        ORIGIN,
+        str(Path(config.state_dir) / "caddy" / "pki" / "authorities" / "local" / "root.crt"),
+        0.2,
+    )
 
-    listener_available = True
+    probe_status = ManagedServiceActivationStatus.READY
     assert caddy.is_ready() is True
-    assert connects[-1][0] == ("127.0.0.1", 8765)
-    assert closes == [True]
 
     process.returncode = 7
-    before = len(connects)
+    before = len(probes)
     assert caddy.is_ready() is False
-    assert len(connects) == before
+    assert len(probes) == before
+
+
+def test_caddy_process_never_claims_foreign_listener_probe_as_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _runtime_config(tmp_path)
+    process = _FakePopen()
+    monkeypatch.setattr(
+        "factlane.webui_app.subprocess.Popen",
+        lambda _argv, *, shell: process,
+    )
+    monkeypatch.setattr(
+        "factlane.webui_app.probe_linux_managed_https",
+        lambda _origin, **_kwargs: ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.PORT_CONFLICT,
+            detail="loopback listener failed exact Caddy CA/SNI verification",
+        ),
+    )
+
+    caddy = create_caddy_process(config, caddy_command(config))
+
+    assert caddy.is_ready() is False
+    assert process.poll() is None
 
 
 def test_caddy_process_graceful_stop_is_bounded_and_never_kills(

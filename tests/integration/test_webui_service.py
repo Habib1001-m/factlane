@@ -15,6 +15,7 @@ if sys.platform != "linux":
 
 from factlane.webui_service import (
     EndpointUnavailable,
+    ServiceStateError,
     ServiceStatus,
     WebUIServiceState,
 )
@@ -209,6 +210,165 @@ def test_maintenance_restores_initial_running_state_unless_a_newer_stop_wins(tmp
     service.finish_maintenance("maintenance-2")
     assert service.snapshot().status is ServiceStatus.STOPPED_UNTIL_REBOOT
     assert controller.actions == ["start", "stop"]
+
+
+def test_governance_revision_is_monotonic_across_maintenance_and_recovery_aba(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    initial = service.snapshot().governance_revision
+
+    maintenance = service.begin_maintenance("governance-maintenance")
+    assert maintenance.governance_revision == initial + 1
+    finished = service.finish_maintenance("governance-maintenance")
+    assert finished.status is ServiceStatus.STARTING
+    assert finished.governance_revision == initial + 2
+
+    recovery = service.mark_recovery_required()
+    assert recovery.governance_revision == initial + 3
+    cleared = service.clear_recovery_required()
+    assert cleared.status is ServiceStatus.STARTING
+    assert cleared.governance_revision == initial + 4
+
+    stopped = service.request_stop("governance-stop")
+    assert stopped.governance_revision == initial + 5
+    started = service.request_start("governance-start")
+    assert started.governance_revision == initial + 6
+
+
+def test_legacy_service_state_without_governance_revision_loads_as_zero(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    service.mark_ready()
+    state_path = tmp_path / "owner-private" / "webui-service.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload.pop("governance_revision")
+    state_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    state_path.chmod(0o600)
+
+    reloaded = _service(tmp_path)
+
+    assert reloaded.snapshot().governance_revision == 0
+
+
+def test_stale_runtime_instance_cannot_overwrite_newer_owner_stop(tmp_path: Path) -> None:
+    state_path = tmp_path / "owner-private" / "webui-service.json"
+    runtime = WebUIServiceState(state_path, boot_id=lambda: "boot-shared")
+    owner = WebUIServiceState(state_path, boot_id=lambda: "boot-shared")
+
+    stopped = owner.request_stop("owner-stop")
+    assert stopped.status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    with pytest.raises(ServiceStateError, match="stopped-until-reboot"):
+        runtime.mark_ready()
+
+    persisted = WebUIServiceState(state_path, boot_id=lambda: "boot-shared").snapshot()
+    assert persisted.status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    assert persisted.intent_revision == 1
+    assert persisted.governance_revision == 1
+
+
+def test_stale_owner_instance_preserves_newer_runtime_endpoint_claim(tmp_path: Path) -> None:
+    state_path = tmp_path / "owner-private" / "webui-service.json"
+    stale_owner = WebUIServiceState(state_path, boot_id=lambda: "boot-shared")
+    runtime = WebUIServiceState(state_path, boot_id=lambda: "boot-shared")
+    endpoint = "https://factlane-demo.test:8765"
+
+    runtime.claim_endpoint(endpoint)
+    runtime.mark_ready()
+    started = stale_owner.request_start("owner-start")
+
+    assert started.saved_endpoint == endpoint
+    assert started.intent_revision == 1
+    persisted = WebUIServiceState(state_path, boot_id=lambda: "boot-shared").snapshot()
+    assert persisted.saved_endpoint == endpoint
+    assert persisted.intent_revision == 1
+
+
+def test_runtime_failure_cannot_demote_newer_owner_stop(tmp_path: Path) -> None:
+    state_path = tmp_path / "owner-private" / "webui-service.json"
+    runtime = WebUIServiceState(state_path, boot_id=lambda: "boot-shared")
+    owner = WebUIServiceState(state_path, boot_id=lambda: "boot-shared")
+
+    owner.request_stop("owner-stop")
+    failed = runtime.mark_failed()
+
+    assert failed.status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    persisted = WebUIServiceState(state_path, boot_id=lambda: "boot-shared").snapshot()
+    assert persisted.status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    assert persisted.intent_revision == 1
+    assert persisted.governance_revision == 1
+
+
+def test_runtime_status_writers_cannot_demote_maintenance_or_recovery(tmp_path: Path) -> None:
+    state_path = tmp_path / "owner-private" / "webui-service.json"
+    runtime = WebUIServiceState(state_path, boot_id=lambda: "boot-shared")
+    owner = WebUIServiceState(state_path, boot_id=lambda: "boot-shared")
+
+    owner.begin_maintenance("maintenance-1")
+    assert runtime.mark_starting().status is ServiceStatus.MAINTENANCE
+    assert runtime.mark_failed().status is ServiceStatus.MAINTENANCE
+    with pytest.raises(ServiceStateError, match="maintenance-owned"):
+        runtime.mark_ready()
+    maintained = owner.snapshot()
+    assert maintained.status is ServiceStatus.MAINTENANCE
+    assert maintained.maintenance_operation_id == "maintenance-1"
+
+    owner.mark_recovery_required()
+    assert runtime.mark_starting().status is ServiceStatus.RECOVERY_REQUIRED
+    assert runtime.mark_failed().status is ServiceStatus.RECOVERY_REQUIRED
+    with pytest.raises(ServiceStateError, match="recovery-required"):
+        runtime.mark_ready()
+    recovered = owner.snapshot()
+    assert recovered.status is ServiceStatus.RECOVERY_REQUIRED
+    assert recovered.maintenance_operation_id is None
+
+
+def test_explicit_failed_recovery_finalization_preserves_newer_owner_stop(tmp_path: Path) -> None:
+    state_path = tmp_path / "owner-private" / "webui-service.json"
+    service = WebUIServiceState(state_path, boot_id=lambda: "boot-shared")
+    service.mark_failed()
+    service.begin_maintenance("maintenance-1")
+    service.mark_recovery_required()
+
+    restored = service.restore_failed_after_recovery()
+    assert restored.status is ServiceStatus.FAILED
+    assert restored.governance_revision == 3
+
+    service.mark_recovery_required()
+    service.request_stop("owner-stop-during-recovery")
+    stopped = service.restore_failed_after_recovery()
+    assert stopped.status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    assert stopped.stopped_boot_id == "boot-shared"
+    assert stopped.intent_revision == 1
+
+
+@pytest.mark.parametrize("protected", ["stop", "maintenance"])
+def test_protected_service_state_refuses_new_endpoint_claims(
+    tmp_path: Path,
+    protected: str,
+) -> None:
+    state_path = tmp_path / "owner-private" / "webui-service.json"
+    service = WebUIServiceState(
+        state_path,
+        boot_id=lambda: "boot-protected",
+        listener=lambda _port: True,
+    )
+    if protected == "stop":
+        service.request_stop("owner-stop")
+    elif protected == "maintenance":
+        service.begin_maintenance("maintenance-1")
+
+    with pytest.raises(EndpointUnavailable):
+        service.claim_endpoint("https://factlane-demo.test:8765")
+    with pytest.raises(EndpointUnavailable):
+        service.ensure_endpoint("factlane-demo.test")
+
+    persisted = service.snapshot()
+    assert persisted.saved_endpoint is None
 
 
 def test_maintenance_preserves_an_initial_stopped_state(tmp_path: Path) -> None:

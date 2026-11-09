@@ -107,6 +107,7 @@ def _service_snapshot(
         saved_endpoint=saved_endpoint,
         stopped_boot_id=None,
         intent_revision=0,
+        governance_revision=0,
         crash_attempts=0,
         next_retry_at=None,
         ready_since=0.0 if status is ServiceStatus.READY else None,
@@ -623,6 +624,53 @@ def test_unknown_candidate_activation_failure_stops_once_and_never_skips_to_next
     assert result.status is InstallerStepStatus.FAILED
     assert result.endpoint_state is EndpointState.PROPOSED
     assert [plan.saved_port for plan in backend.activations] == [8765]
+    assert [plan.saved_port for plan in backend.stops] == [8765]
+
+
+def test_ambiguous_candidate_stop_returns_recovery_without_attempting_rollback() -> None:
+    class _AmbiguousStopBackend(_FakeInstallerBackend):
+        def __init__(self) -> None:
+            super().__init__(
+                activation_by_port={
+                    8765: ManagedServiceActivationStatus.PORT_CONFLICT,
+                }
+            )
+            self.rollback_calls = 0
+            self.recovery_seals = 0
+
+        def stop_candidate(self, *, plan):
+            self.stops.append(plan)
+            return InstallerStepResult(
+                status=InstallerStepStatus.RECOVERY_REQUIRED,
+                operation="STOP_MANAGED_SERVICE",
+                detail="governed service state changed outside setup",
+            )
+
+        def rollback_setup(self, *, plan, completed_operations):
+            del plan, completed_operations
+            self.rollback_calls += 1
+            return InstallerStepResult(
+                status=InstallerStepStatus.APPLIED,
+                operation="ROLLBACK_SETUP",
+            )
+
+        def mark_recovery_required(self, *, plan, detail):
+            del plan, detail
+            self.recovery_seals += 1
+            return InstallerStepResult(
+                status=InstallerStepStatus.APPLIED,
+                operation="MARK_RECOVERY_REQUIRED",
+            )
+
+    backend = _AmbiguousStopBackend()
+    receipt = plan_webui_setup(_request(), _environment(), _consent())
+
+    result = apply_webui_setup(receipt, _consent(), backend)
+
+    assert result.status is InstallerStepStatus.RECOVERY_REQUIRED
+    assert "no rollback was attempted" in (result.detail or "")
+    assert backend.rollback_calls == 0
+    assert backend.recovery_seals == 1
     assert [plan.saved_port for plan in backend.stops] == [8765]
 
 

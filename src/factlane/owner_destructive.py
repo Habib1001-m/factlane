@@ -1566,10 +1566,15 @@ class OwnerDestructiveOrchestrator:
                 await _await_if_needed(clear())
             return
         if initial_status == "FAILED":
-            mark_failed = getattr(self._service_state, "mark_failed", None)
-            if callable(mark_failed):
-                await _await_if_needed(mark_failed())
-                return
+            restore_failed = getattr(self._service_state, "restore_failed_after_recovery", None)
+            if not callable(restore_failed):
+                raise OwnerDestructiveError(
+                    "PURGE_RECOVERY_REQUIRED",
+                    "purge recovery requires explicit FAILED service-state finalization support",
+                    recovery_required=True,
+                )
+            await _await_if_needed(restore_failed())
+            return
         clear = getattr(self._service_state, "clear_recovery_required", None)
         if callable(clear):
             await _await_if_needed(clear())

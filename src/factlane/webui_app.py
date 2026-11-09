@@ -88,7 +88,12 @@ from .webui_runtime import (
     default_runtime_config_path,
     load_runtime_config,
 )
-from .webui_install import WEBUI_SERVICE_NAME, _atomic_owner_file_write
+from .webui_install import (
+    WEBUI_SERVICE_NAME,
+    ManagedServiceActivationStatus,
+    _atomic_owner_file_write,
+    probe_linux_managed_https,
+)
 from .webui_service import ServiceSnapshot, ServiceStatus, WebUIServiceState
 from .webui_windows import (
     WindowsManagedConfig,
@@ -771,10 +776,16 @@ def _make_post_activation_verifier(
 
 
 class _CaddySubprocess:
-    def __init__(self, process: Any, *, host: str, port: int) -> None:
+    def __init__(
+        self,
+        process: Any,
+        *,
+        origin: str,
+        root_cert_path: str | os.PathLike[str],
+    ) -> None:
         self._process = process
-        self._host = host
-        self._port = port
+        self._origin = origin
+        self._root_cert_path = os.fspath(root_cert_path)
 
     def poll(self) -> int | None:
         return self._process.poll()
@@ -782,20 +793,15 @@ class _CaddySubprocess:
     def is_ready(self) -> bool:
         if self.poll() is not None:
             return False
-        try:
-            connection = socket.create_connection(
-                (self._host, self._port),
-                timeout=_CADDY_READINESS_CONNECT_TIMEOUT_SECONDS,
-            )
-        except OSError:
-            return False
-        try:
-            return self.poll() is None
-        finally:
-            try:
-                connection.close()
-            except OSError:
-                pass
+        readiness = probe_linux_managed_https(
+            self._origin,
+            root_cert_path=self._root_cert_path,
+            timeout_seconds=_CADDY_READINESS_CONNECT_TIMEOUT_SECONDS,
+        )
+        return (
+            readiness.status is ManagedServiceActivationStatus.READY
+            and self.poll() is None
+        )
 
     def terminate(self) -> None:
         if self.poll() is None:
@@ -838,7 +844,7 @@ def create_caddy_process(
     config: WebUIRuntimeConfig,
     argv: tuple[str, ...],
 ) -> _CaddySubprocess:
-    """Start the exact configured Caddy argv and prove its loopback TCP listener."""
+    """Start exact Caddy and prove the managed TLS/backend path before readiness."""
 
     validated = _validated_caddy_config(config)
     expected_argv = caddy_command(validated)
@@ -850,11 +856,24 @@ def create_caddy_process(
     if host is None or port is None or parsed.scheme != "https":
         raise ValueError("Caddy readiness origin is unsafe")
     process = subprocess.Popen(argv, shell=False)
-    # The managed .test hostname is intentionally resolvable only inside the
-    # isolated Firefox profile.  Internal process-liveness probing therefore
-    # targets the exact loopback bind directly; setup's outer HTTPS probe owns
-    # the stronger CA/SNI/Host/backend-readiness proof before CLAIMED.
-    return _CaddySubprocess(process, host="127.0.0.1", port=port)
+    root_cert_path = (
+        Path(validated.state_dir)
+        / "caddy"
+        / "pki"
+        / "authorities"
+        / "local"
+        / "root.crt"
+    )
+    # A generic TCP connect is insufficient: another local process may already
+    # own the candidate port while the just-started Caddy child is still exiting
+    # its bind failure.  Reuse the installer's exact local CA/SNI/Host/health
+    # proof so the runtime cannot claim an endpoint merely because *some*
+    # loopback listener answered there.
+    return _CaddySubprocess(
+        process,
+        origin=validated.origin,
+        root_cert_path=root_cert_path,
+    )
 
 
 class _RegistryRuntimeObserver:

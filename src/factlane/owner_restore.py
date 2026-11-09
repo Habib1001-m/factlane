@@ -959,9 +959,6 @@ class FullRestoreService:
         return raw if isinstance(raw, str) else None
 
     async def _finish_service_after_recovery(self, operation_id: str) -> None:
-        if await self._service_status() != "RECOVERY_REQUIRED":
-            await self._finish_service_maintenance(operation_id)
-            return
         journal = self._read_journal_optional(operation_id)
         if journal is None:
             raise AdapterError(
@@ -970,6 +967,11 @@ class FullRestoreService:
             )
         initial = self._validated_service_initial(journal.get("service_initial"))
         current = await self._service_snapshot_receipt()
+        if current["status"] != "RECOVERY_REQUIRED":
+            if initial["status"] == "FAILED" and current["status"] == "FAILED":
+                return
+            await self._finish_service_maintenance(operation_id)
+            return
         if current["intent_revision"] < initial["intent_revision"]:
             raise AdapterError(
                 "RESTORE_STATE_UNAVAILABLE",
@@ -980,13 +982,13 @@ class FullRestoreService:
             and current["intent_revision"] > initial["intent_revision"]
         )
         if not newer_stop and initial["status"] == "FAILED":
-            mark_failed = getattr(self._service_state, "mark_failed", None)
-            if not callable(mark_failed):
+            restore_failed = getattr(self._service_state, "restore_failed_after_recovery", None)
+            if not callable(restore_failed):
                 raise AdapterError(
                     "RESTORE_NOT_CONFIGURED",
-                    "full restore recovery requires FAILED service-state restoration support",
+                    "full restore recovery requires explicit FAILED service-state finalization support",
                 )
-            await _maybe_await(mark_failed())
+            await _maybe_await(restore_failed())
             return
         clear_recovery = getattr(self._service_state, "clear_recovery_required", None)
         if not callable(clear_recovery):

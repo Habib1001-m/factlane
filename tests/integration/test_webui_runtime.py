@@ -164,13 +164,16 @@ def _runner(
     clock: _Clock | None = None,
     backend: _Backend | None = None,
     process: _Process | None = None,
+    memory_configured: bool = True,
 ):
     clock = clock or _Clock()
     backend = backend or _Backend()
     process = process or _Process()
     backend.clock = clock
     process.clock = clock
-    config = load_runtime_config(_write_config(tmp_path))
+    config = load_runtime_config(
+        _write_config(tmp_path, memory_configured=memory_configured)
+    )
     backend_specs = []
     process_argv = []
     service_state = _service(tmp_path, clock)
@@ -680,6 +683,47 @@ def test_readiness_deadline_is_ten_seconds_and_failure_enters_crash_retry_policy
     assert runner.service_state.snapshot().saved_endpoint is None
 
 
+def test_unclaimed_setup_gateway_exit_does_not_consume_service_crash_budget(
+    tmp_path: Path,
+) -> None:
+    process = _Process()
+    process.returncode = 98
+    runner, backend, process, _specs, _argv, _clock = _runner(
+        tmp_path,
+        process=process,
+        memory_configured=False,
+    )
+
+    outcome = runner.start()
+
+    assert outcome.state is RuntimeOutcomeState.FAILED
+    assert outcome.detail == "setup gateway exited before endpoint claim"
+    snapshot = runner.service_state.snapshot()
+    assert snapshot.saved_endpoint is None
+    assert snapshot.crash_attempts == 0
+    assert snapshot.next_retry_at is None
+    assert backend.drain_calls == 1
+    assert process.terminate_calls == 0
+
+
+def test_normal_runtime_gateway_exit_during_readiness_still_consumes_crash_budget(
+    tmp_path: Path,
+) -> None:
+    process = _Process()
+    process.returncode = 98
+    runner, backend, process, _specs, _argv, _clock = _runner(
+        tmp_path,
+        process=process,
+    )
+
+    outcome = runner.start()
+
+    assert outcome.state is RuntimeOutcomeState.RETRY_SCHEDULED
+    assert runner.service_state.snapshot().crash_attempts == 1
+    assert backend.drain_calls == 1
+    assert process.terminate_calls == 0
+
+
 @pytest.mark.parametrize(
     ("backend_ready", "caddy_ready"),
     [(True, False), (False, True)],
@@ -729,6 +773,20 @@ def test_current_boot_stop_marker_prevents_backend_or_caddy_launch(tmp_path: Pat
 
     outcome = runner.start()
 
+    assert outcome.state is RuntimeOutcomeState.STOPPED
+    assert backend.start_calls == 0
+    assert backend_specs == []
+    assert process_argv == []
+
+
+def test_runtime_failure_observation_cannot_hide_owner_stop_before_launch(tmp_path: Path) -> None:
+    runner, backend, _process, backend_specs, process_argv, _clock = _runner(tmp_path)
+    runner.service_state.request_stop("owner-stop")
+    failed = runner.service_state.mark_failed()
+
+    outcome = runner.start()
+
+    assert failed.status is ServiceStatus.STOPPED_UNTIL_REBOOT
     assert outcome.state is RuntimeOutcomeState.STOPPED
     assert backend.start_calls == 0
     assert backend_specs == []

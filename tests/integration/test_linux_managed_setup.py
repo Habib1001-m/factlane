@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 
 import pytest
+import factlane.webui_install as webui_install_module
 
 if sys.platform != "linux":
     pytest.skip("managed Linux setup qualification is Linux-only", allow_module_level=True)
@@ -17,6 +20,8 @@ from factlane.webui_install import (
     InstallEnvironment,
     InstallerStepStatus,
     LinuxSetupRecoveryRequired,
+    ManagedServiceActivationResult,
+    ManagedServiceActivationStatus,
     ProductionLinuxInstallerBackend,
     SetupConsent,
     bootstrap_linux_caddy_root,
@@ -27,6 +32,7 @@ from factlane.webui_install import (
     plan_webui_setup,
 )
 from factlane.webui_platform import LinuxFirefoxBrowserLauncher, build_default_setup_request
+from factlane.webui_service import ServiceStatus, WebUIServiceState
 
 
 def _request(tmp_path: Path, *, lingering_required: bool = False):
@@ -569,6 +575,88 @@ def test_caddy_ca_bootstrap_waits_for_atomic_temp_to_disappear(tmp_path: Path) -
     assert receipt.status == "CREATED"
     assert orphan_removed[0] is True
     assert process.stopped is True
+
+
+def test_caddy_bootstrap_reprobe_tolerates_atomic_temp_disappearing_after_lstat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "caddy"
+    _, pem = _root_pem(tmp_path)
+    _populate_caddy_bootstrap_ready_state(
+        state,
+        "factlane-linuxsetup123.test",
+        pem,
+    )
+    state.chmod(0o700)
+    orphan = (
+        state
+        / "certificates"
+        / "local"
+        / "factlane-linuxsetup123.test"
+        / "1234567890"
+    )
+    orphan.write_bytes(b"partial")
+    orphan.chmod(0o600)
+    original = webui_install_module._require_owner_private_regular_file
+
+    def disappearing(path: Path, *, owner_uid: int):
+        if Path(path) == orphan and orphan.exists():
+            orphan.unlink()
+        return original(Path(path), owner_uid=owner_uid)
+
+    monkeypatch.setattr(
+        webui_install_module,
+        "_require_owner_private_regular_file",
+        disappearing,
+    )
+
+    assert (
+        webui_install_module._caddy_bootstrap_storage_ready(
+            state,
+            hostname="factlane-linuxsetup123.test",
+            owner_uid=os.getuid(),
+        )
+        is None
+    )
+    assert not orphan.exists()
+
+
+def test_caddy_bootstrap_config_disappearance_remains_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "caddy"
+    _, pem = _root_pem(tmp_path)
+    _populate_caddy_bootstrap_ready_state(
+        state,
+        "factlane-linuxsetup123.test",
+        pem,
+    )
+    state.chmod(0o700)
+    bootstrap_config = state / ".factlane-ca-bootstrap.Caddyfile"
+    bootstrap_config.write_text("bootstrap", encoding="utf-8")
+    bootstrap_config.chmod(0o600)
+    original = webui_install_module._require_owner_private_regular_file
+
+    def disappearing(path: Path, *, owner_uid: int):
+        if Path(path) == bootstrap_config and bootstrap_config.exists():
+            bootstrap_config.unlink()
+        return original(Path(path), owner_uid=owner_uid)
+
+    monkeypatch.setattr(
+        webui_install_module,
+        "_require_owner_private_regular_file",
+        disappearing,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        webui_install_module._caddy_bootstrap_storage_ready(
+            state,
+            hostname="factlane-linuxsetup123.test",
+            owner_uid=os.getuid(),
+        )
+    assert not bootstrap_config.exists()
 
 
 def test_setup_owned_existing_root_only_state_resumes_bootstrap_until_complete(tmp_path: Path) -> None:
@@ -1243,6 +1331,527 @@ def test_caddy_rollback_rejects_foreign_runtime_certificate_state(
     assert result.status is InstallerStepStatus.RECOVERY_REQUIRED
     assert foreign.read_text(encoding="utf-8") == "preserve"
     assert _journal_payload(request)["phase"] == "RECOVERY_REQUIRED"
+
+
+def test_owner_stop_during_candidate_activation_is_preserved_and_blocks_rollback(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal_op = receipt.operations[0]
+    state_path = Path(request.state_dir) / "webui-service.json"
+    commands: list[tuple[str, ...]] = []
+
+    def service_state() -> WebUIServiceState:
+        return WebUIServiceState(state_path, boot_id=lambda: "boot-owner")
+
+    def probe(_origin: str) -> ManagedServiceActivationResult:
+        service_state().request_stop("owner-stop-during-activation")
+        return ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.PORT_CONFLICT,
+            detail="foreign loopback listener",
+        )
+
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda argv: commands.append(argv) or 0,
+        service_state_reader=lambda: service_state().snapshot(),
+        activation_probe=probe,
+    )
+    assert (
+        backend.apply_operation(journal_op, plan=receipt.plan).status
+        is InstallerStepStatus.APPLIED
+    )
+
+    activated = backend.activate_candidate(plan=receipt.plan)
+    stopped = backend.stop_candidate(plan=receipt.plan)
+
+    assert activated.status is ManagedServiceActivationStatus.FAILED
+    assert "governed service state changed" in (activated.detail or "")
+    assert stopped.status is InstallerStepStatus.RECOVERY_REQUIRED
+    snapshot = service_state().snapshot()
+    assert snapshot.status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    assert snapshot.intent_revision == 1
+    assert snapshot.saved_endpoint is None
+
+    rollback = backend.rollback_setup(plan=receipt.plan, completed_operations=())
+    assert rollback.status is InstallerStepStatus.RECOVERY_REQUIRED
+    preserved = service_state().snapshot()
+    assert preserved.status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    assert preserved.intent_revision == 1
+    assert state_path.is_file()
+    assert commands == [
+        ("/usr/bin/systemctl", "--user", "start", "factlane-webui.service"),
+    ]
+
+
+def test_owner_stop_between_activation_probe_and_candidate_stop_is_not_resealed(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal_op = receipt.operations[0]
+    state_path = Path(request.state_dir) / "webui-service.json"
+
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda _argv: 0,
+        service_state_reader=lambda: WebUIServiceState(
+            state_path,
+            boot_id=lambda: "boot-owner",
+        ).snapshot(),
+        activation_probe=lambda _origin: ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.PORT_CONFLICT,
+        ),
+    )
+    assert (
+        backend.apply_operation(journal_op, plan=receipt.plan).status
+        is InstallerStepStatus.APPLIED
+    )
+    activated = backend.activate_candidate(plan=receipt.plan)
+    assert activated.status is ManagedServiceActivationStatus.PORT_CONFLICT
+
+    owner_state = WebUIServiceState(state_path, boot_id=lambda: "boot-owner")
+    owner_state.request_stop("owner-stop-before-installer-stop")
+    stopped = backend.stop_candidate(plan=receipt.plan)
+
+    assert stopped.status is InstallerStepStatus.RECOVERY_REQUIRED
+    snapshot = WebUIServiceState(
+        state_path,
+        boot_id=lambda: "boot-owner",
+    ).snapshot()
+    assert snapshot.status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    assert snapshot.intent_revision == 1
+    rollback = backend.rollback_setup(plan=receipt.plan, completed_operations=())
+    assert rollback.status is InstallerStepStatus.RECOVERY_REQUIRED
+    assert state_path.is_file()
+
+
+def test_owner_start_between_activation_and_candidate_stop_is_not_overridden(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal_op = receipt.operations[0]
+    state_path = Path(request.state_dir) / "webui-service.json"
+    owner_state = WebUIServiceState(state_path, boot_id=lambda: "boot-owner-start")
+    commands: list[tuple[str, ...]] = []
+
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda argv: commands.append(argv) or 0,
+        service_state_reader=lambda: WebUIServiceState(
+            state_path,
+            boot_id=lambda: "boot-owner-start",
+        ).snapshot(),
+        activation_probe=lambda _origin: ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.PORT_CONFLICT,
+        ),
+    )
+    assert (
+        backend.apply_operation(journal_op, plan=receipt.plan).status
+        is InstallerStepStatus.APPLIED
+    )
+    assert (
+        backend.activate_candidate(plan=receipt.plan).status
+        is ManagedServiceActivationStatus.PORT_CONFLICT
+    )
+
+    owner_state.request_start("owner-start-before-installer-stop")
+    stopped = backend.stop_candidate(plan=receipt.plan)
+
+    assert stopped.status is InstallerStepStatus.RECOVERY_REQUIRED
+    snapshot = WebUIServiceState(
+        state_path,
+        boot_id=lambda: "boot-owner-start",
+    ).snapshot()
+    assert snapshot.status is ServiceStatus.STARTING
+    assert snapshot.intent_revision == 1
+    assert commands == [
+        ("/usr/bin/systemctl", "--user", "start", "factlane-webui.service"),
+    ]
+
+
+def test_owner_stop_after_rollback_validation_cannot_be_erased(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal_op = receipt.operations[0]
+    state_path = Path(request.state_dir) / "webui-service.json"
+
+    def state_reader():
+        state = WebUIServiceState(state_path, boot_id=lambda: "boot-rollback-race")
+        state.mark_failed()
+        return state.snapshot()
+
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda _argv: 0,
+        service_state_reader=state_reader,
+    )
+    assert (
+        backend.apply_operation(journal_op, plan=receipt.plan).status
+        is InstallerStepStatus.APPLIED
+    )
+    assert (
+        backend.activate_candidate(plan=receipt.plan).status
+        is ManagedServiceActivationStatus.FAILED
+    )
+    assert backend.stop_candidate(plan=receipt.plan).status is InstallerStepStatus.APPLIED
+
+    original_unlink = Path.unlink
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+    writers: list[threading.Thread] = []
+
+    def owner_stop() -> None:
+        writer_started.set()
+        WebUIServiceState(
+            state_path,
+            boot_id=lambda: "boot-rollback-race",
+        ).request_stop("owner-stop-during-rollback")
+        writer_finished.set()
+
+    def racing_unlink(path: Path, *args, **kwargs):
+        if path == state_path and not writers:
+            thread = threading.Thread(target=owner_stop, daemon=True)
+            writers.append(thread)
+            thread.start()
+            assert writer_started.wait(timeout=1.0)
+            time.sleep(0.02)
+            assert not writer_finished.is_set()
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", racing_unlink)
+    rolled_back = backend.rollback_setup(plan=receipt.plan, completed_operations=())
+    assert rolled_back.status is InstallerStepStatus.APPLIED
+    assert writers
+    writers[0].join(timeout=1.0)
+    assert writer_finished.is_set()
+
+    preserved = WebUIServiceState(
+        state_path,
+        boot_id=lambda: "boot-rollback-race",
+    ).snapshot()
+    assert preserved.status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    assert preserved.intent_revision == 1
+
+
+def test_durable_recovery_phase_blocks_fresh_setup_retry(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal_op = receipt.operations[0]
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+    )
+    assert (
+        backend.apply_operation(journal_op, plan=receipt.plan).status
+        is InstallerStepStatus.APPLIED
+    )
+    sealed = backend.mark_recovery_required(
+        plan=receipt.plan,
+        detail="ambiguous candidate liveness",
+    )
+    assert sealed.status is InstallerStepStatus.APPLIED
+    assert _journal_payload(request)["phase"] == "RECOVERY_REQUIRED"
+
+    retry = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+    )
+    retried = retry.apply_operation(journal_op, plan=receipt.plan)
+    assert retried.status is InstallerStepStatus.RECOVERY_REQUIRED
+    assert _journal_payload(request)["phase"] == "RECOVERY_REQUIRED"
+
+
+def test_fresh_setup_retry_refuses_unresolved_activating_phase(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal_op = receipt.operations[0]
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+    )
+    assert (
+        backend.apply_operation(journal_op, plan=receipt.plan).status
+        is InstallerStepStatus.APPLIED
+    )
+    journal_path = linux_setup_journal_path(request.state_dir)
+    payload = _journal_payload(request)
+    payload["phase"] = "ACTIVATING"
+    journal_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    journal_path.chmod(0o600)
+
+    retry = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+    )
+    retried = retry.apply_operation(journal_op, plan=receipt.plan)
+    assert retried.status is InstallerStepStatus.RECOVERY_REQUIRED
+    assert _journal_payload(request)["phase"] == "ACTIVATING"
+
+
+def test_owner_created_service_state_between_candidates_is_not_adopted_by_setup(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal_op = receipt.operations[0]
+    state_path = Path(request.state_dir) / "webui-service.json"
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda _argv: 0,
+        service_state_reader=lambda: WebUIServiceState(
+            state_path,
+            boot_id=lambda: "boot-owner",
+        ).snapshot(),
+        activation_probe=lambda _origin: ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.PORT_CONFLICT,
+        ),
+    )
+    assert (
+        backend.apply_operation(journal_op, plan=receipt.plan).status
+        is InstallerStepStatus.APPLIED
+    )
+    assert (
+        backend.activate_candidate(plan=receipt.plan).status
+        is ManagedServiceActivationStatus.PORT_CONFLICT
+    )
+    assert backend.stop_candidate(plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    assert not state_path.exists()
+
+    owner_state = WebUIServiceState(state_path, boot_id=lambda: "boot-owner")
+    owner_state.request_stop("owner-stop-between-candidates")
+    second_plan = replace(
+        receipt.plan,
+        saved_port=8766,
+        origin=f"https://{receipt.plan.hostname}:8766",
+    )
+    second = backend.activate_candidate(plan=second_plan)
+    second_stop = backend.stop_candidate(plan=second_plan)
+
+    assert second.status is ManagedServiceActivationStatus.FAILED
+    assert "rollback ownership could not be established" in (second.detail or "")
+    assert second_stop.status is InstallerStepStatus.RECOVERY_REQUIRED
+    snapshot = WebUIServiceState(
+        state_path,
+        boot_id=lambda: "boot-owner",
+    ).snapshot()
+    assert snapshot.status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    assert snapshot.intent_revision == 1
+    rollback = backend.rollback_setup(plan=receipt.plan, completed_operations=())
+    assert rollback.status is InstallerStepStatus.RECOVERY_REQUIRED
+    assert state_path.is_file()
+
+
+@pytest.mark.parametrize("governance_cycle", ["maintenance", "recovery"])
+def test_completed_governance_cycle_during_activation_still_blocks_reseal(
+    tmp_path: Path,
+    governance_cycle: str,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal_op = receipt.operations[0]
+    state_path = Path(request.state_dir) / "webui-service.json"
+
+    def service_state() -> WebUIServiceState:
+        return WebUIServiceState(state_path, boot_id=lambda: "boot-governance")
+
+    def probe(_origin: str) -> ManagedServiceActivationResult:
+        state = service_state()
+        if governance_cycle == "maintenance":
+            state.begin_maintenance("maintenance-aba")
+            state.finish_maintenance("maintenance-aba")
+        else:
+            state.mark_recovery_required()
+            state.clear_recovery_required()
+        return ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.PORT_CONFLICT,
+        )
+
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda _argv: 0,
+        service_state_reader=lambda: service_state().snapshot(),
+        activation_probe=probe,
+    )
+    assert (
+        backend.apply_operation(journal_op, plan=receipt.plan).status
+        is InstallerStepStatus.APPLIED
+    )
+
+    activated = backend.activate_candidate(plan=receipt.plan)
+    stopped = backend.stop_candidate(plan=receipt.plan)
+
+    assert activated.status is ManagedServiceActivationStatus.FAILED
+    assert "governed service state changed" in (activated.detail or "")
+    assert stopped.status is InstallerStepStatus.RECOVERY_REQUIRED
+    snapshot = service_state().snapshot()
+    assert snapshot.status is ServiceStatus.STARTING
+    assert snapshot.intent_revision == 0
+    assert snapshot.governance_revision == 2
+    rollback = backend.rollback_setup(plan=receipt.plan, completed_operations=())
+    assert rollback.status is InstallerStepStatus.RECOVERY_REQUIRED
+    assert state_path.is_file()
+
+
+def test_preexisting_previous_boot_stop_is_reconciled_before_governance_baseline(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal_op = receipt.operations[0]
+    state_path = Path(request.state_dir) / "webui-service.json"
+    old_boot = WebUIServiceState(state_path, boot_id=lambda: "boot-old")
+    old_boot.request_stop("old-boot-stop")
+    assert old_boot.snapshot().status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    old_governance_revision = old_boot.snapshot().governance_revision
+
+    def current_state() -> WebUIServiceState:
+        return WebUIServiceState(state_path, boot_id=lambda: "boot-current")
+
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda _argv: 0,
+        service_state_reader=lambda: current_state().snapshot(),
+        activation_probe=lambda _origin: ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.PORT_CONFLICT,
+        ),
+    )
+    assert (
+        backend.apply_operation(journal_op, plan=receipt.plan).status
+        is InstallerStepStatus.APPLIED
+    )
+
+    activated = backend.activate_candidate(plan=receipt.plan)
+    stopped = backend.stop_candidate(plan=receipt.plan)
+
+    assert activated.status is ManagedServiceActivationStatus.PORT_CONFLICT
+    assert stopped.status is InstallerStepStatus.APPLIED
+    reconciled = current_state().snapshot()
+    assert reconciled.status is ServiceStatus.STARTING
+    assert reconciled.stopped_boot_id is None
+    assert reconciled.intent_revision == 1
+    assert reconciled.governance_revision == old_governance_revision + 1
+
+
+@pytest.mark.parametrize("owner_action", ["start", "restart"])
+def test_owner_liveness_intent_in_activation_baseline_gap_is_not_adopted(
+    tmp_path: Path,
+    owner_action: str,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal_op = receipt.operations[0]
+    state_path = Path(request.state_dir) / "webui-service.json"
+    baseline = WebUIServiceState(state_path, boot_id=lambda: "boot-baseline-gap")
+    assert baseline.snapshot().intent_revision == 0
+    commands: list[tuple[str, ...]] = []
+    injected = False
+
+    def service_state_reader():
+        nonlocal injected
+        state = WebUIServiceState(state_path, boot_id=lambda: "boot-baseline-gap")
+        if not injected:
+            injected = True
+            if owner_action == "start":
+                return state.request_start("owner-start-in-baseline-gap")
+            return state.request_restart("owner-restart-in-baseline-gap")
+        return state.snapshot()
+
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda argv: commands.append(argv) or 0,
+        service_state_reader=service_state_reader,
+        activation_probe=lambda _origin: pytest.fail(
+            "candidate probe must not run after Owner liveness intent drift"
+        ),
+    )
+    assert (
+        backend.apply_operation(journal_op, plan=receipt.plan).status
+        is InstallerStepStatus.APPLIED
+    )
+
+    activated = backend.activate_candidate(plan=receipt.plan)
+    stopped = backend.stop_candidate(plan=receipt.plan)
+
+    assert activated.status is ManagedServiceActivationStatus.FAILED
+    assert "changed before candidate activation baseline" in (activated.detail or "")
+    assert stopped.status is InstallerStepStatus.RECOVERY_REQUIRED
+    assert commands == []
+    snapshot = WebUIServiceState(
+        state_path,
+        boot_id=lambda: "boot-baseline-gap",
+    ).snapshot()
+    assert snapshot.status is ServiceStatus.STARTING
+    assert snapshot.intent_revision == 1
+    assert snapshot.governance_revision == 1
+
+
+def test_preexisting_current_boot_stop_blocks_candidate_start(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal_op = receipt.operations[0]
+    state_path = Path(request.state_dir) / "webui-service.json"
+    current = WebUIServiceState(state_path, boot_id=lambda: "boot-current")
+    current.request_stop("current-boot-stop")
+    commands: list[tuple[str, ...]] = []
+
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda argv: commands.append(argv) or 0,
+        service_state_reader=lambda: WebUIServiceState(
+            state_path,
+            boot_id=lambda: "boot-current",
+        ).snapshot(),
+        activation_probe=lambda _origin: pytest.fail(
+            "activation probe must not run for an active Owner stop"
+        ),
+    )
+    assert (
+        backend.apply_operation(journal_op, plan=receipt.plan).status
+        is InstallerStepStatus.APPLIED
+    )
+
+    activated = backend.activate_candidate(plan=receipt.plan)
+
+    assert activated.status is ManagedServiceActivationStatus.FAILED
+    assert activated.detail == "governed service state blocks candidate activation"
+    assert commands == []
+    snapshot = WebUIServiceState(
+        state_path,
+        boot_id=lambda: "boot-current",
+    ).snapshot()
+    assert snapshot.status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    assert snapshot.intent_revision == 1
 
 
 def test_profile_and_user_js_intents_recover_exact_interrupted_state_and_rollback(

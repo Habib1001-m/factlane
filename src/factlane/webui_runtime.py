@@ -478,6 +478,16 @@ class WebUIRuntimeRunner:
                 self.stop()
                 return RuntimeOutcome(RuntimeOutcomeState.STOPPED)
             if not self._components_alive():
+                if (
+                    effective_mode is BackendMode.SETUP_SHELL
+                    and self._external_gateway_required
+                    and self._caddy is not None
+                    and self._caddy.poll() is not None
+                    and self.service_state.snapshot().saved_endpoint is None
+                ):
+                    return self._unclaimed_setup_gateway_failure(
+                        "setup gateway exited before endpoint claim"
+                    )
                 return self._unexpected_failure("runtime component exited during readiness")
             gateway_ready = (
                 not self._external_gateway_required
@@ -605,6 +615,21 @@ class WebUIRuntimeRunner:
             retry_at=retry.retry_at,
             detail=detail,
         )
+
+    def _unclaimed_setup_gateway_failure(self, detail: str) -> RuntimeOutcome:
+        """Fail one provisional setup gateway without consuming crash budget.
+
+        Linux first-install port selection is owned by the managed installer.
+        Before an endpoint has been claimed, a Caddy child may exit because the
+        candidate port belongs to another local process.  The installer's exact
+        HTTPS probe classifies that candidate and decides whether to continue.
+        Treating this expected pre-claim candidate rejection as a service crash
+        would leak retry-budget residue into the next candidate.
+        """
+
+        if not self.stop():
+            detail = f"{detail}; runtime could not drain safely"
+        return RuntimeOutcome(RuntimeOutcomeState.FAILED, detail=detail)
 
     def _endpoint_claim_failure(self, detail: str) -> RuntimeOutcome:
         drained = self.stop()

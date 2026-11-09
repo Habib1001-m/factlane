@@ -3,14 +3,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 from urllib.parse import urlsplit
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - native Windows
+    _fcntl = None
 
 from .webui_windows import WindowsWebUIError, write_owner_private_text_atomic
 from .windows_security import (
@@ -47,6 +54,46 @@ class EndpointUnavailable(ServiceStateError):
     pass
 
 
+@contextmanager
+def service_state_file_guard(
+    state_path: str | os.PathLike[str],
+) -> Iterator[None]:
+    """Serialize POSIX service-state mutation against installer rollback/control.
+
+    The directory inode is stable across the service state's atomic replace writes,
+    so locking it avoids the stale-inode problem of locking the state file itself.
+    Native Windows keeps its existing SID/DACL-backed writer semantics; this guard is
+    specifically the Linux managed-installer coordination boundary.
+    """
+
+    if os.name == "nt":
+        yield
+        return
+    if _fcntl is None:
+        raise ServiceStateError("POSIX service-state serialization is unavailable")
+    path = Path(state_path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_fd = os.open(path.parent, flags)
+    except OSError as exc:
+        raise ServiceStateError("service state directory could not be locked safely") from exc
+    try:
+        info = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise ServiceStateError("service state directory is not owner-private")
+        _fcntl.flock(directory_fd, _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _fcntl.flock(directory_fd, _fcntl.LOCK_UN)
+    finally:
+        os.close(directory_fd)
+
+
 @dataclass(frozen=True)
 class RetrySchedule:
     attempt: int
@@ -59,6 +106,7 @@ class ServiceSnapshot:
     saved_endpoint: str | None
     stopped_boot_id: str | None
     intent_revision: int
+    governance_revision: int
     crash_attempts: int
     next_retry_at: float | None
     ready_since: float | None
@@ -72,6 +120,7 @@ class _PersistentState:
     saved_endpoint: str | None = None
     stopped_boot_id: str | None = None
     intent_revision: int = 0
+    governance_revision: int = 0
     last_intent_id: str | None = None
     last_intent_action: str | None = None
     crash_attempts: int = 0
@@ -140,18 +189,19 @@ class WebUIServiceState:
         self._listener = listener
         self._lock = threading.RLock()
         self._ensure_private_parent()
-        self._state = self._load_state()
-        if self._reconcile_boot():
-            self._write_state()
+        self._state = _PersistentState()
+        with self._state_transaction():
+            if self._reconcile_boot():
+                self._write_state_unlocked()
 
     def snapshot(self) -> ServiceSnapshot:
-        with self._lock:
+        with self._state_transaction():
             if self._reconcile_boot():
-                self._write_state()
+                self._write_state_unlocked()
             return self._snapshot()
 
     def ensure_endpoint(self, hostname: str) -> str:
-        with self._lock:
+        with self._state_transaction():
             if self._listener is None:
                 raise EndpointUnavailable("listener binding function is required")
             self._validate_hostname(hostname)
@@ -163,25 +213,27 @@ class WebUIServiceState:
                 if not self._attempt_bind(saved_port):
                     raise EndpointUnavailable("saved endpoint is unavailable; explicit recovery is required")
                 return saved
+            self._require_endpoint_claim_allowed()
 
             for port in range(PORT_MIN, PORT_MAX + 1):
                 if not self._attempt_bind(port):
                     continue
                 endpoint = f"https://{hostname}:{port}"
                 self._state.saved_endpoint = endpoint
-                self._write_state()
+                self._write_state_unlocked()
                 return endpoint
             raise EndpointUnavailable(f"no endpoint from {PORT_MIN} through {PORT_MAX} could be bound")
 
     def claim_endpoint(self, origin: str) -> ServiceSnapshot:
         """Persist the exact HTTPS endpoint only after the managed listener is ready."""
 
-        with self._lock:
+        with self._state_transaction():
             endpoint = self._canonical_claim_endpoint(origin)
             saved = self._state.saved_endpoint
             if saved is None:
+                self._require_endpoint_claim_allowed()
                 self._state.saved_endpoint = endpoint
-                self._write_state()
+                self._write_state_unlocked()
                 return self._snapshot()
             if saved == endpoint:
                 return self._snapshot()
@@ -190,7 +242,7 @@ class WebUIServiceState:
             )
 
     def request_stop(self, request_id: str) -> ServiceSnapshot:
-        with self._lock:
+        with self._state_transaction():
             if self._is_duplicate_intent("stop", request_id):
                 return self._snapshot()
             current_boot = self._current_boot_id()
@@ -207,12 +259,12 @@ class WebUIServiceState:
                 ServiceStatus.RECOVERY_REQUIRED.value,
             }:
                 self._state.status = ServiceStatus.STOPPED_UNTIL_REBOOT.value
-            self._write_state()
+            self._write_state_unlocked()
             self._controller("stop")
             return self._snapshot()
 
     def request_start(self, request_id: str) -> ServiceSnapshot:
-        with self._lock:
+        with self._state_transaction():
             if self._is_duplicate_intent("start", request_id):
                 return self._snapshot()
             self._reconcile_boot()
@@ -228,7 +280,7 @@ class WebUIServiceState:
                 self._record_intent("start", request_id)
                 self._state.crash_attempts = 0
                 self._state.next_retry_at = None
-                self._write_state()
+                self._write_state_unlocked()
                 return self._snapshot()
 
             self._record_intent("start", request_id)
@@ -239,13 +291,13 @@ class WebUIServiceState:
             if not blocked:
                 self._state.crash_attempts = 0
                 self._state.status = ServiceStatus.STARTING.value
-            self._write_state()
+            self._write_state_unlocked()
             if not blocked:
                 self._controller("start")
             return self._snapshot()
 
     def request_restart(self, request_id: str) -> ServiceSnapshot:
-        with self._lock:
+        with self._state_transaction():
             if self._is_duplicate_intent("restart", request_id):
                 return self._snapshot()
             blocked = self._state.status in {
@@ -260,13 +312,13 @@ class WebUIServiceState:
             if not blocked:
                 self._state.crash_attempts = 0
                 self._state.status = ServiceStatus.STARTING.value
-            self._write_state()
+            self._write_state_unlocked()
             if not blocked:
                 self._controller("restart")
             return self._snapshot()
 
     def begin_maintenance(self, operation_id: str) -> ServiceSnapshot:
-        with self._lock:
+        with self._state_transaction():
             if not operation_id:
                 raise ValueError("operation_id is required")
             if self._state.maintenance_operation_id == operation_id:
@@ -282,14 +334,15 @@ class WebUIServiceState:
             self._state.maintenance_initial_stopped = self._state.stopped_boot_id == current_boot
             self._state.maintenance_intent_revision = self._state.intent_revision
             self._state.status = ServiceStatus.MAINTENANCE.value
+            self._advance_governance()
             self._state.ready_since = None
             self._state.ready_boot_id = None
             self._state.next_retry_at = None
-            self._write_state()
+            self._write_state_unlocked()
             return self._snapshot()
 
     def finish_maintenance(self, operation_id: str) -> ServiceSnapshot:
-        with self._lock:
+        with self._state_transaction():
             self._require_maintenance_operation(operation_id)
             current_boot = self._current_boot_id()
             initial_status = self._state.maintenance_initial_status
@@ -302,47 +355,87 @@ class WebUIServiceState:
             restore_stopped = self._state.maintenance_initial_stopped or newer_stop
 
             self._clear_maintenance_fields()
+            self._advance_governance()
             if restore_stopped:
                 self._state.status = ServiceStatus.STOPPED_UNTIL_REBOOT.value
-                self._write_state()
+                self._write_state_unlocked()
                 return self._snapshot()
 
             if initial_status == ServiceStatus.FAILED.value:
                 self._state.status = ServiceStatus.FAILED.value
-                self._write_state()
+                self._write_state_unlocked()
                 return self._snapshot()
 
             self._state.status = ServiceStatus.STARTING.value
-            self._write_state()
+            self._write_state_unlocked()
             self._controller("start")
             return self._snapshot()
 
     def mark_recovery_required(self) -> ServiceSnapshot:
-        with self._lock:
+        with self._state_transaction():
             self._clear_maintenance_fields()
             self._state.status = ServiceStatus.RECOVERY_REQUIRED.value
+            self._advance_governance()
             self._state.ready_since = None
             self._state.ready_boot_id = None
             self._state.next_retry_at = None
-            self._write_state()
+            self._write_state_unlocked()
             return self._snapshot()
 
     def clear_recovery_required(self) -> ServiceSnapshot:
-        with self._lock:
+        with self._state_transaction():
             if self._state.status != ServiceStatus.RECOVERY_REQUIRED.value:
                 return self._snapshot()
             if self._state.stopped_boot_id == self._current_boot_id():
                 self._state.status = ServiceStatus.STOPPED_UNTIL_REBOOT.value
-                self._write_state()
+                self._advance_governance()
+                self._write_state_unlocked()
                 return self._snapshot()
             self._state.status = ServiceStatus.STARTING.value
-            self._write_state()
+            self._advance_governance()
+            self._write_state_unlocked()
             self._controller("start")
             return self._snapshot()
 
+    def restore_failed_after_recovery(self) -> ServiceSnapshot:
+        """Finalize successful recovery back to durable pre-maintenance FAILED truth.
+
+        This transition is intentionally distinct from ordinary runtime
+        ``mark_failed``: runtime observation may never demote an Owner-protected
+        recovery state.  Recovery orchestration may restore FAILED only after its
+        own durable evidence has been verified.  A newer same-boot Owner STOP wins.
+        """
+
+        with self._state_transaction():
+            if self._state.stopped_boot_id == self._current_boot_id():
+                if self._state.status != ServiceStatus.STOPPED_UNTIL_REBOOT.value:
+                    self._state.status = ServiceStatus.STOPPED_UNTIL_REBOOT.value
+                    self._advance_governance()
+                    self._state.ready_since = None
+                    self._state.ready_boot_id = None
+                    self._state.next_retry_at = None
+                    self._write_state_unlocked()
+                return self._snapshot()
+            if self._state.status == ServiceStatus.FAILED.value:
+                return self._snapshot()
+            if self._state.status != ServiceStatus.RECOVERY_REQUIRED.value:
+                raise ServiceStateError(
+                    "FAILED recovery finalization requires recovery-required service state"
+                )
+            self._state.status = ServiceStatus.FAILED.value
+            self._advance_governance()
+            self._state.ready_since = None
+            self._state.ready_boot_id = None
+            self._state.next_retry_at = None
+            self._write_state_unlocked()
+            return self._snapshot()
+
     def mark_starting(self) -> ServiceSnapshot:
-        with self._lock:
-            if self._state.status == ServiceStatus.RECOVERY_REQUIRED.value:
+        with self._state_transaction():
+            if self._state.status in {
+                ServiceStatus.MAINTENANCE.value,
+                ServiceStatus.RECOVERY_REQUIRED.value,
+            }:
                 return self._snapshot()
             if self._state.stopped_boot_id == self._current_boot_id():
                 self._state.status = ServiceStatus.STOPPED_UNTIL_REBOOT.value
@@ -351,13 +444,15 @@ class WebUIServiceState:
             self._state.ready_since = None
             self._state.ready_boot_id = None
             self._state.next_retry_at = None
-            self._write_state()
+            self._write_state_unlocked()
             return self._snapshot()
 
     def mark_ready(self) -> ServiceSnapshot:
-        with self._lock:
+        with self._state_transaction():
             if self._state.status == ServiceStatus.RECOVERY_REQUIRED.value:
                 raise ServiceStateError("recovery-required service cannot be marked ready")
+            if self._state.status == ServiceStatus.MAINTENANCE.value:
+                raise ServiceStateError("maintenance-owned service cannot be marked ready")
             if self._state.stopped_boot_id == self._current_boot_id():
                 raise ServiceStateError("stopped-until-reboot service cannot be marked ready")
             if self._state.status != ServiceStatus.READY.value or self._state.ready_since is None:
@@ -365,38 +460,38 @@ class WebUIServiceState:
                 self._state.ready_boot_id = self._current_boot_id()
             self._state.status = ServiceStatus.READY.value
             self._state.next_retry_at = None
-            self._write_state()
+            self._write_state_unlocked()
             return self._snapshot()
 
     def observe_ready(self) -> ServiceSnapshot:
-        with self._lock:
+        with self._state_transaction():
             if self._state.status != ServiceStatus.READY.value or self._state.ready_since is None:
                 return self._snapshot()
             if self._state.ready_boot_id != self._current_boot_id():
                 self._state.ready_since = None
                 self._state.ready_boot_id = None
                 self._state.status = ServiceStatus.STARTING.value
-                self._write_state()
+                self._write_state_unlocked()
                 return self._snapshot()
             if self._reset_crash_incident_after_stable_ready():
-                self._write_state()
+                self._write_state_unlocked()
             return self._snapshot()
 
     def record_crash(self) -> RetrySchedule | None:
-        with self._lock:
+        with self._state_transaction():
             if self._reconcile_boot():
-                self._write_state()
+                self._write_state_unlocked()
             if self._state.stopped_boot_id == self._current_boot_id():
                 self._state.status = ServiceStatus.STOPPED_UNTIL_REBOOT.value
                 self._state.next_retry_at = None
-                self._write_state()
+                self._write_state_unlocked()
                 return None
             if self._state.status in {
                 ServiceStatus.MAINTENANCE.value,
                 ServiceStatus.RECOVERY_REQUIRED.value,
             }:
                 self._state.next_retry_at = None
-                self._write_state()
+                self._write_state_unlocked()
                 return None
             self._reset_crash_incident_after_stable_ready()
             self._state.ready_since = None
@@ -404,23 +499,31 @@ class WebUIServiceState:
             if self._state.crash_attempts >= MAX_CRASH_RETRIES:
                 self._state.status = ServiceStatus.FAILED.value
                 self._state.next_retry_at = None
-                self._write_state()
+                self._write_state_unlocked()
                 return None
 
             self._state.crash_attempts += 1
             retry_at = self._clock() + CRASH_RETRY_SECONDS
             self._state.next_retry_at = retry_at
             self._state.status = ServiceStatus.STARTING.value
-            self._write_state()
+            self._write_state_unlocked()
             return RetrySchedule(attempt=self._state.crash_attempts, retry_at=retry_at)
 
     def mark_failed(self) -> ServiceSnapshot:
-        with self._lock:
+        with self._state_transaction():
+            if self._state.stopped_boot_id == self._current_boot_id():
+                self._state.status = ServiceStatus.STOPPED_UNTIL_REBOOT.value
+                return self._snapshot()
+            if self._state.status in {
+                ServiceStatus.MAINTENANCE.value,
+                ServiceStatus.RECOVERY_REQUIRED.value,
+            }:
+                return self._snapshot()
             self._state.status = ServiceStatus.FAILED.value
             self._state.ready_since = None
             self._state.ready_boot_id = None
             self._state.next_retry_at = None
-            self._write_state()
+            self._write_state_unlocked()
             return self._snapshot()
 
     def _snapshot(self) -> ServiceSnapshot:
@@ -429,6 +532,7 @@ class WebUIServiceState:
             saved_endpoint=self._state.saved_endpoint,
             stopped_boot_id=self._state.stopped_boot_id,
             intent_revision=self._state.intent_revision,
+            governance_revision=self._state.governance_revision,
             crash_attempts=self._state.crash_attempts,
             next_retry_at=self._state.next_retry_at,
             ready_since=self._state.ready_since,
@@ -441,6 +545,7 @@ class WebUIServiceState:
         if self._state.last_intent_id == request_id and self._state.last_intent_action != action:
             raise ServiceStateError("request_id was already used for another service intent")
         self._state.intent_revision += 1
+        self._advance_governance()
         self._state.last_intent_id = request_id
         self._state.last_intent_action = action
 
@@ -452,6 +557,9 @@ class WebUIServiceState:
         if self._state.last_intent_action != action:
             raise ServiceStateError("request_id was already used for another service intent")
         return True
+
+    def _advance_governance(self) -> None:
+        self._state.governance_revision += 1
 
     def _require_maintenance_operation(self, operation_id: str) -> None:
         if self._state.maintenance_operation_id != operation_id:
@@ -469,6 +577,12 @@ class WebUIServiceState:
             return bool(self._listener(port))
         except OSError:
             return False
+
+    def _require_endpoint_claim_allowed(self) -> None:
+        if self._state.stopped_boot_id == self._current_boot_id():
+            raise EndpointUnavailable("stopped-until-reboot service cannot claim a new endpoint")
+        if self._state.status == ServiceStatus.MAINTENANCE.value:
+            raise EndpointUnavailable("governed service state blocks new endpoint claim")
 
     def _reset_crash_incident_after_stable_ready(self) -> bool:
         if (
@@ -552,6 +666,7 @@ class WebUIServiceState:
             self._state.stopped_boot_id = None
             if self._state.status == ServiceStatus.STOPPED_UNTIL_REBOOT.value:
                 self._state.status = ServiceStatus.STARTING.value
+            self._advance_governance()
             changed = True
         if self._state.ready_boot_id is not None and self._state.ready_boot_id != current_boot:
             self._state.ready_since = None
@@ -575,7 +690,14 @@ class WebUIServiceState:
         except OSError as exc:
             raise ServiceStateError("owner-private service state directory could not be secured") from exc
 
-    def _load_state(self) -> _PersistentState:
+    @contextmanager
+    def _state_transaction(self) -> Iterator[None]:
+        with self._lock:
+            with service_state_file_guard(self._path):
+                self._state = self._load_state_unlocked()
+                yield
+
+    def _load_state_unlocked(self) -> _PersistentState:
         if not self._path.exists():
             return _PersistentState()
         if os.name == "nt":
@@ -599,14 +721,19 @@ class WebUIServiceState:
             raise ServiceStateError("service state is invalid") from exc
         if not isinstance(state.intent_revision, int) or state.intent_revision < 0:
             raise ServiceStateError("service intent revision is invalid")
+        if (
+            isinstance(state.governance_revision, bool)
+            or not isinstance(state.governance_revision, int)
+            or state.governance_revision < 0
+        ):
+            raise ServiceStateError("service governance revision is invalid")
         if not isinstance(state.crash_attempts, int) or not 0 <= state.crash_attempts <= MAX_CRASH_RETRIES:
             raise ServiceStateError("service crash incident counter is invalid")
         if os.name != "nt" and self._path.stat().st_mode & 0o077:
             os.chmod(self._path, 0o600)
         return state
 
-    def _write_state(self) -> None:
-        self._ensure_private_parent()
+    def _write_state_unlocked(self) -> None:
         payload = json.dumps(asdict(self._state), sort_keys=True, separators=(",", ":")) + "\n"
         if os.name == "nt":
             try:
