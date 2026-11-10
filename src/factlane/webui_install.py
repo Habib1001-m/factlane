@@ -550,8 +550,10 @@ def render_caddy_config(
     return (
         "{\n"
         "    admin off\n"
+        "    persist_config off\n"
         "    auto_https disable_redirects\n"
         "    skip_install_trust\n"
+        "    storage_clean_interval off\n"
         "    servers {\n"
         "        protocols h1 h2\n"
         "        strict_sni_host on\n"

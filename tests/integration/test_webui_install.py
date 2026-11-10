@@ -352,6 +352,8 @@ def test_hostname_and_caddy_config_are_exact_and_have_no_http_or_http3_listener(
     )
 
     assert "admin off" in config
+    assert "persist_config off" in config
+    assert "storage_clean_interval off" in config
     assert "auto_https disable_redirects" in config
     assert "skip_install_trust" in config
     assert "protocols h1 h2" in config

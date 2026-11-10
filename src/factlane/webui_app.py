@@ -2557,7 +2557,7 @@ def create_owner_runtime_backend(
             )
         else:
             native_server = OwnerNativeControlServer(
-                socket_path=Path(spec.runtime_dir) / "owner-control.sock",
+                socket_path=Path(spec.socket_path).parent / "owner-control.sock",
                 owner_uid=uid,
                 auth_state=auth_state,
                 service_control=service_control,

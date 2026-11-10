@@ -127,8 +127,8 @@ def test_default_owner_paths_follow_absolute_xdg_roots_without_creating_them(tmp
     assert paths.caddy_config_path == str(config / "factlane" / "Caddyfile")
     assert paths.user_unit_path == str(config / "systemd" / "user" / "factlane-webui.service")
     assert paths.runtime_dir == str(runtime / "factlane")
-    assert paths.backend_socket == str(runtime / "factlane" / "owner-http.sock")
-    assert paths.native_control_socket == str(runtime / "factlane" / "owner-control.sock")
+    assert paths.backend_socket == str(runtime / "factlane" / "owner-webui" / "owner-http.sock")
+    assert paths.native_control_socket == str(runtime / "factlane" / "owner-webui" / "owner-control.sock")
     assert paths.state_dir == str(state / "factlane")
     assert paths.caddy_state_dir == str(state / "factlane" / "caddy")
     assert paths.browser_profile_dir == str(state / "factlane" / "browser")
@@ -145,6 +145,8 @@ def test_default_owner_paths_use_home_fallbacks_and_standard_user_runtime(tmp_pa
     assert paths.owner_config_home == str(home / ".config")
     assert paths.service_config_path == str(home / ".config" / "factlane" / "webui.json")
     assert paths.runtime_dir == "/run/user/4321/factlane"
+    assert paths.backend_socket == "/run/user/4321/factlane/owner-webui/owner-http.sock"
+    assert paths.native_control_socket == "/run/user/4321/factlane/owner-webui/owner-control.sock"
     assert paths.state_dir == str(home / ".local" / "state" / "factlane")
 
 
@@ -387,6 +389,7 @@ def test_first_run_setup_request_uses_owner_paths_and_absent_memory_trio(tmp_pat
     assert request.saved_port == 8765
     assert request.owner_config_home == str(config)
     assert request.runtime_dir == str(runtime / "factlane")
+    assert request.backend_socket == str(runtime / "factlane" / "owner-webui" / "owner-http.sock")
     assert request.state_dir == str(state / "factlane")
     assert request.launcher_path == str(
         tmp_path / "data" / "applications" / "FactLane Owner Panel.desktop"

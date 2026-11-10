@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -1307,7 +1308,7 @@ def test_normal_backend_binds_exact_runtime_authority_and_adapter_to_one_service
     assert backend.http_server.socket_path == Path(spec.socket_path)
     assert backend.http_server.origin == spec.expected_origin
     assert backend.native_server.socket.family == socket.AF_UNIX
-    assert backend.native_server.socket_path == Path(spec.runtime_dir) / "owner-control.sock"
+    assert backend.native_server.socket_path == Path(spec.socket_path).parent / "owner-control.sock"
     assert backend.native_server.auth_state is backend.auth_state
     assert backend.native_server.service_control.service_state is service_state
     assert backend.http_server.setup_service is None
@@ -1344,6 +1345,40 @@ def test_normal_backend_binds_exact_runtime_authority_and_adapter_to_one_service
         assert backend.wait_stopped(2.0) is True
     assert [item[0] for item in events] == ["create", "close"]
     assert events[0][1:] == events[1][1:]
+
+
+def test_linux_setup_backend_isolates_owner_sockets_beneath_shared_runtime_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = _spec(tmp_path, normal=False)
+    runtime_root = Path("/tmp") / f"factlane-r9-{uuid.uuid4().hex[:8]}"
+    runtime_root.mkdir(mode=0o755)
+    socket_dir = runtime_root / "owner-webui"
+    spec = replace(
+        baseline,
+        runtime_dir=str(runtime_root),
+        socket_path=str(socket_dir / "owner-http.sock"),
+    )
+    _install_linux_setup_runtime_config(tmp_path, spec, monkeypatch)
+    service_state = _service_state(tmp_path)
+
+    backend = create_owner_runtime_backend(
+        spec,
+        service_state,
+        native_confirmation=_Confirmation(),
+        owner_uid=os.getuid(),
+    )
+    try:
+        assert runtime_root.stat().st_mode & 0o777 == 0o755
+        assert socket_dir.stat().st_mode & 0o777 == 0o700
+        assert backend.http_server.socket_path == socket_dir / "owner-http.sock"
+        assert backend.native_server.socket_path == socket_dir / "owner-control.sock"
+    finally:
+        backend.native_server.server_close()
+        backend.http_server.server_close()
+        socket_dir.rmdir()
+        runtime_root.rmdir()
 
 
 def test_owner_adapter_participant_drains_releases_exclusion_and_reopens_exact_launch_binding(

@@ -442,6 +442,7 @@ def default_owner_paths(
 
     config_dir = config_home / "factlane"
     runtime_dir = runtime_home / "factlane"
+    webui_socket_dir = runtime_dir / "owner-webui"
     state_dir = state_home / "factlane"
     return OwnerPaths(
         owner_config_home=str(config_home),
@@ -449,8 +450,8 @@ def default_owner_paths(
         caddy_config_path=str(config_dir / "Caddyfile"),
         user_unit_path=str(config_home / "systemd" / "user" / "factlane-webui.service"),
         runtime_dir=str(runtime_dir),
-        backend_socket=str(runtime_dir / _BACKEND_SOCKET_NAME),
-        native_control_socket=str(runtime_dir / _CONTROL_SOCKET_NAME),
+        backend_socket=str(webui_socket_dir / _BACKEND_SOCKET_NAME),
+        native_control_socket=str(webui_socket_dir / _CONTROL_SOCKET_NAME),
         state_dir=str(state_dir),
         caddy_state_dir=str(state_dir / "caddy"),
         browser_profile_dir=str(state_dir / "browser"),
