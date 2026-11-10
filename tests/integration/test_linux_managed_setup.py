@@ -1383,7 +1383,7 @@ def test_owner_stop_during_candidate_activation_is_preserved_and_blocks_rollback
     assert preserved.intent_revision == 1
     assert state_path.is_file()
     assert commands == [
-        ("/usr/bin/systemctl", "--user", "start", "factlane-webui.service"),
+        ("/usr/bin/systemctl", "--user", "restart", "factlane-webui.service"),
     ]
 
 
@@ -1474,7 +1474,7 @@ def test_owner_start_between_activation_and_candidate_stop_is_not_overridden(
     assert snapshot.status is ServiceStatus.STARTING
     assert snapshot.intent_revision == 1
     assert commands == [
-        ("/usr/bin/systemctl", "--user", "start", "factlane-webui.service"),
+        ("/usr/bin/systemctl", "--user", "restart", "factlane-webui.service"),
     ]
 
 

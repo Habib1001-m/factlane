@@ -3195,10 +3195,10 @@ class ProductionLinuxInstallerBackend:
                 )
             return result
 
-        start_argv = (
+        restart_argv = (
             self._systemctl_path,
             "--user",
-            "start",
+            "restart",
             WEBUI_SERVICE_NAME,
         )
         if state_path is not None:
@@ -3211,7 +3211,7 @@ class ProductionLinuxInstallerBackend:
                             status=ManagedServiceActivationStatus.FAILED,
                             detail="governed service state changed before candidate start",
                         )
-                    start_code = self._command_runner(start_argv)
+                    start_code = self._command_runner(restart_argv)
             except (OSError, ValueError, LinuxSetupRecoveryRequired) as exc:
                 self._activation_state_custody_ready = False
                 return ManagedServiceActivationResult(
@@ -3219,14 +3219,14 @@ class ProductionLinuxInstallerBackend:
                     detail=f"candidate start governance could not be proven: {exc}",
                 )
         else:
-            start_code = self._command_runner(start_argv)
+            start_code = self._command_runner(restart_argv)
         if start_code != 0:
             probed = self._probe_activation(plan.origin)
             if probed is not None and probed.status is ManagedServiceActivationStatus.PORT_CONFLICT:
                 return finish(probed)
             return finish(ManagedServiceActivationResult(
                 status=ManagedServiceActivationStatus.FAILED,
-                detail="managed service start command failed",
+                detail="managed service restart command failed",
             ))
         if self._service_state_reader is None:
             return finish(ManagedServiceActivationResult(

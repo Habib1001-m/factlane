@@ -1049,7 +1049,7 @@ def test_production_backend_managed_activation_uses_exact_start_stop_argv_and_se
     )
     assert stopped.status is InstallerStepStatus.APPLIED
     assert calls == [
-        ("/opt/systemd/bin/systemctl", "--user", "start", WEBUI_SERVICE_NAME),
+        ("/opt/systemd/bin/systemctl", "--user", "restart", WEBUI_SERVICE_NAME),
         ("/opt/systemd/bin/systemctl", "--user", "stop", WEBUI_SERVICE_NAME),
     ]
     assert probe_calls
@@ -1074,7 +1074,7 @@ def test_production_backend_port_conflict_comes_only_from_typed_probe_not_stderr
     assert result.status is ManagedServiceActivationStatus.PORT_CONFLICT
     assert result.detail == f"typed conflict for {receipt.plan.origin}"
     assert calls == [
-        ("/opt/systemd/bin/systemctl", "--user", "start", WEBUI_SERVICE_NAME),
+        ("/opt/systemd/bin/systemctl", "--user", "restart", WEBUI_SERVICE_NAME),
     ]
 
 
