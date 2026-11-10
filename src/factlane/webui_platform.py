@@ -1906,9 +1906,40 @@ class ProductionWebUIController:
                 identity,
             )
         return self._control_client_factory(
-            self.paths.native_control_socket,
+            self._linux_native_control_socket(),
             self.owner_uid,
         )
+
+    def _linux_native_control_socket(self) -> str:
+        """Resolve native control from the persisted Linux backend binding when present.
+
+        Managed configs created before the private `owner-webui` socket directory
+        placed the HTTP socket directly beneath the shared runtime root.  The
+        running backend derives native control as a sibling of that persisted HTTP
+        socket, so launcher/control clients must follow the same binding until a
+        governed setup rerun migrates the config to the current canonical path.
+        """
+
+        config_path = Path(self.paths.service_config_path)
+        try:
+            config_path.lstat()
+        except FileNotFoundError:
+            return self.paths.native_control_socket
+        except OSError as exc:
+            raise WebUIPlatformError(
+                "RUNTIME_CONFIG_ERROR",
+                "existing runtime config could not be inspected safely",
+            ) from exc
+        try:
+            config = load_runtime_config(config_path, owner_uid=self.owner_uid)
+        except RuntimeConfigError as exc:
+            raise WebUIPlatformError("RUNTIME_CONFIG_ERROR", str(exc)) from exc
+        if config.platform_kind is not PlatformKind.LINUX or config.backend_socket is None:
+            raise WebUIPlatformError(
+                "RUNTIME_CONFIG_ERROR",
+                "Linux native control requires a persisted AF_UNIX backend socket",
+            )
+        return str(PurePosixPath(config.backend_socket).parent / _CONTROL_SOCKET_NAME)
 
     def _persistent_service_state(self) -> Any:
         if self._persistent_state is None:
@@ -1952,7 +1983,7 @@ class ProductionWebUIController:
             client = self._live_control_client(unit)
         else:
             client = self._control_client_factory(
-                self.paths.native_control_socket,
+                self._linux_native_control_socket(),
                 self.owner_uid,
             )
         service = client.status()

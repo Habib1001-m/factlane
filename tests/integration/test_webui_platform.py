@@ -406,6 +406,7 @@ def test_existing_owner_private_runtime_config_reuses_persistent_origin_and_memo
 ) -> None:
     path, _config = _write_runtime_config(tmp_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["backend_socket"] = str(tmp_path / "runtime" / "factlane" / "owner-http.sock")
     payload.update(
         {
             "db": str(tmp_path / "memories.db"),
@@ -435,6 +436,9 @@ def test_existing_owner_private_runtime_config_reuses_persistent_origin_and_memo
     assert request.db == str(tmp_path / "memories.db")
     assert request.profile == "nomic-768"
     assert request.host_id == "owner-a"
+    assert request.backend_socket == str(
+        tmp_path / "runtime" / "factlane" / "owner-webui" / "owner-http.sock"
+    )
     assert request.lingering_required is False
 
 
@@ -1729,6 +1733,76 @@ def test_active_service_mutations_use_native_while_status_is_offline(
         ("stop", "request-fixed"),
         ("restart", "request-fixed"),
     ]
+
+
+def test_legacy_linux_runtime_config_keeps_native_control_reachable_until_setup_migrates_it(
+    tmp_path: Path,
+) -> None:
+    paths = default_owner_paths(
+        environ={
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
+            "XDG_STATE_HOME": str(tmp_path / "state"),
+        },
+        home=str(tmp_path / "home"),
+        owner_uid=1000,
+    )
+    legacy_backend = tmp_path / "runtime" / "factlane" / "owner-http.sock"
+    config_path = Path(paths.service_config_path)
+    config_path.parent.mkdir(parents=True, mode=0o700)
+    config_path.write_text(
+        json.dumps(
+            {
+                "db": None,
+                "profile": None,
+                "host_id": None,
+                "origin": "https://factlane-test123.test:8765",
+                "backend_socket": str(legacy_backend),
+                "caddy_path": "/usr/bin/caddy",
+                "caddyfile": paths.caddy_config_path,
+                "runtime_dir": str(tmp_path / "runtime" / "factlane"),
+                "state_dir": str(tmp_path / "state" / "factlane"),
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+    expected_control = str(legacy_backend.parent / "owner-control.sock")
+    seen_paths: list[str] = []
+    service_state = _persistent_service_state(tmp_path)
+    service_state.claim_endpoint("https://factlane-test123.test:8765")
+    service_state.mark_ready()
+    unit = _UnitManager(active=True)
+
+    class Client:
+        def status(self):
+            return {
+                "status": "STARTING",
+                "saved_endpoint": "https://factlane-test123.test:8765",
+            }
+
+        def start(self, *, request_id: str):
+            return {"status": "STARTING", "request_id": request_id}
+
+    def client_factory(path: str, _uid: int):
+        seen_paths.append(path)
+        return Client()
+
+    controller = ProductionWebUIController(
+        paths=paths,
+        owner_uid=1000,
+        service_state_factory=lambda _path: service_state,
+        systemd_manager=unit,
+        control_client_factory=client_factory,
+        request_id_factory=lambda: "legacy-request",
+    )
+
+    assert controller.dispatch("start")["status"] == "OK"
+    opened = controller.dispatch("open")
+    assert opened["status"] == "ERROR"
+    assert opened["error_code"] == "WEBUI_NOT_RUNNING"
+    assert seen_paths == [expected_control, expected_control]
 
 
 def test_open_v01_creates_local_enrollment_launches_locator_only_and_waits_for_claim_approval(
