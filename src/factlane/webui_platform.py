@@ -922,14 +922,37 @@ def build_default_setup_request(
     else:
         parsed = urlsplit(existing.origin)
         hostname = parsed.hostname
-        if hostname is None or not hostname.startswith("factlane-") or not hostname.endswith(".test"):
-            raise WebUIPlatformError(
-                "RUNTIME_CONFIG_INVALID",
-                "existing runtime origin does not contain a canonical FactLane installation ID",
-            )
-        installation_id = hostname[len("factlane-") : -len(".test")]
         assert parsed.port is not None
         saved_port = parsed.port
+        if parsed.scheme == "https":
+            if hostname is None or not hostname.startswith("factlane-") or not hostname.endswith(".test"):
+                raise WebUIPlatformError(
+                    "RUNTIME_CONFIG_INVALID",
+                    "existing runtime origin does not contain a canonical FactLane installation ID",
+                )
+            installation_id = hostname[len("factlane-") : -len(".test")]
+        else:
+            # Browser-neutral managed configs intentionally use the fixed
+            # 127.0.0.1 host, so the installation identity can no longer be
+            # recovered from the origin.  The owner-private setup journal is
+            # the durable binding created before the managed config is first
+            # written and retained after CLAIMED; require that binding rather
+            # than minting a new installation identity on a setup rerun.
+            try:
+                installation_id = load_linux_provisional_installation_id(
+                    paths.state_dir,
+                    owner_uid=uid,
+                )
+            except RuntimeError as exc:
+                raise WebUIPlatformError(
+                    "SETUP_RECOVERY_REQUIRED",
+                    "provisional Linux setup state conflicts with the exact managed target",
+                ) from exc
+            if installation_id is None:
+                raise WebUIPlatformError(
+                    "RUNTIME_CONFIG_INVALID",
+                    "browser-neutral runtime origin lacks its managed installation binding",
+                )
         db, profile, host_id = existing.db, existing.profile, existing.host_id
 
     return SetupRequest(

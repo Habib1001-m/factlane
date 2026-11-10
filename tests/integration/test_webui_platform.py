@@ -30,6 +30,7 @@ from factlane.webui_install import (
     InstallerStepStatus,
     SetupConsent,
     apply_webui_setup,
+    linux_setup_journal_path,
     plan_webui_setup,
 )
 from factlane.webui_platform import (
@@ -441,6 +442,87 @@ def test_existing_owner_private_runtime_config_reuses_persistent_origin_and_memo
         tmp_path / "runtime" / "factlane" / "owner-webui" / "owner-http.sock"
     )
     assert request.lingering_required is False
+
+
+def test_browser_neutral_runtime_config_reuses_installation_id_from_claimed_setup_journal(
+    tmp_path: Path,
+) -> None:
+    owner_uid = os.getuid()
+    paths = default_owner_paths(
+        environ={
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
+            "XDG_STATE_HOME": str(tmp_path / "state"),
+            "XDG_DATA_HOME": str(tmp_path / "data"),
+        },
+        home=str(tmp_path / "home"),
+        owner_uid=owner_uid,
+    )
+    config_path = Path(paths.service_config_path)
+    config_path.parent.mkdir(parents=True, mode=0o700)
+    config_path.write_text(
+        json.dumps(
+            {
+                "db": str(tmp_path / "memories.db"),
+                "profile": "nomic-768",
+                "host_id": "owner-a",
+                "origin": "http://127.0.0.1:8765",
+                "backend_socket": paths.backend_socket,
+                "caddy_path": "/usr/bin/caddy",
+                "caddyfile": paths.caddy_config_path,
+                "runtime_dir": paths.runtime_dir,
+                "state_dir": paths.state_dir,
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+
+    journal_path = linux_setup_journal_path(paths.state_dir)
+    journal_path.parent.mkdir(parents=True, mode=0o700)
+    journal_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "phase": "CLAIMED",
+                "installation_id": "test123",
+                "hostname": "factlane-test123.test",
+                "installing_user": "alice",
+                "browser_family": None,
+                "browser_executable": None,
+                "browser_profile_dir": paths.browser_profile_dir,
+                "state_dir": paths.state_dir,
+                "caddy_state_dir": paths.caddy_state_dir,
+                "root_fingerprint_sha256": None,
+                "ownership": {},
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    journal_path.chmod(0o600)
+
+    request = build_default_setup_request(
+        environ={
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
+            "XDG_STATE_HOME": str(tmp_path / "state"),
+            "XDG_DATA_HOME": str(tmp_path / "data"),
+        },
+        home=str(tmp_path / "home"),
+        owner_uid=owner_uid,
+        installing_user="alice",
+        factlane_executable="/home/alice/.local/bin/factlane",
+        installation_id_factory=lambda: "must-not-be-used",
+        lingering_detector=lambda _user: False,
+    )
+
+    assert request.installation_id == "test123"
+    assert request.saved_port == 8765
+    assert request.db == str(tmp_path / "memories.db")
+    assert request.profile == "nomic-768"
+    assert request.host_id == "owner-a"
 
 
 def test_zenity_setup_consent_uses_one_fixed_argv_review_and_never_auto_consents() -> None:
