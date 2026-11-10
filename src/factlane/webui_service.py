@@ -54,7 +54,12 @@ class EndpointUnavailable(ServiceStateError):
     pass
 
 
-def is_legacy_endpoint_canonicalization(saved_endpoint: str, target_origin: str) -> bool:
+def is_legacy_endpoint_canonicalization(
+    saved_endpoint: str,
+    target_origin: str,
+    *,
+    expected_legacy_hostname: str | None,
+) -> bool:
     """Return whether one legacy managed HTTPS origin may become loopback HTTP.
 
     Browser-neutral managed installs intentionally replace the installation-
@@ -63,7 +68,12 @@ def is_legacy_endpoint_canonicalization(saved_endpoint: str, target_origin: str)
     transition that does not require explicit endpoint recovery.
     """
 
-    if not isinstance(saved_endpoint, str) or not isinstance(target_origin, str):
+    if (
+        not isinstance(saved_endpoint, str)
+        or not isinstance(target_origin, str)
+        or not isinstance(expected_legacy_hostname, str)
+        or _CLAIM_HOST_RE.fullmatch(expected_legacy_hostname) is None
+    ):
         return False
     try:
         saved = urlsplit(saved_endpoint)
@@ -77,7 +87,11 @@ def is_legacy_endpoint_canonicalization(saved_endpoint: str, target_origin: str)
     if not PORT_MIN <= saved_port <= PORT_MAX:
         return False
     saved_host = saved.hostname
-    if saved_host is None or _CLAIM_HOST_RE.fullmatch(saved_host) is None:
+    if (
+        saved_host is None
+        or saved_host != expected_legacy_hostname
+        or _CLAIM_HOST_RE.fullmatch(saved_host) is None
+    ):
         return False
     legacy_https = (
         saved.scheme == "https"
@@ -271,7 +285,12 @@ class WebUIServiceState:
                 return endpoint
             raise EndpointUnavailable(f"no endpoint from {PORT_MIN} through {PORT_MAX} could be bound")
 
-    def claim_endpoint(self, origin: str) -> ServiceSnapshot:
+    def claim_endpoint(
+        self,
+        origin: str,
+        *,
+        expected_legacy_hostname: str | None = None,
+    ) -> ServiceSnapshot:
         """Persist the exact managed endpoint only after the managed listener is ready."""
 
         with self._state_transaction():
@@ -284,7 +303,15 @@ class WebUIServiceState:
                 return self._snapshot()
             if saved == endpoint:
                 return self._snapshot()
-            if is_legacy_endpoint_canonicalization(saved, endpoint):
+            if is_legacy_endpoint_canonicalization(
+                saved,
+                endpoint,
+                expected_legacy_hostname=expected_legacy_hostname,
+            ):
+                if self._state.status == ServiceStatus.RECOVERY_REQUIRED.value:
+                    raise EndpointUnavailable(
+                        "recovery-required service cannot canonicalize its saved endpoint"
+                    )
                 self._require_endpoint_claim_allowed()
                 self._state.saved_endpoint = endpoint
                 self._write_state_unlocked()

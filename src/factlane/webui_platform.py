@@ -61,6 +61,7 @@ from .webui_install import (
     load_linux_provisional_installation_id,
     probe_linux_managed_https,
     validate_linux_firefox_managed_profile,
+    webui_hostname,
     LinuxSetupRecoveryRequired,
 )
 from .webui_runtime import (
@@ -1655,6 +1656,22 @@ class ProductionWebUIController:
             return self._serve_windows()
         config_path = default_runtime_config_path(environ=self.environ, home=self.home)
         config = load_runtime_config(config_path, owner_uid=self.owner_uid)
+        legacy_endpoint_hostname: str | None = None
+        if config.origin.startswith("http://127.0.0.1:"):
+            try:
+                installation_id = load_linux_provisional_installation_id(
+                    config.state_dir,
+                    owner_uid=self.owner_uid,
+                )
+            except RuntimeError as exc:
+                raise RuntimeConfigError(
+                    "browser-neutral runtime installation binding is invalid"
+                ) from exc
+            if installation_id is None:
+                raise RuntimeConfigError(
+                    "browser-neutral runtime installation binding is unavailable"
+                )
+            legacy_endpoint_hostname = webui_hostname(installation_id)
         backend_factory, process_factory = self._runtime_factories()
         service_state_path = str(PurePosixPath(config.state_dir) / _SERVICE_STATE_NAME)
         service_state = self._service_state_factory(service_state_path)
@@ -1663,6 +1680,11 @@ class ProductionWebUIController:
             service_state,
             backend_factory=backend_factory,
             process_factory=process_factory,
+            **(
+                {"legacy_endpoint_hostname": legacy_endpoint_hostname}
+                if legacy_endpoint_hostname is not None
+                else {}
+            ),
         )
         outcome = runner.run()
         state = getattr(outcome.state, "value", outcome.state)
@@ -1728,6 +1750,15 @@ class ProductionWebUIController:
             backend_factory=self._runtime_backend_factory(),
             process_factory=None,
             external_gateway_required=False,
+            **(
+                {
+                    "legacy_endpoint_hostname": webui_hostname(
+                        managed_config.installation_id
+                    )
+                }
+                if runtime_config.origin.startswith("http://127.0.0.1:")
+                else {}
+            ),
         )
         outcome = runner.run()
         state = getattr(outcome.state, "value", outcome.state)

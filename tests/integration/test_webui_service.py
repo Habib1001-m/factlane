@@ -175,7 +175,10 @@ def test_claim_endpoint_allows_only_same_port_legacy_https_to_loopback_http_cano
     service = _service(tmp_path)
     service.claim_endpoint("https://factlane-installation.test:8767")
 
-    migrated = service.claim_endpoint("http://127.0.0.1:8767")
+    migrated = service.claim_endpoint(
+        "http://127.0.0.1:8767",
+        expected_legacy_hostname="factlane-installation.test",
+    )
 
     assert migrated.saved_endpoint == "http://127.0.0.1:8767"
     persisted = json.loads(
@@ -184,7 +187,10 @@ def test_claim_endpoint_allows_only_same_port_legacy_https_to_loopback_http_cano
     assert persisted["saved_endpoint"] == "http://127.0.0.1:8767"
 
     with pytest.raises(EndpointUnavailable, match="explicit recovery"):
-        service.claim_endpoint("https://factlane-installation.test:8767")
+        service.claim_endpoint(
+            "https://factlane-installation.test:8767",
+            expected_legacy_hostname="factlane-installation.test",
+        )
 
 
 def test_claim_endpoint_legacy_transport_canonicalization_rejects_port_change(
@@ -194,9 +200,45 @@ def test_claim_endpoint_legacy_transport_canonicalization_rejects_port_change(
     service.claim_endpoint("https://factlane-installation.test:8767")
 
     with pytest.raises(EndpointUnavailable, match="explicit recovery"):
-        service.claim_endpoint("http://127.0.0.1:8768")
+        service.claim_endpoint(
+            "http://127.0.0.1:8768",
+            expected_legacy_hostname="factlane-installation.test",
+        )
 
     assert service.snapshot().saved_endpoint == "https://factlane-installation.test:8767"
+
+
+def test_claim_endpoint_legacy_transport_canonicalization_rejects_foreign_installation_hostname(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    service.claim_endpoint("https://factlane-foreign.test:8767")
+
+    with pytest.raises(EndpointUnavailable, match="explicit recovery"):
+        service.claim_endpoint(
+            "http://127.0.0.1:8767",
+            expected_legacy_hostname="factlane-installation.test",
+        )
+
+    assert service.snapshot().saved_endpoint == "https://factlane-foreign.test:8767"
+
+
+def test_claim_endpoint_legacy_transport_canonicalization_never_mutates_recovery_state(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    service.claim_endpoint("https://factlane-installation.test:8767")
+    service.mark_recovery_required()
+
+    with pytest.raises(EndpointUnavailable, match="recovery"):
+        service.claim_endpoint(
+            "http://127.0.0.1:8767",
+            expected_legacy_hostname="factlane-installation.test",
+        )
+
+    snapshot = service.snapshot()
+    assert snapshot.status is ServiceStatus.RECOVERY_REQUIRED
+    assert snapshot.saved_endpoint == "https://factlane-installation.test:8767"
 
 
 def test_start_stop_and_restart_intents_are_idempotent(tmp_path: Path) -> None:

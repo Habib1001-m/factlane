@@ -1208,6 +1208,7 @@ def test_windows_serve_route_runs_native_backend_owned_http_without_tls_or_caddy
             backend_factory: object,
             process_factory: object,
             external_gateway_required: bool,
+            legacy_endpoint_hostname: str,
         ) -> None:
             events.append("runner_init")
             calls["config"] = config
@@ -1215,6 +1216,7 @@ def test_windows_serve_route_runs_native_backend_owned_http_without_tls_or_caddy
             calls["backend_factory"] = backend_factory
             calls["process_factory"] = process_factory
             calls["external_gateway_required"] = external_gateway_required
+            calls["legacy_endpoint_hostname"] = legacy_endpoint_hostname
 
         def run(self):
             events.append("runner_run")
@@ -1241,4 +1243,5 @@ def test_windows_serve_route_runs_native_backend_owned_http_without_tls_or_caddy
     assert calls["backend_factory"] is backend_factory
     assert calls["process_factory"] is None
     assert calls["external_gateway_required"] is False
+    assert calls["legacy_endpoint_hostname"] == "factlane-browserneutral123.test"
     assert events == ["runner_init", "runner_run"]

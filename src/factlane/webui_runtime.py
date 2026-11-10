@@ -431,6 +431,7 @@ class WebUIRuntimeRunner:
         *,
         backend_factory: BackendFactory,
         process_factory: ProcessFactory | None,
+        legacy_endpoint_hostname: str | None = None,
         external_gateway_required: bool = True,
         clock: Clock = time.monotonic,
         sleep: Sleep = time.sleep,
@@ -442,6 +443,7 @@ class WebUIRuntimeRunner:
         self.service_state = service_state
         self._backend_factory = backend_factory
         self._process_factory = process_factory
+        self._legacy_endpoint_hostname = legacy_endpoint_hostname
         self._external_gateway_required = bool(external_gateway_required)
         if self._external_gateway_required and self._process_factory is None:
             raise ValueError("process_factory is required when the external gateway is enabled")
@@ -458,18 +460,24 @@ class WebUIRuntimeRunner:
         snapshot = self.service_state.snapshot()
         if snapshot.status is ServiceStatus.STOPPED_UNTIL_REBOOT:
             return RuntimeOutcome(RuntimeOutcomeState.STOPPED)
-        if (
-            snapshot.saved_endpoint is not None
-            and snapshot.saved_endpoint != self.config.origin
-            and not is_legacy_endpoint_canonicalization(
+        if snapshot.saved_endpoint is not None and snapshot.saved_endpoint != self.config.origin:
+            canonicalization_allowed = is_legacy_endpoint_canonicalization(
                 snapshot.saved_endpoint,
                 self.config.origin,
+                expected_legacy_hostname=self._legacy_endpoint_hostname,
             )
-        ):
-            return RuntimeOutcome(
-                RuntimeOutcomeState.FAILED,
-                detail="runtime config origin differs from saved endpoint; explicit recovery is required",
-            )
+            if (
+                not canonicalization_allowed
+                or snapshot.status
+                in {
+                    ServiceStatus.MAINTENANCE,
+                    ServiceStatus.RECOVERY_REQUIRED,
+                }
+            ):
+                return RuntimeOutcome(
+                    RuntimeOutcomeState.FAILED,
+                    detail="runtime config origin differs from saved endpoint; explicit recovery is required",
+                )
 
         if snapshot.status is ServiceStatus.RECOVERY_REQUIRED:
             effective_mode = BackendMode.RECOVERY_SHELL
@@ -527,7 +535,13 @@ class WebUIRuntimeRunner:
             )
             if self._backend.is_ready() and gateway_ready:
                 try:
-                    self.service_state.claim_endpoint(self.config.origin)
+                    if self._legacy_endpoint_hostname is None:
+                        self.service_state.claim_endpoint(self.config.origin)
+                    else:
+                        self.service_state.claim_endpoint(
+                            self.config.origin,
+                            expected_legacy_hostname=self._legacy_endpoint_hostname,
+                        )
                 except EndpointUnavailable as exc:
                     return self._endpoint_claim_failure(str(exc))
                 except Exception as exc:

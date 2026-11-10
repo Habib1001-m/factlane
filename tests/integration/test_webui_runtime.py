@@ -593,6 +593,7 @@ def test_runner_canonicalizes_same_port_legacy_https_state_after_loopback_http_i
     runner = WebUIRuntimeRunner(
         config,
         service,
+        legacy_endpoint_hostname="factlane-a1b2c3.test",
         backend_factory=lambda _spec, exact_service_state: (
             pytest.fail("runner passed a different service-state instance")
             if exact_service_state is not service
@@ -629,6 +630,7 @@ def test_windows_runner_canonicalizes_same_port_legacy_https_state_to_loopback_h
     runner = WebUIRuntimeRunner(
         config,
         service,
+        legacy_endpoint_hostname="factlane-legacy123.test",
         backend_factory=lambda _spec, exact_service_state: (
             pytest.fail("runner passed a different service-state instance")
             if exact_service_state is not service
@@ -647,6 +649,69 @@ def test_windows_runner_canonicalizes_same_port_legacy_https_state_to_loopback_h
     assert backend.start_calls == 1
     assert service.snapshot().saved_endpoint == "http://127.0.0.1:8767"
     assert service.snapshot().status is ServiceStatus.READY
+
+
+def test_runner_rejects_same_port_legacy_endpoint_from_foreign_installation_before_launch(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    service = _service(tmp_path, clock)
+    service.claim_endpoint("https://factlane-foreign.test:8767")
+    backend = _Backend()
+    process = _Process()
+    config = load_runtime_config(
+        _write_config(tmp_path, extra={"origin": "http://127.0.0.1:8767"})
+    )
+    runner = WebUIRuntimeRunner(
+        config,
+        service,
+        legacy_endpoint_hostname="factlane-a1b2c3.test",
+        backend_factory=lambda _spec, _service_state: backend,
+        process_factory=lambda _config, _argv: process,
+        clock=clock,
+        sleep=clock.sleep,
+        poll_interval=1.0,
+    )
+
+    outcome = runner.start()
+
+    assert outcome.state is RuntimeOutcomeState.FAILED
+    assert "explicit recovery" in (outcome.detail or "")
+    assert backend.start_calls == 0
+    assert service.snapshot().saved_endpoint == "https://factlane-foreign.test:8767"
+
+
+def test_runner_does_not_canonicalize_legacy_endpoint_while_recovery_is_required(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    service = _service(tmp_path, clock)
+    service.claim_endpoint("https://factlane-a1b2c3.test:8767")
+    service.mark_recovery_required()
+    backend = _Backend()
+    process = _Process()
+    config = load_runtime_config(
+        _write_config(tmp_path, extra={"origin": "http://127.0.0.1:8767"})
+    )
+    runner = WebUIRuntimeRunner(
+        config,
+        service,
+        legacy_endpoint_hostname="factlane-a1b2c3.test",
+        backend_factory=lambda _spec, _service_state: backend,
+        process_factory=lambda _config, _argv: process,
+        clock=clock,
+        sleep=clock.sleep,
+        poll_interval=1.0,
+    )
+
+    outcome = runner.start()
+
+    assert outcome.state is RuntimeOutcomeState.FAILED
+    assert "explicit recovery" in (outcome.detail or "")
+    assert backend.start_calls == 0
+    snapshot = service.snapshot()
+    assert snapshot.status is ServiceStatus.RECOVERY_REQUIRED
+    assert snapshot.saved_endpoint == "https://factlane-a1b2c3.test:8767"
 
 
 def test_runner_claim_failure_after_readiness_drains_and_returns_failed(tmp_path: Path) -> None:

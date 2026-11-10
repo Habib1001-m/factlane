@@ -1603,6 +1603,78 @@ def test_serve_loads_owner_private_default_config_and_runs_runtime_with_supplied
     assert path.exists()
 
 
+def test_browser_neutral_serve_binds_legacy_transition_to_setup_installation_identity(
+    tmp_path: Path,
+) -> None:
+    config_path, _legacy_config = _write_runtime_config(tmp_path)
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["origin"] = "http://127.0.0.1:8765"
+    config_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+    journal_path = linux_setup_journal_path(payload["state_dir"])
+    journal_path.parent.mkdir(parents=True, mode=0o700)
+    journal_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "phase": "CLAIMED",
+                "installation_id": "test123",
+                "hostname": "factlane-test123.test",
+                "installing_user": "owner",
+                "browser_family": None,
+                "browser_executable": None,
+                "browser_profile_dir": str(journal_path.parent / "browser"),
+                "state_dir": payload["state_dir"],
+                "caddy_state_dir": str(journal_path.parent / "caddy"),
+                "root_fingerprint_sha256": None,
+                "ownership": {},
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n",
+        encoding="utf-8",
+    )
+    journal_path.chmod(0o600)
+    calls: dict[str, object] = {}
+
+    class FakeRunner:
+        def __init__(
+            self,
+            _config,
+            _service_state,
+            *,
+            backend_factory,
+            process_factory,
+            legacy_endpoint_hostname,
+        ):
+            calls["backend_factory"] = backend_factory
+            calls["process_factory"] = process_factory
+            calls["legacy_endpoint_hostname"] = legacy_endpoint_hostname
+
+        def run(self):
+            return RuntimeOutcome(RuntimeOutcomeState.SHELL_READY)
+
+    controller = ProductionWebUIController(
+        environ={"XDG_CONFIG_HOME": str(tmp_path / "config")},
+        home=str(tmp_path / "home"),
+        owner_uid=os.getuid(),
+        runtime_runner_factory=FakeRunner,
+        backend_factory=object(),  # type: ignore[arg-type]
+        process_factory=object(),  # type: ignore[arg-type]
+        service_state_factory=lambda _path: object(),
+        control_client_factory=lambda _path, _uid: pytest.fail("control client not used"),
+        browser_launcher=lambda _origin: pytest.fail("browser not used"),
+    )
+
+    result = controller.dispatch("serve")
+
+    assert result == {"status": "OK", "state": "SHELL_READY"}
+    assert calls["legacy_endpoint_hostname"] == "factlane-test123.test"
+
+
 def test_serve_missing_default_config_fails_with_concrete_config_error_without_factories(
     tmp_path: Path,
 ) -> None:
