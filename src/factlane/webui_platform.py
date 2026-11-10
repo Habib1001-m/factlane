@@ -1562,7 +1562,7 @@ class ProductionWebUIController:
         request_id_factory: RequestIdFactory = lambda: secrets.token_urlsafe(18),
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
-        startup_timeout: float = 10.0,
+        startup_timeout: float = 30.0,
         startup_poll_interval: float = 0.1,
         enrollment_timeout: float = _LOCAL_ENROLLMENT_TIMEOUT_SECONDS,
         enrollment_poll_interval: float = _LOCAL_ENROLLMENT_POLL_INTERVAL_SECONDS,

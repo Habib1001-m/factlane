@@ -1300,6 +1300,54 @@ def test_offline_start_records_start_intent_before_exact_unit_start_and_waits_re
     assert order == ["systemd-start"]
 
 
+def test_offline_start_default_budget_allows_observed_fifteen_second_cold_start(
+    tmp_path: Path,
+) -> None:
+    service_state = _persistent_service_state(tmp_path)
+    service_state.claim_endpoint("http://127.0.0.1:8765")
+    service_state.request_stop("stop-before-cold-start")
+    unit = _UnitManager(active=False)
+
+    class Clock:
+        def __init__(self) -> None:
+            self.value = 0.0
+
+        def __call__(self) -> float:
+            return self.value
+
+        def sleep(self, seconds: float) -> None:
+            self.value += seconds
+            if self.value >= 15.0 and service_state.snapshot().status is ServiceStatus.STARTING:
+                service_state.mark_ready()
+
+    clock = Clock()
+    controller = ProductionWebUIController(
+        paths=default_owner_paths(
+            environ={"XDG_STATE_HOME": str(tmp_path / "state-root")},
+            home=str(tmp_path / "home"),
+            owner_uid=1000,
+        ),
+        owner_uid=1000,
+        service_state_factory=lambda _path: service_state,
+        systemd_manager=unit,
+        control_client_factory=lambda _path, _uid: pytest.fail(
+            "offline start must not require native control"
+        ),
+        request_id_factory=lambda: "cold-start-default-budget",
+        clock=clock,
+        sleep=clock.sleep,
+        startup_poll_interval=5.0,
+    )
+
+    result = controller.dispatch("start")
+
+    assert result["status"] == "OK"
+    assert result["service"]["status"] == "READY"
+    assert result["unit"]["active"] is True
+    assert unit.starts == 1
+    assert clock.value == pytest.approx(15.0)
+
+
 def test_offline_restart_from_stopped_uses_explicit_start_semantics(
     tmp_path: Path,
 ) -> None:
