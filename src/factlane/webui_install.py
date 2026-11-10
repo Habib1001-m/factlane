@@ -1228,7 +1228,7 @@ class ProductionLinuxInstallerBackend:
         activation_probe: ActivationProbe | None = None,
         clock: InstallClock = time.monotonic,
         sleep: InstallSleep = time.sleep,
-        activation_timeout: float = 10.0,
+        activation_timeout: float = 30.0,
         poll_interval: float = 0.1,
     ) -> None:
         _validate_absolute_path(systemctl_path, "systemctl executable")
@@ -2922,6 +2922,12 @@ class ProductionLinuxInstallerBackend:
             if not isinstance(files, dict) or not isinstance(order, list):
                 raise LinuxSetupRecoveryRequired("setup journal rollback file ownership is invalid")
             service_state_path = self._journal_path.parent / "webui-service.json"
+            user_unit_targets = {
+                Path(operation.target)
+                for operation in plan.operations
+                if operation.kind == "INSTALL_USER_UNIT"
+            }
+            restored_user_unit = False
             for key in reversed(order):
                 record = files.get(key)
                 if not isinstance(record, dict):
@@ -2940,6 +2946,15 @@ class ProductionLinuxInstallerBackend:
                         record,
                         owner_uid=self._owner_uid,
                     )
+                if managed_path in user_unit_targets:
+                    restored_user_unit = True
+
+            if restored_user_unit and self._command_runner(
+                (self._systemctl_path, "--user", "daemon-reload")
+            ) != 0:
+                raise LinuxSetupRecoveryRequired(
+                    "rollback restored the user unit bytes but could not reload the user manager"
+                )
 
             linger_preexisting = ownership.get("linger_preexisting")
             linger_intent = ownership.get("linger_change_intent") is True

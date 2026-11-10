@@ -843,6 +843,36 @@ def test_file_rollback_restores_exact_preexisting_bytes_and_foreign_change_holds
     assert target.read_text(encoding="utf-8") == "foreign-change\n"
 
 
+def test_file_rollback_reloads_systemd_after_restoring_preexisting_user_unit(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    calls: list[tuple[str, ...]] = []
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/usr/bin/systemctl",
+        owner_uid=os.getuid(),
+        command_runner=lambda argv: calls.append(argv) or 0,
+    )
+    journal = receipt.operations[0]
+    assert backend.apply_operation(journal, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    unit = next(op for op in receipt.operations if op.kind == "INSTALL_USER_UNIT")
+    target = Path(unit.target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("original-unit\n", encoding="utf-8")
+    target.chmod(0o600)
+
+    assert backend.apply_operation(unit, plan=receipt.plan).status is InstallerStepStatus.APPLIED
+    assert target.read_text(encoding="utf-8") == unit.desired_state
+
+    rolled = backend.rollback_setup(plan=receipt.plan, completed_operations=(unit.kind,))
+
+    assert rolled.status is InstallerStepStatus.APPLIED
+    assert target.read_text(encoding="utf-8") == "original-unit\n"
+    assert calls == [("/usr/bin/systemctl", "--user", "daemon-reload")]
+
+
 def test_endpoint_managed_file_allows_same_backend_candidate_rebind_and_rolls_back(
     tmp_path: Path,
 ) -> None:

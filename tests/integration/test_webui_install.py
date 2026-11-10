@@ -1062,6 +1062,49 @@ def test_production_backend_waits_through_exact_legacy_endpoint_migration(
     assert probe_calls == [receipt.plan.origin, receipt.plan.origin]
 
 
+def test_production_backend_default_activation_budget_allows_slow_cold_start() -> None:
+    calls: list[tuple[str, ...]] = []
+    clock = _InstallClock()
+    receipt = plan_webui_setup(_request(), _environment(), _consent())
+    assert receipt.plan is not None
+
+    def state_reader() -> ServiceSnapshot:
+        if clock.value < 15.0:
+            return _service_snapshot(ServiceStatus.STARTING, receipt.plan.origin)
+        return _service_snapshot(ServiceStatus.READY, receipt.plan.origin)
+
+    def probe(_origin: str) -> ManagedServiceActivationResult:
+        return ManagedServiceActivationResult(
+            status=(
+                ManagedServiceActivationStatus.PENDING
+                if clock.value < 15.0
+                else ManagedServiceActivationStatus.READY
+            )
+        )
+
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/opt/systemd/bin/systemctl",
+        owner_uid=1000,
+        command_runner=lambda argv: calls.append(argv) or 0,
+        service_state_reader=state_reader,
+        activation_probe=probe,
+        clock=clock,
+        sleep=clock.sleep,
+        poll_interval=0.5,
+    )
+
+    activated = backend.activate_candidate(plan=receipt.plan)
+
+    assert activated == ManagedServiceActivationResult(
+        status=ManagedServiceActivationStatus.READY,
+        saved_endpoint=receipt.plan.origin,
+    )
+    assert 15.0 <= clock.value < 30.0
+    assert calls == [
+        ("/opt/systemd/bin/systemctl", "--user", "restart", WEBUI_SERVICE_NAME),
+    ]
+
+
 def test_production_backend_still_rejects_foreign_same_port_saved_endpoint() -> None:
     receipt = plan_webui_setup(_request(), _environment(), _consent())
     assert receipt.plan is not None
