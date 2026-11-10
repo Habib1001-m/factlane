@@ -1183,6 +1183,9 @@ def test_setup_routes_require_exact_origin_session_csrf_and_explicit_setup_servi
             "request_id": "setup-request-1",
         }
     ]
+    deadline = time.monotonic() + 1.0
+    while setup.handoff_calls != ["setup-request-1"] and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert setup.handoff_calls == ["setup-request-1"]
 
     normal_server, normal_auth, *_rest = running_server
