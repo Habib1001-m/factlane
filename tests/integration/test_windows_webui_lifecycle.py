@@ -1243,5 +1243,5 @@ def test_windows_serve_route_runs_native_backend_owned_http_without_tls_or_caddy
     assert calls["backend_factory"] is backend_factory
     assert calls["process_factory"] is None
     assert calls["external_gateway_required"] is False
-    assert calls["legacy_endpoint_hostname"] == "factlane-browserneutral123.test"
+    assert calls["legacy_endpoint_hostname"] == "factlane-a2serve123.test"
     assert events == ["runner_init", "runner_run"]
