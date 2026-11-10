@@ -53,6 +53,7 @@ from .webui_install import (
     SetupConsent,
     SetupReceipt,
     SetupRequest,
+    WindowsSetupPrecondition,
     WEBUI_PORT_MIN,
     WEBUI_SERVICE_NAME,
     WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME,
@@ -990,6 +991,7 @@ def build_default_setup_executor(
     activation_probe: Callable[[str], ManagedServiceActivationResult] | None = None,
     service_state_factory: Callable[[str], Any] = WebUIServiceState,
     windows_supervisor: WindowsTaskSchedulerSupervisor | None = None,
+    windows_setup_precondition: WindowsSetupPrecondition | None = None,
 ) -> SetupApplyExecutor:
     """Compose the default shipped setup backend for the active platform."""
 
@@ -997,6 +999,7 @@ def build_default_setup_executor(
         backend = ProductionWindowsInstallerBackend(
             request=request,
             supervisor=windows_supervisor,
+            expected_precondition=windows_setup_precondition,
         )
 
         def execute_windows(
@@ -1066,6 +1069,25 @@ def build_default_setup_executor(
         return apply_webui_setup(receipt, consent, backend)
 
     return execute
+
+
+def capture_windows_setup_precondition(
+    request: SetupRequest,
+    *,
+    windows_supervisor: WindowsTaskSchedulerSupervisor | None = None,
+) -> WindowsSetupPrecondition:
+    """Capture the exact native-Windows setup custody before human consent."""
+
+    if os.name != "nt":
+        raise WebUIPlatformError(
+            "WINDOWS_SETUP_UNAVAILABLE",
+            "native Windows setup precondition is only available on Windows",
+        )
+    backend = ProductionWindowsInstallerBackend(
+        request=request,
+        supervisor=windows_supervisor,
+    )
+    return backend.capture_precondition()
 
 
 class NativeLauncherClient:
@@ -1844,6 +1866,7 @@ class ProductionWebUIController:
             service = self._persistent_service_state().request_stop(request_id)
             return {
                 "status": "OK",
+                "request_id": request_id,
                 "unit": _unit_payload(unit),
                 "service": _service_snapshot_payload(service),
             }
@@ -1917,12 +1940,14 @@ class ProductionWebUIController:
             } and last_unit.active:
                 return {
                     "status": "OK",
+                    "request_id": request_id,
                     "unit": _unit_payload(last_unit),
                     "service": _service_snapshot_payload(last_service),
                 }
             if last_service.status is ServiceStatus.FAILED:
                 return {
                     "status": "ERROR",
+                    "request_id": request_id,
                     "error_code": "SERVICE_START_FAILED",
                     "message": "WebUI service entered FAILED during explicit start",
                     "unit": _unit_payload(last_unit),
@@ -1932,6 +1957,7 @@ class ProductionWebUIController:
             if now >= deadline:
                 return {
                     "status": "ERROR",
+                    "request_id": request_id,
                     "error_code": "SERVICE_START_TIMEOUT",
                     "message": "WebUI service did not become ready within the startup deadline",
                     "unit": _unit_payload(last_unit),
@@ -1960,7 +1986,7 @@ class ProductionWebUIController:
                 "unsupported live WebUI control action",
             )
         service = method(request_id=request_id)
-        return {"status": "OK", "service": dict(service)}
+        return {"status": "OK", "request_id": request_id, "service": dict(service)}
 
     def _live_control_client(self, unit: Any) -> LauncherControlClient:
         if self.platform_system == "Windows" and os.name == "nt":

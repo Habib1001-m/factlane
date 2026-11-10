@@ -29,6 +29,7 @@ from factlane.webui_platform import (
     WebUIPlatformError,
     build_default_setup_executor,
     build_default_setup_request,
+    capture_windows_setup_precondition,
     default_owner_paths,
 )
 from factlane.webui_service import ServiceStateError, ServiceStatus, WebUIServiceState
@@ -62,6 +63,37 @@ def _factlane_executable() -> str:
     if candidate.is_file():
         return str(candidate)
     pytest.skip("native Windows Python executable is unavailable")
+
+
+class _SetupSupervisor:
+    """In-memory Task Scheduler boundary for native setup tests."""
+
+    def __init__(self) -> None:
+        self.task: dict[str, object] = {"exists": False}
+        self.prepared: list[str] = []
+
+    def snapshot_task(self) -> dict[str, object]:
+        return dict(self.task)
+
+    def prepare_task(self, executable: str, *, transaction_id: str) -> dict[str, object]:
+        self.prepared.append(executable)
+        return {
+            "exists": True,
+            "xml": transaction_id,
+            "sddl": "test-owner",
+            "enabled": True,
+        }
+
+    def publish_task(self, intended: dict[str, object], *, expected: dict[str, object]) -> None:
+        assert self.task == expected
+        self.task = dict(intended)
+
+    def restore_task(self, original: dict[str, object], *, expected: dict[str, object]) -> None:
+        assert self.task == expected
+        self.task = dict(original)
+
+    def verify_quiescent(self) -> None:
+        return None
 
 
 def test_default_windows_task_supervisor_uses_base_python_with_current_environment_binding(
@@ -818,25 +850,24 @@ def test_windows_setup_plan_and_apply_have_no_linux_caddy_hosts_or_lingering_req
     ):
         assert forbidden not in serialized
 
-    registered: list[str] = []
-
-    class Supervisor:
-        def register_or_update(self, factlane_executable: str):
-            registered.append(factlane_executable)
-            return None
-
     assert request.launcher_path is not None
     Path(request.launcher_path).parent.mkdir(parents=True, exist_ok=True)
+    supervisor = _SetupSupervisor()
+    precondition = capture_windows_setup_precondition(
+        request,
+        windows_supervisor=supervisor,  # type: ignore[arg-type]
+    )
     executor = build_default_setup_executor(
         request,
         environment,
-        windows_supervisor=Supervisor(),  # type: ignore[arg-type]
+        windows_supervisor=supervisor,  # type: ignore[arg-type]
+        windows_setup_precondition=precondition,
     )
     applied = executor(receipt, consent)
     assert applied.status is InstallerStepStatus.APPLIED
     assert applied.endpoint_state is EndpointState.PROPOSED
     expected_base, _environment = windows_managed_python_executables(environment_executable=executable)
-    assert registered == [expected_base]
+    assert supervisor.prepared == [expected_base]
     config = load_windows_managed_config(request.service_config_path)
     assert config is not None
     assert config.origin == "http://127.0.0.1:8765"
@@ -1174,16 +1205,18 @@ def test_windows_serve_route_runs_native_backend_owned_http_without_tls_or_caddy
     consent = SetupConsent(False, False, False, windows_native_setup=True)
     receipt = plan_webui_setup(request, environment, consent)
 
-    class Supervisor:
-        def register_or_update(self, _executable: str):
-            return None
-
     assert request.launcher_path is not None
     Path(request.launcher_path).parent.mkdir(parents=True, exist_ok=True)
+    supervisor = _SetupSupervisor()
+    precondition = capture_windows_setup_precondition(
+        request,
+        windows_supervisor=supervisor,  # type: ignore[arg-type]
+    )
     result = build_default_setup_executor(
         request,
         environment,
-        windows_supervisor=Supervisor(),  # type: ignore[arg-type]
+        windows_supervisor=supervisor,  # type: ignore[arg-type]
+        windows_setup_precondition=precondition,
     )(receipt, consent)
     assert result.status is InstallerStepStatus.APPLIED
 
@@ -1245,3 +1278,49 @@ def test_windows_serve_route_runs_native_backend_owned_http_without_tls_or_caddy
     assert calls["external_gateway_required"] is False
     assert calls["legacy_endpoint_hostname"] == "factlane-a2serve123.test"
     assert events == ["runner_init", "runner_run"]
+
+
+def test_windows_mutation_guard_process_timeout_and_crash_release(tmp_path, monkeypatch):
+    """Exercise real LockFileEx against an isolated per-test LOCALAPPDATA."""
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path / 'local'))
+    from factlane.webui_windows import windows_mutation_guard
+    child = '''
+import os
+from factlane.webui_windows import windows_mutation_guard, WindowsWebUIError
+try:
+    with windows_mutation_guard(timeout=0.15):
+        print('acquired', flush=True)
+        os._exit(0)
+except WindowsWebUIError as exc:
+    print(exc.code, flush=True)
+'''
+    with windows_mutation_guard():
+        lock = Path(windows_owner_paths().state_dir) / 'webui-mutation.lock'
+        before = lock.stat().st_ino
+        result = subprocess.run([sys.executable, '-c', child], capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0
+        assert result.stdout.strip() == 'WINDOWS_MUTATION_BUSY'
+    result = subprocess.run([sys.executable, '-c', child], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0
+    assert result.stdout.strip() == 'acquired'
+    with windows_mutation_guard():
+        assert lock.stat().st_ino == before
+
+
+def test_windows_mutation_guard_rejects_substituted_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path / 'local'))
+    from factlane.webui_windows import windows_mutation_guard
+    from factlane.windows_security import WindowsSecurityError
+    paths = windows_owner_paths()
+    ensure_windows_owner_paths(paths)
+    foreign = tmp_path / 'foreign'
+    foreign.write_text('foreign', encoding='utf-8')
+    lock = Path(paths.state_dir) / 'webui-mutation.lock'
+    try:
+        lock.symlink_to(foreign)
+    except OSError:
+        pytest.skip('Windows symlink creation privilege unavailable')
+    with pytest.raises((WindowsWebUIError, WindowsSecurityError)):
+        with windows_mutation_guard():
+            pytest.fail('substituted lock was accepted')
+    assert foreign.read_text(encoding='utf-8') == 'foreign'

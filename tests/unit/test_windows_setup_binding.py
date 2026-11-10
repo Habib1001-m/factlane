@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import json
 import sqlite3
 
@@ -59,9 +61,31 @@ def _service(*, db_validator=None, db_inspector=None, restart_plan: _RestartPlan
         assert owner_sid == SID
         return store["config"]
 
-    def writer(path: str, content: str, *, owner_sid: str | None = None) -> None:
+    def snapshot(path: str, *, owner_sid: str | None = None):
         assert path == CONFIG_PATH
         assert owner_sid == SID
+        content = json.dumps(
+            store["config"].__dict__,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+        return {
+            "exists": True,
+            "identity": [1, 1],
+            "content": base64.b64encode(content.encode()).decode(),
+            "sddl": "owner",
+        }
+
+    def writer(
+        path: str,
+        content: str,
+        *,
+        owner_sid: str | None = None,
+        expected_state=None,
+    ) -> None:
+        assert path == CONFIG_PATH
+        assert owner_sid == SID
+        assert expected_state == snapshot(path, owner_sid=owner_sid)
         config = WindowsManagedConfig(**json.loads(content))
         writes.append(config)
         store["config"] = config
@@ -73,6 +97,8 @@ def _service(*, db_validator=None, db_inspector=None, restart_plan: _RestartPlan
         supported_profiles={"nomic-768", "minilm-384"},
         config_loader=loader,
         config_writer=writer,
+        config_snapshot=snapshot,
+        mutation_guard=contextlib.nullcontext,
         database_validator=db_validator or (lambda path, *, owner_sid: path),
         database_inspector=db_inspector or (lambda _path, _profile: None),
         restart_preparer=lambda: plan,

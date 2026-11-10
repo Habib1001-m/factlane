@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import base64
 import getpass
 import hashlib
 import json
@@ -10,6 +11,8 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
+from contextlib import contextmanager
 import uuid
 from dataclasses import dataclass
 from ctypes import wintypes
@@ -24,6 +27,7 @@ from .windows_security import (
     ensure_owner_private_directory,
     owner_only_security_attributes,
     process_identity,
+    validate_owner_controlled_kernel_object,
     validate_owner_only_kernel_object,
     validate_owner_private_path,
     validate_windows_path_no_reparse,
@@ -73,6 +77,100 @@ class WindowsWebUIError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.safe_message = message
+
+
+_mutation_registry_lock = threading.Lock()
+_mutation_locks: dict[str, threading.RLock] = {}
+_mutation_owned = threading.local()
+
+
+@contextmanager
+def windows_mutation_guard(*, timeout: float = 10.0):
+    """Serialize participating writers; external same-user edits remain detectable drift."""
+    if not 0 < timeout <= 60:
+        raise ValueError("Windows mutation timeout must be in (0, 60]")
+    path = str(PureWindowsPath(windows_owner_paths().state_dir) / "webui-mutation.lock")
+    key = str(PureWindowsPath(os.path.realpath(path))).casefold()
+    with _mutation_registry_lock:
+        lock = _mutation_locks.setdefault(key, threading.RLock())
+    deadline = time.monotonic() + timeout
+    if not lock.acquire(timeout=timeout):
+        raise WindowsWebUIError("WINDOWS_MUTATION_BUSY", "another FactLane mutation is in progress")
+    owned = getattr(_mutation_owned, "keys", None)
+    if owned is None:
+        owned = _mutation_owned.keys = set()
+    try:
+        if key in owned:
+            yield
+        else:
+            with _native_windows_mutation_lock(path, deadline=deadline):
+                owned.add(key)
+                try:
+                    yield
+                finally:
+                    owned.remove(key)
+    finally:
+        lock.release()
+
+
+@contextmanager
+def _native_windows_mutation_lock(path: str, *, deadline: float):
+    sid = current_user_sid()
+    target = Path(path)
+    validate_windows_path_no_reparse(target)
+    root = target.parent.parent
+    if root.exists():
+        validate_owner_private_path(root, owner_sid=sid, directory=True)
+    else:
+        ensure_owner_private_directory(root, owner_sid=sid)
+    if target.parent.exists():
+        validate_owner_private_path(target.parent, owner_sid=sid, directory=True)
+    else:
+        ensure_owner_private_directory(target.parent, owner_sid=sid)
+    validate_owner_private_path(target.parent, owner_sid=sid, directory=True)
+    _api, con, files = _require_win32file()
+    import pywintypes
+
+    parent_guard = _open_windows_parent_guard(target.parent, owner_sid=sid)
+    try:
+        handle = files.CreateFile(
+            path, int(con.GENERIC_READ) | int(con.GENERIC_WRITE),
+            int(con.FILE_SHARE_READ) | int(con.FILE_SHARE_WRITE),
+            owner_only_security_attributes(sid), int(con.OPEN_ALWAYS),
+            int(con.FILE_ATTRIBUTE_NORMAL) | 0x00200000, None,
+        )
+    except BaseException:
+        parent_guard.close()
+        raise
+    acquired = False
+    overlapped = pywintypes.OVERLAPPED()
+    try:
+        validate_owner_only_kernel_object(handle, sid)
+        identity = _windows_handle_identity(handle, expected_path=path, directory=False)
+        validate_owner_private_path(path, owner_sid=sid, directory=False)
+        while True:
+            try:
+                files.LockFileEx(handle, 0x00000002 | 0x00000001, 0, 1, overlapped)
+                acquired = True
+                break
+            except pywintypes.error as exc:
+                if int(exc.winerror) != _ERROR_LOCK_VIOLATION:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise WindowsWebUIError("WINDOWS_MUTATION_BUSY", "another FactLane mutation is in progress") from exc
+                time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+        validate_windows_path_no_reparse(path)
+        validate_owner_only_kernel_object(handle, sid)
+        if not _same_windows_file(identity, _windows_handle_identity(handle, expected_path=path, directory=False)):
+            raise WindowsWebUIError("WINDOWS_MUTATION_UNSAFE", "mutation lock identity changed")
+        yield
+    finally:
+        try:
+            if acquired:
+                files.UnlockFileEx(handle, 0, 1, overlapped)
+        finally:
+            handle.Close()
+            parent_guard.close()
 
 
 @dataclass(frozen=True)
@@ -676,53 +774,125 @@ class WindowsTaskSchedulerSupervisor:
             user_id=self.user_id,
         )
 
-    def register_or_update(self, executable: str) -> WindowsTaskPlan:
-        plan = self.plan(executable)
-        def register(service: Any) -> None:
-            root = service.GetFolder("\\")
-            definition = service.NewTask(0)
-            definition.RegistrationInfo.Description = "FactLane Owner WebUI current-user managed runtime"
-            principal = definition.Principal
-            principal.UserId = plan.user_id
-            principal.LogonType = plan.logon_type
-            principal.RunLevel = plan.run_level
-            trigger = definition.Triggers.Create(_TASK_TRIGGER_LOGON)
-            trigger.Id = "FactLaneOwnerLogon"
-            trigger.UserId = plan.user_id
-            trigger.Enabled = True
-            action = definition.Actions.Create(_TASK_ACTION_EXEC)
-            action.Path = plan.executable
-            action.Arguments = plan.arguments
-            settings = definition.Settings
-            settings.Enabled = True
-            settings.AllowDemandStart = True
-            settings.StartWhenAvailable = True
-            settings.DisallowStartIfOnBatteries = False
-            settings.StopIfGoingOnBatteries = False
-            settings.RunOnlyIfIdle = False
-            settings.Hidden = False
-            settings.MultipleInstances = plan.multiple_instances
-            settings.ExecutionTimeLimit = plan.execution_time_limit
-            try:
-                registered = root.RegisterTaskDefinition(
-                    plan.task_name,
-                    definition,
-                    _TASK_CREATE_OR_UPDATE,
-                    plan.user_id,
-                    None,
-                    plan.logon_type,
-                )
-            except Exception as exc:
-                raise WindowsWebUIError(
-                    "WINDOWS_TASK_REGISTRATION_FAILED",
-                    "current-user scheduled task could not be registered",
-                ) from exc
-            self._tighten_task_security(registered)
-            self._validate_registered_task(registered, plan)
+    def _task_definition(self, service: Any, plan: WindowsTaskPlan):
+        definition = service.NewTask(0)
+        definition.RegistrationInfo.Description = "FactLane Owner WebUI current-user managed runtime"
+        principal = definition.Principal
+        principal.UserId = plan.user_id
+        principal.LogonType = plan.logon_type
+        principal.RunLevel = plan.run_level
+        trigger = definition.Triggers.Create(_TASK_TRIGGER_LOGON)
+        trigger.Id = "FactLaneOwnerLogon"
+        trigger.UserId = plan.user_id
+        trigger.Enabled = True
+        action = definition.Actions.Create(_TASK_ACTION_EXEC)
+        action.Path = plan.executable
+        action.Arguments = plan.arguments
+        settings = definition.Settings
+        settings.Enabled = True
+        settings.AllowDemandStart = True
+        settings.StartWhenAvailable = True
+        settings.DisallowStartIfOnBatteries = False
+        settings.StopIfGoingOnBatteries = False
+        settings.RunOnlyIfIdle = False
+        settings.Hidden = False
+        settings.MultipleInstances = plan.multiple_instances
+        settings.ExecutionTimeLimit = plan.execution_time_limit
+        return definition
 
-        self._run_with_service(register)
-        self.expected_executable = plan.executable
-        return plan
+    def prepare_task(self, executable: str, *, transaction_id: str) -> dict[str, Any]:
+        plan = self.plan(executable)
+        def prepare(service):
+            before = self._snapshot_task_with_service(service)
+            if before["exists"]:
+                task = service.GetFolder("\\").GetTask(self.task_name)
+                self._validate_registered_task(task, plan, allow_disabled=True)
+                if int(task.State) in {_TASK_STATE_RUNNING, _TASK_STATE_QUEUED}:
+                    raise WindowsWebUIError("WINDOWS_SETUP_BUSY", "managed task must be quiescent before setup")
+            definition = self._task_definition(service, plan)
+            definition.RegistrationInfo.Source = "FactLane setup " + str(uuid.UUID(transaction_id))
+            return {"exists": True, "xml": str(definition.XmlText),
+                    "sddl": f"O:{self.owner_sid}G:{self.owner_sid}D:P(A;;GA;;;{self.owner_sid})(A;;GA;;;SY)",
+                    "enabled": True}
+        return self._run_with_service(prepare)
+
+    def publish_task(self, intended: dict[str, Any], *, expected: dict[str, Any]) -> dict[str, Any]:
+        def publish(service):
+            if self._snapshot_task_with_service(service) != expected:
+                raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task changed before registration")
+            root = service.GetFolder("\\")
+            task = root.RegisterTask(self.task_name, intended["xml"], _TASK_CREATE_OR_UPDATE | 0x10,
+                                     self.user_id, None, _TASK_LOGON_INTERACTIVE_TOKEN, intended["sddl"])
+            self._validate_registered_task(task, self.plan(self.expected_executable))
+            self._validate_task_security(task)
+            post = self._snapshot_task_with_service(service)
+            if post != intended:
+                raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task postimage differs from prepared registration")
+            return post
+        return self._run_with_service(publish)
+
+    def register_or_update(self, executable: str) -> WindowsTaskPlan:
+        with windows_mutation_guard():
+            before = self.snapshot_task()
+            intended = self.prepare_task(executable, transaction_id=str(uuid.uuid4()))
+            self.publish_task(intended, expected=before)
+        self.expected_executable = executable
+        return self.plan(executable)
+
+    def _snapshot_task_with_service(self, service: Any) -> dict[str, Any]:
+        root = service.GetFolder("\\")
+        try:
+            task = root.GetTask(self.task_name)
+        except Exception as exc:
+            code = getattr(exc, "hresult", None)
+            if code is None and exc.args:
+                code = exc.args[0]
+            if isinstance(code, int) and (code & 0xffffffff) == 0x80020009:
+                info = getattr(exc, "excepinfo", None)
+                if isinstance(info, tuple) and len(info) == 6:
+                    code = info[5]
+            if isinstance(code, int) and (code & 0xffffffff) == 0x80070002:
+                return {"exists": False}
+            raise WindowsWebUIError("WINDOWS_TASK_SNAPSHOT_UNAVAILABLE", "scheduled task absence could not be verified") from exc
+        self._validate_task_security(task)
+        xml = str(task.Xml)
+        sddl = str(task.GetSecurityDescriptor(1 | 2 | 4))
+        if not xml or len(xml.encode("utf-8")) > 262144 or not sddl or len(sddl) > 32768:
+            raise WindowsWebUIError("WINDOWS_TASK_SNAPSHOT_UNAVAILABLE", "scheduled task snapshot is unbounded or incomplete")
+        return {"exists": True, "xml": xml, "sddl": sddl, "enabled": bool(task.Enabled)}
+
+    def verify_quiescent(self) -> None:
+        def verify(service):
+            snapshot = self._snapshot_task_with_service(service)
+            if snapshot["exists"]:
+                task = service.GetFolder("\\").GetTask(self.task_name)
+                if int(task.State) not in {_TASK_STATE_DISABLED, _TASK_STATE_READY}:
+                    raise WindowsWebUIError("WINDOWS_SETUP_BUSY", "managed task must be quiescent before recovery")
+        self._run_with_service(verify)
+
+    def snapshot_task(self) -> dict[str, Any]:
+        """Return bounded plain data; never return a COM proxy outside its apartment."""
+        return self._run_with_service(self._snapshot_task_with_service)
+
+    def restore_task(self, original: dict[str, Any], *, expected: dict[str, Any]) -> None:
+        """Conditionally restore exact registration state without activating the task."""
+        def restore(service: Any) -> None:
+            if self._snapshot_task_with_service(service) != expected:
+                raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task changed outside setup")
+            root = service.GetFolder("\\")
+            if not original["exists"]:
+                if expected["exists"]:
+                    root.DeleteTask(self.task_name, 0)
+            else:
+                task = root.RegisterTask(
+                    self.task_name, original["xml"], _TASK_CREATE_OR_UPDATE | 0x10,
+                    self.user_id, None, _TASK_LOGON_INTERACTIVE_TOKEN, original["sddl"],
+                )
+                task.SetSecurityDescriptor(original["sddl"], 0x10)
+                task.Enabled = original["enabled"]
+            if self._snapshot_task_with_service(service) != original:
+                raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task exact restoration could not be verified")
+        self._run_with_service(restore)
 
     def observe(self) -> WindowsTaskObservation:
         def observe(service: Any) -> WindowsTaskObservation:
@@ -817,6 +987,10 @@ class WindowsTaskSchedulerSupervisor:
         self._run_with_service(delete)
 
     def _run_with_service(self, operation: Callable[[Any], Any]) -> Any:
+        with windows_mutation_guard():
+            return self._run_with_service_unlocked(operation)
+
+    def _run_with_service_unlocked(self, operation: Callable[[Any], Any]) -> Any:
         com_uninitialize: Callable[[], Any] | None = None
         try:
             import pythoncom
@@ -880,7 +1054,7 @@ class WindowsTaskSchedulerSupervisor:
             raise WindowsWebUIError(*error_data)
         return result
 
-    def _validate_registered_task(self, task: Any, plan: WindowsTaskPlan) -> None:
+    def _validate_registered_task(self, task: Any, plan: WindowsTaskPlan, *, allow_disabled: bool = False) -> None:
         try:
             definition = task.Definition
             principal = definition.Principal
@@ -908,7 +1082,7 @@ class WindowsTaskSchedulerSupervisor:
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task logon trigger is not exact current-user scope")
             settings = definition.Settings
             if (
-                not bool(settings.Enabled)
+                (not allow_disabled and not bool(settings.Enabled))
                 or not bool(settings.AllowDemandStart)
                 or int(settings.MultipleInstances) != plan.multiple_instances
                 or str(settings.ExecutionTimeLimit).upper() != plan.execution_time_limit
@@ -918,16 +1092,6 @@ class WindowsTaskSchedulerSupervisor:
             raise
         except Exception as exc:
             raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task definition could not be verified") from exc
-
-    def _tighten_task_security(self, task: Any) -> None:
-        sddl = f"O:{self.owner_sid}D:P(A;;GA;;;{self.owner_sid})(A;;GA;;;SY)"
-        try:
-            task.SetSecurityDescriptor(sddl, 0)
-        except Exception:
-            # Task Scheduler may preserve its own protected SYSTEM/admin ACEs. The
-            # next verification is authoritative and rejects ordinary foreign SIDs.
-            pass
-        self._validate_task_security(task)
 
     def _validate_task_security(self, task: Any) -> None:
         _pywintypes, _win32api, _win32con, win32security = _require_windows()
@@ -1052,6 +1216,7 @@ class _WindowsParentGuard:
     path: str
     handle: Any
     identity: _WindowsFileIdentity
+    private_parent: bool = True
 
     def close(self) -> None:
         handle, self.handle = self.handle, None
@@ -1181,12 +1346,13 @@ def _same_windows_object(left: _WindowsFileIdentity, right: _WindowsFileIdentity
     )
 
 
-def _open_windows_parent_guard(parent: Path, *, owner_sid: str) -> _WindowsParentGuard:
+def _open_windows_parent_guard(parent: Path, *, owner_sid: str, private_parent: bool = True) -> _WindowsParentGuard:
     _win32api, win32con, win32file = _require_win32file()
     parent_text = str(parent)
     try:
         validate_windows_path_no_reparse(parent)
-        validate_owner_private_path(parent, owner_sid=owner_sid, directory=True)
+        if private_parent:
+            validate_owner_private_path(parent, owner_sid=owner_sid, directory=True)
         handle = win32file.CreateFile(
             parent_text,
             0,
@@ -1208,7 +1374,7 @@ def _open_windows_parent_guard(parent: Path, *, owner_sid: str) -> _WindowsParen
         ) from exc
     try:
         identity = _windows_handle_identity(handle, expected_path=parent_text, directory=True)
-        return _WindowsParentGuard(parent_text, handle, identity)
+        return _WindowsParentGuard(parent_text, handle, identity, private_parent)
     except BaseException:
         handle.Close()
         raise
@@ -1222,7 +1388,8 @@ def _revalidate_windows_parent_guard(guard: _WindowsParentGuard, *, owner_sid: s
         )
     try:
         validate_windows_path_no_reparse(guard.path)
-        validate_owner_private_path(guard.path, owner_sid=owner_sid, directory=True)
+        if guard.private_parent:
+            validate_owner_private_path(guard.path, owner_sid=owner_sid, directory=True)
         retained = _windows_handle_identity(guard.handle, expected_path=guard.path, directory=True)
     except (OSError, WindowsSecurityError, WindowsWebUIError) as exc:
         if isinstance(exc, WindowsWebUIError):
@@ -1241,7 +1408,7 @@ def _revalidate_windows_parent_guard(guard: _WindowsParentGuard, *, owner_sid: s
 def _create_owner_private_temp(
     guard: _WindowsParentGuard,
     target: Path,
-    content: str,
+    content: str | bytes,
     *,
     owner_sid: str,
 ) -> _WindowsTempFile:
@@ -1253,7 +1420,7 @@ def _create_owner_private_temp(
         validate_windows_path_no_reparse(temporary)
         handle = win32file.CreateFile(
             str(temporary),
-            int(win32con.GENERIC_WRITE) | 0x00010000,
+            int(win32con.GENERIC_READ) | int(win32con.GENERIC_WRITE) | 0x00010000 | 0x00020000 | 0x00040000 | 0x00080000,
             0,
             owner_only_security_attributes(owner_sid),
             int(win32con.CREATE_NEW),
@@ -1262,7 +1429,7 @@ def _create_owner_private_temp(
         )
         validate_owner_only_kernel_object(handle, owner_sid)
         identity = _windows_handle_identity(handle, expected_path=str(temporary), directory=False)
-        encoded = content.encode("utf-8")
+        encoded = content.encode("utf-8") if isinstance(content, str) else content
         error_code, written = win32file.WriteFile(handle, encoded)
         if int(error_code) != 0 or int(written) != len(encoded):
             raise WindowsWebUIError(
@@ -1359,6 +1526,7 @@ def _publish_owner_private_temp(
     target: Path,
     *,
     owner_sid: str,
+    owner_private: bool = True,
 ) -> None:
     _require_win32file()
     _revalidate_windows_parent_guard(guard, owner_sid=owner_sid)
@@ -1381,7 +1549,8 @@ def _publish_owner_private_temp(
             )
         if target.exists() or target.is_symlink():
             validate_windows_path_no_reparse(target)
-            validate_owner_private_path(target, owner_sid=owner_sid, directory=False)
+            if owner_private:
+                validate_owner_private_path(target, owner_sid=owner_sid, directory=False)
         _revalidate_windows_parent_guard(guard, owner_sid=owner_sid)
         _rename_windows_handle_replace(temporary.handle, guard.handle, target.name)
         published = _windows_handle_identity(
@@ -1396,7 +1565,8 @@ def _publish_owner_private_temp(
                 "published owner-private Windows file identity changed",
             )
         _revalidate_windows_parent_guard(guard, owner_sid=owner_sid)
-        validate_owner_private_path(target, owner_sid=owner_sid, directory=False)
+        if owner_private:
+            validate_owner_private_path(target, owner_sid=owner_sid, directory=False)
         temporary.published = True
     except WindowsWebUIError:
         raise
@@ -1449,7 +1619,177 @@ def _cleanup_owner_private_temp(
         return
 
 
-def write_owner_private_text_atomic(path: str, content: str, *, owner_sid: str | None = None) -> None:
+WINDOWS_SETUP_FILE_LIMIT = 262144
+
+
+def windows_file_custody_matches(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    # Content equality alone never proves transaction custody.
+    return left == right
+
+
+def _snapshot_windows_file_handle(
+    handle: Any,
+    path: str,
+    *,
+    owner_sid: str,
+    limit: int = WINDOWS_SETUP_FILE_LIMIT,
+    owner_private: bool = True,
+) -> dict[str, Any]:
+    _py, _api, _con, security = _require_windows()
+    _api, _con, files = _require_win32file()
+    if owner_private:
+        validate_owner_only_kernel_object(handle, owner_sid)
+    else:
+        validate_owner_controlled_kernel_object(handle, owner_sid)
+    identity = _windows_handle_identity(handle, expected_path=path, directory=False)
+    size = int(files.GetFileSize(handle))
+    if size > limit:
+        raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "setup file exceeds custody bound")
+    files.SetFilePointer(handle, 0, 0)
+    data = b"" if size == 0 else bytes(files.ReadFile(handle, size)[1])
+    if len(data) != size:
+        raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "setup file read was incomplete")
+    descriptor = security.GetSecurityInfo(handle, security.SE_FILE_OBJECT, 1 | 2 | 4)
+    sddl = security.ConvertSecurityDescriptorToStringSecurityDescriptor(descriptor, 1, 1 | 2 | 4)
+    return {"exists": True, "identity": [identity.volume_serial_number, identity.file_index],
+            "content": base64.b64encode(data).decode("ascii"), "sddl": str(sddl)}
+
+
+def snapshot_windows_setup_file(
+    path: str,
+    *,
+    owner_sid: str,
+    limit: int = WINDOWS_SETUP_FILE_LIMIT,
+    owner_private: bool = True,
+) -> dict[str, Any]:
+    validate_windows_path_no_reparse(path)
+    _api, con, files = _require_win32file()
+    import pywintypes
+    try:
+        handle = files.CreateFile(path, int(con.GENERIC_READ) | 0x00020000,
+                                  int(con.FILE_SHARE_READ) | int(con.FILE_SHARE_WRITE), None,
+                                  int(con.OPEN_EXISTING), 0x00200000, None)
+    except pywintypes.error as exc:
+        if int(exc.winerror) in {_ERROR_FILE_NOT_FOUND, _ERROR_PATH_NOT_FOUND}:
+            return {"exists": False}
+        raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "setup file custody unavailable") from exc
+    try:
+        return _snapshot_windows_file_handle(
+            handle,
+            path,
+            owner_sid=owner_sid,
+            limit=limit,
+            owner_private=owner_private,
+        )
+    finally:
+        handle.Close()
+
+
+def stage_windows_setup_file(path: str, content: bytes, *, owner_sid: str,
+                             private_parent: bool, sddl: str | None = None,
+                             owner_private: bool = True):
+    """Create a unique secured postimage and retain its handle until publication."""
+    guard = _open_windows_parent_guard(Path(path).parent, owner_sid=owner_sid, private_parent=private_parent)
+    temporary = None
+    try:
+        temporary = _create_owner_private_temp(guard, Path(path), content, owner_sid=owner_sid)
+        if sddl is not None:
+            _py, _api, _con, security = _require_windows()
+            descriptor = security.ConvertStringSecurityDescriptorToSecurityDescriptor(sddl, 1)
+            control = descriptor.GetSecurityDescriptorControl()[0]
+            protection = 0x80000000 if control & 0x1000 else 0x20000000
+            security.SetSecurityInfo(temporary.handle, security.SE_FILE_OBJECT, 1 | 2 | 4 | protection,
+                                     descriptor.GetSecurityDescriptorOwner(), descriptor.GetSecurityDescriptorGroup(),
+                                     descriptor.GetSecurityDescriptorDacl(), None)
+        post = _snapshot_windows_file_handle(
+            temporary.handle,
+            str(temporary.path),
+            owner_sid=owner_sid,
+            owner_private=owner_private,
+        )
+        return guard, temporary, post
+    except BaseException:
+        _cleanup_owner_private_temp(guard, temporary, owner_sid=owner_sid)
+        if temporary is not None:
+            temporary.close()
+        guard.close()
+        raise
+
+
+def publish_windows_setup_file(
+    path: str,
+    staged,
+    *,
+    expected: dict[str, Any],
+    owner_sid: str,
+    owner_private: bool = True,
+) -> None:
+    guard, temporary, post = staged
+    if not windows_file_custody_matches(
+        snapshot_windows_setup_file(path, owner_sid=owner_sid, owner_private=owner_private),
+        expected,
+    ):
+        raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "setup file changed before publication")
+    _publish_owner_private_temp(
+        guard,
+        temporary,
+        Path(path),
+        owner_sid=owner_sid,
+        owner_private=owner_private,
+    )
+    if not windows_file_custody_matches(
+        _snapshot_windows_file_handle(
+            temporary.handle,
+            path,
+            owner_sid=owner_sid,
+            owner_private=owner_private,
+        ),
+        post,
+    ):
+        raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "setup publication postimage changed")
+
+
+def close_windows_setup_stage(staged, *, owner_sid: str) -> None:
+    guard, temporary, _post = staged
+    try:
+        _cleanup_owner_private_temp(guard, temporary, owner_sid=owner_sid)
+    finally:
+        temporary.close()
+        guard.close()
+
+
+def delete_windows_setup_file(
+    path: str,
+    *,
+    expected: dict[str, Any],
+    owner_sid: str,
+    owner_private: bool = True,
+) -> None:
+    _api, con, files = _require_win32file()
+    validate_windows_path_no_reparse(path)
+    handle = files.CreateFile(path, int(con.GENERIC_READ) | 0x00020000 | 0x00010000,
+                              int(con.FILE_SHARE_READ), None, int(con.OPEN_EXISTING), 0x00200000, None)
+    try:
+        if _snapshot_windows_file_handle(
+            handle,
+            path,
+            owner_sid=owner_sid,
+            owner_private=owner_private,
+        ) != expected:
+            raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "setup file changed before deletion")
+        disposition = _FILE_DISPOSITION_INFO(DeleteFile=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        operation = kernel32.SetFileInformationByHandle
+        operation.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        operation.restype = wintypes.BOOL
+        if not operation(_win32_handle_value(handle), 4, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        handle.Close()
+
+
+def write_owner_private_text_atomic(path: str, content: str, *, owner_sid: str | None = None,
+                                  expected_state=..., snapshot_limit: int = WINDOWS_SETUP_FILE_LIMIT) -> None:
     _require_windows()
     target_text = _validate_windows_product_path(path, "owner-private file")
     target = Path(target_text)
@@ -1464,6 +1804,8 @@ def write_owner_private_text_atomic(path: str, content: str, *, owner_sid: str |
         if target.exists() or target.is_symlink():
             validate_owner_private_path(target, owner_sid=sid, directory=False)
         temporary = _create_owner_private_temp(guard, target, content, owner_sid=sid)
+        if expected_state is not ... and snapshot_windows_setup_file(str(target), owner_sid=sid, limit=snapshot_limit) != expected_state:
+            raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "owner-private file changed before publication")
         _publish_owner_private_temp(guard, temporary, target, owner_sid=sid)
     except WindowsWebUIError:
         raise

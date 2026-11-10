@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import hashlib
 import os
 import platform
@@ -18,9 +19,10 @@ from enum import Enum
 from http.client import HTTPException, HTTPResponse
 from importlib import resources
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import urlsplit
 
+from . import webui_windows as windows
 from .webui_runtime import WebUIRuntimeConfig
 from .webui_service import (
     ServiceSnapshot,
@@ -112,7 +114,20 @@ class SetupApplyResult:
     claimed_port: int | None = None
     origin: str | None = None
     completed_operations: tuple[str, ...] = ()
+    transaction_id: str | None = None
     detail: str | None = None
+
+
+@dataclass(frozen=True)
+class WindowsSetupPrecondition:
+    """Exact pre-consent Windows setup custody captured without mutation."""
+
+    owner_sid: str
+    service_config: dict[str, Any]
+    scheduled_task: dict[str, Any]
+    launcher: dict[str, Any]
+    service_state: dict[str, Any]
+    setup_journal: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -1053,38 +1068,55 @@ def _apply_windows_webui_setup(
             endpoint_state=plan.endpoint_state,
             detail="Windows setup plan already crossed the proposed endpoint boundary",
         )
+    for operation in plan.operations:
+        if operation.consent_key is not None and not _consent_granted(consent, operation.consent_key):
+            return SetupApplyResult(
+                status=InstallerStepStatus.BLOCKED,
+                endpoint_state=EndpointState.PROPOSED,
+                detail=f"explicit consent is missing for {operation.consent_key}",
+            )
     completed: list[str] = []
     try:
-        for operation in plan.operations:
-            if operation.consent_key is not None and not _consent_granted(consent, operation.consent_key):
+        with backend.mutation_guard():
+            try:
+                backend.prepare_setup(plan=plan)
+                for operation in plan.operations:
+                    result = backend.apply_operation(operation, plan=plan)
+                    if result.status is not InstallerStepStatus.APPLIED:
+                        raise WindowsWebUIError("WINDOWS_SETUP_OPERATION_FAILED", result.detail or operation.kind)
+                    completed.append(operation.kind)
+                backend.commit_setup(plan=plan)
+            except Exception as exc:
+                primary = str(exc) if isinstance(exc, WindowsWebUIError) else type(exc).__name__
+                try:
+                    rollback = backend.rollback_setup(plan=plan, completed_operations=tuple(completed))
+                    conflict = rollback.status is not InstallerStepStatus.APPLIED
+                    recovery_detail = rollback.detail or rollback.status.value
+                except Exception as rollback_exc:
+                    conflict = True
+                    recovery_detail = type(rollback_exc).__name__
                 return SetupApplyResult(
-                    status=InstallerStepStatus.BLOCKED,
+                    status=(InstallerStepStatus.RECOVERY_REQUIRED
+                            if conflict or (isinstance(exc, WindowsWebUIError) and exc.code == "WINDOWS_SETUP_RECOVERY_REQUIRED")
+                            else InstallerStepStatus.FAILED),
                     endpoint_state=EndpointState.PROPOSED,
                     completed_operations=tuple(completed),
-                    detail=f"explicit consent is missing for {operation.consent_key}",
+                    transaction_id=getattr(backend, "transaction_id", None),
+                    detail=f"Windows setup failed: {primary}; rollback: {recovery_detail}",
                 )
-            result = backend.apply_operation(operation, plan=plan)
-            if result.status is not InstallerStepStatus.APPLIED:
-                return SetupApplyResult(
-                    status=result.status,
-                    endpoint_state=EndpointState.PROPOSED,
-                    completed_operations=tuple(completed),
-                    detail=result.detail,
-                )
-            completed.append(operation.kind)
         return SetupApplyResult(
             status=InstallerStepStatus.APPLIED,
             endpoint_state=EndpointState.PROPOSED,
             origin=plan.origin,
             completed_operations=tuple(completed),
+            transaction_id=getattr(backend, "transaction_id", None),
             detail="Windows lifecycle substrate configured; endpoint claim remains owned by the managed runtime",
         )
     except Exception as exc:
         return SetupApplyResult(
-            status=InstallerStepStatus.FAILED,
+            status=InstallerStepStatus.BLOCKED,
             endpoint_state=EndpointState.PROPOSED,
-            completed_operations=tuple(completed),
-            detail=f"Windows setup apply failed safely: {type(exc).__name__}",
+            detail=f"Windows setup mutation guard unavailable: {type(exc).__name__}",
         )
 
 
@@ -3447,6 +3479,21 @@ def _write_windows_owner_panel_shortcut(
                 save = method(persist_file, 6, ctypes.c_long, ctypes.c_wchar_p, ctypes.c_int)
                 try:
                     check(save(persist_file, destination, 1), "IPersistFile.Save")
+                    load = method(persist_file, 5, ctypes.c_long, ctypes.c_wchar_p, ctypes.c_uint32)
+                    check(load(persist_file, destination, 0), "IPersistFile.Load")
+                    for index, expected in ((6, "Open the local FactLane Owner Panel"),
+                                            (8, working_directory), (10, arguments)):
+                        buffer = ctypes.create_unicode_buffer(32768)
+                        getter = method(shell_link, index, ctypes.c_long, ctypes.c_wchar_p, ctypes.c_int)
+                        check(getter(shell_link, buffer, len(buffer)), "IShellLinkW.GetProperty")
+                        if buffer.value != expected:
+                            raise ValueError("staged shortcut property differs")
+                    buffer = ctypes.create_unicode_buffer(32768)
+                    get_path = method(shell_link, 3, ctypes.c_long, ctypes.c_wchar_p, ctypes.c_int,
+                                      ctypes.c_void_p, ctypes.c_uint32)
+                    check(get_path(shell_link, buffer, len(buffer), None, 4), "IShellLinkW.GetPath")
+                    if buffer.value.casefold() != target.casefold():
+                        raise ValueError("staged shortcut target differs")
                 finally:
                     persist_release(persist_file)
             finally:
@@ -3466,6 +3513,136 @@ def _write_windows_owner_panel_shortcut(
         )
 
 
+WINDOWS_SETUP_JOURNAL_LIMIT = 4 * 1024 * 1024
+
+
+def _decode_windows_setup_journal(raw: bytes, *, installation_id: str, owner_sid: str,
+                                  targets: dict[str, str]) -> dict:
+    def reject(message="Windows setup journal is invalid or foreign"):
+        raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", message)
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                reject()
+            result[key] = value
+        return result
+    if len(raw) > WINDOWS_SETUP_JOURNAL_LIMIT:
+        reject()
+    try:
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+        if not isinstance(payload, dict) or set(payload) != {
+            "version", "transaction_id", "installation_id", "owner_sid", "phase", "operations"
+        }:
+            reject()
+        if type(payload["version"]) is not int or payload["version"] != 1:
+            reject()
+        if str(uuid.UUID(payload["transaction_id"])) != payload["transaction_id"]:
+            reject()
+        if payload["installation_id"] != installation_id or payload["owner_sid"] != owner_sid:
+            reject()
+        if payload["phase"] not in {"PREPARED", "APPLYING", "ROLLING_BACK", "RECOVERY_REQUIRED", "ROLLED_BACK", "COMMITTED"}:
+            reject()
+        operations = payload["operations"]
+        if not isinstance(operations, list) or not operations or len(operations) > 3:
+            reject()
+        seen = set()
+        for record in operations:
+            if not isinstance(record, dict) or set(record) != {
+                "kind", "target", "status", "before", "intended", "after", "restore"
+            }:
+                reject()
+            kind = record["kind"]
+            if kind in seen or kind not in targets or record["target"] != targets[kind]:
+                reject()
+            seen.add(kind)
+            if record["status"] not in {"PREPARED", "APPLIED", "RESTORED", "CONFLICT"}:
+                reject()
+            for field in ("before", "intended", "after", "restore"):
+                value = record[field]
+                if value is None and field in {"after", "restore"}:
+                    continue
+                _validate_windows_setup_snapshot(value, task=kind == "REGISTER_WINDOWS_TASK")
+            if record["status"] == "APPLIED" and record["after"] is None:
+                reject()
+        if seen != set(targets) or [r["kind"] for r in operations] != list(targets):
+            reject()
+        if payload["phase"] == "COMMITTED" and any(r["status"] != "APPLIED" for r in operations):
+            reject()
+        return payload
+    except (ValueError, TypeError, KeyError, UnicodeError, AttributeError) as exc:
+        raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "Windows setup journal is malformed") from exc
+
+
+def _validate_windows_setup_snapshot(value, *, task: bool) -> None:
+    invalid = WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "Windows setup custody record is invalid")
+    if not isinstance(value, dict) or type(value.get("exists")) is not bool:
+        raise invalid
+    if not value["exists"]:
+        if set(value) != {"exists"}:
+            raise invalid
+        return
+    keys = {"exists", "xml", "sddl", "enabled"} if task else {"exists", "identity", "content", "sddl"}
+    if set(value) != keys or not isinstance(value["sddl"], str) or not 0 < len(value["sddl"]) <= 32768:
+        raise invalid
+    if task:
+        if type(value["enabled"]) is not bool or not isinstance(value["xml"], str) or not 0 < len(value["xml"].encode()) <= 262144:
+            raise invalid
+    else:
+        identity = value["identity"]
+        if not isinstance(identity, list) or len(identity) != 2 or any(type(n) is not int or n < 0 for n in identity):
+            raise invalid
+        try:
+            if len(base64.b64decode(value["content"], validate=True)) > windows.WINDOWS_SETUP_FILE_LIMIT:
+                raise invalid
+        except (ValueError, TypeError) as exc:
+            raise invalid from exc
+
+
+def _windows_setup_config_from_snapshot(snapshot, *, installation_id):
+    if not snapshot["exists"]:
+        return None
+    try:
+        payload = json.loads(base64.b64decode(snapshot["content"], validate=True))
+        if not isinstance(payload, dict) or set(payload) != set(WindowsManagedConfig.__dataclass_fields__):
+            raise ValueError("unexpected managed config fields")
+        config = WindowsManagedConfig(**payload)
+        if config.installation_id != installation_id:
+            raise ValueError("foreign installation config")
+        return config
+    except (ValueError, TypeError, WindowsWebUIError) as exc:
+        raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "managed config is invalid or belongs to another installation") from exc
+
+
+def _validate_windows_setup_config(snapshot, *, installation_id):
+    _windows_setup_config_from_snapshot(snapshot, installation_id=installation_id)
+
+
+def _authorized_windows_setup_config_evolution(previous, current, *, installation_id) -> bool:
+    """Allow only the authenticated one-way memory-binding transition."""
+
+    try:
+        before = _windows_setup_config_from_snapshot(previous, installation_id=installation_id)
+        after = _windows_setup_config_from_snapshot(current, installation_id=installation_id)
+    except WindowsWebUIError:
+        return False
+    if before is None or after is None:
+        return False
+    immutable = (
+        "installation_id",
+        "origin",
+        "native_control_pipe",
+        "runtime_dir",
+        "state_dir",
+        "browser_profile_dir",
+    )
+    if any(getattr(before, name) != getattr(after, name) for name in immutable):
+        return False
+    if any(getattr(before, name) is not None for name in ("db", "profile", "host_id")):
+        return False
+    return all(getattr(after, name) is not None for name in ("db", "profile", "host_id"))
+
+
 class ProductionWindowsInstallerBackend:
     """Owner-side native Windows setup backend; no system service or trust-store mutation."""
 
@@ -3475,10 +3652,12 @@ class ProductionWindowsInstallerBackend:
         request: SetupRequest,
         supervisor: WindowsTaskSchedulerSupervisor | None = None,
         shortcut_writer: Callable[[str, str, str, str], None] | None = None,
+        expected_precondition: WindowsSetupPrecondition | None = None,
     ) -> None:
         if os.name != "nt":
             raise ValueError("native Windows installer backend requires Windows")
         self.request = request
+        self._expected_precondition = expected_precondition
         base_executable, environment_executable = windows_managed_python_executables(
             environment_executable=request.factlane_executable,
         )
@@ -3504,64 +3683,414 @@ class ProductionWindowsInstallerBackend:
             task_receipt_path=request.user_unit_path,
         )
 
-    def apply_operation(
-        self,
-        operation: PlannedOperation,
-        *,
-        plan: SetupPlan,
-    ) -> InstallerStepResult:
-        if not _is_windows_setup_plan(plan):
-            return InstallerStepResult(
-                status=InstallerStepStatus.FAILED,
-                operation=operation.kind,
-                detail="Windows installer received a non-Windows setup plan",
+    def capture_precondition(self) -> WindowsSetupPrecondition:
+        """Capture every setup-owned Windows surface before native consent."""
+
+        owner_sid = windows.current_user_sid()
+        canonical = windows.windows_owner_paths(owner_sid=owner_sid)
+        self._validate_launcher_target()
+        if self._paths != canonical:
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_PATH_INVALID",
+                "Windows setup requires fixed canonical owner paths",
             )
+        service_state_path = str(PureWindowsPath(self.request.state_dir) / "webui-service.json")
+        journal_path = str(PureWindowsPath(self.request.state_dir) / "windows-setup-journal.json")
+        launcher = (
+            windows.snapshot_windows_setup_file(
+                self.request.launcher_path,
+                owner_sid=owner_sid,
+                owner_private=False,
+            )
+            if self.request.launcher_path is not None
+            else {"exists": False}
+        )
+        return WindowsSetupPrecondition(
+            owner_sid=owner_sid,
+            service_config=windows.snapshot_windows_setup_file(
+                self.request.service_config_path,
+                owner_sid=owner_sid,
+            ),
+            scheduled_task=self.supervisor.snapshot_task(),
+            launcher=launcher,
+            service_state=windows.snapshot_windows_setup_file(
+                service_state_path,
+                owner_sid=owner_sid,
+            ),
+            setup_journal=windows.snapshot_windows_setup_file(
+                journal_path,
+                owner_sid=owner_sid,
+                limit=WINDOWS_SETUP_JOURNAL_LIMIT,
+            ),
+        )
+
+    def _require_precondition_unchanged(self) -> WindowsSetupPrecondition:
+        expected = self._expected_precondition
+        if expected is None:
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_PRECONDITION_REQUIRED",
+                "Windows setup requires an exact pre-consent custody snapshot",
+            )
+        observed = self.capture_precondition()
+        if observed != expected:
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_PRECONDITION_CHANGED",
+                "Windows setup custody changed after native consent",
+            )
+        return observed
+
+    def mutation_guard(self):
+        return windows.windows_mutation_guard()
+
+    @property
+    def transaction_id(self) -> str | None:
+        journal = getattr(self, "_journal", None)
+        if not isinstance(journal, dict):
+            return None
+        value = journal.get("transaction_id")
+        if not isinstance(value, str):
+            return None
         try:
-            if operation.kind == "ENSURE_WINDOWS_OWNER_STATE":
-                ensure_windows_owner_paths(self._paths)
-            elif operation.kind == "WRITE_SERVICE_CONFIG":
-                if operation.target.casefold() != self.request.service_config_path.casefold():
-                    raise WindowsWebUIError("WINDOWS_CONFIG_TARGET_INVALID", "managed config target changed")
-                write_owner_private_text_atomic(operation.target, operation.desired_state)
-            elif operation.kind == "REGISTER_WINDOWS_TASK":
-                if operation.target != WINDOWS_TASK_NAME:
-                    raise WindowsWebUIError("WINDOWS_TASK_TARGET_INVALID", "scheduled task target changed")
-                self.supervisor.register_or_update(self._task_executable)
-            elif operation.kind == "INSTALL_OWNER_LAUNCHER":
-                if self.request.launcher_path is None or operation.target.casefold() != self.request.launcher_path.casefold():
-                    raise WindowsWebUIError("WINDOWS_LAUNCHER_TARGET_INVALID", "Owner Panel shortcut target changed")
-                if PureWindowsPath(operation.target).name != WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME:
-                    raise WindowsWebUIError("WINDOWS_LAUNCHER_TARGET_INVALID", "Owner Panel shortcut filename changed")
-                payload = _parse_windows_owner_panel_launcher(operation.desired_state)
-                target = Path(payload["target"])
-                if not target.is_file() or target.name.casefold() != "python.exe":
-                    raise WindowsWebUIError(
-                        "WINDOWS_LAUNCHER_RUNTIME_INVALID",
-                        "FactLane console Python runtime is unavailable",
-                    )
-                destination = validate_windows_path_no_reparse(operation.target)
-                parent = validate_windows_path_no_reparse(destination.parent)
-                if not parent.is_dir():
-                    raise WindowsWebUIError("WINDOWS_LAUNCHER_TARGET_INVALID", "Owner Panel shortcut directory is unavailable")
-                self._shortcut_writer(
-                    str(destination),
-                    payload["target"],
-                    payload["arguments"],
-                    payload["working_directory"],
-                )
+            return str(uuid.UUID(value))
+        except ValueError:
+            return None
+
+    def _validate_launcher_target(self):
+        if self.request.launcher_path is None:
+            return
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            raise WindowsWebUIError("WINDOWS_SETUP_PATH_INVALID", "current-user Start Menu location is unavailable")
+        expected = PureWindowsPath(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME
+        if not expected.is_absolute() or ".." in expected.parts or PureWindowsPath(self.request.launcher_path) != expected:
+            raise WindowsWebUIError("WINDOWS_SETUP_PATH_INVALID", "launcher must use the fixed current-user Start Menu target")
+
+    def _targets(self):
+        result = {"WRITE_SERVICE_CONFIG": self.request.service_config_path,
+                  "REGISTER_WINDOWS_TASK": WINDOWS_TASK_NAME}
+        if self.request.launcher_path is not None:
+            result["INSTALL_OWNER_LAUNCHER"] = self.request.launcher_path
+        return result
+
+    def _snapshot_target(self, kind, target):
+        if kind == "REGISTER_WINDOWS_TASK":
+            return self.supervisor.snapshot_task()
+        return windows.snapshot_windows_setup_file(
+            target,
+            owner_sid=self._owner_sid,
+            owner_private=kind != "INSTALL_OWNER_LAUNCHER",
+        )
+
+    def _persist_journal(self):
+        payload = json.dumps(self._journal, sort_keys=True, separators=(",", ":"))
+        _decode_windows_setup_journal(payload.encode(), installation_id=self.request.installation_id,
+                                     owner_sid=self._owner_sid, targets=self._targets())
+        write_owner_private_text_atomic(self._journal_path, payload, owner_sid=self._owner_sid,
+            expected_state=self._journal_custody, snapshot_limit=WINDOWS_SETUP_JOURNAL_LIMIT)
+        self._journal_custody = windows.snapshot_windows_setup_file(self._journal_path, owner_sid=self._owner_sid,
+                                                                   limit=WINDOWS_SETUP_JOURNAL_LIMIT)
+
+    def _close_stages(self):
+        stages, self._stages = getattr(self, "_stages", {}), {}
+        for staged in stages.values():
+            windows.close_windows_setup_stage(staged, owner_sid=self._owner_sid)
+
+    def prepare_setup(self, *, plan):
+        self._journal = None
+        self._stages = {}
+        precondition = self._require_precondition_unchanged()
+        self._owner_sid = precondition.owner_sid
+        canonical = windows.windows_owner_paths(owner_sid=self._owner_sid)
+        self._validate_launcher_target()
+        if self._paths != canonical:
+            raise WindowsWebUIError("WINDOWS_SETUP_PATH_INVALID", "Windows setup requires fixed canonical owner paths")
+        for raw in (self._paths.root_dir, self._paths.owner_config_home, self._paths.runtime_dir, self._paths.state_dir):
+            path = validate_windows_path_no_reparse(raw)
+            if path.exists():
+                windows.validate_owner_private_path(path, owner_sid=self._owner_sid, directory=True)
             else:
-                return InstallerStepResult(
-                    status=InstallerStepStatus.FAILED,
-                    operation=operation.kind,
-                    detail="unsupported Windows installer operation",
-                )
-        except Exception as exc:
-            return InstallerStepResult(
-                status=InstallerStepStatus.FAILED,
-                operation=operation.kind,
-                detail=f"Windows owner setup operation failed safely: {type(exc).__name__}",
-            )
+                windows.ensure_owner_private_directory(path, owner_sid=self._owner_sid)
+        self._journal_path = str(PureWindowsPath(self.request.state_dir) / "windows-setup-journal.json")
+        prior = windows.snapshot_windows_setup_file(self._journal_path, owner_sid=self._owner_sid,
+                                                   limit=WINDOWS_SETUP_JOURNAL_LIMIT)
+        self._journal_custody = prior
+        if prior["exists"]:
+            previous = _decode_windows_setup_journal(base64.b64decode(prior["content"]),
+                installation_id=self.request.installation_id, owner_sid=self._owner_sid, targets=self._targets())
+            if previous["phase"] == "COMMITTED":
+                for record in previous["operations"]:
+                    current = self._snapshot_target(record["kind"], record["target"])
+                    if current == record["after"]:
+                        continue
+                    if (
+                        record["kind"] == "WRITE_SERVICE_CONFIG"
+                        and _authorized_windows_setup_config_evolution(
+                            record["after"],
+                            current,
+                            installation_id=self.request.installation_id,
+                        )
+                    ):
+                        continue
+                    raise WindowsWebUIError(
+                        "WINDOWS_SETUP_RECOVERY_REQUIRED",
+                        "committed setup targets changed outside authorized evolution",
+                    )
+            else:
+                self._journal = previous
+                recovered = self.rollback_setup(plan=plan, completed_operations=())
+                if recovered.status is not InstallerStepStatus.APPLIED:
+                    raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", recovered.detail or "interrupted setup unresolved")
+            self._journal = None
+        # Read current intent; setup never rewrites or replays service state.
+        state_path = str(PureWindowsPath(self.request.state_dir) / "webui-service.json")
+        state = windows.snapshot_windows_setup_file(state_path, owner_sid=self._owner_sid)
+        if state["exists"]:
+            intent = json.loads(base64.b64decode(state["content"]))
+            if intent.get("status") in {ServiceStatus.STARTING.value, ServiceStatus.READY.value,
+                                       ServiceStatus.MAINTENANCE.value, ServiceStatus.RECOVERY_REQUIRED.value}:
+                raise WindowsWebUIError("WINDOWS_SETUP_BUSY", "managed lifecycle must be quiescent before setup")
+        targets = self._targets()
+        operations = [op for op in plan.operations if op.kind != "ENSURE_WINDOWS_OWNER_STATE"]
+        if [(op.kind, op.target) for op in operations] != list(targets.items()):
+            raise WindowsWebUIError("WINDOWS_SETUP_PATH_INVALID", "Windows setup operation order or targets changed")
+        transaction_id = str(uuid.uuid4())
+        records = []
+        try:
+            # Prove task ownership/quiescence before preparing any binding change.
+            task_intended = self.supervisor.prepare_task(self._task_executable, transaction_id=transaction_id)
+            for operation in operations:
+                before = self._snapshot_target(operation.kind, operation.target)
+                if operation.kind == "WRITE_SERVICE_CONFIG":
+                    _validate_windows_setup_config(before, installation_id=self.request.installation_id)
+                if operation.kind == "REGISTER_WINDOWS_TASK":
+                    intended = task_intended
+                else:
+                    if operation.kind == "WRITE_SERVICE_CONFIG":
+                        content = operation.desired_state.encode("utf-8")
+                    else:
+                        content = self._stage_launcher_bytes(operation)
+                    if before["exists"] and base64.b64decode(before["content"]) == content:
+                        intended = before
+                    else:
+                        staged = windows.stage_windows_setup_file(operation.target, content, owner_sid=self._owner_sid,
+                            private_parent=operation.kind == "WRITE_SERVICE_CONFIG",
+                            owner_private=operation.kind != "INSTALL_OWNER_LAUNCHER")
+                        self._stages[operation.kind] = staged
+                        intended = staged[2]
+                records.append({"kind": operation.kind, "target": operation.target, "status": "PREPARED",
+                                "before": before, "intended": intended, "after": None, "restore": None})
+            self._journal = {"version": 1, "transaction_id": transaction_id,
+                "installation_id": self.request.installation_id, "owner_sid": self._owner_sid,
+                "phase": "PREPARED", "operations": records}
+            self._persist_journal()
+        except BaseException:
+            self._close_stages()
+            raise
+
+    def _stage_launcher_bytes(self, operation):
+        payload = _parse_windows_owner_panel_launcher(operation.desired_state)
+        target = Path(payload["target"])
+        if not target.is_file() or PureWindowsPath(payload["target"]).name.casefold() != "python.exe":
+            raise WindowsWebUIError("WINDOWS_LAUNCHER_RUNTIME_INVALID", "FactLane console Python runtime is unavailable")
+        if PureWindowsPath(operation.target).name != WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME:
+            raise WindowsWebUIError("WINDOWS_LAUNCHER_TARGET_INVALID", "Owner Panel shortcut filename changed")
+        stage_path = str(PureWindowsPath(self.request.state_dir) / (".launcher-" + uuid.uuid4().hex + ".lnk"))
+        try:
+            self._shortcut_writer(stage_path, payload["target"], payload["arguments"], payload["working_directory"])
+            staged = windows.snapshot_windows_setup_file(stage_path, owner_sid=self._owner_sid)
+            if not staged["exists"]:
+                raise WindowsWebUIError("WINDOWS_LAUNCHER_WRITE_FAILED", "staged launcher is missing")
+            return base64.b64decode(staged["content"])
+        finally:
+            # Never delete unknown partial output: only a verified owned staging file.
+            partial = windows.snapshot_windows_setup_file(stage_path, owner_sid=self._owner_sid)
+            if partial["exists"]:
+                windows.delete_windows_setup_file(stage_path, expected=partial, owner_sid=self._owner_sid)
+
+    def apply_operation(self, operation, *, plan):
+        if not self._journal or self._journal["phase"] not in {"PREPARED", "APPLYING"}:
+            raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "setup was not durably prepared")
+        if operation.kind == "ENSURE_WINDOWS_OWNER_STATE":
+            return InstallerStepResult(status=InstallerStepStatus.APPLIED, operation=operation.kind)
+        record = next(r for r in self._journal["operations"] if r["kind"] == operation.kind)
+        if operation.target != record["target"]:
+            raise WindowsWebUIError("WINDOWS_SETUP_PATH_INVALID", "prepared target changed")
+        self._journal["phase"] = "APPLYING"
+        self._persist_journal()  # Includes the current PREPARED op before any publication.
+        if record["intended"] != record["before"]:
+            if operation.kind == "REGISTER_WINDOWS_TASK":
+                self.supervisor.publish_task(record["intended"], expected=record["before"])
+            else:
+                windows.publish_windows_setup_file(record["target"], self._stages[operation.kind],
+                                                   expected=record["before"], owner_sid=self._owner_sid,
+                                                   owner_private=operation.kind != "INSTALL_OWNER_LAUNCHER")
+                windows.close_windows_setup_stage(self._stages.pop(operation.kind), owner_sid=self._owner_sid)
+        post = self._snapshot_target(record["kind"], record["target"])
+        if post != record["intended"]:
+            raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "setup postimage could not be verified")
+        record["after"] = post
+        record["status"] = "APPLIED"
+        self._persist_journal()
         return InstallerStepResult(status=InstallerStepStatus.APPLIED, operation=operation.kind)
+
+    def commit_setup(self, *, plan):
+        if any(r["status"] != "APPLIED" or self._snapshot_target(r["kind"], r["target"]) != r["after"]
+               for r in self._journal["operations"]):
+            raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "setup commit postconditions changed")
+        self._journal["phase"] = "COMMITTED"
+        self._persist_journal()
+        self._close_stages()
+
+    def _restore_record(self, record, expected):
+        if record["kind"] == "REGISTER_WINDOWS_TASK":
+            # Crash recovery rereads owner intent rather than replaying saved state.
+            state_path = str(PureWindowsPath(self.request.state_dir) / "webui-service.json")
+            state = windows.snapshot_windows_setup_file(state_path, owner_sid=self._owner_sid)
+            if state["exists"]:
+                intent = json.loads(base64.b64decode(state["content"]))
+                if (intent.get("status") in {
+                        ServiceStatus.MAINTENANCE.value,
+                        ServiceStatus.RECOVERY_REQUIRED.value,
+                    }
+                        and record["before"].get("enabled") is True):
+                    raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "current owner intent prevents task enable restoration")
+            self.supervisor.restore_task(record["before"], expected=expected)
+            return record["before"]
+        original = record["before"]
+        if not original["exists"]:
+            windows.delete_windows_setup_file(
+                record["target"],
+                expected=expected,
+                owner_sid=self._owner_sid,
+                owner_private=record["kind"] != "INSTALL_OWNER_LAUNCHER",
+            )
+            return original
+        staged = windows.stage_windows_setup_file(record["target"], base64.b64decode(original["content"]),
+            owner_sid=self._owner_sid, private_parent=record["kind"] == "WRITE_SERVICE_CONFIG", sddl=original["sddl"],
+            owner_private=record["kind"] != "INSTALL_OWNER_LAUNCHER")
+        try:
+            record["restore"] = staged[2]
+            self._persist_journal()  # Recovery may itself be interrupted after publication.
+            windows.publish_windows_setup_file(
+                record["target"],
+                staged,
+                expected=expected,
+                owner_sid=self._owner_sid,
+                owner_private=record["kind"] != "INSTALL_OWNER_LAUNCHER",
+            )
+            return staged[2]
+        finally:
+            windows.close_windows_setup_stage(staged, owner_sid=self._owner_sid)
+
+    @staticmethod
+    def _owned_task_intermediate(record, current):
+        if record["kind"] != "REGISTER_WINDOWS_TASK" or not current.get("exists"):
+            return False
+        before, intended = record["before"], record["intended"]
+        # The prepared XML carries a unique transaction source. Only the two
+        # anticipated security/enabled values qualify as partial publication.
+        return (current.get("xml") == intended["xml"]
+                and current.get("sddl") in {intended["sddl"], before.get("sddl")}
+                and current.get("enabled") in {intended["enabled"], before.get("enabled")})
+
+    def _assert_recovery_quiescent(self):
+        state_path = str(PureWindowsPath(self.request.state_dir) / "webui-service.json")
+        state = windows.snapshot_windows_setup_file(state_path, owner_sid=self._owner_sid)
+        if state["exists"]:
+            intent = json.loads(base64.b64decode(state["content"]))
+            if intent.get("status") in {ServiceStatus.STARTING.value, ServiceStatus.READY.value}:
+                raise WindowsWebUIError("WINDOWS_SETUP_BUSY", "managed service must be quiescent before recovery")
+        self.supervisor.verify_quiescent()
+
+    def rollback_setup(self, *, plan, completed_operations):
+        del plan, completed_operations
+        self._close_stages()
+        if getattr(self, "_journal", None) is None:
+            return InstallerStepResult(status=InstallerStepStatus.APPLIED, operation="ROLLBACK", detail="no prepared mutation")
+        self._assert_recovery_quiescent()
+        self._journal["phase"] = "ROLLING_BACK"
+        self._persist_journal()
+        conflicts = []
+        for record in reversed(self._journal["operations"]):
+            try:
+                current = self._snapshot_target(record["kind"], record["target"])
+                if current == record["before"] or (record["restore"] is not None and current == record["restore"]):
+                    record["status"] = "RESTORED"
+                elif (current == record["intended"] or (record["after"] is not None and current == record["after"])
+                      or self._owned_task_intermediate(record, current)):
+                    record["restore"] = self._restore_record(record, current)
+                    if self._snapshot_target(record["kind"], record["target"]) != record["restore"]:
+                        raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "rollback postimage changed")
+                    record["status"] = "RESTORED"
+                else:
+                    raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "target changed outside transaction custody")
+            except Exception:
+                record["status"] = "CONFLICT"
+                conflicts.append(record["kind"])
+            self._persist_journal()
+        self._journal["phase"] = "RECOVERY_REQUIRED" if conflicts else "ROLLED_BACK"
+        self._persist_journal()
+        return InstallerStepResult(status=InstallerStepStatus.RECOVERY_REQUIRED if conflicts else InstallerStepStatus.APPLIED,
+            operation="ROLLBACK", detail="unresolved custody: " + ", ".join(conflicts) if conflicts else "exact owned state restored")
+
+    def rollback_committed_setup(self, transaction_id: str) -> InstallerStepResult:
+        """Rollback one exact committed Windows setup transaction, or fail closed."""
+
+        try:
+            expected_transaction_id = str(uuid.UUID(transaction_id))
+        except (ValueError, TypeError) as exc:
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_TRANSACTION_INVALID",
+                "Windows setup transaction identity is invalid",
+            ) from exc
+        self._journal = None
+        self._stages = {}
+        self._owner_sid = windows.current_user_sid()
+        canonical = windows.windows_owner_paths(owner_sid=self._owner_sid)
+        self._validate_launcher_target()
+        if self._paths != canonical:
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_PATH_INVALID",
+                "Windows setup requires fixed canonical owner paths",
+            )
+        for raw in (
+            self._paths.root_dir,
+            self._paths.owner_config_home,
+            self._paths.runtime_dir,
+            self._paths.state_dir,
+        ):
+            path = validate_windows_path_no_reparse(raw)
+            if not path.exists():
+                raise WindowsWebUIError(
+                    "WINDOWS_SETUP_RECOVERY_REQUIRED",
+                    "Windows setup recovery owner path is unavailable",
+                )
+            windows.validate_owner_private_path(path, owner_sid=self._owner_sid, directory=True)
+        self._journal_path = str(PureWindowsPath(self.request.state_dir) / "windows-setup-journal.json")
+        custody = windows.snapshot_windows_setup_file(
+            self._journal_path,
+            owner_sid=self._owner_sid,
+            limit=WINDOWS_SETUP_JOURNAL_LIMIT,
+        )
+        if not custody["exists"]:
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_RECOVERY_REQUIRED",
+                "committed Windows setup journal is unavailable",
+            )
+        journal = _decode_windows_setup_journal(
+            base64.b64decode(custody["content"]),
+            installation_id=self.request.installation_id,
+            owner_sid=self._owner_sid,
+            targets=self._targets(),
+        )
+        if journal["transaction_id"] != expected_transaction_id or journal["phase"] != "COMMITTED":
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_TRANSACTION_MISMATCH",
+                "committed Windows setup transaction does not match the requested rollback",
+            )
+        self._journal = journal
+        self._journal_custody = custody
+        return self.rollback_setup(plan=None, completed_operations=())
 
     def read_saved_endpoint(self) -> str | None:
         return None
@@ -3579,6 +4108,36 @@ class ProductionWindowsInstallerBackend:
             status=InstallerStepStatus.APPLIED,
             operation="STOP_MANAGED_SERVICE",
         )
+
+
+def rollback_committed_windows_webui_setup(
+    request: SetupRequest,
+    transaction_id: str,
+    *,
+    supervisor: WindowsTaskSchedulerSupervisor | None = None,
+) -> SetupApplyResult:
+    """Recover one exact committed native-Windows setup without replaying service state."""
+
+    backend = ProductionWindowsInstallerBackend(
+        request=request,
+        supervisor=supervisor,
+    )
+    try:
+        with backend.mutation_guard():
+            rollback = backend.rollback_committed_setup(transaction_id)
+    except WindowsWebUIError as exc:
+        return SetupApplyResult(
+            status=InstallerStepStatus.RECOVERY_REQUIRED,
+            endpoint_state=EndpointState.PROPOSED,
+            transaction_id=transaction_id,
+            detail=exc.safe_message,
+        )
+    return SetupApplyResult(
+        status=rollback.status,
+        endpoint_state=EndpointState.PROPOSED,
+        transaction_id=transaction_id,
+        detail=rollback.detail,
+    )
 
 
 def _rebind_plan_endpoint(

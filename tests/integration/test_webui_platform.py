@@ -1475,6 +1475,8 @@ def test_offline_stop_is_idempotent_and_persists_stop_intent_without_native_sock
 
     assert first["status"] == "OK"
     assert second["status"] == "OK"
+    assert first["request_id"] == "stop-fixed"
+    assert second["request_id"] == "stop-fixed"
     assert first["service"]["status"] == "STOPPED_UNTIL_REBOOT"
     assert second["service"]["status"] == "STOPPED_UNTIL_REBOOT"
     assert unit.starts == 0
@@ -1515,6 +1517,7 @@ def test_active_stop_or_restart_keeps_native_graceful_control(
     result = controller.dispatch(action)
 
     assert result["status"] == "OK"
+    assert result["request_id"] == "native-fixed"
     assert calls == [(action, "native-fixed")]
     assert unit.starts == 0
 
@@ -1598,6 +1601,7 @@ def test_offline_start_fails_visibly_when_unit_never_reaches_ready_or_recovery_s
 
     assert result["status"] == "ERROR"
     assert result["error_code"] == "SERVICE_START_TIMEOUT"
+    assert result["request_id"] == "start-timeout"
     assert result["service"]["status"] == "STARTING"
     assert result["unit"]["active"] is True
 

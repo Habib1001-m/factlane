@@ -19,7 +19,7 @@ try:
 except ImportError:  # pragma: no cover - native Windows
     _fcntl = None
 
-from .webui_windows import WindowsWebUIError, write_owner_private_text_atomic
+from .webui_windows import WindowsWebUIError, windows_mutation_guard, write_owner_private_text_atomic
 from .windows_security import (
     WindowsSecurityError,
     current_user_sid,
@@ -123,12 +123,12 @@ def service_state_file_guard(
 
     The directory inode is stable across the service state's atomic replace writes,
     so locking it avoids the stale-inode problem of locking the state file itself.
-    Native Windows keeps its existing SID/DACL-backed writer semantics; this guard is
-    specifically the Linux managed-installer coordination boundary.
+    Native Windows shares the permanent mutation lock with setup.
     """
 
     if os.name == "nt":
-        yield
+        with windows_mutation_guard():
+            yield
         return
     if _fcntl is None:
         raise ServiceStateError("POSIX service-state serialization is unavailable")
@@ -790,8 +790,8 @@ class WebUIServiceState:
 
     @contextmanager
     def _state_transaction(self) -> Iterator[None]:
-        with self._lock:
-            with service_state_file_guard(self._path):
+        with service_state_file_guard(self._path):
+            with self._lock:
                 self._state = self._load_state_unlocked()
                 yield
 

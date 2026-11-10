@@ -14,6 +14,7 @@ from .webui_install import (
     SetupConsent,
     SetupReceipt,
     SetupRequest,
+    WindowsSetupPrecondition,
     detect_install_environment,
     plan_webui_setup,
 )
@@ -23,6 +24,7 @@ from .webui_platform import (
     build_default_setup_executor,
     build_default_setup_request,
     build_webui_doctor_report,
+    capture_windows_setup_precondition,
 )
 
 
@@ -51,6 +53,7 @@ class SetupConfiguration:
     request: SetupRequest
     consent: SetupConsent
     environment: InstallEnvironment | None = None
+    windows_precondition: WindowsSetupPrecondition | None = None
 
 
 class WebUIServiceController(Protocol):
@@ -287,6 +290,7 @@ def _dispatch_setup(
             setup_executor = build_default_setup_executor(
                 configuration.request,
                 environment,
+                windows_setup_precondition=configuration.windows_precondition,
             )
         except Exception:
             payload["apply"] = {
@@ -550,10 +554,16 @@ def _setup_apply_ok(result: Mapping[str, Any]) -> bool:
 def _default_setup_configuration() -> SetupConfiguration:
     environment = detect_install_environment()
     request = build_default_setup_request()
+    windows_precondition = (
+        capture_windows_setup_precondition(request)
+        if environment.system == "Windows" and os.name == "nt"
+        else None
+    )
     return SetupConfiguration(
         request=request,
         consent=acquire_default_setup_consent(request, environment),
         environment=environment,
+        windows_precondition=windows_precondition,
     )
 
 

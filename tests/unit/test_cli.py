@@ -287,7 +287,8 @@ def test_setup_default_acquires_explicit_consent_then_uses_default_executor(
         or configuration.consent,
     )
 
-    def build_executor(request: object, environment: object):
+    def build_executor(request: object, environment: object, **kwargs: object):
+        assert kwargs == {"windows_setup_precondition": None}
         executor_builds.append((request, environment))
 
         def executor(receipt: object, consent: object) -> SetupApplyResult:
@@ -295,6 +296,7 @@ def test_setup_default_acquires_explicit_consent_then_uses_default_executor(
             return SetupApplyResult(
                 status=InstallerStepStatus.NEEDS_PRIVILEGED_INSTALLER,
                 endpoint_state=EndpointState.PROPOSED,
+                transaction_id="11111111-1111-1111-1111-111111111111",
                 detail="privileged installer required",
             )
 
@@ -318,6 +320,42 @@ def test_setup_default_acquires_explicit_consent_then_uses_default_executor(
     assert payload["apply_available"] is True
     assert payload["apply"]["status"] == "NEEDS_PRIVILEGED_INSTALLER"
     assert payload["apply"]["endpoint_state"] == "PROPOSED"
+    assert payload["apply"]["transaction_id"] == "11111111-1111-1111-1111-111111111111"
+
+
+def test_default_windows_setup_captures_exact_precondition_before_native_consent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = _setup_configuration()
+    environment = InstallEnvironment(
+        system="Windows",
+        systemd=False,
+        caddy_path=None,
+        zenity_path=None,
+        browser=None,
+        euid=-1,
+    )
+    token = object()
+    events: list[str] = []
+    monkeypatch.setattr(cli.os, "name", "nt")
+    monkeypatch.setattr(cli, "detect_install_environment", lambda: environment)
+    monkeypatch.setattr(cli, "build_default_setup_request", lambda: configuration.request)
+    monkeypatch.setattr(
+        cli,
+        "capture_windows_setup_precondition",
+        lambda request: events.append("capture") or token,
+    )
+    monkeypatch.setattr(
+        cli,
+        "acquire_default_setup_consent",
+        lambda request, observed_environment: events.append("consent")
+        or SetupConsent(False, False, False, windows_native_setup=True),
+    )
+
+    observed = cli._default_setup_configuration()
+
+    assert events == ["capture", "consent"]
+    assert observed.windows_precondition is token
 
 
 def test_injected_setup_executor_receives_exact_receipt_and_consent_and_bypasses_default_builder(

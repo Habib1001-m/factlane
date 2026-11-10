@@ -1168,3 +1168,629 @@ def test_activation_ready_must_report_exact_claimed_endpoint() -> None:
     assert result.status is InstallerStepStatus.FAILED
     assert result.endpoint_state is EndpointState.PROPOSED
     assert [plan.saved_port for plan in backend.stops] == [8765]
+
+
+def test_windows_mutation_guard_reentrant_serializes_and_times_out(monkeypatch):
+    import threading
+    import factlane.webui_windows as windows
+    from contextlib import contextmanager
+
+    events = []
+    @contextmanager
+    def native_lock(*args, **kwargs):
+        events.append('acquire')
+        try:
+            yield
+        finally:
+            events.append('release')
+
+    monkeypatch.setattr(windows, '_native_windows_mutation_lock', native_lock, raising=False)
+    monkeypatch.setattr(windows, 'windows_owner_paths', lambda: type('Paths', (), {'state_dir': r'C:\Local\FactLane\state'})())
+    failures = []
+    with windows.windows_mutation_guard(timeout=0.1):
+        with windows.windows_mutation_guard(timeout=0.1):
+            def contender():
+                try:
+                    with windows.windows_mutation_guard(timeout=0.01):
+                        failures.append('entered')
+                except windows.WindowsWebUIError as exc:
+                    failures.append(exc.code)
+            thread = threading.Thread(target=contender)
+            thread.start()
+            thread.join(1)
+            assert not thread.is_alive()
+        assert events == ['acquire']
+    assert failures == ['WINDOWS_MUTATION_BUSY']
+    assert events == ['acquire', 'release']
+    with pytest.raises(RuntimeError), windows.windows_mutation_guard():
+        raise RuntimeError('abort')
+    with windows.windows_mutation_guard():
+        pass
+    assert events == ['acquire', 'release'] * 3
+
+
+def test_service_transaction_acquires_file_guard_before_instance_lock(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    import factlane.webui_service as service
+    state = service.WebUIServiceState(tmp_path / 'service.json', boot_id=lambda: 'boot')
+    events = []
+    @contextmanager
+    def guard(path):
+        events.append('mutation')
+        yield
+    @contextmanager
+    def instance_lock():
+        events.append('instance')
+        yield
+    monkeypatch.setattr(service, 'service_state_file_guard', guard)
+    state._lock = instance_lock()
+    state.snapshot()
+    assert events == ['mutation', 'instance']
+
+
+@pytest.mark.parametrize('failure', ['result', 'exception', 'commit'])
+def test_windows_apply_rolls_back_current_partial_operation(failure):
+    from contextlib import contextmanager
+    import factlane.webui_install as install
+    plan = plan_webui_setup(_request(), _environment(), _consent()).plan
+    assert plan is not None
+    events = []
+    class Backend:
+        @contextmanager
+        def mutation_guard(self):
+            events.append('lock')
+            try:
+                yield
+            finally:
+                events.append('unlock')
+        def prepare_setup(self, *, plan):
+            events.append('prepare')
+        def apply_operation(self, operation, *, plan):
+            events.append('partial')
+            if failure == 'exception':
+                raise RuntimeError('primary')
+            return InstallerStepResult(status=InstallerStepStatus.FAILED if failure == 'result' else InstallerStepStatus.APPLIED, operation=operation.kind, detail='primary')
+        def commit_setup(self, *, plan):
+            events.append('commit')
+            raise RuntimeError('commit')
+        def rollback_setup(self, *, plan, completed_operations):
+            events.append('rollback')
+            return InstallerStepResult(status=InstallerStepStatus.APPLIED, operation='ROLLBACK')
+    result = install._apply_windows_webui_setup(plan, _consent(), Backend())
+    assert result.status is InstallerStepStatus.FAILED
+    assert events[-2:] == ['rollback', 'unlock']
+    assert events[:3] == ['lock', 'prepare', 'partial']
+    assert 'failed safely' not in result.detail
+
+
+def test_windows_apply_preflights_all_consent_before_prepare():
+    import factlane.webui_install as install
+    plan = plan_webui_setup(_request(), _environment(), _consent()).plan
+    assert plan is not None
+    operation = replace(plan.operations[-1], consent_key='windows_native_setup')
+    plan = replace(plan, operations=(*plan.operations[:-1], operation))
+    backend = _FakeInstallerBackend()
+    result = install._apply_windows_webui_setup(plan, _consent(), backend)
+    assert result.status is InstallerStepStatus.BLOCKED
+    assert backend.operations == []
+
+
+def test_task_snapshot_and_conditional_restore_plain_data():
+    from types import SimpleNamespace
+    from copy import deepcopy
+    import factlane.webui_windows as windows
+    supervisor = object.__new__(windows.WindowsTaskSchedulerSupervisor)
+    supervisor.task_name = windows.WINDOWS_TASK_NAME
+    supervisor.owner_sid = 'S-1-5-21-1'
+    supervisor.user_id = 'Alice'
+    supervisor.expected_executable = r'C:\Python\python.exe'
+    supervisor.environment_executable = r'C:\FactLane\python.exe'
+    task = SimpleNamespace(Xml='<Task/>', Enabled=False, State=1)
+    task.GetSecurityDescriptor = lambda flags: 'O:ownerG:groupD:P(A;;GA;;;owner)'
+    task.SetSecurityDescriptor = lambda sddl, flags: None
+    calls = []
+    root = SimpleNamespace(GetTask=lambda name: task)
+    def register(*args):
+        calls.append(args)
+        task.Xml = args[1]
+        return task
+    root.RegisterTask = register
+    service = SimpleNamespace(GetFolder=lambda path: root)
+    supervisor._run_with_service = lambda callback: callback(service)
+    supervisor._validate_task_security = lambda task: None
+    supervisor._validate_registered_task = lambda task, plan: None
+    before = supervisor.snapshot_task()
+    assert before == {'exists': True, 'xml': '<Task/>', 'sddl': 'O:ownerG:groupD:P(A;;GA;;;owner)', 'enabled': False}
+    task.Xml = '<Task updated="yes"/>'
+    post = supervisor.snapshot_task()
+    supervisor.restore_task(before, expected=post)
+    assert supervisor.snapshot_task() == before
+    assert calls[0][1] == '<Task/>'
+    assert calls[0][-1] == before['sddl']
+    foreign = deepcopy(post)
+    foreign['xml'] = 'foreign'
+    with pytest.raises(windows.WindowsWebUIError, match='changed'):
+        supervisor.restore_task(before, expected=foreign)
+
+
+def test_windows_file_custody_rejects_equal_bytes_foreign_identity():
+    import factlane.webui_windows as windows
+    original = {'exists': True, 'identity': [1, 10], 'content': 'YQ==', 'sddl': 'private'}
+    foreign = dict(original, identity=[1, 11])
+    assert windows.windows_file_custody_matches(original, dict(original))
+    assert not windows.windows_file_custody_matches(original, foreign)
+
+
+@pytest.mark.parametrize('damage', ['oversize', 'version', 'owner', 'target', 'extra', 'phase'])
+def test_windows_journal_rejects_ambiguous_or_foreign_state(damage):
+    import factlane.webui_install as install
+    payload = {'version': 1, 'transaction_id': '9a0eaec9-33c8-4bd0-aef5-4755cc8ce380',
+               'installation_id': 'install', 'owner_sid': 'owner', 'phase': 'PREPARED',
+               'operations': []}
+    if damage == 'oversize':
+        raw = b' ' * (install.WINDOWS_SETUP_JOURNAL_LIMIT + 1)
+    else:
+        if damage == 'version': payload['version'] = 2
+        if damage == 'owner': payload['owner_sid'] = 'foreign'
+        if damage == 'target': payload['operations'] = [{'target': 'foreign'}]
+        if damage == 'extra': payload['foreign'] = True
+        if damage == 'phase': payload['phase'] = 'maybe'
+        raw = json.dumps(payload).encode()
+    with pytest.raises(install.WindowsWebUIError):
+        install._decode_windows_setup_journal(raw, installation_id='install', owner_sid='owner', targets={})
+
+
+@pytest.mark.parametrize('current_state', ['before', 'published', 'foreign'])
+def test_windows_recovery_inspects_prepared_and_is_idempotent(current_state):
+    import factlane.webui_install as install
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    before = {'exists': False}
+    intended = {'exists': True, 'identity': [1, 2], 'content': 'eA==', 'sddl': 'private'}
+    current = dict(before if current_state == 'before' else intended)
+    if current_state == 'foreign':
+        current['identity'] = [1, 3]
+    record = {'kind': 'WRITE_SERVICE_CONFIG', 'target': 'config', 'status': 'PREPARED',
+              'before': before, 'intended': intended, 'after': None, 'restore': None}
+    backend._journal = {'phase': 'APPLYING', 'operations': [record]}
+    backend._snapshot_target = lambda kind, target: dict(current)
+    persisted = []
+    backend._persist_journal = lambda: persisted.append(json.loads(json.dumps(backend._journal)))
+    def restore(record, expected):
+        assert expected == intended
+        current.clear()
+        current.update(before)
+        return dict(before)
+    backend._restore_record = restore
+    backend._close_stages = lambda: None
+    backend._assert_recovery_quiescent = lambda: None
+    result = backend.rollback_setup(plan=None, completed_operations=())
+    if current_state == 'foreign':
+        assert result.status is InstallerStepStatus.RECOVERY_REQUIRED
+        assert record['status'] == 'CONFLICT'
+        assert backend._journal['phase'] == 'RECOVERY_REQUIRED'
+    else:
+        assert result.status is InstallerStepStatus.APPLIED
+        assert current == before
+        again = backend.rollback_setup(plan=None, completed_operations=())
+        assert again.status is InstallerStepStatus.APPLIED
+        assert record['status'] == 'RESTORED'
+    assert persisted
+
+
+def test_windows_partial_task_enabled_failure_is_recoverable():
+    import factlane.webui_install as install
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    original = {'exists': True, 'xml': 'original', 'sddl': 'old-private', 'enabled': False}
+    intended = {'exists': True, 'xml': 'transaction-postimage', 'sddl': 'new-private', 'enabled': True}
+    intermediate = dict(intended, enabled=False, sddl='old-private')
+    record = {'kind': 'REGISTER_WINDOWS_TASK', 'target': 'task', 'status': 'PREPARED',
+              'before': original, 'intended': intended, 'after': None, 'restore': None}
+    backend._journal = {'phase': 'APPLYING', 'operations': [record]}
+    current = dict(intermediate)
+    backend._snapshot_target = lambda kind, target: dict(current)
+    backend._persist_journal = lambda: None
+    backend._close_stages = lambda: None
+    backend._assert_recovery_quiescent = lambda: None
+    def restore(record, expected):
+        assert expected == intermediate
+        current.clear()
+        current.update(original)
+        return dict(original)
+    backend._restore_record = restore
+    result = backend.rollback_setup(plan=None, completed_operations=())
+    assert result.status is InstallerStepStatus.APPLIED
+    assert current == original
+
+
+def test_task_scheduler_operations_participate_in_mutation_guard(monkeypatch):
+    from contextlib import contextmanager
+    import factlane.webui_windows as windows
+    supervisor = object.__new__(windows.WindowsTaskSchedulerSupervisor)
+    events = []
+    @contextmanager
+    def guard():
+        events.append('locked')
+        try:
+            yield
+        finally:
+            events.append('released')
+    monkeypatch.setattr(windows, 'windows_mutation_guard', guard)
+    supervisor._run_with_service_unlocked = lambda operation: operation('service')
+    assert supervisor._run_with_service(lambda service: events.append(service) or 42) == 42
+    assert events == ['locked', 'service', 'released']
+
+
+@pytest.mark.parametrize('fault', ['none', 'before', 'after', 'ack', 'ack_after'])
+@pytest.mark.parametrize('kind', ['WRITE_SERVICE_CONFIG', 'REGISTER_WINDOWS_TASK', 'INSTALL_OWNER_LAUNCHER'])
+@pytest.mark.parametrize('prestate', ['absent', 'preexisting', 'config-noop'])
+def test_windows_setup_journal_faults_restore_exact_owned_state(tmp_path, monkeypatch, kind, fault, prestate):
+    """Run the production coordinator/journal with native file and COM boundaries faked."""
+    from types import SimpleNamespace
+    from copy import deepcopy
+    import base64
+    import factlane.webui_install as install
+    windows = install.windows
+    import sqlite3
+    monkeypatch.setattr(sqlite3, 'connect', lambda *args, **kwargs: pytest.fail('setup accessed a database'))
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    backend.request = SimpleNamespace(installation_id='install', service_config_path='config', launcher_path='launcher', state_dir='state')
+    backend._paths = SimpleNamespace(root_dir='root', owner_config_home='home', runtime_dir='runtime', state_dir='state')
+    backend._task_executable = 'python'
+    backend._validate_launcher_target = lambda: None
+    monkeypatch.setattr(windows, 'current_user_sid', lambda: 'owner')
+    monkeypatch.setattr(windows, 'windows_owner_paths', lambda **kwargs: backend._paths)
+    monkeypatch.setattr(install, 'validate_windows_path_no_reparse', lambda path: tmp_path)
+    monkeypatch.setattr(windows, 'validate_owner_private_path', lambda *args, **kwargs: None)
+    monkeypatch.setattr(windows, 'windows_mutation_guard', __import__('contextlib').nullcontext)
+    managed = windows.WindowsManagedConfig(installation_id='install', origin='http://127.0.0.1:8765',
+        native_control_pipe=r'\\.\pipe\factlane-owner-test', runtime_dir=r'C:\Local\FactLane\runtime',
+        state_dir=r'C:\Local\FactLane\state', browser_profile_dir=r'C:\Local\FactLane\browser')
+    original_config = windows.render_windows_managed_config(managed).encode()
+    desired_config = windows.render_windows_managed_config(replace(managed, origin='http://127.0.0.1:8766'))
+    files = {'config': {'exists': True, 'identity': [1, 1], 'content': base64.b64encode(original_config).decode(), 'sddl': 'private'},
+             'launcher': {'exists': True, 'identity': [1, 2], 'content': base64.b64encode(b'old-link').decode(), 'sddl': 'private'}}
+    if prestate == 'absent':
+        files.clear()
+    if prestate == 'config-noop':
+        files['config']['content'] = base64.b64encode(desired_config.encode()).decode()
+    files['unrelated-sibling'] = {'exists': True, 'identity': [1, 42], 'content': 'c2libGluZw==', 'sddl': 'private'}
+    initial = deepcopy(files)
+    task = ({'exists': False} if prestate == 'absent' else
+            {'exists': True, 'xml': 'disabled-original', 'sddl': 'old-private', 'enabled': False})
+    initial_task = deepcopy(task)
+    injected = False
+    events = []
+    def fail(point, operation):
+        nonlocal injected
+        if not injected and point == fault and operation == kind:
+            injected = True
+            raise RuntimeError('injected ' + point)
+    def snapshot(path, **kwargs):
+        return deepcopy(files.get(path, {'exists': False}))
+    monkeypatch.setattr(windows, 'snapshot_windows_setup_file', snapshot)
+    serial = 100
+    def stage(path, content, **kwargs):
+        nonlocal serial
+        serial += 1
+        post = {'exists': True, 'identity': [1, serial], 'content': base64.b64encode(content).decode(), 'sddl': kwargs.get('sddl') or 'private'}
+        return (path, None, post)
+    monkeypatch.setattr(windows, 'stage_windows_setup_file', stage)
+    monkeypatch.setattr(windows, 'close_windows_setup_stage', lambda *args, **kwargs: None)
+    def publish(path, staged, *, expected, **kwargs):
+        operation = 'WRITE_SERVICE_CONFIG' if path == 'config' else 'INSTALL_OWNER_LAUNCHER'
+        assert files.get(path, {'exists': False}) == expected
+        fail('before', operation)
+        events.append(('publish', operation))
+        files[path] = deepcopy(staged[2])
+        fail('after', operation)
+    monkeypatch.setattr(windows, 'publish_windows_setup_file', publish)
+    def delete(path, *, expected, **kwargs):
+        assert files[path] == expected
+        del files[path]
+    monkeypatch.setattr(windows, 'delete_windows_setup_file', delete)
+    backend._stage_launcher_bytes = lambda operation: b'new-link'
+    def prepare_task(executable, *, transaction_id):
+        return {'exists': True, 'xml': transaction_id, 'sddl': 'private', 'enabled': True}
+    def publish_task(intended, *, expected):
+        assert task == expected
+        fail('before', 'REGISTER_WINDOWS_TASK')
+        events.append(('publish', 'REGISTER_WINDOWS_TASK'))
+        task.clear()
+        task.update(deepcopy(intended))
+        fail('after', 'REGISTER_WINDOWS_TASK')
+    def restore_task(before, *, expected):
+        assert task == expected
+        task.clear()
+        task.update(deepcopy(before))
+    backend.supervisor = SimpleNamespace(prepare_task=prepare_task, snapshot_task=lambda: deepcopy(task),
+                                        publish_task=publish_task, restore_task=restore_task, verify_quiescent=lambda: None)
+    backend._expected_precondition = backend.capture_precondition()
+    def journal_write(path, content, **kwargs):
+        payload = json.loads(content)
+        assert files.get(path, {'exists': False}) == kwargs['expected_state']
+        for record in payload['operations']:
+            if record['status'] == 'APPLIED':
+                fail('ack', record['kind'])
+        files[path] = {'exists': True, 'identity': [1, 999], 'content': base64.b64encode(content.encode()).decode(), 'sddl': 'private'}
+        events.append(('journal', payload['phase']))
+        for record in payload['operations']:
+            if record['status'] == 'APPLIED':
+                fail('ack_after', record['kind'])
+    monkeypatch.setattr(install, 'write_owner_private_text_atomic', journal_write)
+    operations = tuple(SimpleNamespace(kind=k, target=v, desired_state=desired_config, consent_key=None)
+                       for k, v in backend._targets().items())
+    plan = SimpleNamespace(endpoint_state=EndpointState.PROPOSED, operations=operations, origin='http://127.0.0.1:8765')
+    result = install._apply_windows_webui_setup(plan, _consent(), backend)
+    assert events[0] == ('journal', 'PREPARED')
+    no_op_fault = prestate == 'config-noop' and kind == 'WRITE_SERVICE_CONFIG' and fault in {'before', 'after'}
+    if fault == 'none' or no_op_fault:
+        assert result.status is InstallerStepStatus.APPLIED
+        assert result.transaction_id == backend.transaction_id
+        if prestate == 'config-noop':
+            assert files['config'] == initial['config']
+        assert backend._journal['phase'] == 'COMMITTED'
+    else:
+        assert injected
+        if fault == 'ack_after':
+            # A failed journal write acknowledgment cannot adopt bytes as custody.
+            # Reload the durable journal as a subsequent process would do.
+            assert result.status is InstallerStepStatus.RECOVERY_REQUIRED
+            backend._journal_custody = snapshot(backend._journal_path)
+            backend._journal = install._decode_windows_setup_journal(
+                base64.b64decode(backend._journal_custody['content']),
+                installation_id='install', owner_sid='owner', targets=backend._targets())
+            assert backend.rollback_setup(plan=plan, completed_operations=()).status is InstallerStepStatus.APPLIED
+        else:
+            assert result.status is InstallerStepStatus.FAILED
+        assert backend._journal['phase'] == 'ROLLED_BACK'
+        for path, original in initial.items():
+            assert files[path]['content'] == original['content']
+            assert files[path]['sddl'] == original['sddl']
+        assert task == initial_task
+        for path in {'config', 'launcher'} - initial.keys():
+            assert path not in files
+        assert files['unrelated-sibling'] == initial['unrelated-sibling']
+        assert backend.rollback_setup(plan=plan, completed_operations=()).status is InstallerStepStatus.APPLIED
+
+
+def test_windows_task_recovery_preserves_stop_intent_without_replaying_service_state(monkeypatch):
+    from types import SimpleNamespace
+    import base64
+    import factlane.webui_install as install
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    backend.request = SimpleNamespace(state_dir='state')
+    backend._owner_sid = 'owner'
+    restored = []
+    backend.supervisor = SimpleNamespace(
+        restore_task=lambda original, *, expected: restored.append((original, expected))
+    )
+    intent = json.dumps({'status': ServiceStatus.STOPPED_UNTIL_REBOOT.value, 'intent_revision': 99}).encode()
+    monkeypatch.setattr(install.windows, 'snapshot_windows_setup_file',
+                        lambda *args, **kwargs: {'exists': True, 'content': base64.b64encode(intent).decode()})
+    original = {'exists': True, 'xml': 'old', 'sddl': 'private', 'enabled': True}
+    current = dict(original, xml='new')
+    assert backend._restore_record({'kind': 'REGISTER_WINDOWS_TASK', 'before': original}, current) == original
+    assert restored == [(original, current)]
+
+
+def test_windows_setup_guard_queues_lifecycle_without_lost_intent(tmp_path, monkeypatch):
+    import threading
+    from contextlib import nullcontext
+    import factlane.webui_service as service
+    import factlane.webui_windows as windows
+    state = service.WebUIServiceState(tmp_path / 'service.json', boot_id=lambda: 'boot')
+    initial = state.snapshot()
+    monkeypatch.setattr(windows, '_native_windows_mutation_lock', lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(windows, 'windows_owner_paths', lambda: type('Paths', (), {'state_dir': r'C:\Local\FactLane\state'})())
+    monkeypatch.setattr(service, 'service_state_file_guard', lambda path: windows.windows_mutation_guard())
+    queued = threading.Event()
+    done = threading.Event()
+    failures = []
+    def lifecycle():
+        queued.set()
+        try:
+            state.request_stop('queued-stop')
+        except Exception as exc:
+            failures.append(exc)
+        finally:
+            done.set()
+    with windows.windows_mutation_guard():
+        worker = threading.Thread(target=lifecycle)
+        worker.start()
+        assert queued.wait(1)
+        assert not done.wait(0.03)
+        assert state.snapshot().intent_revision == initial.intent_revision
+    worker.join(2)
+    assert done.is_set() and not failures
+    final = state.snapshot()
+    assert final.status is ServiceStatus.STOPPED_UNTIL_REBOOT
+    assert final.intent_revision == initial.intent_revision + 1
+
+
+@pytest.mark.parametrize('code, absent', [(0x80070002, True), (0x80070005, False), (0x80004005, False)])
+def test_windows_task_snapshot_only_treats_not_found_as_absence(code, absent):
+    from types import SimpleNamespace
+    import factlane.webui_windows as windows
+    supervisor = object.__new__(windows.WindowsTaskSchedulerSupervisor)
+    supervisor.task_name = windows.WINDOWS_TASK_NAME
+    class ComFailure(Exception):
+        hresult = code
+    def get_task(name):
+        raise ComFailure()
+    service = SimpleNamespace(GetFolder=lambda path: SimpleNamespace(GetTask=get_task))
+    supervisor._run_with_service = lambda callback: callback(service)
+    if absent:
+        assert supervisor.snapshot_task() == {'exists': False}
+    else:
+        with pytest.raises(windows.WindowsWebUIError) as error:
+            supervisor.snapshot_task()
+        assert error.value.code == 'WINDOWS_TASK_SNAPSHOT_UNAVAILABLE'
+
+
+def test_windows_conditional_file_publication_rejects_equal_bytes_foreign_custody(monkeypatch):
+    import factlane.webui_windows as windows
+    owned = {'exists': True, 'identity': [1, 1], 'content': 'eA==', 'sddl': 'private'}
+    foreign = dict(owned, identity=[1, 2])
+    monkeypatch.setattr(windows, 'snapshot_windows_setup_file', lambda *args, **kwargs: foreign)
+    monkeypatch.setattr(windows, '_publish_owner_private_temp', lambda *args, **kwargs: pytest.fail('foreign file overwritten'))
+    with pytest.raises(windows.WindowsWebUIError, match='changed'):
+        windows.publish_windows_setup_file('target', (None, None, owned), expected=owned, owner_sid='owner')
+
+
+def test_windows_launcher_partial_staging_leaves_destination_untouched(monkeypatch):
+    from types import SimpleNamespace
+    import factlane.webui_install as install
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    backend.request = SimpleNamespace(state_dir='state')
+    backend._owner_sid = 'owner'
+    payload = install.render_windows_owner_panel_launcher(factlane_executable=r'C:\Python\python.exe', owner_config_home=r'C:\Local\FactLane\config')
+    operation = SimpleNamespace(desired_state=payload, target=install.WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME)
+    monkeypatch.setattr(install.Path, 'is_file', lambda path: True)
+    partial = {}
+    def writer(path, *args):
+        assert path != operation.target
+        partial[path] = {'exists': True, 'identity': [1, 99], 'content': 'eA==', 'sddl': 'private'}
+        raise RuntimeError('partial staging write')
+    backend._shortcut_writer = writer
+    monkeypatch.setattr(install.windows, 'snapshot_windows_setup_file', lambda path, **kwargs: partial.get(path, {'exists': False}))
+    def delete(path, *, expected, **kwargs):
+        assert path != operation.target and partial[path] == expected
+        del partial[path]
+    monkeypatch.setattr(install.windows, 'delete_windows_setup_file', delete)
+    with pytest.raises(RuntimeError, match='partial staging'):
+        backend._stage_launcher_bytes(operation)
+    assert partial == {}
+
+
+def test_windows_setup_refuses_unknown_config_before_journaling_credentials():
+    import base64
+    import factlane.webui_install as install
+    snapshot = {'exists': True, 'identity': [1, 1], 'sddl': 'private',
+                'content': base64.b64encode(b'{"password":"do-not-copy"}').decode()}
+    with pytest.raises(install.WindowsWebUIError, match='config'):
+        install._validate_windows_setup_config(snapshot, installation_id='install')
+
+
+def test_windows_setup_rejects_launcher_outside_current_user_start_menu(monkeypatch):
+    from types import SimpleNamespace
+    import factlane.webui_install as install
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    monkeypatch.setenv('APPDATA', r'C:\Users\Alice\AppData\Roaming')
+    backend.request = SimpleNamespace(launcher_path=r'C:\Other\FactLane Owner Panel.lnk')
+    with pytest.raises(install.WindowsWebUIError, match='Start Menu'):
+        backend._validate_launcher_target()
+
+
+def test_windows_setup_precondition_change_after_consent_fails_before_prepare_mutation():
+    import factlane.webui_install as install
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    expected = install.WindowsSetupPrecondition(
+        owner_sid='owner',
+        service_config={'exists': True, 'identity': [1, 1]},
+        scheduled_task={'exists': True, 'xml': 'before'},
+        launcher={'exists': True, 'identity': [1, 2]},
+        service_state={'exists': True, 'identity': [1, 3]},
+        setup_journal={'exists': False},
+    )
+    backend._expected_precondition = expected
+    backend.capture_precondition = lambda: replace(
+        expected,
+        scheduled_task={'exists': True, 'xml': 'changed-during-consent'},
+    )
+
+    with pytest.raises(install.WindowsWebUIError) as raised:
+        backend._require_precondition_unchanged()
+
+    assert raised.value.code == 'WINDOWS_SETUP_PRECONDITION_CHANGED'
+
+
+def test_windows_committed_setup_accepts_only_authenticated_memory_binding_evolution():
+    import base64
+    import factlane.webui_install as install
+    managed = install.WindowsManagedConfig(
+        installation_id='install',
+        origin='http://127.0.0.1:8765',
+        native_control_pipe=r'\\.\pipe\factlane-owner-test',
+        runtime_dir=r'C:\Local\FactLane\runtime',
+        state_dir=r'C:\Local\FactLane\state',
+        browser_profile_dir=r'C:\Local\FactLane\browser',
+    )
+    bound = replace(managed, db=r'C:\Local\FactLane\state\memory.db', profile='nomic-768', host_id='owner-install')
+    def snapshot(config):
+        raw = install.render_windows_managed_config(config).encode()
+        return {'exists': True, 'identity': [1, 1], 'sddl': 'private',
+                'content': base64.b64encode(raw).decode()}
+
+    assert install._authorized_windows_setup_config_evolution(
+        snapshot(managed), snapshot(bound), installation_id='install'
+    ) is True
+    assert install._authorized_windows_setup_config_evolution(
+        snapshot(managed), snapshot(replace(bound, origin='http://127.0.0.1:8766')), installation_id='install'
+    ) is False
+
+
+def test_windows_committed_rollback_requires_exact_transaction_identity(tmp_path, monkeypatch):
+    import base64
+    import uuid
+    from types import SimpleNamespace
+    import factlane.webui_install as install
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    backend.request = SimpleNamespace(installation_id='install', state_dir='state')
+    backend._paths = SimpleNamespace(root_dir='root', owner_config_home='home', runtime_dir='runtime', state_dir='state')
+    backend._validate_launcher_target = lambda: None
+    backend._targets = lambda: {'WRITE_SERVICE_CONFIG': 'config'}
+    transaction_id = str(uuid.uuid4())
+    journal = {'transaction_id': transaction_id, 'phase': 'COMMITTED', 'operations': []}
+    custody = {'exists': True, 'identity': [1, 1], 'sddl': 'private',
+               'content': base64.b64encode(b'{}').decode()}
+    monkeypatch.setattr(install.windows, 'current_user_sid', lambda: 'owner')
+    monkeypatch.setattr(install.windows, 'windows_owner_paths', lambda **kwargs: backend._paths)
+    monkeypatch.setattr(install, 'validate_windows_path_no_reparse', lambda path: tmp_path)
+    monkeypatch.setattr(install.windows, 'validate_owner_private_path', lambda *args, **kwargs: None)
+    monkeypatch.setattr(install.windows, 'snapshot_windows_setup_file', lambda *args, **kwargs: custody)
+    monkeypatch.setattr(install, '_decode_windows_setup_journal', lambda *args, **kwargs: journal)
+    calls = []
+    backend.rollback_setup = lambda *, plan, completed_operations: calls.append((plan, completed_operations)) or InstallerStepResult(
+        status=InstallerStepStatus.APPLIED,
+        operation='ROLLBACK',
+        detail='exact owned state restored',
+    )
+
+    result = backend.rollback_committed_setup(transaction_id)
+    assert result.status is InstallerStepStatus.APPLIED
+    assert calls == [(None, ())]
+
+    calls.clear()
+    with pytest.raises(install.WindowsWebUIError) as raised:
+        backend.rollback_committed_setup(str(uuid.uuid4()))
+    assert raised.value.code == 'WINDOWS_SETUP_TRANSACTION_MISMATCH'
+    assert calls == []
+
+
+def test_windows_task_snapshot_recognizes_wrapped_com_not_found():
+    from types import SimpleNamespace
+    import factlane.webui_windows as windows
+    supervisor = object.__new__(windows.WindowsTaskSchedulerSupervisor)
+    supervisor.task_name = windows.WINDOWS_TASK_NAME
+    class ComFailure(Exception):
+        hresult = -2147352567  # DISP_E_EXCEPTION from IDispatch
+        excepinfo = (0, 'Task Scheduler', 'not found', None, 0, -2147024894)
+    def get_task(name):
+        raise ComFailure()
+    service = SimpleNamespace(GetFolder=lambda path: SimpleNamespace(GetTask=get_task))
+    supervisor._run_with_service = lambda callback: callback(service)
+    assert supervisor.snapshot_task() == {'exists': False}
+
+
+def test_windows_recovery_blocks_live_service_even_when_task_is_quiescent(monkeypatch):
+    import base64
+    from types import SimpleNamespace
+    import factlane.webui_install as install
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    backend.request = SimpleNamespace(state_dir='state')
+    backend._owner_sid = 'owner'
+    backend.supervisor = SimpleNamespace(verify_quiescent=lambda: None)
+    raw = base64.b64encode(json.dumps({'status': 'READY'}).encode()).decode()
+    monkeypatch.setattr(install.windows, 'snapshot_windows_setup_file', lambda *args, **kwargs: {'exists': True, 'content': raw})
+    with pytest.raises(install.WindowsWebUIError, match='quiescent'):
+        backend._assert_recovery_quiescent()

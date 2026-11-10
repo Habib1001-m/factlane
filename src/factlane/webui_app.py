@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
@@ -102,8 +103,10 @@ from .webui_windows import (
     load_windows_managed_config,
     prepare_windows_managed_restart,
     render_windows_managed_config,
+    snapshot_windows_setup_file,
     validate_windows_database_binding_path,
     windows_boot_id,
+    windows_mutation_guard,
     windows_native_confirm,
     windows_owner_paths,
     write_owner_private_text_atomic,
@@ -1123,6 +1126,8 @@ class _WindowsSetupBindingService:
         supported_profiles: set[str] | frozenset[str],
         config_loader: Callable[..., WindowsManagedConfig | None] = load_windows_managed_config,
         config_writer: Callable[..., None] = write_owner_private_text_atomic,
+        config_snapshot: Callable[..., dict[str, Any]] = snapshot_windows_setup_file,
+        mutation_guard: Callable[..., Any] = windows_mutation_guard,
         database_validator: Callable[..., str] = validate_windows_database_binding_path,
         database_inspector: Callable[[str, str], None] = _validate_existing_windows_setup_database,
         restart_preparer: Callable[[], Any] = prepare_windows_managed_restart,
@@ -1140,6 +1145,8 @@ class _WindowsSetupBindingService:
             raise ValueError("Windows setup binding requires at least one supported profile")
         self._config_loader = config_loader
         self._config_writer = config_writer
+        self._config_snapshot = config_snapshot
+        self._mutation_guard = mutation_guard
         self._database_validator = database_validator
         self._database_inspector = database_inspector
         self._restart_preparer = restart_preparer
@@ -1211,25 +1218,73 @@ class _WindowsSetupBindingService:
                 ) from exc
             self._database_inspector(canonical_db, profile)
 
-            current = self._load_current()
-            if self._published_config is not None and current == self._published_config:
-                if (
-                    current.db != canonical_db
-                    or current.profile != profile
-                    or current.host_id != host_id
-                ):
-                    raise OwnerSetupError(
-                        "SETUP_ALREADY_CONFIGURED",
-                        "managed Windows memory binding is already published",
-                        status=409,
-                    )
-                if self._restart_error is None:
+            with self._mutation_guard():
+                current, current_custody = self._load_current_with_custody()
+                if self._published_config is not None and current == self._published_config:
+                    if (
+                        current.db != canonical_db
+                        or current.profile != profile
+                        or current.host_id != host_id
+                    ):
+                        raise OwnerSetupError(
+                            "SETUP_ALREADY_CONFIGURED",
+                            "managed Windows memory binding is already published",
+                            status=409,
+                        )
+                    if self._restart_error is None:
+                        return {
+                            "status": "CONFIG_PUBLISHED",
+                            "restart": "REQUESTED",
+                            "request_id": self._restart_request_id or request_id,
+                        }
+                    restart_plan = self._prepare_restart()
+                    self._restart_plan = restart_plan
+                    self._restart_request_id = request_id
+                    self._restart_handed_off = False
+                    self._restart_error = None
                     return {
                         "status": "CONFIG_PUBLISHED",
                         "restart": "REQUESTED",
-                        "request_id": self._restart_request_id or request_id,
+                        "request_id": request_id,
                     }
+                if current != self.baseline_config:
+                    raise OwnerSetupError(
+                        "SETUP_CONFIG_CHANGED",
+                        "managed Windows configuration changed while setup was active",
+                        status=409,
+                    )
+
                 restart_plan = self._prepare_restart()
+                published = replace(
+                    current,
+                    db=canonical_db,
+                    profile=profile,
+                    host_id=host_id,
+                )
+                try:
+                    self._config_writer(
+                        self.config_path,
+                        render_windows_managed_config(published),
+                        owner_sid=self.owner_sid,
+                        expected_state=current_custody,
+                    )
+                    observed = self._config_loader(self.config_path, owner_sid=self.owner_sid)
+                    if observed != published:
+                        raise WindowsWebUIError(
+                            "WINDOWS_CONFIG_PUBLICATION_UNVERIFIED",
+                            "managed Windows configuration publication could not be verified",
+                        )
+                except Exception as exc:
+                    self._restore_baseline_after_publication_failure(published)
+                    if isinstance(exc, WindowsWebUIError):
+                        raise OwnerSetupError(exc.code, exc.safe_message, status=500) from exc
+                    raise OwnerSetupError(
+                        "WINDOWS_CONFIG_PUBLICATION_FAILED",
+                        "managed Windows configuration could not be published safely",
+                        status=500,
+                    ) from exc
+
+                self._published_config = published
                 self._restart_plan = restart_plan
                 self._restart_request_id = request_id
                 self._restart_handed_off = False
@@ -1239,52 +1294,6 @@ class _WindowsSetupBindingService:
                     "restart": "REQUESTED",
                     "request_id": request_id,
                 }
-            if current != self.baseline_config:
-                raise OwnerSetupError(
-                    "SETUP_CONFIG_CHANGED",
-                    "managed Windows configuration changed while setup was active",
-                    status=409,
-                )
-
-            restart_plan = self._prepare_restart()
-            published = replace(
-                current,
-                db=canonical_db,
-                profile=profile,
-                host_id=host_id,
-            )
-            try:
-                self._config_writer(
-                    self.config_path,
-                    render_windows_managed_config(published),
-                    owner_sid=self.owner_sid,
-                )
-                observed = self._config_loader(self.config_path, owner_sid=self.owner_sid)
-                if observed != published:
-                    raise WindowsWebUIError(
-                        "WINDOWS_CONFIG_PUBLICATION_UNVERIFIED",
-                        "managed Windows configuration publication could not be verified",
-                    )
-            except Exception as exc:
-                self._restore_baseline_after_publication_failure()
-                if isinstance(exc, WindowsWebUIError):
-                    raise OwnerSetupError(exc.code, exc.safe_message, status=500) from exc
-                raise OwnerSetupError(
-                    "WINDOWS_CONFIG_PUBLICATION_FAILED",
-                    "managed Windows configuration could not be published safely",
-                    status=500,
-                ) from exc
-
-            self._published_config = published
-            self._restart_plan = restart_plan
-            self._restart_request_id = request_id
-            self._restart_handed_off = False
-            self._restart_error = None
-            return {
-                "status": "CONFIG_PUBLISHED",
-                "restart": "REQUESTED",
-                "request_id": request_id,
-            }
 
     def handoff_restart(self, request_id: str) -> bool:
         with self._lock:
@@ -1340,15 +1349,50 @@ class _WindowsSetupBindingService:
             )
         return current
 
-    def _restore_baseline_after_publication_failure(self) -> None:
+    def _load_current_with_custody(self) -> tuple[WindowsManagedConfig, dict[str, Any]]:
+        snapshot = self._config_snapshot(
+            self.config_path,
+            owner_sid=self.owner_sid,
+        )
+        if not snapshot.get("exists"):
+            raise OwnerSetupError(
+                "WINDOWS_MANAGED_CONFIG_UNAVAILABLE",
+                "managed Windows configuration is unavailable",
+                status=409,
+            )
+        current = self._load_current()
+        canonical = render_windows_managed_config(current).encode("utf-8")
         try:
-            observed = self._config_loader(self.config_path, owner_sid=self.owner_sid)
+            observed = base64.b64decode(str(snapshot["content"]), validate=True)
+        except (KeyError, ValueError, TypeError) as exc:
+            raise OwnerSetupError(
+                "WINDOWS_CONFIG_INVALID",
+                "managed Windows configuration custody is invalid",
+                status=500,
+            ) from exc
+        if observed != canonical:
+            raise OwnerSetupError(
+                "SETUP_CONFIG_CHANGED",
+                "managed Windows configuration changed while setup was active",
+                status=409,
+            )
+        return current, snapshot
+
+    def _restore_baseline_after_publication_failure(
+        self,
+        expected_published: WindowsManagedConfig,
+    ) -> None:
+        try:
+            observed, observed_custody = self._load_current_with_custody()
             if observed == self.baseline_config:
                 return
+            if observed != expected_published:
+                raise RuntimeError("configuration left publication custody")
             self._config_writer(
                 self.config_path,
                 render_windows_managed_config(self.baseline_config),
                 owner_sid=self.owner_sid,
+                expected_state=observed_custody,
             )
             restored = self._config_loader(self.config_path, owner_sid=self.owner_sid)
             if restored != self.baseline_config:

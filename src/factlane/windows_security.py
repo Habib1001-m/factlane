@@ -204,6 +204,59 @@ def validate_owner_only_kernel_object(handle: Any, owner_sid: str) -> None:
     _validate_descriptor(descriptor, owner_sid, win32security)
 
 
+def validate_owner_controlled_kernel_object(handle: Any, owner_sid: str) -> None:
+    """Allow a user-profile object only when no untrusted principal can access it.
+
+    Start Menu shortcuts inherit the user's profile ACL on existing releases, so
+    they are not owner-only private state.  They are still safe to adopt when
+    the current Owner owns the object and every allow ACE is limited to the
+    Owner, LocalSystem, or the local Administrators group.
+    """
+
+    _pywintypes, _win32api, _win32con, _win32process, win32security = _require_windows()
+    try:
+        descriptor = win32security.GetSecurityInfo(
+            handle,
+            win32security.SE_KERNEL_OBJECT,
+            win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION,
+        )
+        owner = descriptor.GetSecurityDescriptorOwner()
+        dacl = descriptor.GetSecurityDescriptorDacl()
+    except Exception as exc:
+        raise WindowsSecurityError("WINDOWS_DACL_UNAVAILABLE", "Windows kernel-object DACL could not be read") from exc
+    if owner is None or _sid_string(win32security, owner).casefold() != owner_sid.casefold():
+        raise WindowsSecurityError("WINDOWS_OWNER_MISMATCH", "Windows object owner SID is not the expected Owner")
+    if dacl is None:
+        raise WindowsSecurityError("WINDOWS_DACL_UNSAFE", "Windows object DACL is unavailable")
+    allowed = {
+        owner_sid.casefold(),
+        "s-1-5-18",       # LocalSystem
+        "s-1-5-32-544",  # BUILTIN\\Administrators
+    }
+    owner_allowed = False
+    try:
+        for index in range(dacl.GetAceCount()):
+            header, _mask, ace_sid = dacl.GetAce(index)
+            if int(header[0]) != win32security.ACCESS_ALLOWED_ACE_TYPE:
+                raise WindowsSecurityError(
+                    "WINDOWS_DACL_UNSAFE",
+                    "Windows object DACL contains an unsupported ACE type",
+                )
+            sid = _sid_string(win32security, ace_sid).casefold()
+            if sid not in allowed:
+                raise WindowsSecurityError(
+                    "WINDOWS_DACL_UNSAFE",
+                    "Windows object DACL grants access to another principal",
+                )
+            owner_allowed = owner_allowed or sid == owner_sid.casefold()
+    except WindowsSecurityError:
+        raise
+    except Exception as exc:
+        raise WindowsSecurityError("WINDOWS_DACL_UNAVAILABLE", "Windows DACL could not be enumerated") from exc
+    if not owner_allowed:
+        raise WindowsSecurityError("WINDOWS_DACL_UNSAFE", "Windows object DACL does not grant Owner access")
+
+
 def _path_has_reparse_point(path: Path) -> bool:
     try:
         info = path.lstat()
