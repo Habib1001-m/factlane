@@ -1738,6 +1738,7 @@ def test_active_service_mutations_use_native_while_status_is_offline(
 def test_legacy_linux_runtime_config_keeps_native_control_reachable_until_setup_migrates_it(
     tmp_path: Path,
 ) -> None:
+    owner_uid = os.getuid()
     paths = default_owner_paths(
         environ={
             "XDG_CONFIG_HOME": str(tmp_path / "config"),
@@ -1745,7 +1746,7 @@ def test_legacy_linux_runtime_config_keeps_native_control_reachable_until_setup_
             "XDG_STATE_HOME": str(tmp_path / "state"),
         },
         home=str(tmp_path / "home"),
-        owner_uid=1000,
+        owner_uid=owner_uid,
     )
     legacy_backend = tmp_path / "runtime" / "factlane" / "owner-http.sock"
     config_path = Path(paths.service_config_path)
@@ -1791,7 +1792,7 @@ def test_legacy_linux_runtime_config_keeps_native_control_reachable_until_setup_
 
     controller = ProductionWebUIController(
         paths=paths,
-        owner_uid=1000,
+        owner_uid=owner_uid,
         service_state_factory=lambda _path: service_state,
         systemd_manager=unit,
         control_client_factory=client_factory,
