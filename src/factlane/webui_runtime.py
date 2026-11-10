@@ -12,7 +12,12 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Protocol
 from urllib.parse import urlsplit
 
-from factlane.webui_service import EndpointUnavailable, ServiceStatus, WebUIServiceState
+from factlane.webui_service import (
+    EndpointUnavailable,
+    ServiceStatus,
+    WebUIServiceState,
+    is_legacy_endpoint_canonicalization,
+)
 
 
 READINESS_DEADLINE_SECONDS = 10.0
@@ -453,7 +458,14 @@ class WebUIRuntimeRunner:
         snapshot = self.service_state.snapshot()
         if snapshot.status is ServiceStatus.STOPPED_UNTIL_REBOOT:
             return RuntimeOutcome(RuntimeOutcomeState.STOPPED)
-        if snapshot.saved_endpoint is not None and snapshot.saved_endpoint != self.config.origin:
+        if (
+            snapshot.saved_endpoint is not None
+            and snapshot.saved_endpoint != self.config.origin
+            and not is_legacy_endpoint_canonicalization(
+                snapshot.saved_endpoint,
+                self.config.origin,
+            )
+        ):
             return RuntimeOutcome(
                 RuntimeOutcomeState.FAILED,
                 detail="runtime config origin differs from saved endpoint; explicit recovery is required",

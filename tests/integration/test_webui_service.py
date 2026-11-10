@@ -169,6 +169,36 @@ def test_claim_endpoint_rejects_different_saved_endpoint_with_explicit_recovery(
     assert service.snapshot().saved_endpoint == "https://factlane-installation.test:8767"
 
 
+def test_claim_endpoint_allows_only_same_port_legacy_https_to_loopback_http_canonicalization(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    service.claim_endpoint("https://factlane-installation.test:8767")
+
+    migrated = service.claim_endpoint("http://127.0.0.1:8767")
+
+    assert migrated.saved_endpoint == "http://127.0.0.1:8767"
+    persisted = json.loads(
+        (tmp_path / "owner-private" / "webui-service.json").read_text(encoding="utf-8")
+    )
+    assert persisted["saved_endpoint"] == "http://127.0.0.1:8767"
+
+    with pytest.raises(EndpointUnavailable, match="explicit recovery"):
+        service.claim_endpoint("https://factlane-installation.test:8767")
+
+
+def test_claim_endpoint_legacy_transport_canonicalization_rejects_port_change(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    service.claim_endpoint("https://factlane-installation.test:8767")
+
+    with pytest.raises(EndpointUnavailable, match="explicit recovery"):
+        service.claim_endpoint("http://127.0.0.1:8768")
+
+    assert service.snapshot().saved_endpoint == "https://factlane-installation.test:8767"
+
+
 def test_start_stop_and_restart_intents_are_idempotent(tmp_path: Path) -> None:
     controller = _Controller()
     service = _service(tmp_path, controller=controller)

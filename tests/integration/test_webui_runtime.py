@@ -576,6 +576,79 @@ def test_runner_rejects_config_saved_endpoint_mismatch_before_launch(tmp_path: P
     assert service.snapshot().saved_endpoint == "https://factlane-a1b2c3.test:8766"
 
 
+def test_runner_canonicalizes_same_port_legacy_https_state_after_loopback_http_is_ready(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    service = _service(tmp_path, clock)
+    service.claim_endpoint("https://factlane-a1b2c3.test:8767")
+    service.mark_ready()
+    backend = _Backend()
+    process = _Process()
+    backend.clock = clock
+    process.clock = clock
+    config = load_runtime_config(
+        _write_config(tmp_path, extra={"origin": "http://127.0.0.1:8767"})
+    )
+    runner = WebUIRuntimeRunner(
+        config,
+        service,
+        backend_factory=lambda _spec, exact_service_state: (
+            pytest.fail("runner passed a different service-state instance")
+            if exact_service_state is not service
+            else backend
+        ),
+        process_factory=lambda exact_config, _argv: (
+            pytest.fail("runner passed a different runtime config instance")
+            if exact_config is not config
+            else process
+        ),
+        clock=clock,
+        sleep=clock.sleep,
+        poll_interval=1.0,
+    )
+
+    outcome = runner.start()
+
+    assert outcome.state is RuntimeOutcomeState.READY
+    assert backend.start_calls == 1
+    assert service.snapshot().saved_endpoint == "http://127.0.0.1:8767"
+    assert service.snapshot().status is ServiceStatus.READY
+
+
+def test_windows_runner_canonicalizes_same_port_legacy_https_state_to_loopback_http(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    service = _service(tmp_path, clock)
+    service.claim_endpoint("https://factlane-legacy123.test:8767")
+    service.mark_ready()
+    backend = _Backend()
+    backend.clock = clock
+    config = load_runtime_config(_write_windows_config(tmp_path))
+    runner = WebUIRuntimeRunner(
+        config,
+        service,
+        backend_factory=lambda _spec, exact_service_state: (
+            pytest.fail("runner passed a different service-state instance")
+            if exact_service_state is not service
+            else backend
+        ),
+        process_factory=None,
+        external_gateway_required=False,
+        clock=clock,
+        sleep=clock.sleep,
+        poll_interval=1.0,
+    )
+
+    outcome = runner.start()
+
+    assert outcome.state is RuntimeOutcomeState.READY
+    assert backend.start_calls == 1
+    assert service.snapshot().saved_endpoint == "http://127.0.0.1:8767"
+    assert service.snapshot().status is ServiceStatus.READY
+
+
 def test_runner_claim_failure_after_readiness_drains_and_returns_failed(tmp_path: Path) -> None:
     class _RejectingState:
         def __init__(self, wrapped: WebUIServiceState) -> None:

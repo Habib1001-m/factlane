@@ -54,6 +54,53 @@ class EndpointUnavailable(ServiceStateError):
     pass
 
 
+def is_legacy_endpoint_canonicalization(saved_endpoint: str, target_origin: str) -> bool:
+    """Return whether one legacy managed HTTPS origin may become loopback HTTP.
+
+    Browser-neutral managed installs intentionally replace the installation-
+    private ``https://factlane-*.test:<port>`` transport with the exact
+    ``http://127.0.0.1:<same-port>`` transport.  This is the only saved-endpoint
+    transition that does not require explicit endpoint recovery.
+    """
+
+    if not isinstance(saved_endpoint, str) or not isinstance(target_origin, str):
+        return False
+    try:
+        saved = urlsplit(saved_endpoint)
+        target = urlsplit(target_origin)
+        saved_port = saved.port
+        target_port = target.port
+    except ValueError:
+        return False
+    if saved_port is None or target_port is None or saved_port != target_port:
+        return False
+    if not PORT_MIN <= saved_port <= PORT_MAX:
+        return False
+    saved_host = saved.hostname
+    if saved_host is None or _CLAIM_HOST_RE.fullmatch(saved_host) is None:
+        return False
+    legacy_https = (
+        saved.scheme == "https"
+        and saved.username is None
+        and saved.password is None
+        and not saved.path
+        and not saved.query
+        and not saved.fragment
+        and saved_endpoint == f"https://{saved_host}:{saved_port}"
+    )
+    loopback_http = (
+        target.scheme == "http"
+        and target.hostname == "127.0.0.1"
+        and target.username is None
+        and target.password is None
+        and not target.path
+        and not target.query
+        and not target.fragment
+        and target_origin == f"http://127.0.0.1:{target_port}"
+    )
+    return legacy_https and loopback_http
+
+
 @contextmanager
 def service_state_file_guard(
     state_path: str | os.PathLike[str],
@@ -236,6 +283,11 @@ class WebUIServiceState:
                 self._write_state_unlocked()
                 return self._snapshot()
             if saved == endpoint:
+                return self._snapshot()
+            if is_legacy_endpoint_canonicalization(saved, endpoint):
+                self._require_endpoint_claim_allowed()
+                self._state.saved_endpoint = endpoint
+                self._write_state_unlocked()
                 return self._snapshot()
             raise EndpointUnavailable(
                 "saved endpoint differs from the ready managed endpoint; explicit recovery is required"
