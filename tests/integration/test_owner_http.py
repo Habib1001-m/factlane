@@ -35,6 +35,7 @@ from factlane.owner_http import (
     MAX_BODY_BYTES,
     REQUEST_TIMEOUT_SECONDS,
     OwnerHTTPServer,
+    WindowsOwnerHTTPServer,
 )
 from factlane.owner_overview import OwnerOverviewService
 from factlane.recovery import RecoveryScope
@@ -44,6 +45,19 @@ from factlane.storage import SQLiteVecEngine
 OWNER_UID = 1000
 ORIGIN = "http://127.0.0.1:8765"
 HOST = "127.0.0.1:8765"
+
+
+def test_windows_origin_parser_keeps_legacy_https_compatibility_without_expanding_new_http_ports() -> None:
+    origin = "https://factlane-legacy123.test:54321"
+
+    exact, host, hostname, port = WindowsOwnerHTTPServer._validate_windows_origin(origin)
+
+    assert exact == origin
+    assert host == "factlane-legacy123.test:54321"
+    assert hostname == "factlane-legacy123.test"
+    assert port == 54321
+    with pytest.raises(ValueError, match="canonical FactLane loopback HTTP"):
+        WindowsOwnerHTTPServer._validate_windows_origin("http://127.0.0.1:54321")
 
 
 @dataclass

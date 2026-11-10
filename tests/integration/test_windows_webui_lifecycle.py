@@ -182,9 +182,11 @@ def test_windows_owner_paths_use_localappdata_and_owner_sid_custody(tmp_path: Pa
         paths.owner_config_home,
         paths.runtime_dir,
         paths.state_dir,
-        paths.browser_profile_dir,
     ):
         validate_owner_private_path(directory, owner_sid=sid, directory=True)
+    assert not Path(paths.browser_profile_dir).exists(), (
+        "browser-neutral managed setup must not create a dedicated browser profile"
+    )
 
 
 def test_windows_boot_identity_is_stable_and_service_state_is_owner_private(tmp_path: Path) -> None:

@@ -3014,7 +3014,6 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
             parsed.scheme == "https"
             and hostname is not None
             and port is not None
-            and 8765 <= port <= 8774
             and _WINDOWS_OWNER_HOST_RE.fullmatch(hostname) is not None
             and exact_origin == f"https://{hostname}:{port}"
         )
