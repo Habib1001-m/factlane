@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import sqlite3
 import stat
 import subprocess
@@ -793,6 +794,18 @@ class _CaddySubprocess:
     def is_ready(self) -> bool:
         if self.poll() is not None:
             return False
+        parsed = urlsplit(self._origin)
+        if parsed.scheme == "http":
+            port = parsed.port
+            pid = getattr(self._process, "pid", None)
+            if (
+                port is None
+                or isinstance(pid, bool)
+                or not isinstance(pid, int)
+                or pid <= 0
+                or not _linux_process_owns_loopback_listener(pid, port)
+            ):
+                return False
         readiness = probe_linux_managed_https(
             self._origin,
             root_cert_path=self._root_cert_path,
@@ -817,6 +830,49 @@ class _CaddySubprocess:
         except subprocess.TimeoutExpired:
             return False
         return True
+
+
+def _linux_process_owns_loopback_listener(pid: int, port: int) -> bool:
+    """Prove one Linux child owns the exact IPv4 loopback LISTEN socket.
+
+    Plain loopback HTTP intentionally removes the old private-CA proof.  Before
+    accepting the health response, bind runtime readiness to the Caddy child by
+    intersecting its socket FDs with the kernel TCP table.  Failure to inspect
+    procfs is a fail-closed not-ready result.
+    """
+
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid <= 0
+        or isinstance(port, bool)
+        or not isinstance(port, int)
+        or not 1 <= port <= 65535
+    ):
+        return False
+    socket_inodes: set[str] = set()
+    try:
+        for fd in (Path("/proc") / str(pid) / "fd").iterdir():
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            match = re.fullmatch(r"socket:\[(\d+)\]", target)
+            if match is not None:
+                socket_inodes.add(match.group(1))
+        if not socket_inodes:
+            return False
+        expected_local = f"0100007F:{port:04X}"
+        for line in Path("/proc/net/tcp").read_text(encoding="ascii").splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 10:
+                continue
+            local, state, inode = fields[1], fields[3], fields[9]
+            if local == expected_local and state == "0A" and inode in socket_inodes:
+                return True
+    except (OSError, UnicodeError):
+        return False
+    return False
 
 
 def _validated_caddy_config(config: WebUIRuntimeConfig) -> WebUIRuntimeConfig:
@@ -844,7 +900,7 @@ def create_caddy_process(
     config: WebUIRuntimeConfig,
     argv: tuple[str, ...],
 ) -> _CaddySubprocess:
-    """Start exact Caddy and prove the managed TLS/backend path before readiness."""
+    """Start exact Caddy and prove the managed loopback/backend path before readiness."""
 
     validated = _validated_caddy_config(config)
     expected_argv = caddy_command(validated)
@@ -853,7 +909,12 @@ def create_caddy_process(
     parsed = urlsplit(validated.origin)
     host = parsed.hostname
     port = parsed.port
-    if host is None or port is None or parsed.scheme != "https":
+    if (
+        host is None
+        or port is None
+        or parsed.scheme not in {"http", "https"}
+        or (parsed.scheme == "http" and host != "127.0.0.1")
+    ):
         raise ValueError("Caddy readiness origin is unsafe")
     process = subprocess.Popen(argv, shell=False)
     root_cert_path = (
@@ -1959,8 +2020,11 @@ def _database_runtime_roots(spec: BackendLaunchSpec, database_path: str) -> tupl
 
 def _is_windows_backend_spec(spec: BackendLaunchSpec) -> bool:
     if spec.platform_kind is PlatformKind.WINDOWS:
-        if spec.backend_transport is not BackendTransportKind.WINDOWS_HTTPS:
-            raise ValueError("Windows Owner backend requires WINDOWS_HTTPS transport")
+        if spec.backend_transport not in {
+            BackendTransportKind.WINDOWS_HTTP,
+            BackendTransportKind.WINDOWS_HTTPS,
+        }:
+            raise ValueError("Windows Owner backend requires managed loopback HTTP(S) transport")
         return True
     if spec.platform_kind is not PlatformKind.LINUX or spec.backend_transport is not BackendTransportKind.AF_UNIX:
         raise ValueError("Linux Owner backend requires AF_UNIX transport")
@@ -2013,6 +2077,8 @@ def _build_maintenance(
     runtime_root, barrier_root = _database_runtime_roots(spec, database_path)
     windows_backend = _is_windows_backend_spec(spec)
     owner_sid: str | None = None
+    server_tls_context: ssl.SSLContext | None = None
+    client_tls_context: ssl.SSLContext | None = None
     if windows_backend:
         owner_sid = current_user_sid()
         registry = RuntimeRegistry(
@@ -2385,17 +2451,18 @@ def create_owner_runtime_backend(
                     owner_sid=owner_sid,
                     supported_profiles=set(PROFILE_DEFINITIONS),
                 )
-            parsed = urlsplit(spec.expected_origin)
-            hostname = parsed.hostname
-            if hostname is None:
-                raise ValueError("Windows Owner backend origin must contain a hostname")
-            tls_material = load_windows_tls_material(
-                Path(spec.state_dir) / "tls",
-                hostname,
-                owner_sid=owner_sid,
-            )
-            server_tls_context = build_windows_server_ssl_context(tls_material)
-            client_tls_context = build_windows_client_ssl_context(tls_material)
+            if spec.backend_transport is BackendTransportKind.WINDOWS_HTTPS:
+                parsed = urlsplit(spec.expected_origin)
+                hostname = parsed.hostname
+                if hostname is None:
+                    raise ValueError("Windows Owner HTTPS origin must contain a hostname")
+                tls_material = load_windows_tls_material(
+                    Path(spec.state_dir) / "tls",
+                    hostname,
+                    owner_sid=owner_sid,
+                )
+                server_tls_context = build_windows_server_ssl_context(tls_material)
+                client_tls_context = build_windows_client_ssl_context(tls_material)
             confirmer = native_confirmation or _WindowsNativeConfirmation()
         else:
             if not isinstance(spec.socket_path, str) or not spec.socket_path:

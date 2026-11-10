@@ -333,7 +333,6 @@ def ensure_windows_owner_paths(paths: WindowsOwnerPaths, *, owner_sid: str | Non
         paths.owner_config_home,
         paths.runtime_dir,
         paths.state_dir,
-        paths.browser_profile_dir,
     ):
         _validate_windows_product_path(raw, "FactLane owner path")
         ensure_owner_private_directory(raw, owner_sid=sid)
@@ -1514,21 +1513,35 @@ def _validate_origin(origin: str) -> None:
         port = parsed.port
     except ValueError as exc:
         raise WindowsWebUIError("WINDOWS_CONFIG_INVALID", "managed endpoint is invalid") from exc
+    local_http = (
+        parsed.scheme == "http"
+        and parsed.hostname == "127.0.0.1"
+        and port is not None
+        and 8765 <= port <= 8774
+        and origin == f"http://127.0.0.1:{port}"
+    )
+    legacy_https = (
+        parsed.scheme == "https"
+        and parsed.hostname is not None
+        and parsed.hostname.startswith("factlane-")
+        and parsed.hostname.endswith(".test")
+        and port is not None
+        and 8765 <= port <= 8774
+        and origin == f"https://{parsed.hostname}:{port}"
+    )
     if (
-        parsed.scheme != "https"
-        or parsed.hostname is None
-        or not parsed.hostname.startswith("factlane-")
-        or not parsed.hostname.endswith(".test")
-        or port is None
-        or not 8765 <= port <= 8774
+        parsed.hostname is None
         or parsed.path
         or parsed.query
         or parsed.fragment
         or parsed.username is not None
         or parsed.password is not None
-        or origin != f"https://{parsed.hostname}:{port}"
+        or not (local_http or legacy_https)
     ):
-        raise WindowsWebUIError("WINDOWS_CONFIG_INVALID", "managed endpoint must be one canonical FactLane HTTPS origin")
+        raise WindowsWebUIError(
+            "WINDOWS_CONFIG_INVALID",
+            "managed endpoint must be canonical FactLane loopback HTTP or legacy HTTPS",
+        )
 
 
 def _validate_connect_url(url: str) -> None:

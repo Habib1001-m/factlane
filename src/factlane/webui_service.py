@@ -208,7 +208,7 @@ class WebUIServiceState:
             saved = self._state.saved_endpoint
             if saved is not None:
                 saved_host, saved_port = self._parse_saved_endpoint(saved)
-                if saved_host != hostname:
+                if saved_host not in {hostname, "127.0.0.1"}:
                     raise EndpointUnavailable("saved endpoint hostname does not match this installation")
                 if not self._attempt_bind(saved_port):
                     raise EndpointUnavailable("saved endpoint is unavailable; explicit recovery is required")
@@ -218,14 +218,14 @@ class WebUIServiceState:
             for port in range(PORT_MIN, PORT_MAX + 1):
                 if not self._attempt_bind(port):
                     continue
-                endpoint = f"https://{hostname}:{port}"
+                endpoint = f"http://127.0.0.1:{port}"
                 self._state.saved_endpoint = endpoint
                 self._write_state_unlocked()
                 return endpoint
             raise EndpointUnavailable(f"no endpoint from {PORT_MIN} through {PORT_MAX} could be bound")
 
     def claim_endpoint(self, origin: str) -> ServiceSnapshot:
-        """Persist the exact HTTPS endpoint only after the managed listener is ready."""
+        """Persist the exact managed endpoint only after the managed listener is ready."""
 
         with self._state_transaction():
             endpoint = self._canonical_claim_endpoint(origin)
@@ -605,27 +605,38 @@ class WebUIServiceState:
     @staticmethod
     def _parse_saved_endpoint(endpoint: str) -> tuple[str, int]:
         parsed = urlsplit(endpoint)
-        if parsed.scheme != "https" or parsed.hostname is None or parsed.port is None:
+        if parsed.hostname is None or parsed.port is None:
             raise ServiceStateError("saved endpoint is invalid")
         if parsed.path or parsed.query or parsed.fragment or parsed.username or parsed.password:
             raise ServiceStateError("saved endpoint is invalid")
         if not PORT_MIN <= parsed.port <= PORT_MAX:
             raise ServiceStateError("saved endpoint port is outside the supported range")
+        local_http = (
+            parsed.scheme == "http"
+            and parsed.hostname == "127.0.0.1"
+            and endpoint == f"http://127.0.0.1:{parsed.port}"
+        )
+        legacy_https = (
+            parsed.scheme == "https"
+            and _CLAIM_HOST_RE.fullmatch(parsed.hostname) is not None
+            and endpoint == f"https://{parsed.hostname}:{parsed.port}"
+        )
+        if not (local_http or legacy_https):
+            raise ServiceStateError("saved endpoint is invalid")
         return parsed.hostname, parsed.port
 
     @staticmethod
     def _canonical_claim_endpoint(origin: str) -> str:
         if not isinstance(origin, str):
-            raise EndpointUnavailable("endpoint must be one canonical FactLane HTTPS origin")
+            raise EndpointUnavailable("endpoint must be one canonical FactLane managed origin")
         try:
             parsed = urlsplit(origin)
             port = parsed.port
         except ValueError as exc:
-            raise EndpointUnavailable("endpoint must be one canonical FactLane HTTPS origin") from exc
+            raise EndpointUnavailable("endpoint must be one canonical FactLane managed origin") from exc
         hostname = parsed.hostname
         if (
-            parsed.scheme != "https"
-            or hostname is None
+            hostname is None
             or port is None
             or parsed.username is not None
             or parsed.password is not None
@@ -633,13 +644,21 @@ class WebUIServiceState:
             or parsed.query
             or parsed.fragment
             or not PORT_MIN <= port <= PORT_MAX
-            or _CLAIM_HOST_RE.fullmatch(hostname) is None
         ):
-            raise EndpointUnavailable("endpoint must be one canonical FactLane HTTPS origin")
-        canonical = f"https://{hostname}:{port}"
-        if origin != canonical:
-            raise EndpointUnavailable("endpoint must be one canonical FactLane HTTPS origin")
-        return canonical
+            raise EndpointUnavailable("endpoint must be one canonical FactLane managed origin")
+        local_http = (
+            parsed.scheme == "http"
+            and hostname == "127.0.0.1"
+            and origin == f"http://127.0.0.1:{port}"
+        )
+        legacy_https = (
+            parsed.scheme == "https"
+            and _CLAIM_HOST_RE.fullmatch(hostname) is not None
+            and origin == f"https://{hostname}:{port}"
+        )
+        if not (local_http or legacy_https):
+            raise EndpointUnavailable("endpoint must be one canonical FactLane managed origin")
+        return origin
 
     def _current_boot_id(self) -> str:
         boot = self._boot_id()

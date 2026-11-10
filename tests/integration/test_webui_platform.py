@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import socket
 import struct
@@ -473,8 +474,8 @@ def test_zenity_setup_consent_uses_one_fixed_argv_review_and_never_auto_consents
     consent = provider.acquire(request, environment)
 
     assert consent == SetupConsent(
-        hostname_mapping=True,
-        browser_profile_trust=True,
+        hostname_mapping=False,
+        browser_profile_trust=False,
         user_lingering=True,
     )
     assert len(calls) == 1
@@ -489,9 +490,10 @@ def test_zenity_setup_consent_uses_one_fixed_argv_review_and_never_auto_consents
         "--cancel-label=Cancel",
     )
     text_arg = next(arg for arg in argv if arg.startswith("--text="))
-    assert "isolated FactLane Firefox profile" in text_arg
-    assert "isolated FactLane browser profile" in text_arg
     assert "user lingering" in text_arg
+    assert "Firefox" not in text_arg
+    assert "No browser profile" in text_arg
+    assert "browser trust store" in text_arg
     assert all(token not in argv for token in ("sudo", "pkexec", "certutil"))
 
 
@@ -622,7 +624,7 @@ def test_default_setup_executor_fails_closed_when_required_linux_setup_tooling_i
     executor = build_default_setup_executor(
         request,
         environment,
-        which=lambda name: "/usr/bin/systemctl" if name == "systemctl" else None,
+        which=lambda _name: None,
         command_runner=lambda argv: commands.append(argv) or 0,
         service_state_reader=lambda: state_reads.append(True)
         or pytest.fail("state reader must not run when setup tooling is unavailable"),
@@ -1806,7 +1808,7 @@ def test_legacy_linux_runtime_config_keeps_native_control_reachable_until_setup_
     assert seen_paths == [expected_control, expected_control]
 
 
-def test_open_v01_creates_local_enrollment_launches_locator_only_and_waits_for_claim_approval(
+def test_open_creates_local_enrollment_presents_loopback_locator_once_before_waiting_for_claim_approval(
     tmp_path: Path,
 ) -> None:
     paths = default_owner_paths(
@@ -1816,7 +1818,7 @@ def test_open_v01_creates_local_enrollment_launches_locator_only_and_waits_for_c
     )
 
     calls: list[tuple[str, object]] = []
-    opened: list[str] = []
+    presented: list[str] = []
 
     class Clock:
         def __init__(self) -> None:
@@ -1835,7 +1837,7 @@ def test_open_v01_creates_local_enrollment_launches_locator_only_and_waits_for_c
             calls.append(("status", None))
             return {
                 "status": "READY",
-                "saved_endpoint": "https://factlane-test123.test:8765",
+                "saved_endpoint": "http://127.0.0.1:8765",
             }
 
         def approve_pending_sensitive(self):
@@ -1872,7 +1874,10 @@ def test_open_v01_creates_local_enrollment_launches_locator_only_and_waits_for_c
         process_factory=lambda _config, _argv: pytest.fail("process not used"),
         service_state_factory=lambda _path: pytest.fail("state not used"),
         control_client_factory=lambda _path, _uid: Client(),
-        browser_launcher=lambda url: opened.append(url) or True,
+        open_link_presenter=lambda url: (
+            calls.append(("present", url)),
+            presented.append(url),
+        ),
         clock=clock,
         sleep=clock.sleep,
         enrollment_timeout=30.0,
@@ -1884,22 +1889,24 @@ def test_open_v01_creates_local_enrollment_launches_locator_only_and_waits_for_c
     assert result == {
         "status": "OK",
         "state": "OPENED",
-        "origin": "https://factlane-test123.test:8765",
+        "origin": "http://127.0.0.1:8765",
     }
-    assert opened == [
-        "https://factlane-test123.test:8765#connect=loc%20a%2Fb%3Fc"
+    assert presented == [
+        "http://127.0.0.1:8765#connect=loc%20a%2Fb%3Fc"
     ]
-    parsed = urlsplit(opened[0])
-    assert parsed.scheme == "https"
+    parsed = urlsplit(presented[0])
+    assert parsed.scheme == "http"
+    assert parsed.hostname == "127.0.0.1"
     assert parsed.fragment == "connect=loc%20a%2Fb%3Fc"
     assert parsed.query == ""
-    assert "amber" not in opened[0]
-    assert "csrf" not in opened[0].casefold()
-    assert "session" not in opened[0].casefold()
+    assert "amber" not in presented[0]
+    assert "csrf" not in presented[0].casefold()
+    assert "session" not in presented[0].casefold()
     assert calls == [
         ("status", None),
         ("sensitive", None),
         ("begin", "FactLane local browser"),
+        ("present", "http://127.0.0.1:8765#connect=loc%20a%2Fb%3Fc"),
         ("approve", "loc a/b?c"),
         ("approve", "loc a/b?c"),
         ("approve", "loc a/b?c"),
@@ -1908,13 +1915,13 @@ def test_open_v01_creates_local_enrollment_launches_locator_only_and_waits_for_c
 
 
 def test_open_fails_closed_on_non_retryable_native_approval_error(tmp_path: Path) -> None:
-    opened: list[str] = []
+    presented: list[str] = []
 
     class Client:
         def status(self):
             return {
                 "status": "RECOVERY_REQUIRED",
-                "saved_endpoint": "https://factlane-test123.test:8765",
+                "saved_endpoint": "http://127.0.0.1:8765",
             }
 
         def approve_pending_sensitive(self):
@@ -1947,26 +1954,27 @@ def test_open_fails_closed_on_non_retryable_native_approval_error(tmp_path: Path
         owner_uid=1000,
         service_state_factory=lambda _path: pytest.fail("state not used"),
         control_client_factory=lambda _path, _uid: Client(),
-        browser_launcher=lambda url: opened.append(url) or True,
+        open_link_presenter=presented.append,
     )
 
     result = controller.dispatch("open")
 
     assert result["status"] == "ERROR"
     assert result["error_code"] == "NATIVE_CONFIRMATION_DENIED"
-    assert opened == [
-        "https://factlane-test123.test:8765#connect=locator-1"
+    assert presented == [
+        "http://127.0.0.1:8765#connect=locator-1"
     ]
 
 
 def test_open_does_not_retry_ambiguous_native_approval_transport_timeout(tmp_path: Path) -> None:
     approvals: list[str] = []
+    presented: list[str] = []
 
     class Client:
         def status(self):
             return {
                 "status": "READY",
-                "saved_endpoint": "https://factlane-test123.test:8765",
+                "saved_endpoint": "http://127.0.0.1:8765",
             }
 
         def approve_pending_sensitive(self):
@@ -1999,7 +2007,7 @@ def test_open_does_not_retry_ambiguous_native_approval_transport_timeout(tmp_pat
         owner_uid=1000,
         service_state_factory=lambda _path: pytest.fail("state not used"),
         control_client_factory=lambda _path, _uid: Client(),
-        browser_launcher=lambda _url: True,
+        open_link_presenter=presented.append,
     )
 
     result = controller.dispatch("open")
@@ -2007,19 +2015,17 @@ def test_open_does_not_retry_ambiguous_native_approval_transport_timeout(tmp_pat
     assert result["status"] == "ERROR"
     assert result["error_code"] == "CONTROL_UNAVAILABLE"
     assert approvals == ["locator-timeout"]
+    assert presented == ["http://127.0.0.1:8765#connect=locator-timeout"]
 
 
-def test_open_without_isolated_profile_launcher_fails_closed_after_safe_locator_creation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_open_link_presentation_failure_fails_closed_before_native_approval(tmp_path: Path) -> None:
     approvals: list[str] = []
 
     class Client:
         def status(self):
             return {
                 "status": "READY",
-                "saved_endpoint": "https://factlane-test123.test:8765",
+                "saved_endpoint": "http://127.0.0.1:8765",
             }
 
         def approve_pending_sensitive(self):
@@ -2038,17 +2044,11 @@ def test_open_without_isolated_profile_launcher_fails_closed_after_safe_locator_
 
         def approve_pending(self, *, locator: str):
             approvals.append(locator)
-            pytest.fail("approval must not run when browser launch is unavailable")
+            pytest.fail("approval must not run when link presentation failed")
 
-    monkeypatch.setattr(
-        "factlane.webui_platform._resolve_production_browser_launcher",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            WebUIPlatformError(
-                "BROWSER_LAUNCH_UNAVAILABLE",
-                "isolated launcher unavailable",
-            )
-        ),
-    )
+    def fail_presenter(_url: str) -> None:
+        raise OSError("stderr unavailable")
+
     controller = ProductionWebUIController(
         paths=default_owner_paths(
             environ={"XDG_RUNTIME_DIR": str(tmp_path / "runtime")},
@@ -2057,13 +2057,13 @@ def test_open_without_isolated_profile_launcher_fails_closed_after_safe_locator_
         ),
         owner_uid=1000,
         control_client_factory=lambda _path, _uid: Client(),
-        browser_launcher=None,
+        open_link_presenter=fail_presenter,
     )
 
     result = controller.dispatch("open")
 
     assert result["status"] == "ERROR"
-    assert result["error_code"] == "BROWSER_LAUNCH_UNAVAILABLE"
+    assert result["error_code"] == "OPEN_LINK_PRESENTATION_FAILED"
     assert approvals == []
 
 
@@ -2082,12 +2082,13 @@ def test_open_times_out_waiting_for_browser_claim_without_approving_or_starting_
 
     clock = Clock()
     approvals: list[str] = []
+    presented: list[str] = []
 
     class Client:
         def status(self):
             return {
                 "status": "READY",
-                "saved_endpoint": "https://factlane-test123.test:8765",
+                "saved_endpoint": "http://127.0.0.1:8765",
             }
 
         def approve_pending_sensitive(self):
@@ -2124,7 +2125,7 @@ def test_open_times_out_waiting_for_browser_claim_without_approving_or_starting_
         owner_uid=1000,
         service_state_factory=lambda _path: pytest.fail("state not used"),
         control_client_factory=lambda _path, _uid: Client(),
-        browser_launcher=lambda _url: True,
+        open_link_presenter=presented.append,
         clock=clock,
         sleep=clock.sleep,
         enrollment_timeout=30.0,
@@ -2136,11 +2137,12 @@ def test_open_times_out_waiting_for_browser_claim_without_approving_or_starting_
     assert result["status"] == "ERROR"
     assert result["error_code"] == "PENDING_CLAIM_TIMEOUT"
     assert len(approvals) >= 2
+    assert presented == ["http://127.0.0.1:8765#connect=locator-timeout"]
     assert clock.value == pytest.approx(10.3)
 
 
 @pytest.mark.parametrize("service_state", ["READY", "RECOVERY_REQUIRED"])
-def test_open_approves_pending_sensitive_before_enrollment_and_returns_without_browser(
+def test_open_approves_pending_sensitive_before_enrollment_and_returns_without_presenting_url(
     tmp_path: Path,
     service_state: str,
 ) -> None:
@@ -2151,7 +2153,7 @@ def test_open_approves_pending_sensitive_before_enrollment_and_returns_without_b
             calls.append("status")
             return {
                 "status": service_state,
-                "saved_endpoint": "https://factlane-test123.test:8765",
+                "saved_endpoint": "http://127.0.0.1:8765",
             }
 
         def approve_pending_sensitive(self):
@@ -2169,13 +2171,13 @@ def test_open_approves_pending_sensitive_before_enrollment_and_returns_without_b
         ),
         owner_uid=1000,
         control_client_factory=lambda _path, _uid: Client(),
-        browser_launcher=lambda _url: pytest.fail("sensitive approval must not open browser"),
+        open_link_presenter=lambda _url: pytest.fail("sensitive approval must not present a URL"),
     )
 
     assert controller.dispatch("open") == {
         "status": "OK",
         "state": "SENSITIVE_APPROVED",
-        "origin": "https://factlane-test123.test:8765",
+        "origin": "http://127.0.0.1:8765",
     }
     assert calls == ["status", "sensitive"]
 
@@ -2190,7 +2192,7 @@ def test_open_approves_pending_sensitive_before_enrollment_and_returns_without_b
         "CONTROL_UNAVAILABLE",
     ],
 )
-def test_open_sensitive_errors_fail_closed_without_enrollment_or_browser(
+def test_open_sensitive_errors_fail_closed_without_enrollment_or_url_presentation(
     tmp_path: Path,
     code: str,
 ) -> None:
@@ -2201,7 +2203,7 @@ def test_open_sensitive_errors_fail_closed_without_enrollment_or_browser(
             calls.append("status")
             return {
                 "status": "READY",
-                "saved_endpoint": "https://factlane-test123.test:8765",
+                "saved_endpoint": "http://127.0.0.1:8765",
             }
 
         def approve_pending_sensitive(self):
@@ -2219,7 +2221,7 @@ def test_open_sensitive_errors_fail_closed_without_enrollment_or_browser(
         ),
         owner_uid=1000,
         control_client_factory=lambda _path, _uid: Client(),
-        browser_launcher=lambda _url: pytest.fail("sensitive failure must not open browser"),
+        open_link_presenter=lambda _url: pytest.fail("sensitive failure must not present a URL"),
     )
 
     result = controller.dispatch("open")
@@ -2236,7 +2238,7 @@ def test_open_stopped_service_fails_without_beginning_enrollment_or_starting(tmp
             calls.append("status")
             return {
                 "status": "STOPPED_UNTIL_REBOOT",
-                "saved_endpoint": "https://factlane-test123.test:8765",
+                "saved_endpoint": "http://127.0.0.1:8765",
             }
 
         def begin_local_enrollment(self, *, device_label: str):
@@ -2253,7 +2255,7 @@ def test_open_stopped_service_fails_without_beginning_enrollment_or_starting(tmp
         ),
         owner_uid=1000,
         control_client_factory=lambda _path, _uid: Client(),
-        browser_launcher=lambda _url: pytest.fail("browser must not open"),
+        open_link_presenter=lambda _url: pytest.fail("stopped service must not present a URL"),
     )
 
     result = controller.dispatch("open")
@@ -2261,3 +2263,42 @@ def test_open_stopped_service_fails_without_beginning_enrollment_or_starting(tmp
     assert result["status"] == "ERROR"
     assert result["error_code"] == "WEBUI_NOT_RUNNING"
     assert calls == ["status"]
+
+
+def test_default_platform_controller_binds_exact_stderr_link_presenter_and_flushes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FlushTrackingStream(io.StringIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.flushes = 0
+
+        def flush(self) -> None:
+            self.flushes += 1
+            super().flush()
+
+    stream = FlushTrackingStream()
+    sentinel = object()
+
+    def controller_factory(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(webui_platform_module, "ProductionWebUIController", controller_factory)
+    monkeypatch.setattr(webui_platform_module.sys, "stderr", stream)
+
+    assert webui_platform_module.build_default_platform_controller() is sentinel
+    presenter = captured["open_link_presenter"]
+    assert callable(presenter)
+
+    url = "http://127.0.0.1:8765#connect=locator-1"
+    presenter(url)
+
+    assert stream.getvalue() == (
+        "Open this URL in any browser:\n"
+        f"{url}\n"
+        "Waiting for browser connection and local approval...\n"
+    )
+    assert stream.flushes == 1

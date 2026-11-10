@@ -101,7 +101,7 @@ def test_first_endpoint_is_persisted_only_after_successful_bind_and_never_silent
     service = _service(tmp_path, listener=bind_first_install)
     endpoint = service.ensure_endpoint("factlane-installation.test")
 
-    assert endpoint == "https://factlane-installation.test:8767"
+    assert endpoint == "http://127.0.0.1:8767"
     assert attempts == [8765, 8766, 8767]
     assert service.snapshot().saved_endpoint == endpoint
 

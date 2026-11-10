@@ -42,8 +42,8 @@ from factlane.storage import SQLiteVecEngine
 
 
 OWNER_UID = 1000
-ORIGIN = "https://owner.test"
-HOST = "owner.test"
+ORIGIN = "http://127.0.0.1:8765"
+HOST = "127.0.0.1:8765"
 
 
 @dataclass
@@ -898,7 +898,7 @@ def issue_preauth(server: OwnerHTTPServer) -> str:
     )
     assert response.status == 200, payload
     cookies = response_cookies(response)
-    return cookies["__Host-factlane-preauth"]
+    return cookies["factlane-preauth"]
 
 
 def establish_primary_session(server: OwnerHTTPServer, auth: OwnerAuthState):
@@ -910,7 +910,7 @@ def establish_primary_session(server: OwnerHTTPServer, auth: OwnerAuthState):
         "/auth/connect/claim",
         body={"locator": pending.locator},
         headers={"Origin": ORIGIN},
-        cookies={"__Host-factlane-preauth": preauth},
+        cookies={"factlane-preauth": preauth},
     )
     assert response.status == 200, payload
     auth.approve_pending(locator=pending.locator, caller_uid=OWNER_UID)
@@ -920,12 +920,12 @@ def establish_primary_session(server: OwnerHTTPServer, auth: OwnerAuthState):
         "/auth/connect/poll",
         body={"locator": pending.locator},
         headers={"Origin": ORIGIN},
-        cookies={"__Host-factlane-preauth": preauth},
+        cookies={"factlane-preauth": preauth},
     )
     assert response.status == 200, payload
     result = json_payload(payload)
     cookies = response_cookies(response)
-    return cookies["__Host-factlane-session"], str(result["csrf"])
+    return cookies["factlane-session"], str(result["csrf"])
 
 
 def test_service_status_and_stop_require_authenticated_same_origin_csrf_and_exact_envelopes(
@@ -945,7 +945,7 @@ def test_service_status_and_stop_require_authenticated_same_origin_csrf_and_exac
     assert service.status_calls == 0
 
     session, csrf = establish_primary_session(server, auth)
-    cookies = {"__Host-factlane-session": session}
+    cookies = {"factlane-session": session}
 
     response, payload = request(
         server,
@@ -1107,7 +1107,7 @@ def test_setup_routes_require_exact_origin_session_csrf_and_explicit_setup_servi
     assert setup.status_calls == 0
 
     session, csrf = establish_primary_session(server, auth)
-    cookies = {"__Host-factlane-session": session}
+    cookies = {"factlane-session": session}
 
     response, payload = request(
         server,
@@ -1179,7 +1179,7 @@ def test_setup_routes_require_exact_origin_session_csrf_and_explicit_setup_servi
         "/api/setup/status",
         body={"csrf": normal_csrf},
         headers={"Origin": ORIGIN},
-        cookies={"__Host-factlane-session": normal_session},
+        cookies={"factlane-session": normal_session},
     )
     assert response.status == 404
     assert json_payload(payload)["code"] == "NOT_FOUND"
@@ -1194,7 +1194,7 @@ def mint_sensitive_grant(
     preview: str,
 ) -> str:
     headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-    cookies = {"__Host-factlane-session": session}
+    cookies = {"factlane-session": session}
     response, payload = request(
         server,
         "POST",
@@ -1347,7 +1347,7 @@ def test_concurrent_service_calls_share_one_server_async_loop_and_close_stops_it
     try:
         session, csrf = establish_primary_session(server, auth)
         headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-        cookie = {"__Host-factlane-session": session}
+        cookie = {"factlane-session": session}
         statuses: list[int] = []
 
         def invoke() -> None:
@@ -1431,7 +1431,7 @@ def test_service_coroutine_wait_is_bounded_and_timed_out_task_is_cancelled(tmp_p
                 "idempotency_key": "slow-candidate",
             },
             headers={"Origin": ORIGIN, "X-FactLane-CSRF": csrf},
-            cookies={"__Host-factlane-session": session},
+            cookies={"factlane-session": session},
         )
         assert response.status == 504
         assert json_payload(payload)["code"] == "SERVICE_TIMEOUT"
@@ -1488,7 +1488,7 @@ def test_composition_create_use_and_cleanup_share_server_service_loop(tmp_path) 
     try:
         session, csrf = establish_primary_session(server, auth)
         headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-        cookie = {"__Host-factlane-session": session}
+        cookie = {"factlane-session": session}
         statuses: list[int] = []
 
         def invoke(index: int) -> None:
@@ -1724,7 +1724,7 @@ def test_explicit_public_origin_allowlist_preserves_raw_authority_binding_and_pr
 
         primary_session, primary_csrf = establish_primary_session(server, auth)
         primary_headers = {"Origin": ORIGIN, "X-FactLane-CSRF": primary_csrf}
-        primary_cookie = {"__Host-factlane-session": primary_session}
+        primary_cookie = {"factlane-session": primary_session}
 
         response, payload = request(
             server,
@@ -1739,6 +1739,15 @@ def test_explicit_public_origin_allowlist_preserves_raw_authority_binding_and_pr
             },
         )
         assert response.status == 200, payload
+        preauth_headers = set_cookie_headers(response)
+        preauth_header = next(
+            value for value in preauth_headers if value.startswith("__Host-factlane-preauth=")
+        )
+        assert "Secure" in preauth_header
+        assert "HttpOnly" in preauth_header
+        assert "SameSite=Strict" in preauth_header
+        assert "Path=/" in preauth_header
+        assert "Domain=" not in preauth_header
         remote_preauth = response_cookies(response)["__Host-factlane-preauth"]
 
         response, payload = request(
@@ -1806,6 +1815,16 @@ def test_explicit_public_origin_allowlist_preserves_raw_authority_binding_and_pr
         assert response.status == 200, payload
         remote_result = json_payload(payload)
         assert remote_result["primary_local"] is False
+        remote_csrf = str(remote_result["csrf"])
+        session_headers = set_cookie_headers(response)
+        session_header = next(
+            value for value in session_headers if value.startswith("__Host-factlane-session=")
+        )
+        assert "Secure" in session_header
+        assert "HttpOnly" in session_header
+        assert "SameSite=Strict" in session_header
+        assert "Path=/" in session_header
+        assert "Domain=" not in session_header
         remote_session = response_cookies(response)["__Host-factlane-session"]
 
         response, payload = request(
@@ -1816,15 +1835,29 @@ def test_explicit_public_origin_allowlist_preserves_raw_authority_binding_and_pr
             headers={"Host": public_host, "Origin": public_origin},
             cookies={"__Host-factlane-session": remote_session},
         )
-        assert response.status == 200, payload
+        assert response.status == 400
+        assert json_payload(payload)["code"] == "INVALID_ENVELOPE"
 
         response, payload = request(
             server,
             "POST",
             "/auth/session/resume",
-            body={},
-            headers={"Origin": ORIGIN},
+            body={"csrf": remote_csrf},
+            headers={"Host": public_host, "Origin": public_origin},
             cookies={"__Host-factlane-session": remote_session},
+        )
+        assert response.status == 200, payload
+        rotated_remote_csrf = str(json_payload(payload)["csrf"])
+        assert rotated_remote_csrf != remote_csrf
+        assert set_cookie_headers(response) == []
+
+        response, payload = request(
+            server,
+            "POST",
+            "/auth/session/resume",
+            body={"csrf": rotated_remote_csrf},
+            headers={"Origin": ORIGIN},
+            cookies={"factlane-session": remote_session},
         )
         assert response.status == 403
         assert json_payload(payload)["code"] == "SESSION_ORIGIN_MISMATCH"
@@ -1834,10 +1867,26 @@ def test_explicit_public_origin_allowlist_preserves_raw_authority_binding_and_pr
         thread.join(timeout=2)
 
 
-def test_local_connect_poll_sets_secure_host_only_auth_cookies_and_separate_csrf(running_server) -> None:
+def test_local_connect_poll_sets_host_only_non_secure_auth_cookies_and_separate_csrf(running_server) -> None:
     server, auth, _, _, _, confirmation = running_server
     pending = auth.begin_enrollment(caller_uid=OWNER_UID, source="local-launcher", device_label="Primary browser")
-    preauth = issue_preauth(server)
+    response, payload = request(
+        server,
+        "POST",
+        "/auth/preauth",
+        body={},
+        headers={"Origin": ORIGIN},
+    )
+    assert response.status == 200, payload
+    preauth_headers = set_cookie_headers(response)
+    preauth_header = next(value for value in preauth_headers if value.startswith("factlane-preauth="))
+    assert "Secure" not in preauth_header
+    assert "HttpOnly" in preauth_header
+    assert "SameSite=Strict" in preauth_header
+    assert "Path=/" in preauth_header
+    assert "Domain=" not in preauth_header
+    assert "__Host-factlane-preauth=" not in preauth_header
+    preauth = response_cookies(response)["factlane-preauth"]
 
     response, payload = request(
         server,
@@ -1845,7 +1894,7 @@ def test_local_connect_poll_sets_secure_host_only_auth_cookies_and_separate_csrf
         "/auth/connect/claim",
         body={"locator": pending.locator},
         headers={"Origin": ORIGIN},
-        cookies={"__Host-factlane-preauth": preauth},
+        cookies={"factlane-preauth": preauth},
     )
     assert response.status == 200
     assert json_payload(payload)["verification_phrase"] == pending.verification_phrase
@@ -1856,7 +1905,7 @@ def test_local_connect_poll_sets_secure_host_only_auth_cookies_and_separate_csrf
         "/auth/connect/poll",
         body={"locator": pending.locator},
         headers={"Origin": ORIGIN},
-        cookies={"__Host-factlane-preauth": preauth},
+        cookies={"factlane-preauth": preauth},
     )
     assert response.status == 202
 
@@ -1868,7 +1917,7 @@ def test_local_connect_poll_sets_secure_host_only_auth_cookies_and_separate_csrf
         "/auth/connect/poll",
         body={"locator": pending.locator},
         headers={"Origin": ORIGIN},
-        cookies={"__Host-factlane-preauth": preauth},
+        cookies={"factlane-preauth": preauth},
     )
     assert response.status == 200
     result = json_payload(payload)
@@ -1879,27 +1928,28 @@ def test_local_connect_poll_sets_secure_host_only_auth_cookies_and_separate_csrf
     assert "expires_at" not in result
     assert "absolute_expires_at" not in result
     cookie_headers = set_cookie_headers(response)
-    session_header = next(value for value in cookie_headers if value.startswith("__Host-factlane-session="))
-    assert "Secure" in session_header
+    session_header = next(value for value in cookie_headers if value.startswith("factlane-session="))
+    assert "Secure" not in session_header
     assert "HttpOnly" in session_header
     assert "SameSite=Strict" in session_header
     assert "Path=/" in session_header
     assert "Domain=" not in session_header
+    assert "__Host-factlane-session=" not in session_header
     assert result["csrf"] not in session_header
-    session_secret = response_cookies(response)["__Host-factlane-session"]
+    session_secret = response_cookies(response)["factlane-session"]
     assert session_secret.encode("utf-8") not in payload
 
 
 def test_session_resume_rotates_csrf_without_minting_or_resetting_session(running_server) -> None:
     server, auth, _, _, _, _ = running_server
     session, old_csrf = establish_primary_session(server, auth)
-    cookie = {"__Host-factlane-session": session}
+    cookie = {"factlane-session": session}
 
     response, payload = request(
         server,
         "POST",
         "/auth/session/resume",
-        body={},
+        body={"csrf": old_csrf},
         headers={"Origin": "https://wrong.test"},
         cookies=cookie,
     )
@@ -1910,14 +1960,20 @@ def test_session_resume_rotates_csrf_without_minting_or_resetting_session(runnin
         server,
         "POST",
         "/auth/session/resume",
-        body={},
+        body={"csrf": old_csrf},
         headers={"Origin": ORIGIN, "Host": "wrong.test"},
         cookies=cookie,
     )
     assert response.status == 403
     assert json_payload(payload)["code"] == "HOST_DENIED"
 
-    response, payload = request(server, "POST", "/auth/session/resume", body={}, headers={"Origin": ORIGIN})
+    response, payload = request(
+        server,
+        "POST",
+        "/auth/session/resume",
+        body={"csrf": old_csrf},
+        headers={"Origin": ORIGIN},
+    )
     assert response.status == 401
     assert json_payload(payload)["code"] == "AUTH_COOKIE_INVALID"
 
@@ -1927,6 +1983,30 @@ def test_session_resume_rotates_csrf_without_minting_or_resetting_session(runnin
         "POST",
         "/auth/session/resume",
         body={},
+        headers={"Origin": ORIGIN},
+        cookies=cookie,
+    )
+    assert response.status == 400
+    assert json_payload(payload)["code"] == "INVALID_ENVELOPE"
+    assert set(auth._sessions) == sessions_before
+
+    response, payload = request(
+        server,
+        "POST",
+        "/auth/session/resume",
+        body={"csrf": "forged-csrf"},
+        headers={"Origin": ORIGIN},
+        cookies=cookie,
+    )
+    assert response.status == 403
+    assert json_payload(payload)["code"] == "CSRF_INVALID"
+    assert set(auth._sessions) == sessions_before
+
+    response, payload = request(
+        server,
+        "POST",
+        "/auth/session/resume",
+        body={"csrf": old_csrf},
         headers={"Origin": ORIGIN},
         cookies=cookie,
     )
@@ -1991,7 +2071,7 @@ def test_explicit_capabilities_project_to_authenticated_session_and_block_unsupp
             "/auth/connect/claim",
             body={"locator": pending.locator},
             headers={"Origin": ORIGIN},
-            cookies={"__Host-factlane-preauth": preauth},
+            cookies={"factlane-preauth": preauth},
         )
         assert response.status == 200, payload
         auth.approve_pending(locator=pending.locator, caller_uid=OWNER_UID)
@@ -2001,15 +2081,15 @@ def test_explicit_capabilities_project_to_authenticated_session_and_block_unsupp
             "/auth/connect/poll",
             body={"locator": pending.locator},
             headers={"Origin": ORIGIN},
-            cookies={"__Host-factlane-preauth": preauth},
+            cookies={"factlane-preauth": preauth},
         )
         assert response.status == 200, payload
         result = json_payload(payload)
         assert result["capabilities"] == capabilities
-        session = response_cookies(response)["__Host-factlane-session"]
+        session = response_cookies(response)["factlane-session"]
         csrf = str(result["csrf"])
         headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-        cookies = {"__Host-factlane-session": session}
+        cookies = {"factlane-session": session}
 
         response, payload = request(
             server,
@@ -2075,7 +2155,7 @@ def test_supported_capability_with_missing_service_remains_service_unavailable(t
             "/api/database/backup/create",
             body={},
             headers={"Origin": ORIGIN, "X-FactLane-CSRF": csrf},
-            cookies={"__Host-factlane-session": session},
+            cookies={"factlane-session": session},
         )
         assert response.status == 503
         assert json_payload(payload)["code"] == "SERVICE_UNAVAILABLE"
@@ -2096,14 +2176,14 @@ def test_remote_enrollment_and_primary_approval_flow_use_browser_binding_and_sen
         "/auth/enroll/remote",
         body={"device_label": "Remote laptop"},
         headers={"Origin": ORIGIN},
-        cookies={"__Host-factlane-preauth": remote_preauth},
+        cookies={"factlane-preauth": remote_preauth},
     )
     assert response.status == 200, payload
     remote = json_payload(payload)
     locator = str(remote["locator"])
 
     auth_headers = {"Origin": ORIGIN, "X-FactLane-CSRF": primary_csrf}
-    primary_cookie = {"__Host-factlane-session": primary_session}
+    primary_cookie = {"factlane-session": primary_session}
     response, payload = request(
         server,
         "POST",
@@ -2145,7 +2225,7 @@ def test_remote_enrollment_and_primary_approval_flow_use_browser_binding_and_sen
         "/auth/connect/poll",
         body={"locator": locator},
         headers={"Origin": ORIGIN},
-        cookies={"__Host-factlane-preauth": remote_preauth},
+        cookies={"factlane-preauth": remote_preauth},
     )
     assert response.status == 200, payload
     assert json_payload(payload)["primary_local"] is False
@@ -2165,7 +2245,7 @@ def test_owner_wide_discovery_and_search_require_auth_csrf_and_valid_optional_sc
     assert overview.discover_calls == []
 
     session, csrf = establish_primary_session(server, auth)
-    cookie = {"__Host-factlane-session": session}
+    cookie = {"factlane-session": session}
 
     response, _ = request(
         server,
@@ -2259,7 +2339,7 @@ def test_owner_wide_discovery_and_search_require_auth_csrf_and_valid_optional_sc
 def test_authenticated_read_routes_require_csrf_and_exact_scope_before_service_call(running_server) -> None:
     server, auth, overview, control, _, _ = running_server
     session, csrf = establish_primary_session(server, auth)
-    cookie = {"__Host-factlane-session": session}
+    cookie = {"factlane-session": session}
 
     response, _ = request(
         server,
@@ -2369,7 +2449,7 @@ def test_body_limit_and_unsupported_mutation_route_fail_closed(running_server) -
 def test_protected_overview_conflicts_origin_scope_csrf_and_get_mutation_boundaries(running_server) -> None:
     server, auth, overview, control, _, _ = running_server
     session, csrf = establish_primary_session(server, auth)
-    cookie = {"__Host-factlane-session": session}
+    cookie = {"factlane-session": session}
     headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
 
     forged = raw_request(
@@ -2379,7 +2459,7 @@ def test_protected_overview_conflicts_origin_scope_csrf_and_get_mutation_boundar
             f"Host: {HOST}\r\n"
             "Origin: https://forged.test\r\n"
             f"X-FactLane-CSRF: {csrf}\r\n"
-            f"Cookie: __Host-factlane-session={session}\r\n"
+            f"Cookie: factlane-session={session}\r\n"
             "Content-Length: 0\r\n"
             "Connection: close\r\n\r\n"
         ).encode("ascii"),
@@ -2459,7 +2539,7 @@ def test_create_candidate_and_batch_review_forward_exact_kwargs_and_enforce_boun
     server, auth, _, control, _, _ = running_server
     session, csrf = establish_primary_session(server, auth)
     headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-    cookie = {"__Host-factlane-session": session}
+    cookie = {"factlane-session": session}
 
     create_body = {
         "scope": "PROJECT",
@@ -2634,7 +2714,7 @@ def test_nonprogrammer_owner_http_journey_discovers_cross_scope_candidate_and_pr
         thread.start()
 
         session, csrf = establish_primary_session(server, auth)
-        cookies = {"__Host-factlane-session": session}
+        cookies = {"factlane-session": session}
         headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
 
         response, payload = request(
@@ -2732,7 +2812,7 @@ def test_governed_lifecycle_routes_are_explicit_and_resolve_forwards_exact_kwarg
     server, auth, _, control, _, _ = running_server
     session, csrf = establish_primary_session(server, auth)
     headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-    cookie = {"__Host-factlane-session": session}
+    cookie = {"factlane-session": session}
     scope = {"scope": "PROJECT", "project_id": "project-a"}
     common = {
         **scope,
@@ -2818,7 +2898,7 @@ def test_operations_routes_forward_exact_kwargs_and_exclude_destructive_database
     server, auth, _, control, operations, _ = running_server
     session, csrf = establish_primary_session(server, auth)
     headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-    cookie = {"__Host-factlane-session": session}
+    cookie = {"factlane-session": session}
     scoped = {
         "scope": "PROJECT",
         "project_id": "project-a",
@@ -2999,7 +3079,7 @@ def test_protected_routes_mark_user_activity_and_backend_errors_do_not_leak_fact
 
     auth.validate_session = recording_validate  # type: ignore[method-assign]
     headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-    cookie = {"__Host-factlane-session": session}
+    cookie = {"factlane-session": session}
     response, payload = request(
         server,
         "POST",
@@ -3043,7 +3123,7 @@ def test_protected_routes_mark_user_activity_and_backend_errors_do_not_leak_fact
 def test_purge_preview_requires_auth_exact_target_identity_and_returns_server_binding(running_destructive_server) -> None:
     server, auth, destructive = running_destructive_server
     session, csrf = establish_primary_session(server, auth)
-    cookie = {"__Host-factlane-session": session}
+    cookie = {"factlane-session": session}
     operation_id = str(uuid.uuid4())
     body = {"operation_id": operation_id, "targets": [purge_target_body()]}
 
@@ -3087,7 +3167,7 @@ def test_purge_preview_requires_auth_exact_target_identity_and_returns_server_bi
             f"Host: {HOST}\r\n"
             "Origin: https://forged.test\r\n"
             f"X-FactLane-CSRF: {csrf}\r\n"
-            f"Cookie: __Host-factlane-session={session}\r\n"
+            f"Cookie: factlane-session={session}\r\n"
             "Content-Length: 0\r\n"
             "Connection: close\r\n\r\n"
         ).encode("ascii"),
@@ -3148,7 +3228,7 @@ def test_purge_commit_and_recovery_retry_reuse_exact_server_preview(running_dest
     server, auth, destructive = running_destructive_server
     session, csrf = establish_primary_session(server, auth)
     headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-    cookie = {"__Host-factlane-session": session}
+    cookie = {"factlane-session": session}
     operation_id = str(uuid.uuid4())
     preview_response, preview_payload = request(
         server,
@@ -3339,7 +3419,7 @@ def test_purge_recovery_retry_after_new_server_recovers_durable_preview_and_keep
     try:
         session, csrf = establish_primary_session(server, auth)
         headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-        cookie = {"__Host-factlane-session": session}
+        cookie = {"factlane-session": session}
         response, payload = request(
             server,
             "POST",
@@ -3398,7 +3478,7 @@ def test_purge_recovery_retry_after_new_server_recovers_durable_preview_and_keep
     try:
         resumed_session, resumed_csrf = establish_primary_session(resumed_server, resumed_auth)
         resumed_headers = {"Origin": ORIGIN, "X-FactLane-CSRF": resumed_csrf}
-        resumed_cookie = {"__Host-factlane-session": resumed_session}
+        resumed_cookie = {"factlane-session": resumed_session}
         recovery_grant = mint_sensitive_grant(
             resumed_server,
             resumed_auth,
@@ -3461,7 +3541,7 @@ def test_database_json_routes_are_strict_digest_bound_and_jobs_poll_without_acti
     }
     session, csrf = establish_primary_session(server, auth)
     headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-    cookies = {"__Host-factlane-session": session}
+    cookies = {"factlane-session": session}
 
     response, payload = request(server, "POST", "/api/database/artifacts/list", body={}, headers=headers, cookies=cookies)
     assert response.status == 200, payload
@@ -3657,7 +3737,7 @@ def test_database_restore_transport_uses_lazy_fresh_grant_binding_for_commit_and
     server, auth, database = running_database_server
     session, csrf = establish_primary_session(server, auth)
     headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-    cookies = {"__Host-factlane-session": session}
+    cookies = {"factlane-session": session}
     database.invoke_restore_authorize = True
     artifact_id = "restore-artifact"
 
@@ -3748,7 +3828,7 @@ def test_database_restore_boolean_fields_are_strict_and_forwarded(running_databa
     server, auth, database = running_database_server
     session, csrf = establish_primary_session(server, auth)
     headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-    cookies = {"__Host-factlane-session": session}
+    cookies = {"factlane-session": session}
     artifact_id = "restore-artifact"
     operation_id = str(uuid.uuid4())
 
@@ -3823,7 +3903,7 @@ def test_database_restore_boolean_fields_are_strict_and_forwarded(running_databa
 def test_raw_logical_upload_bypasses_json_limit_and_returns_path_free_receipt(running_database_server) -> None:
     server, auth, database = running_database_server
     session, csrf = establish_primary_session(server, auth)
-    cookies = {"__Host-factlane-session": session}
+    cookies = {"factlane-session": session}
     payload = b"x" * (MAX_BODY_BYTES + 1024)
     digest = hashlib.sha256(payload).hexdigest()
     headers = {
@@ -3872,7 +3952,7 @@ def test_raw_logical_upload_bypasses_json_limit_and_returns_path_free_receipt(ru
 def test_raw_upload_rejects_invalid_transport_and_aborts_incomplete_or_stalled_body(running_database_server, monkeypatch) -> None:
     server, auth, database = running_database_server
     session, csrf = establish_primary_session(server, auth)
-    cookie = f"__Host-factlane-session={session}"
+    cookie = f"factlane-session={session}"
     base = (
         f"Host: {HOST}\r\nOrigin: {ORIGIN}\r\nX-FactLane-CSRF: {csrf}\r\nCookie: {cookie}\r\n"
     )
@@ -3953,7 +4033,7 @@ def test_raw_upload_rejects_invalid_transport_and_aborts_incomplete_or_stalled_b
 def test_authenticated_download_denies_before_open_then_streams_exact_verified_handle(running_database_server) -> None:
     server, auth, database = running_database_server
     session, csrf = establish_primary_session(server, auth)
-    cookies = {"__Host-factlane-session": session}
+    cookies = {"factlane-session": session}
     artifact_id = "artifact-safe"
     response, _ = request(
         server,
@@ -4005,7 +4085,7 @@ def test_database_json_routes_reject_unknown_fields_before_facade_calls(running_
     server, auth, database = running_database_server
     session, csrf = establish_primary_session(server, auth)
     headers = {"Origin": ORIGIN, "X-FactLane-CSRF": csrf}
-    cookies = {"__Host-factlane-session": session}
+    cookies = {"factlane-session": session}
     cases = (
         ("/api/database/artifacts/list", {"unexpected": True}),
         ("/api/database/backup/create", {"unexpected": True}),

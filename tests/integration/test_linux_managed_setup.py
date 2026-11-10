@@ -22,6 +22,7 @@ from factlane.webui_install import (
     LinuxSetupRecoveryRequired,
     ManagedServiceActivationResult,
     ManagedServiceActivationStatus,
+    PlannedOperation,
     ProductionLinuxInstallerBackend,
     SetupConsent,
     bootstrap_linux_caddy_root,
@@ -71,19 +72,75 @@ def _consent(*, lingering: bool = False) -> SetupConsent:
     )
 
 
-def test_linux_plan_uses_profile_local_dns_and_ca_bootstrap_without_hosts(tmp_path: Path) -> None:
+def _legacy_browser_receipt(tmp_path: Path):
+    """Build an explicit legacy-browser plan solely for compatibility-path tests.
+
+    New managed setup no longer emits these operations.  The helpers remain
+    shipped for bounded recovery/migration compatibility, so their rollback
+    behavior is tested by constructing the old operation envelope directly
+    instead of coupling current setup planning back to Firefox/CA state.
+    """
+
+    request = _request(tmp_path)
+    receipt = plan_webui_setup(request, _environment(), _consent())
+    assert receipt.plan is not None
+    journal = json.loads(receipt.operations[0].desired_state)
+    journal["browser_family"] = "firefox"
+    journal["browser_executable"] = "/usr/bin/firefox"
+    journal_op = replace(
+        receipt.operations[0],
+        desired_state=json.dumps(journal, sort_keys=True, separators=(",", ":")) + "\n",
+    )
+    caddy_root = str(
+        Path(receipt.plan.caddy_state_dir)
+        / "pki"
+        / "authorities"
+        / "local"
+        / "root.crt"
+    )
+    legacy_ops = (
+        journal_op,
+        PlannedOperation(
+            kind="BOOTSTRAP_CADDY_CA",
+            target=caddy_root,
+            desired_state="legacy compatibility CA bootstrap",
+            consent_key="browser_profile_trust",
+        ),
+        PlannedOperation(
+            kind="ENSURE_ISOLATED_PROFILE_NETWORK",
+            target=request.browser_profile_dir,
+            desired_state="legacy compatibility Firefox network policy",
+            consent_key="hostname_mapping",
+        ),
+        PlannedOperation(
+            kind="ENSURE_ISOLATED_PROFILE_TRUST",
+            target=request.browser_profile_dir,
+            desired_state="legacy compatibility Firefox trust",
+            consent_key="browser_profile_trust",
+        ),
+        *receipt.operations[1:],
+    )
+    plan = replace(
+        receipt.plan,
+        browser=BrowserInstall(family="firefox", executable="/usr/bin/firefox"),
+        operations=legacy_ops,
+    )
+    return request, replace(receipt, plan=plan)
+
+
+def test_linux_plan_is_browser_neutral_loopback_without_hosts_or_private_ca(tmp_path: Path) -> None:
     request = _request(tmp_path)
     receipt = plan_webui_setup(request, _environment(), _consent())
 
     assert receipt.status == "READY_TO_APPLY"
     kinds = [operation.kind for operation in receipt.operations]
     assert "ENSURE_HOSTNAME_MAPPING" not in kinds
-    assert kinds[:4] == [
-        "PERSIST_PROVISIONAL_SETUP",
-        "BOOTSTRAP_CADDY_CA",
-        "ENSURE_ISOLATED_PROFILE_NETWORK",
-        "ENSURE_ISOLATED_PROFILE_TRUST",
-    ]
+    assert "BOOTSTRAP_CADDY_CA" not in kinds
+    assert "ENSURE_ISOLATED_PROFILE_NETWORK" not in kinds
+    assert "ENSURE_ISOLATED_PROFILE_TRUST" not in kinds
+    assert receipt.plan is not None
+    assert receipt.plan.browser is None
+    assert receipt.plan.origin == "http://127.0.0.1:8765"
     assert all(operation.target != "/etc/hosts" for operation in receipt.operations)
 
 
@@ -1003,8 +1060,7 @@ def test_service_enable_retry_infers_crash_after_enable_without_repeating_mutati
 def test_caddy_create_intent_recovers_empty_unreceipted_directory_and_durable_rollback(
     tmp_path: Path,
 ) -> None:
-    request = _request(tmp_path)
-    receipt = plan_webui_setup(request, _environment(), _consent())
+    request, receipt = _legacy_browser_receipt(tmp_path)
     assert receipt.plan is not None
     journal_op = receipt.operations[0]
     caddy_op = next(op for op in receipt.operations if op.kind == "BOOTSTRAP_CADDY_CA")
@@ -1076,8 +1132,7 @@ def test_caddy_create_intent_recovers_empty_unreceipted_directory_and_durable_ro
 def test_caddy_rollback_preserves_unrelated_state_and_requires_recovery(
     tmp_path: Path,
 ) -> None:
-    request = _request(tmp_path)
-    receipt = plan_webui_setup(request, _environment(), _consent())
+    request, receipt = _legacy_browser_receipt(tmp_path)
     assert receipt.plan is not None
     journal_op = receipt.operations[0]
     caddy_op = next(op for op in receipt.operations if op.kind == "BOOTSTRAP_CADDY_CA")
@@ -1134,8 +1189,7 @@ def test_caddy_rollback_preserves_unrelated_state_and_requires_recovery(
 def test_caddy_rollback_removes_exact_runtime_certificate_state_and_empty_locks(
     tmp_path: Path,
 ) -> None:
-    request = _request(tmp_path)
-    receipt = plan_webui_setup(request, _environment(), _consent())
+    request, receipt = _legacy_browser_receipt(tmp_path)
     assert receipt.plan is not None
     journal_op = receipt.operations[0]
     caddy_op = next(op for op in receipt.operations if op.kind == "BOOTSTRAP_CADDY_CA")
@@ -1212,8 +1266,7 @@ def test_caddy_rollback_removes_exact_runtime_certificate_state_and_empty_locks(
 
 
 def test_caddy_rollback_rejects_foreign_last_clean_marker(tmp_path: Path) -> None:
-    request = _request(tmp_path)
-    receipt = plan_webui_setup(request, _environment(), _consent())
+    request, receipt = _legacy_browser_receipt(tmp_path)
     assert receipt.plan is not None
     journal_op = receipt.operations[0]
     caddy_op = next(op for op in receipt.operations if op.kind == "BOOTSTRAP_CADDY_CA")
@@ -1273,8 +1326,7 @@ def test_caddy_rollback_rejects_foreign_last_clean_marker(tmp_path: Path) -> Non
 def test_caddy_rollback_rejects_foreign_runtime_certificate_state(
     tmp_path: Path,
 ) -> None:
-    request = _request(tmp_path)
-    receipt = plan_webui_setup(request, _environment(), _consent())
+    request, receipt = _legacy_browser_receipt(tmp_path)
     assert receipt.plan is not None
     journal_op = receipt.operations[0]
     caddy_op = next(op for op in receipt.operations if op.kind == "BOOTSTRAP_CADDY_CA")
@@ -1857,8 +1909,7 @@ def test_preexisting_current_boot_stop_blocks_candidate_start(
 def test_profile_and_user_js_intents_recover_exact_interrupted_state_and_rollback(
     tmp_path: Path,
 ) -> None:
-    request = _request(tmp_path)
-    receipt = plan_webui_setup(request, _environment(), _consent())
+    request, receipt = _legacy_browser_receipt(tmp_path)
     assert receipt.plan is not None
     journal_op = receipt.operations[0]
     network_op = next(
@@ -1919,8 +1970,7 @@ def test_profile_and_user_js_intents_recover_exact_interrupted_state_and_rollbac
 def test_profile_create_intent_recovers_empty_directory_created_before_receipt(
     tmp_path: Path,
 ) -> None:
-    request = _request(tmp_path)
-    receipt = plan_webui_setup(request, _environment(), _consent())
+    request, receipt = _legacy_browser_receipt(tmp_path)
     assert receipt.plan is not None
     journal_op = receipt.operations[0]
     network_op = next(
@@ -1957,8 +2007,7 @@ def test_profile_create_intent_recovers_empty_directory_created_before_receipt(
 def test_partial_nss_creation_retries_from_durable_intent_and_new_backend_rollback_uses_journal(
     tmp_path: Path,
 ) -> None:
-    request = _request(tmp_path)
-    receipt = plan_webui_setup(request, _environment(), _consent())
+    request, receipt = _legacy_browser_receipt(tmp_path)
     assert receipt.plan is not None
     journal_op = receipt.operations[0]
     network_op = next(
@@ -2044,8 +2093,7 @@ def test_partial_nss_creation_retries_from_durable_intent_and_new_backend_rollba
 def test_trust_import_without_manifest_recovers_only_with_prior_durable_intent(
     tmp_path: Path,
 ) -> None:
-    request = _request(tmp_path)
-    receipt = plan_webui_setup(request, _environment(), _consent())
+    request, receipt = _legacy_browser_receipt(tmp_path)
     assert receipt.plan is not None
     journal_op = receipt.operations[0]
     network_op = next(
@@ -2107,8 +2155,7 @@ def test_trust_import_without_manifest_recovers_only_with_prior_durable_intent(
 def test_interrupted_nss_state_without_prior_intent_is_foreign_and_preserved(
     tmp_path: Path,
 ) -> None:
-    request = _request(tmp_path)
-    receipt = plan_webui_setup(request, _environment(), _consent())
+    request, receipt = _legacy_browser_receipt(tmp_path)
     assert receipt.plan is not None
     journal_op = receipt.operations[0]
     network_op = next(

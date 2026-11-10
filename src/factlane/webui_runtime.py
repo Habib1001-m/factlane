@@ -64,6 +64,7 @@ class PlatformKind(str, Enum):
 class BackendTransportKind(str, Enum):
     AF_UNIX = "AF_UNIX"
     WINDOWS_HTTPS = "WINDOWS_HTTPS"
+    WINDOWS_HTTP = "WINDOWS_HTTP"
 
 
 class RuntimeOutcomeState(str, Enum):
@@ -169,8 +170,27 @@ class WebUIRuntimeConfig:
                 raise RuntimeConfigError("backend_socket must name a socket path inside runtime_dir")
             return
 
-        if backend_transport is not BackendTransportKind.WINDOWS_HTTPS:
-            raise RuntimeConfigError("Windows runtime requires WINDOWS_HTTPS backend transport")
+        if backend_transport not in {
+            BackendTransportKind.WINDOWS_HTTP,
+            BackendTransportKind.WINDOWS_HTTPS,
+        }:
+            raise RuntimeConfigError("Windows runtime requires a managed loopback backend transport")
+        parsed_origin = urlsplit(self.origin)
+        if (
+            backend_transport is BackendTransportKind.WINDOWS_HTTP
+            and not (
+                parsed_origin.scheme == "http"
+                and parsed_origin.hostname == "127.0.0.1"
+            )
+        ):
+            raise RuntimeConfigError(
+                "WINDOWS_HTTP requires the canonical 127.0.0.1 HTTP origin"
+            )
+        if (
+            backend_transport is BackendTransportKind.WINDOWS_HTTPS
+            and parsed_origin.scheme != "https"
+        ):
+            raise RuntimeConfigError("WINDOWS_HTTPS requires a managed HTTPS origin")
         if self.backend_socket is not None or self.caddy_path is not None or self.caddyfile is not None:
             raise RuntimeConfigError(
                 "Windows backend-owned HTTPS transport must not configure backend_socket or Caddy paths"
@@ -714,21 +734,33 @@ def _validate_origin(origin: str) -> None:
         port = parsed.port
     except ValueError as exc:
         raise RuntimeConfigError("origin contains an invalid port") from exc
+    local_http = (
+        parsed.scheme == "http"
+        and parsed.hostname == "127.0.0.1"
+        and port is not None
+        and _PORT_MIN <= port <= _PORT_MAX
+        and origin == f"http://127.0.0.1:{port}"
+    )
+    legacy_https = (
+        parsed.scheme == "https"
+        and parsed.hostname is not None
+        and port is not None
+        and _PORT_MIN <= port <= _PORT_MAX
+        and _HOST_RE.fullmatch(parsed.hostname) is not None
+        and origin == f"https://{parsed.hostname}:{port}"
+    )
     if (
-        parsed.scheme != "https"
-        or parsed.hostname is None
+        parsed.hostname is None
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path
         or parsed.query
         or parsed.fragment
-        or port is None
-        or not _PORT_MIN <= port <= _PORT_MAX
-        or _HOST_RE.fullmatch(parsed.hostname) is None
+        or not (local_http or legacy_https)
     ):
-        raise RuntimeConfigError("origin must be one exact FactLane HTTPS .test origin on the saved port range")
-    if origin != f"https://{parsed.hostname}:{port}":
-        raise RuntimeConfigError("origin must use the canonical exact FactLane HTTPS origin form")
+        raise RuntimeConfigError(
+            "origin must be canonical FactLane loopback HTTP or legacy managed HTTPS"
+        )
 
 
 def _validate_public_origin(origin: str) -> None:

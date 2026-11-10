@@ -47,8 +47,10 @@ UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 LOGICAL_IMPORT_UPLOAD_MAX_BYTES = 10 * 1024 * 1024
 RESTORE_UPLOAD_MAX_BYTES = 1024 * 1024 * 1024
 
-PREAUTH_COOKIE = "__Host-factlane-preauth"
-SESSION_COOKIE = "__Host-factlane-session"
+LOCAL_PREAUTH_COOKIE = "factlane-preauth"
+LOCAL_SESSION_COOKIE = "factlane-session"
+SECURE_PREAUTH_COOKIE = "__Host-factlane-preauth"
+SECURE_SESSION_COOKIE = "__Host-factlane-session"
 CSRF_HEADER = "X-FactLane-CSRF"
 
 _CSP = (
@@ -581,23 +583,38 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, _OwnerUnixStreamServer):
     @staticmethod
     def _validate_configured_origin(origin: str) -> tuple[str, str]:
         if not isinstance(origin, str) or not origin or len(origin) > 2048:
-            raise ValueError("origin must be a bounded HTTPS origin")
+            raise ValueError("origin must be a bounded exact origin")
         parsed = urlsplit(origin)
         try:
-            parsed.port
+            port = parsed.port
         except ValueError as exc:
             raise ValueError("origin contains an invalid port") from exc
-        if (
-            parsed.scheme != "https"
-            or not parsed.netloc
+        common_invalid = (
+            not parsed.netloc
             or parsed.hostname is None
             or parsed.username is not None
             or parsed.password is not None
             or parsed.path
             or parsed.query
             or parsed.fragment
-        ):
-            raise ValueError("origin must be an exact HTTPS origin without path, query, or fragment")
+        )
+        local_http = (
+            parsed.scheme == "http"
+            and parsed.hostname == "127.0.0.1"
+            and port is not None
+            and 8765 <= port <= 8774
+            and origin == f"http://127.0.0.1:{port}"
+        )
+        exact_https = (
+            parsed.scheme == "https"
+            and parsed.hostname is not None
+            and origin
+            == f"https://{parsed.hostname}" + (f":{port}" if port is not None else "")
+        )
+        if common_invalid or not (local_http or exact_https):
+            raise ValueError(
+                "origin must be exact HTTPS or the canonical FactLane loopback HTTP origin"
+            )
         return origin, parsed.netloc
 
     @classmethod
@@ -794,7 +811,13 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, _OwnerUnixStreamServer):
                 handler,
                 200,
                 {"status": "OK"},
-                extra_headers={"Set-Cookie": self._cookie(PREAUTH_COOKIE, preauth)},
+                extra_headers={
+                    "Set-Cookie": self._cookie(
+                        self._preauth_cookie_name(handler),
+                        preauth,
+                        secure=self._request_cookie_secure(handler),
+                    )
+                },
             )
             return
 
@@ -849,7 +872,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, _OwnerUnixStreamServer):
         if path == "/auth/connect/claim":
             self._only_fields(body, {"locator"})
             locator = self._required_string(body, "locator", 512)
-            preauth = self._required_cookie(handler, PREAUTH_COOKIE)
+            preauth = self._required_cookie(handler, self._preauth_cookie_name(handler))
             claim = self.auth_state.claim_pending(
                 locator=locator,
                 origin=self._request_origin(handler),
@@ -861,7 +884,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, _OwnerUnixStreamServer):
         if path == "/auth/enroll/remote":
             self._only_fields(body, {"device_label"})
             device_label = self._required_string(body, "device_label", 256)
-            preauth = self._required_cookie(handler, PREAUTH_COOKIE)
+            preauth = self._required_cookie(handler, self._preauth_cookie_name(handler))
             claim = self.auth_state.begin_remote_enrollment(
                 source="AF_UNIX_BROWSER",
                 device_label=device_label,
@@ -874,7 +897,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, _OwnerUnixStreamServer):
         if path == "/auth/connect/poll":
             self._only_fields(body, {"locator"})
             locator = self._required_string(body, "locator", 512)
-            preauth = self._required_cookie(handler, PREAUTH_COOKIE)
+            preauth = self._required_cookie(handler, self._preauth_cookie_name(handler))
             credentials = self.auth_state.poll_pending(
                 locator=locator,
                 origin=self._request_origin(handler),
@@ -884,8 +907,21 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, _OwnerUnixStreamServer):
                 self._json(handler, 202, {"status": "PENDING"})
                 return
             headers = [
-                ("Set-Cookie", self._cookie(SESSION_COOKIE, credentials.session_secret)),
-                ("Set-Cookie", self._clear_cookie(PREAUTH_COOKIE)),
+                (
+                    "Set-Cookie",
+                    self._cookie(
+                        self._session_cookie_name(handler),
+                        credentials.session_secret,
+                        secure=self._request_cookie_secure(handler),
+                    ),
+                ),
+                (
+                    "Set-Cookie",
+                    self._clear_cookie(
+                        self._preauth_cookie_name(handler),
+                        secure=self._request_cookie_secure(handler),
+                    ),
+                ),
             ]
             self._json(
                 handler,
@@ -896,11 +932,13 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, _OwnerUnixStreamServer):
             return
 
         if path == "/auth/session/resume":
-            self._only_fields(body, set())
-            session_secret = self._required_cookie(handler, SESSION_COOKIE)
+            self._only_fields(body, {"csrf"})
+            session_secret = self._required_cookie(handler, self._session_cookie_name(handler))
+            csrf_secret = self._required_string(body, "csrf", 512)
             credentials = self.auth_state.resume_session(
                 session_secret=session_secret,
                 origin=self._request_origin(handler),
+                csrf_secret=csrf_secret,
             )
             self._json(handler, 200, self._browser_session_payload(credentials))
             return
@@ -913,7 +951,12 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, _OwnerUnixStreamServer):
                 handler,
                 200,
                 {"status": "OK"},
-                extra_headers={"Set-Cookie": self._clear_cookie(SESSION_COOKIE)},
+                extra_headers={
+                    "Set-Cookie": self._clear_cookie(
+                        self._session_cookie_name(handler),
+                        secure=self._request_cookie_secure(handler),
+                    )
+                },
             )
             return
 
@@ -2406,7 +2449,7 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, _OwnerUnixStreamServer):
         *,
         user_activity: bool = True,
     ) -> tuple[str, str]:
-        session = self._required_cookie(handler, SESSION_COOKIE)
+        session = self._required_cookie(handler, self._session_cookie_name(handler))
         header_values = handler.headers.get_all(CSRF_HEADER, failobj=[])
         if len(header_values) > 1:
             raise _HTTPFailure(403, "CSRF_INVALID")
@@ -2671,27 +2714,46 @@ class OwnerHTTPServer(socketserver.ThreadingMixIn, _OwnerUnixStreamServer):
         return parsed
 
     @staticmethod
-    def _cookie(name: str, value: str) -> str:
+    def _cookie(name: str, value: str, *, secure: bool) -> str:
         cookie = SimpleCookie()
         cookie[name] = value
         morsel = cookie[name]
         morsel["path"] = "/"
-        morsel["secure"] = True
+        if secure:
+            morsel["secure"] = True
         morsel["httponly"] = True
         morsel["samesite"] = "Strict"
         return morsel.OutputString()
 
     @staticmethod
-    def _clear_cookie(name: str) -> str:
+    def _clear_cookie(name: str, *, secure: bool) -> str:
         cookie = SimpleCookie()
         cookie[name] = ""
         morsel = cookie[name]
         morsel["path"] = "/"
-        morsel["secure"] = True
+        if secure:
+            morsel["secure"] = True
         morsel["httponly"] = True
         morsel["samesite"] = "Strict"
         morsel["max-age"] = 0
         return morsel.OutputString()
+
+    def _request_cookie_secure(self, handler: _OwnerHTTPRequestHandler) -> bool:
+        return self._request_origin(handler).startswith("https://")
+
+    def _preauth_cookie_name(self, handler: _OwnerHTTPRequestHandler) -> str:
+        return (
+            SECURE_PREAUTH_COOKIE
+            if self._request_cookie_secure(handler)
+            else LOCAL_PREAUTH_COOKIE
+        )
+
+    def _session_cookie_name(self, handler: _OwnerHTTPRequestHandler) -> str:
+        return (
+            SECURE_SESSION_COOKIE
+            if self._request_cookie_secure(handler)
+            else LOCAL_SESSION_COOKIE
+        )
 
     @staticmethod
     def _required_cookie(handler: _OwnerHTTPRequestHandler, name: str) -> str:
@@ -2819,7 +2881,13 @@ class _HTTPFailure(Exception):
 
 
 class WindowsOwnerHTTPServer(OwnerHTTPServer):
-    """Owner HTTP policy served directly over loopback TLS on native Windows."""
+    """Owner HTTP policy served directly on native-Windows loopback.
+
+    New managed installs use canonical ``http://127.0.0.1:<port>`` so the Owner
+    can choose any browser without browser-local trust material.  The optional
+    TLS path remains for backward-compatible loading of pre-migration managed
+    configurations until governed setup rewrites them.
+    """
 
     address_family = socket.AF_INET
     socket_type = socket.SOCK_STREAM
@@ -2831,7 +2899,7 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
         *,
         origin: str,
         public_origins: tuple[str, ...] | list[str] = (),
-        tls_context: ssl.SSLContext,
+        tls_context: ssl.SSLContext | None,
         auth_state: OwnerAuthState,
         overview_service: OwnerOverviewLike | None = None,
         control_service: OwnerControlLike | None = None,
@@ -2846,14 +2914,17 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
         queue_size: int = DEFAULT_QUEUE_SIZE,
         request_timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
     ) -> None:
-        if not isinstance(tls_context, ssl.SSLContext):
-            raise TypeError("tls_context must be an SSLContext")
-        if tls_context.protocol == ssl.PROTOCOL_TLS_CLIENT:
-            raise ValueError("tls_context must support server-side TLS")
-        if tls_context.minimum_version < ssl.TLSVersion.TLSv1_2:
-            tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
-
         self.origin, self.host, self.hostname, self.origin_port = self._validate_windows_origin(origin)
+        self._uses_tls = self.origin.startswith("https://")
+        if self._uses_tls:
+            if not isinstance(tls_context, ssl.SSLContext):
+                raise TypeError("legacy HTTPS origin requires an SSLContext")
+            if tls_context.protocol == ssl.PROTOCOL_TLS_CLIENT:
+                raise ValueError("tls_context must support server-side TLS")
+            if tls_context.minimum_version < ssl.TLSVersion.TLSv1_2:
+                tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        elif tls_context is not None:
+            raise ValueError("loopback HTTP origin must not configure TLS context")
         self.public_origins, self._origin_by_host = self._validate_origin_allowlist(
             self.origin,
             self.host,
@@ -2906,7 +2977,7 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
         self._purge_previews: dict[str, PurgePreview] = {}
         self._purge_preview_lock = threading.Lock()
         self._tls_context = tls_context
-        self._previous_sni_callback = tls_context.sni_callback
+        self._previous_sni_callback = tls_context.sni_callback if tls_context is not None else None
         self._installed_sni_callback: Callable[[ssl.SSLSocket, str | None, ssl.SSLContext], Any] | None = None
 
         socketserver.TCPServer.__init__(
@@ -2918,7 +2989,8 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
         try:
             self.server_bind()
             self.server_activate()
-            self._install_sni_guard()
+            if self._uses_tls:
+                self._install_sni_guard()
             self._async_runner = _AsyncServiceRunner(timeout_seconds=self.request_timeout_seconds)
         except BaseException:
             self._restore_sni_callback()
@@ -2931,14 +3003,30 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
         parsed = urlsplit(exact_origin)
         hostname = parsed.hostname
         port = parsed.port
+        local_http = (
+            parsed.scheme == "http"
+            and hostname == "127.0.0.1"
+            and port is not None
+            and 8765 <= port <= 8774
+            and exact_origin == f"http://127.0.0.1:{port}"
+        )
+        legacy_https = (
+            parsed.scheme == "https"
+            and hostname is not None
+            and port is not None
+            and 8765 <= port <= 8774
+            and _WINDOWS_OWNER_HOST_RE.fullmatch(hostname) is not None
+            and exact_origin == f"https://{hostname}:{port}"
+        )
         if (
             hostname is None
             or port is None
             or not 1 <= port <= 65535
-            or _WINDOWS_OWNER_HOST_RE.fullmatch(hostname) is None
-            or exact_origin != f"https://{hostname}:{port}"
+            or not (local_http or legacy_https)
         ):
-            raise ValueError("origin must be one canonical factlane-<id>.test HTTPS origin with an explicit port")
+            raise ValueError(
+                "origin must be canonical FactLane loopback HTTP or legacy managed HTTPS"
+            )
         return exact_origin, host, hostname, port
 
     def server_bind(self) -> None:
@@ -2953,6 +3041,8 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
             raise OSError("Windows Owner HTTP listener did not bind the exact loopback origin port")
 
     def _install_sni_guard(self) -> None:
+        if self._tls_context is None:
+            return
         expected_hostname = self.hostname
         previous_callback = self._previous_sni_callback
 
@@ -2971,14 +3061,19 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
         self._tls_context.set_servername_callback(require_exact_sni)
 
     def _restore_sni_callback(self) -> None:
+        if self._tls_context is None:
+            return
         installed = self._installed_sni_callback
         if installed is not None and self._tls_context.sni_callback is installed:
             self._tls_context.set_servername_callback(self._previous_sni_callback)
         self._installed_sni_callback = None
 
-    def get_request(self) -> tuple[ssl.SSLSocket, Any]:
+    def get_request(self) -> tuple[socket.socket, Any]:
         request, client_address = socketserver.TCPServer.get_request(self)
         request.settimeout(self.request_timeout_seconds)
+        if not self._uses_tls:
+            return request, client_address
+        assert self._tls_context is not None
         try:
             tls_request = self._tls_context.wrap_socket(
                 request,
@@ -2991,7 +3086,7 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
         tls_request.settimeout(self.request_timeout_seconds)
         return tls_request, client_address
 
-    def process_request(self, request: ssl.SSLSocket, client_address: Any) -> None:
+    def process_request(self, request: socket.socket, client_address: Any) -> None:
         if not self._worker_slots.acquire(blocking=False):
             self.shutdown_request(request)
             return
@@ -3002,13 +3097,17 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
             self.shutdown_request(request)
             raise
 
-    def process_request_thread(self, request: ssl.SSLSocket, client_address: Any) -> None:
+    def process_request_thread(self, request: socket.socket, client_address: Any) -> None:
         try:
-            try:
-                request.do_handshake()
-            except (OSError, ssl.SSLError):
-                self.shutdown_request(request)
-                return
+            if self._uses_tls:
+                if not isinstance(request, ssl.SSLSocket):
+                    self.shutdown_request(request)
+                    return
+                try:
+                    request.do_handshake()
+                except (OSError, ssl.SSLError):
+                    self.shutdown_request(request)
+                    return
             socketserver.ThreadingMixIn.process_request_thread(self, request, client_address)
         finally:
             self._worker_slots.release()
@@ -3016,17 +3115,20 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
     def probe_ready(
         self,
         *,
-        trust_context: ssl.SSLContext,
+        trust_context: ssl.SSLContext | None,
         timeout_seconds: float = 1.0,
     ) -> bool:
-        """Verify the exact loopback TLS/SNI/Host transport and health route."""
+        """Verify the exact loopback Host transport and health route."""
 
-        if not isinstance(trust_context, ssl.SSLContext):
-            raise TypeError("trust_context must be an SSLContext")
-        if trust_context.verify_mode != ssl.CERT_REQUIRED or not trust_context.check_hostname:
-            raise ValueError("trust_context must require certificate and hostname verification")
-        if trust_context.minimum_version < ssl.TLSVersion.TLSv1_2:
-            trust_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        if self._uses_tls:
+            if not isinstance(trust_context, ssl.SSLContext):
+                raise TypeError("legacy HTTPS readiness requires an SSLContext")
+            if trust_context.verify_mode != ssl.CERT_REQUIRED or not trust_context.check_hostname:
+                raise ValueError("trust_context must require certificate and hostname verification")
+            if trust_context.minimum_version < ssl.TLSVersion.TLSv1_2:
+                trust_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        elif trust_context is not None:
+            raise ValueError("loopback HTTP readiness must not configure trust context")
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
@@ -3039,19 +3141,28 @@ class WindowsOwnerHTTPServer(OwnerHTTPServer):
         try:
             with socket.create_connection(("127.0.0.1", self.origin_port), timeout=timeout) as raw:
                 raw.settimeout(timeout)
-                with trust_context.wrap_socket(raw, server_hostname=self.hostname) as tls_socket:
-                    tls_socket.settimeout(timeout)
-                    tls_socket.sendall(
+                stream: socket.socket | ssl.SSLSocket = raw
+                wrapped: ssl.SSLSocket | None = None
+                if self._uses_tls:
+                    assert trust_context is not None
+                    wrapped = trust_context.wrap_socket(raw, server_hostname=self.hostname)
+                    wrapped.settimeout(timeout)
+                    stream = wrapped
+                try:
+                    stream.sendall(
                         (
                             "GET /health HTTP/1.1\r\n"
                             f"Host: {self.host}\r\n"
                             "Connection: close\r\n\r\n"
                         ).encode("ascii")
                     )
-                    response = HTTPResponse(tls_socket)
+                    response = HTTPResponse(stream)
                     response.begin()
                     payload = response.read(MAX_BODY_BYTES)
                     return response.status == 200 and payload == b'{"status":"OK"}'
+                finally:
+                    if wrapped is not None:
+                        wrapped.close()
         except (HTTPException, OSError, ssl.SSLError):
             return False
 

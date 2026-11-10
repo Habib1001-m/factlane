@@ -13,7 +13,7 @@ from factlane.owner_auth import (
 
 
 OWNER_UID = 1000
-ORIGIN = "https://factlane-test.test:8765"
+ORIGIN = "http://127.0.0.1:8765"
 REMOTE_ORIGIN = "https://factlane.example.test"
 
 
@@ -579,7 +579,21 @@ def test_session_resume_rotates_only_csrf_without_renewing_session_or_idle_ttl()
     primary_local = session.primary_local
 
     clock.advance(123)
-    resumed = state.resume_session(session_secret=credentials.session_secret, origin=ORIGIN)
+    original_csrf_digest = session.csrf_digest
+    with pytest.raises(AuthError) as exc_info:
+        state.resume_session(
+            session_secret=credentials.session_secret,
+            origin=ORIGIN,
+            csrf_secret="stolen-cookie-without-current-csrf",
+        )
+    assert_error_code(exc_info, "CSRF_INVALID")
+    assert session.csrf_digest == original_csrf_digest
+
+    resumed = state.resume_session(
+        session_secret=credentials.session_secret,
+        origin=ORIGIN,
+        csrf_secret=credentials.csrf_secret,
+    )
 
     assert len(state._sessions) == 1
     assert next(iter(state._sessions)) == digest
@@ -611,18 +625,30 @@ def test_session_resume_rotates_only_csrf_without_renewing_session_or_idle_ttl()
     )
 
     with pytest.raises(AuthError) as exc_info:
-        state.resume_session(session_secret=credentials.session_secret, origin="https://other.example.test")
+        state.resume_session(
+            session_secret=credentials.session_secret,
+            origin="https://other.example.test",
+            csrf_secret=resumed.csrf_secret,
+        )
     assert_error_code(exc_info, "SESSION_ORIGIN_MISMATCH")
 
     clock.advance(1_677)
     with pytest.raises(AuthError) as exc_info:
-        state.resume_session(session_secret=credentials.session_secret, origin=ORIGIN)
+        state.resume_session(
+            session_secret=credentials.session_secret,
+            origin=ORIGIN,
+            csrf_secret=resumed.csrf_secret,
+        )
     assert_error_code(exc_info, "SESSION_EXPIRED")
 
     fresh = enroll(state)
     state.invalidate_all_sessions_after_maintenance()
     with pytest.raises(AuthError) as exc_info:
-        state.resume_session(session_secret=fresh.session_secret, origin=ORIGIN)
+        state.resume_session(
+            session_secret=fresh.session_secret,
+            origin=ORIGIN,
+            csrf_secret=fresh.csrf_secret,
+        )
     assert_error_code(exc_info, "SESSION_INVALID")
 
 

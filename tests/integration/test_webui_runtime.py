@@ -132,14 +132,14 @@ def _windows_payload(*, memory_configured: bool = True) -> dict[str, object]:
         "db": r"C:\Users\Owner\AppData\Local\FactLane\memory.db" if memory_configured else None,
         "profile": "nomic-768" if memory_configured else None,
         "host_id": "owner-host-win" if memory_configured else None,
-        "origin": "https://factlane-a1b2c3.test:8767",
+        "origin": "http://127.0.0.1:8767",
         "backend_socket": None,
         "caddy_path": None,
         "caddyfile": None,
         "runtime_dir": r"C:\Users\Owner\AppData\Local\FactLane\runtime",
         "state_dir": r"C:\Users\Owner\AppData\Local\FactLane\state",
         "platform_kind": "WINDOWS",
-        "backend_transport": "WINDOWS_HTTPS",
+        "backend_transport": "WINDOWS_HTTP",
     }
 
 
@@ -278,14 +278,14 @@ def test_legacy_linux_config_schema_remains_explicitly_linux_af_unix_without_hos
     assert config.public_origins == ()
 
 
-def test_windows_native_config_constructs_and_loads_with_backend_owned_https_on_linux_host(tmp_path: Path) -> None:
+def test_windows_native_config_constructs_and_loads_with_browser_neutral_loopback_http_on_linux_host(tmp_path: Path) -> None:
     payload = _windows_payload()
     direct = WebUIRuntimeConfig(**payload)  # type: ignore[arg-type]
     loaded = load_runtime_config(_write_windows_config(tmp_path, payload=payload))
 
     for config in (direct, loaded):
         assert config.platform_kind is PlatformKind.WINDOWS
-        assert config.backend_transport is BackendTransportKind.WINDOWS_HTTPS
+        assert config.backend_transport is BackendTransportKind.WINDOWS_HTTP
         assert config.db == r"C:\Users\Owner\AppData\Local\FactLane\memory.db"
         assert config.runtime_dir == r"C:\Users\Owner\AppData\Local\FactLane\runtime"
         assert config.state_dir == r"C:\Users\Owner\AppData\Local\FactLane\state"
@@ -329,13 +329,29 @@ def test_windows_native_config_requires_explicit_complete_platform_transport_con
 
     fake_unix = _windows_payload()
     fake_unix["backend_transport"] = "AF_UNIX"
-    with pytest.raises(RuntimeConfigError, match="WINDOWS_HTTPS"):
+    with pytest.raises(RuntimeConfigError, match="managed loopback"):
         load_runtime_config(_write_windows_config(tmp_path, payload=fake_unix))
 
     fake_socket = _windows_payload()
     fake_socket["backend_socket"] = r"C:\FactLane\owner-http.sock"
     with pytest.raises(RuntimeConfigError, match="must be null"):
         load_runtime_config(_write_windows_config(tmp_path, payload=fake_socket))
+
+    wrong_transport_origin = _windows_payload()
+    wrong_transport_origin["backend_transport"] = "WINDOWS_HTTPS"
+    with pytest.raises(RuntimeConfigError, match="WINDOWS_HTTPS"):
+        load_runtime_config(_write_windows_config(tmp_path, payload=wrong_transport_origin))
+
+
+def test_windows_legacy_https_runtime_config_remains_loadable_for_governed_migration(tmp_path: Path) -> None:
+    payload = _windows_payload()
+    payload["origin"] = "https://factlane-a1b2c3.test:8767"
+    payload["backend_transport"] = "WINDOWS_HTTPS"
+
+    loaded = load_runtime_config(_write_windows_config(tmp_path, payload=payload))
+
+    assert loaded.backend_transport is BackendTransportKind.WINDOWS_HTTPS
+    assert loaded.origin == "https://factlane-a1b2c3.test:8767"
 
 
 def test_config_loader_accepts_absent_memory_selection_as_one_null_trio(tmp_path: Path) -> None:
@@ -486,7 +502,7 @@ def test_runner_can_supervise_backend_owned_transport_without_external_gateway(t
     assert backend.drain_calls == 1
 
 
-def test_runner_launches_windows_backend_owned_https_without_caddy_or_fake_unix_socket(tmp_path: Path) -> None:
+def test_runner_launches_windows_backend_owned_loopback_http_without_caddy_or_fake_unix_socket(tmp_path: Path) -> None:
     clock = _Clock()
     backend = _Backend()
     backend.clock = clock
@@ -515,7 +531,7 @@ def test_runner_launches_windows_backend_owned_https_without_caddy_or_fake_unix_
     assert len(backend_specs) == 1
     spec = backend_specs[0]
     assert spec.platform_kind is PlatformKind.WINDOWS
-    assert spec.backend_transport is BackendTransportKind.WINDOWS_HTTPS
+    assert spec.backend_transport is BackendTransportKind.WINDOWS_HTTP
     assert spec.socket_path is None
     assert spec.runtime_dir == config.runtime_dir
     assert spec.state_dir == config.state_dir

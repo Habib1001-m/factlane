@@ -153,6 +153,7 @@ class LauncherControlClient(Protocol):
 ControlClientFactory = Callable[[str, int], LauncherControlClient]
 WindowsControlClientFactory = Callable[[str, WindowsProcessIdentity], LauncherControlClient]
 BrowserLauncher = Callable[[str], bool]
+OpenLinkPresenter = Callable[[str], None]
 RunnerFactory = Callable[..., Any]
 ServiceStateFactory = Callable[[str], Any]
 RequestIdFactory = Callable[[], str]
@@ -316,9 +317,18 @@ class ZenitySetupConsentProvider:
         requirements = consent_requirements(
             lingering_required=request.lingering_required
         )
+        details = [
+            (
+                "Configure the Owner Panel on an exact 127.0.0.1 loopback endpoint, "
+                "update its current-user managed service/configuration, and install the "
+                "Owner launcher. No browser profile, browser trust store, DNS mapping, "
+                "or system trust store is modified."
+            ),
+            *(item.explanation for item in requirements),
+        ]
         review = (
             "FactLane WebUI requires explicit consent for these installation changes:\n\n"
-            + "\n".join(f"• {item.explanation}" for item in requirements)
+            + "\n".join(f"• {item}" for item in details)
         )
         argv = (
             self._zenity_path,
@@ -335,8 +345,8 @@ class ZenitySetupConsentProvider:
         if not approved:
             return denied
         return SetupConsent(
-            hostname_mapping=True,
-            browser_profile_trust=True,
+            hostname_mapping=False,
+            browser_profile_trust=False,
             user_lingering=request.lingering_required,
         )
 
@@ -975,15 +985,12 @@ def build_default_setup_executor(
 
     systemctl_path = which("systemctl")
     loginctl_path = which("loginctl")
-    certutil_path = which("certutil")
     caddy_path = environment.caddy_path
     if (
         environment.system != "Linux"
         or not environment.systemd
         or systemctl_path is None
         or not os.path.isabs(systemctl_path)
-        or certutil_path is None
-        or not os.path.isabs(certutil_path)
         or caddy_path is None
         or not os.path.isabs(caddy_path)
         or (request.lingering_required and (loginctl_path is None or not os.path.isabs(loginctl_path)))
@@ -1011,7 +1018,7 @@ def build_default_setup_executor(
     backend_kwargs: dict[str, Any] = {
         "systemctl_path": systemctl_path,
         "loginctl_path": loginctl_path,
-        "certutil_path": certutil_path,
+        "certutil_path": None,
         "caddy_path": caddy_path,
         "owner_uid": os.getuid(),
         "service_state_reader": service_state_reader or default_state_reader,
@@ -1526,6 +1533,7 @@ class ProductionWebUIController:
         service_manager: ManagedServiceSupervisor | None = None,
         windows_control_client_factory: WindowsControlClientFactory | None = None,
         browser_launcher: BrowserLauncher | None = None,
+        open_link_presenter: OpenLinkPresenter | None = None,
         platform_system: str | None = None,
         request_id_factory: RequestIdFactory = lambda: secrets.token_urlsafe(18),
         clock: Callable[[], float] = time.monotonic,
@@ -1567,6 +1575,7 @@ class ProductionWebUIController:
             self._service_manager = systemd_manager or _default_systemd_user_manager()
         self._systemd_manager = self._service_manager if isinstance(self._service_manager, SystemdUserUnitManager) else systemd_manager
         self._browser_launcher = browser_launcher
+        self._open_link_presenter = open_link_presenter
         self._request_id_factory = request_id_factory
         if startup_timeout <= 0:
             raise ValueError("startup_timeout must be positive")
@@ -1670,18 +1679,24 @@ class ProductionWebUIController:
             runtime_dir=managed_config.runtime_dir,
             state_dir=managed_config.state_dir,
             platform_kind=PlatformKind.WINDOWS,
-            backend_transport=BackendTransportKind.WINDOWS_HTTPS,
+            backend_transport=(
+                BackendTransportKind.WINDOWS_HTTP
+                if managed_config.origin.startswith("http://")
+                else BackendTransportKind.WINDOWS_HTTPS
+            ),
         )
-        hostname = urlsplit(runtime_config.origin).hostname
+        parsed_origin = urlsplit(runtime_config.origin)
+        hostname = parsed_origin.hostname
         if hostname is None:
             raise WebUIPlatformError(
                 "WINDOWS_CONFIG_INVALID",
-                "managed Windows HTTPS origin has no hostname",
+                "managed Windows origin has no hostname",
             )
-        try:
-            ensure_windows_tls_material(Path(runtime_config.state_dir) / "tls", hostname)
-        except WindowsTLSError as exc:
-            raise WebUIPlatformError(exc.code, exc.safe_message) from exc
+        if runtime_config.backend_transport is BackendTransportKind.WINDOWS_HTTPS:
+            try:
+                ensure_windows_tls_material(Path(runtime_config.state_dir) / "tls", hostname)
+            except WindowsTLSError as exc:
+                raise WebUIPlatformError(exc.code, exc.safe_message) from exc
 
         service_state = self._persistent_service_state()
         runner = self._runtime_runner_factory(
@@ -1991,7 +2006,7 @@ class ProductionWebUIController:
         if not isinstance(origin, str) or not _is_safe_origin(origin):
             raise WebUIPlatformError(
                 "WEBUI_ENDPOINT_UNAVAILABLE",
-                "WebUI service has no valid saved HTTPS endpoint to open",
+                "WebUI service has no valid saved managed endpoint to open",
             )
         state = service.get("status", service.get("state"))
         if state not in {"READY", "RECOVERY_REQUIRED"}:
@@ -2013,30 +2028,24 @@ class ProductionWebUIController:
         enrollment = client.begin_local_enrollment(
             device_label=_LOCAL_ENROLLMENT_DEVICE_LABEL
         )
-        # Keep the non-credential enrollment locator entirely in the URL fragment.
-        # Fragments are not sent in the HTTP request, so the private backend can
-        # continue rejecting every query string while the SPA consumes and
-        # immediately scrubs the one-time local handoff value.
+        # Keep the one-time local enrollment capability entirely in the URL
+        # fragment. Fragments are not sent in the HTTP request; the SPA consumes
+        # and immediately scrubs the handoff value before claiming it.  Browser
+        # choice is deliberately left to the Owner.
         connect_url = f"{origin}#connect={quote(enrollment.locator, safe='')}"
-        if self._browser_launcher is not None:
-            launcher = self._browser_launcher
-        elif self.platform_system == "Windows" and os.name == "nt":
-            launcher = _resolve_production_browser_launcher(
-                origin=origin,
-                state_dir=self.paths.state_dir,
-                profile_dir=self.paths.browser_profile_dir,
-            )
-        else:
-            launcher = _resolve_production_browser_launcher(
-                origin=origin,
-                state_dir=self.paths.state_dir,
-                profile_dir=self.paths.browser_profile_dir,
-            )
-        if not launcher(connect_url):
+        if self._open_link_presenter is None:
             raise WebUIPlatformError(
-                "BROWSER_LAUNCH_FAILED",
-                "supported browser launcher did not open the WebUI",
+                "OPEN_LINK_PRESENTATION_UNAVAILABLE",
+                "Owner Panel link could not be presented safely",
             )
+        try:
+            self._open_link_presenter(connect_url)
+        except Exception as exc:
+            raise WebUIPlatformError(
+                "OPEN_LINK_PRESENTATION_FAILED",
+                "Owner Panel link could not be presented safely",
+            ) from exc
+
         deadline = min(
             enrollment.expires_at,
             self._clock() + self._enrollment_timeout,
@@ -2063,8 +2072,17 @@ class ProductionWebUIController:
         return {"status": "OK", "state": "OPENED", "origin": origin}
 
 
+def _present_open_link_to_stderr(url: str) -> None:
+    sys.stderr.write(
+        "Open this URL in any browser:\n"
+        f"{url}\n"
+        "Waiting for browser connection and local approval...\n"
+    )
+    sys.stderr.flush()
+
+
 def build_default_platform_controller() -> ProductionWebUIController:
-    return ProductionWebUIController()
+    return ProductionWebUIController(open_link_presenter=_present_open_link_to_stderr)
 
 
 def _default_systemd_user_manager() -> SystemdUserUnitManager | None:
@@ -2349,11 +2367,8 @@ def _is_safe_origin(origin: str) -> bool:
         port = parsed.port
     except ValueError:
         return False
-    return bool(
-        parsed.scheme == "https"
-        and parsed.hostname is not None
-        and parsed.hostname.startswith("factlane-")
-        and parsed.hostname.endswith(".test")
+    common = bool(
+        parsed.hostname is not None
         and port is not None
         and 8765 <= port <= 8774
         and not parsed.path
@@ -2361,5 +2376,14 @@ def _is_safe_origin(origin: str) -> bool:
         and not parsed.fragment
         and parsed.username is None
         and parsed.password is None
+    )
+    if not common:
+        return False
+    if parsed.scheme == "http":
+        return parsed.hostname == "127.0.0.1" and origin == f"http://127.0.0.1:{port}"
+    return bool(
+        parsed.scheme == "https"
+        and parsed.hostname.startswith("factlane-")
+        and parsed.hostname.endswith(".test")
         and origin == f"https://{parsed.hostname}:{port}"
     )

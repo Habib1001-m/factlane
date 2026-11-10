@@ -16,7 +16,6 @@ _LINUX_OWNER_PRIVATE_WRITE = pytest.mark.skipif(
 from factlane.webui_service import ServiceSnapshot, ServiceStatus
 
 from factlane.webui_install import (
-    BrowserInstall,
     EndpointState,
     InstallEnvironment,
     ManagedServiceActivationResult,
@@ -39,7 +38,6 @@ from factlane.webui_install import (
     render_user_unit,
     webui_hostname,
 )
-from factlane.webui_windows import WindowsBrowserInstall
 
 
 class _FakeInstallerBackend:
@@ -121,7 +119,7 @@ def _environment() -> InstallEnvironment:
         systemd=True,
         caddy_path="/usr/bin/caddy",
         zenity_path="/usr/bin/zenity",
-        browser=BrowserInstall(family="firefox", executable="/usr/bin/firefox"),
+        browser=None,
         euid=1000,
     )
 
@@ -154,18 +152,17 @@ def _request(
 
 def _consent(*, lingering: bool = True) -> SetupConsent:
     return SetupConsent(
-        hostname_mapping=True,
-        browser_profile_trust=True,
+        hostname_mapping=False,
+        browser_profile_trust=False,
         user_lingering=lingering,
     )
 
 
-def test_detects_linux_systemd_caddy_zenity_and_supported_browser() -> None:
+def test_detects_linux_systemd_caddy_zenity_without_browser_requirement() -> None:
     executables = {
         "systemctl": "/usr/bin/systemctl",
         "caddy": "/usr/bin/caddy",
         "zenity": "/usr/bin/zenity",
-        "firefox": "/usr/bin/firefox",
     }
 
     environment = detect_install_environment(
@@ -180,10 +177,7 @@ def test_detects_linux_systemd_caddy_zenity_and_supported_browser() -> None:
         systemd=True,
         caddy_path="/usr/bin/caddy",
         zenity_path="/usr/bin/zenity",
-        browser=BrowserInstall(
-            family="firefox",
-            executable="/usr/bin/firefox",
-        ),
+        browser=None,
         euid=1000,
     )
 
@@ -210,7 +204,6 @@ def test_non_linux_detection_returns_unsupported_facts_without_posix_uid_support
         ("systemd", "systemd"),
         ("caddy", "Caddy"),
         ("zenity", "zenity"),
-        ("browser", "browser"),
     ],
 )
 def test_setup_fails_closed_when_required_dependency_is_missing(
@@ -221,7 +214,7 @@ def test_setup_fails_closed_when_required_dependency_is_missing(
         "systemd": True,
         "caddy_path": "/usr/bin/caddy",
         "zenity_path": "/usr/bin/zenity",
-        "browser": BrowserInstall(family="firefox", executable="/usr/bin/firefox"),
+        "browser": None,
     }
     if missing == "systemd":
         values["systemd"] = False
@@ -229,8 +222,6 @@ def test_setup_fails_closed_when_required_dependency_is_missing(
         values["caddy_path"] = None
     elif missing == "zenity":
         values["zenity_path"] = None
-    else:
-        values["browser"] = None
 
     receipt = plan_webui_setup(
         _request(),
@@ -250,7 +241,7 @@ def test_setup_fails_closed_when_run_as_root() -> None:
         systemd=True,
         caddy_path="/usr/bin/caddy",
         zenity_path="/usr/bin/zenity",
-        browser=BrowserInstall(family="firefox", executable="/usr/bin/firefox"),
+        browser=None,
         euid=0,
     )
 
@@ -270,45 +261,18 @@ def test_consent_values_must_be_explicit_booleans() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    ("consent", "expected_reason"),
-    [
-        (
-            SetupConsent(
-                hostname_mapping=False,
-                browser_profile_trust=True,
-                user_lingering=True,
-            ),
-            "hostname",
-        ),
-        (
-            SetupConsent(
-                hostname_mapping=True,
-                browser_profile_trust=False,
-                user_lingering=True,
-            ),
-            "browser",
-        ),
-        (
-            SetupConsent(
-                hostname_mapping=True,
-                browser_profile_trust=True,
-                user_lingering=False,
-            ),
-            "lingering",
-        ),
-    ],
-)
-def test_setup_fails_closed_without_every_required_consent(
-    consent: SetupConsent,
-    expected_reason: str,
-) -> None:
+def test_setup_requires_only_lingering_consent_when_lingering_is_needed() -> None:
+    consent = SetupConsent(
+        hostname_mapping=False,
+        browser_profile_trust=False,
+        user_lingering=False,
+    )
     receipt = plan_webui_setup(_request(), _environment(), consent)
 
     assert receipt.status == "BLOCKED"
     assert receipt.plan is None
     assert receipt.operations == ()
-    assert any(expected_reason in reason.lower() for reason in receipt.blocked_reasons)
+    assert any("lingering" in reason.lower() for reason in receipt.blocked_reasons)
 
 
 def test_lingering_consent_is_not_required_when_existing_state_needs_no_change() -> None:
@@ -316,8 +280,8 @@ def test_lingering_consent_is_not_required_when_existing_state_needs_no_change()
         _request(lingering_required=False),
         _environment(),
         SetupConsent(
-            hostname_mapping=True,
-            browser_profile_trust=True,
+            hostname_mapping=False,
+            browser_profile_trust=False,
             user_lingering=False,
         ),
     )
@@ -330,17 +294,11 @@ def test_lingering_consent_is_not_required_when_existing_state_needs_no_change()
 def test_consent_explanations_name_the_exact_state_changes() -> None:
     requirements = {item.key: item for item in consent_requirements(lingering_required=True)}
 
-    assert set(requirements) == {
-        "hostname_mapping",
-        "browser_profile_trust",
-        "user_lingering",
-    }
-    assert "isolated FactLane Firefox profile" in requirements["hostname_mapping"].explanation
-    assert "isolated FactLane browser profile" in requirements["browser_profile_trust"].explanation
+    assert set(requirements) == {"user_lingering"}
     assert "boot before login" in requirements["user_lingering"].explanation
 
 
-def test_hostname_and_caddy_config_are_exact_and_have_no_http_or_http3_listener() -> None:
+def test_caddy_config_is_exact_plain_loopback_to_af_unix_without_tls_or_http3() -> None:
     hostname = webui_hostname("1a2b3c4d-55aa")
     assert hostname == "factlane-1a2b3c4d-55aa.test"
 
@@ -354,17 +312,14 @@ def test_hostname_and_caddy_config_are_exact_and_have_no_http_or_http3_listener(
     assert "admin off" in config
     assert "persist_config off" in config
     assert "storage_clean_interval off" in config
-    assert "auto_https disable_redirects" in config
-    assert "skip_install_trust" in config
-    assert "protocols h1 h2" in config
-    assert "strict_sni_host on" in config
-    assert "storage file_system /home/alice/.local/state/factlane/caddy" in config
-    assert "issuer internal" in config
-    assert "https://factlane-1a2b3c4d-55aa.test:8767" in config
+    assert "auto_https off" in config
+    assert "http://127.0.0.1:8767" in config
     assert "bind 127.0.0.1" in config
     assert "unix//run/user/1000/factlane/webui.sock" in config
-    assert ":80" not in config
-    assert "http://" not in config
+    assert "https://" not in config
+    assert "tls" not in config.lower()
+    assert "issuer" not in config.lower()
+    assert "skip_install_trust" not in config
     assert "h3" not in config
     assert "acme" not in config.lower()
 
@@ -428,7 +383,7 @@ def test_setup_plan_writes_exact_runtime_config_with_fixed_owner_private_semanti
         "caddyfile": request.caddy_config_path,
         "db": request.db,
         "host_id": request.host_id,
-        "origin": "https://factlane-1a2b3c4d-55aa.test:8767",
+        "origin": "http://127.0.0.1:8767",
         "profile": request.profile,
         "runtime_dir": request.runtime_dir,
         "state_dir": request.state_dir,
@@ -439,7 +394,7 @@ def test_setup_plan_writes_exact_runtime_config_with_fixed_owner_private_semanti
         '"caddyfile":"/home/alice/.config/factlane/Caddyfile",'
         '"db":"/home/alice/.local/share/factlane/memories.db",'
         '"host_id":"owner-host-a",'
-        '"origin":"https://factlane-1a2b3c4d-55aa.test:8767",'
+        '"origin":"http://127.0.0.1:8767",'
         '"profile":"nomic-768",'
         '"runtime_dir":"/run/user/1000/factlane",'
         '"state_dir":"/home/alice/.local/state/factlane"}\n'
@@ -460,7 +415,7 @@ def test_initial_setup_emits_transport_config_with_null_memory_selection_trio() 
     assert payload["db"] is None
     assert payload["profile"] is None
     assert payload["host_id"] is None
-    assert payload["origin"] == "https://factlane-1a2b3c4d-55aa.test:8767"
+    assert payload["origin"] == "http://127.0.0.1:8767"
     assert payload["backend_socket"] == request.backend_socket
     assert config_write.write_contract == "OWNER_PRIVATE_ATOMIC_REGULAR_FILE_0600"
 
@@ -496,16 +451,15 @@ def test_successful_setup_returns_explicit_preserving_operations_and_generated_m
     assert receipt.plan is not None
     plan = receipt.plan
     assert plan.hostname == "factlane-1a2b3c4d-55aa.test"
-    assert plan.origin == "https://factlane-1a2b3c4d-55aa.test:8767"
-    assert "issuer internal" in plan.caddy_config
+    assert plan.origin == "http://127.0.0.1:8767"
+    assert plan.browser is None
+    assert "http://127.0.0.1:8767" in plan.caddy_config
+    assert "https://" not in plan.caddy_config
     assert "serve webui" in plan.user_unit
 
     operations = {operation.kind: operation for operation in receipt.operations}
     assert set(operations) == {
         "PERSIST_PROVISIONAL_SETUP",
-        "BOOTSTRAP_CADDY_CA",
-        "ENSURE_ISOLATED_PROFILE_NETWORK",
-        "ENSURE_ISOLATED_PROFILE_TRUST",
         "WRITE_SERVICE_CONFIG",
         "WRITE_CADDY_CONFIG",
         "INSTALL_USER_UNIT",
@@ -513,18 +467,12 @@ def test_successful_setup_returns_explicit_preserving_operations_and_generated_m
         "REGISTER_USER_SERVICE",
     }
     assert all(operation.target != "/etc/hosts" for operation in receipt.operations)
-    network = operations["ENSURE_ISOLATED_PROFILE_NETWORK"]
-    assert network.target == "/home/alice/.local/state/factlane/browser"
-    assert 'network.dns.localDomains' in network.desired_state
-    assert "factlane-1a2b3c4d-55aa.test" in network.desired_state
-    assert network.consent_key == "hostname_mapping"
-
-    trust = operations["ENSURE_ISOLATED_PROFILE_TRUST"]
-    assert trust.target == "/home/alice/.local/state/factlane/browser"
-    assert trust.preserve_unrelated_state is True
-    assert trust.consent_key == "browser_profile_trust"
-    assert "public root" in trust.desired_state
-    assert "system" not in trust.desired_state.lower()
+    assert not {
+        "BOOTSTRAP_CADDY_CA",
+        "ENSURE_ISOLATED_PROFILE_NETWORK",
+        "ENSURE_ISOLATED_PROFILE_TRUST",
+        "ENSURE_HOSTNAME_MAPPING",
+    } & set(operations)
 
     lingering = operations["ENABLE_USER_LINGERING"]
     assert lingering.target == "alice"
@@ -599,7 +547,7 @@ def test_first_install_iterates_candidates_and_claims_only_after_managed_service
     assert result.status is InstallerStepStatus.APPLIED
     assert result.endpoint_state is EndpointState.CLAIMED
     assert result.claimed_port == 8766
-    assert result.origin == "https://factlane-1a2b3c4d-55aa.test:8766"
+    assert result.origin == "http://127.0.0.1:8766"
     assert [plan.saved_port for plan in backend.activations] == [8765, 8766]
     assert [plan.saved_port for plan in backend.stops] == [8765]
     candidate_writes = [
@@ -608,10 +556,10 @@ def test_first_install_iterates_candidates_and_claims_only_after_managed_service
         if operation.kind in {"WRITE_CADDY_CONFIG", "WRITE_SERVICE_CONFIG"}
     ]
     assert candidate_writes == [
-        ("WRITE_CADDY_CONFIG", "https://factlane-1a2b3c4d-55aa.test:8765"),
-        ("WRITE_SERVICE_CONFIG", "https://factlane-1a2b3c4d-55aa.test:8765"),
-        ("WRITE_CADDY_CONFIG", "https://factlane-1a2b3c4d-55aa.test:8766"),
-        ("WRITE_SERVICE_CONFIG", "https://factlane-1a2b3c4d-55aa.test:8766"),
+        ("WRITE_CADDY_CONFIG", "http://127.0.0.1:8765"),
+        ("WRITE_SERVICE_CONFIG", "http://127.0.0.1:8765"),
+        ("WRITE_CADDY_CONFIG", "http://127.0.0.1:8766"),
+        ("WRITE_SERVICE_CONFIG", "http://127.0.0.1:8766"),
     ]
 
 
@@ -676,7 +624,7 @@ def test_ambiguous_candidate_stop_returns_recovery_without_attempting_rollback()
     assert [plan.saved_port for plan in backend.stops] == [8765]
 
 
-def test_existing_saved_endpoint_gets_exactly_one_attempt_and_conflict_requires_recovery() -> None:
+def test_legacy_https_saved_endpoint_reuses_port_once_with_canonical_http_candidate() -> None:
     saved = "https://factlane-1a2b3c4d-55aa.test:8769"
     backend = _FakeInstallerBackend(
         saved_endpoint=saved,
@@ -689,6 +637,7 @@ def test_existing_saved_endpoint_gets_exactly_one_attempt_and_conflict_requires_
     assert result.status is InstallerStepStatus.RECOVERY_REQUIRED
     assert result.endpoint_state is EndpointState.PROPOSED
     assert [plan.saved_port for plan in backend.activations] == [8769]
+    assert [plan.origin for plan in backend.activations] == ["http://127.0.0.1:8769"]
     assert [plan.saved_port for plan in backend.stops] == [8769]
 
 
@@ -698,8 +647,8 @@ def test_apply_refuses_non_ready_receipt_and_missing_operation_consent() -> None
         _environment(),
         SetupConsent(
             hostname_mapping=False,
-            browser_profile_trust=True,
-            user_lingering=True,
+            browser_profile_trust=False,
+            user_lingering=False,
         ),
     )
     backend = _FakeInstallerBackend()
@@ -712,8 +661,8 @@ def test_apply_refuses_non_ready_receipt_and_missing_operation_consent() -> None
         ready,
         SetupConsent(
             hostname_mapping=False,
-            browser_profile_trust=True,
-            user_lingering=True,
+            browser_profile_trust=False,
+            user_lingering=False,
         ),
         backend,
     )
@@ -733,7 +682,7 @@ def test_linux_owner_panel_launcher_is_planned_and_applied_only_after_ready_acti
     assert launcher.desired_state == render_linux_owner_panel_launcher(
         factlane_executable=request.factlane_executable
     )
-    assert "Terminal=false" in launcher.desired_state
+    assert "Terminal=true" in launcher.desired_state
     assert 'Exec="/home/alice/.local/bin/factlane" launch webui' in launcher.desired_state
 
     backend = _FakeInstallerBackend()
@@ -746,7 +695,7 @@ def test_linux_owner_panel_launcher_is_planned_and_applied_only_after_ready_acti
 
 
 @_LINUX_OWNER_PRIVATE_WRITE
-def test_linux_production_backend_writes_owner_launcher_without_shell_or_terminal(tmp_path: Path) -> None:
+def test_linux_production_backend_writes_visible_terminal_launcher_without_shell(tmp_path: Path) -> None:
     request = replace(
         _request(lingering_required=False),
         launcher_path=f"/home/alice/.local/share/applications/{LINUX_OWNER_PANEL_LAUNCHER_FILENAME}",
@@ -765,12 +714,12 @@ def test_linux_production_backend_writes_owner_launcher_without_shell_or_termina
 
     assert result.status is InstallerStepStatus.APPLIED
     content = target.read_text(encoding="utf-8")
-    assert "Terminal=false" in content
+    assert "Terminal=true" in content
     assert 'Exec="/home/alice/.local/bin/factlane" launch webui' in content
     assert all(token not in content for token in ("sh -c", "bash -c", "sudo", "pkexec"))
 
 
-def test_windows_owner_panel_launcher_spec_is_current_user_pythonw_and_shell_free() -> None:
+def test_windows_owner_panel_launcher_spec_uses_visible_current_user_python_and_is_shell_free() -> None:
     rendered = render_windows_owner_panel_launcher(
         factlane_executable=r"C:\Users\Alice\factlane\Scripts\python.exe",
         owner_config_home=r"C:\Users\Alice\AppData\Local\FactLane\config",
@@ -780,7 +729,7 @@ def test_windows_owner_panel_launcher_spec_is_current_user_pythonw_and_shell_fre
     assert payload == {
         "arguments": "-m factlane.webui_launcher",
         "description": "Open the local FactLane Owner Panel",
-        "target": r"C:\Users\Alice\factlane\Scripts\pythonw.exe",
+        "target": r"C:\Users\Alice\factlane\Scripts\python.exe",
         "working_directory": r"C:\Users\Alice\AppData\Local\FactLane",
     }
     assert all(token not in rendered.casefold() for token in ("cmd.exe", "powershell", "wscript.exe"))
@@ -815,10 +764,7 @@ def test_windows_setup_plan_adds_only_current_user_start_menu_launcher(monkeypat
         systemd=False,
         caddy_path=None,
         zenity_path=None,
-        browser=WindowsBrowserInstall(
-            family="firefox",
-            executable=r"C:\Program Files\Mozilla Firefox\firefox.exe",
-        ),
+        browser=None,
         euid=-1,
     )
     consent = SetupConsent(
@@ -836,31 +782,28 @@ def test_windows_setup_plan_adds_only_current_user_start_menu_launcher(monkeypat
     assert launcher.consent_key == "windows_native_setup"
     assert launcher.target.endswith(r"\Start Menu\Programs\FactLane Owner Panel.lnk")
     assert "ProgramData" not in launcher.target
+    assert receipt.plan is not None
+    assert receipt.plan.browser is None
+    assert receipt.plan.origin == "http://127.0.0.1:8765"
+    assert not {
+        "ENSURE_ISOLATED_PROFILE_NETWORK",
+        "ENSURE_ISOLATED_PROFILE_TRUST",
+        "BOOTSTRAP_CADDY_CA",
+    } & {operation.kind for operation in receipt.operations}
 
 
-def test_apply_propagates_typed_preclaim_failures_before_endpoint_writes() -> None:
+def test_apply_propagates_typed_provisional_failure_before_endpoint_writes() -> None:
     receipt = plan_webui_setup(_request(), _environment(), _consent())
-    bootstrap_failed = _FakeInstallerBackend(
+    provisional_failed = _FakeInstallerBackend(
         step_statuses={
-            "BOOTSTRAP_CADDY_CA": InstallerStepStatus.RECOVERY_REQUIRED,
+            "PERSIST_PROVISIONAL_SETUP": InstallerStepStatus.RECOVERY_REQUIRED,
         }
     )
-    result = apply_webui_setup(receipt, _consent(), bootstrap_failed)
+    result = apply_webui_setup(receipt, _consent(), provisional_failed)
     assert result.status is InstallerStepStatus.RECOVERY_REQUIRED
     assert result.endpoint_state is EndpointState.PROPOSED
     assert result.claimed_port is None
-    assert all(op.kind != "WRITE_SERVICE_CONFIG" for op, _plan in bootstrap_failed.operations)
-
-    incomplete = _FakeInstallerBackend(
-        step_statuses={
-            "ENSURE_ISOLATED_PROFILE_TRUST": InstallerStepStatus.INCOMPLETE_BROWSER_TRUST,
-        }
-    )
-    result = apply_webui_setup(receipt, _consent(), incomplete)
-    assert result.status is InstallerStepStatus.INCOMPLETE_BROWSER_TRUST
-    assert result.endpoint_state is EndpointState.PROPOSED
-    assert result.claimed_port is None
-    assert all(op.kind != "WRITE_SERVICE_CONFIG" for op, _plan in incomplete.operations)
+    assert all(op.kind != "WRITE_SERVICE_CONFIG" for op, _plan in provisional_failed.operations)
 
 
 @_LINUX_OWNER_PRIVATE_WRITE
@@ -966,11 +909,15 @@ def test_user_unit_write_preserves_unrelated_sibling_units(tmp_path: Path) -> No
     assert (unit_dir / WEBUI_SERVICE_NAME).read_text(encoding="utf-8") == unit.desired_state
 
 
-def test_linux_plan_has_no_system_hostname_mutation_or_chromium_path() -> None:
+def test_linux_plan_has_no_browser_profile_ca_or_system_hostname_operations() -> None:
     receipt = plan_webui_setup(_request(), _environment(), _consent())
     assert receipt.plan is not None
-    assert receipt.plan.browser.family == "firefox"
-    assert "ENSURE_HOSTNAME_MAPPING" not in {operation.kind for operation in receipt.operations}
+    assert receipt.plan.browser is None
+    kinds = {operation.kind for operation in receipt.operations}
+    assert "ENSURE_HOSTNAME_MAPPING" not in kinds
+    assert "ENSURE_ISOLATED_PROFILE_NETWORK" not in kinds
+    assert "ENSURE_ISOLATED_PROFILE_TRUST" not in kinds
+    assert "BOOTSTRAP_CADDY_CA" not in kinds
     assert all(operation.target != "/etc/hosts" for operation in receipt.operations)
 
 

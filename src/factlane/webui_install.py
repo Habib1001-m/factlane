@@ -426,7 +426,7 @@ class SetupPlan:
     hostname: str
     origin: str
     saved_port: int
-    browser: BrowserInstall | WindowsBrowserInstall
+    browser: BrowserInstall | WindowsBrowserInstall | None
     backend_socket: str
     caddy_state_dir: str
     caddy_config: str
@@ -490,25 +490,7 @@ def detect_install_environment(
 
 
 def consent_requirements(*, lingering_required: bool) -> tuple[ConsentRequirement, ...]:
-    requirements = [
-        ConsentRequirement(
-            key="hostname_mapping",
-            explanation=(
-                "Bind this installation's exact local hostname only inside the isolated "
-                "FactLane Firefox profile; system hostname mappings and personal browser "
-                "profiles must remain untouched."
-            ),
-        ),
-        ConsentRequirement(
-            key="browser_profile_trust",
-            explanation=(
-                "Trust this installation's public local issuer only inside an isolated "
-                "FactLane browser profile; its protected issuer key can authorize local UI "
-                "certificates, while normal browser profiles and other trust entries must "
-                "be preserved."
-            ),
-        ),
-    ]
+    requirements: list[ConsentRequirement] = []
     if lingering_required:
         requirements.append(
             ConsentRequirement(
@@ -551,21 +533,12 @@ def render_caddy_config(
         "{\n"
         "    admin off\n"
         "    persist_config off\n"
-        "    auto_https disable_redirects\n"
-        "    skip_install_trust\n"
+        "    auto_https off\n"
         "    storage_clean_interval off\n"
-        "    servers {\n"
-        "        protocols h1 h2\n"
-        "        strict_sni_host on\n"
-        "    }\n"
-        f"    storage file_system {_caddy_token(caddy_state_dir)}\n"
         "}\n"
         "\n"
-        f"https://{hostname}:{port} {{\n"
+        f"http://127.0.0.1:{port} {{\n"
         "    bind 127.0.0.1\n"
-        "    tls {\n"
-        "        issuer internal\n"
-        "    }\n"
         f"    reverse_proxy {_caddy_token(socket_upstream)}\n"
         "}\n"
     )
@@ -595,7 +568,7 @@ def _desktop_exec_token(value: str) -> str:
 
 
 def render_linux_owner_panel_launcher(*, factlane_executable: str) -> str:
-    """Render one shell-free freedesktop launcher for the trusted managed open flow."""
+    """Render one shell-free launcher with a visible browser-neutral link surface."""
 
     _validate_absolute_path(factlane_executable, "FactLane executable")
     return (
@@ -604,7 +577,7 @@ def render_linux_owner_panel_launcher(*, factlane_executable: str) -> str:
         f"Name={OWNER_PANEL_LAUNCHER_LABEL}\n"
         "Comment=Open the local FactLane Owner Panel\n"
         f"Exec={_desktop_exec_token(factlane_executable)} launch webui\n"
-        "Terminal=false\n"
+        "Terminal=true\n"
         "Categories=Utility;\n"
         "StartupNotify=true\n"
     )
@@ -618,14 +591,14 @@ def render_windows_owner_panel_launcher(*, factlane_executable: str, owner_confi
         "FactLane environment executable",
     )
     executable = PureWindowsPath(factlane_executable)
-    pythonw = executable.with_name("pythonw.exe")
+    python_console = executable.with_name("python.exe")
     _validate_windows_absolute_path(owner_config_home, "Owner config home")
     working_directory = PureWindowsPath(owner_config_home).parent
     return json.dumps(
         {
             "arguments": "-m factlane.webui_launcher",
             "description": "Open the local FactLane Owner Panel",
-            "target": str(pythonw),
+            "target": str(python_console),
             "working_directory": str(working_directory),
         },
         sort_keys=True,
@@ -644,12 +617,6 @@ def plan_webui_setup(
         return _plan_windows_webui_setup(request, environment, consent)
 
     blocked_reasons = list(_environment_blockers(environment))
-    if not consent.hostname_mapping:
-        blocked_reasons.append(
-            "explicit consent for the isolated Firefox hostname binding is required"
-        )
-    if not consent.browser_profile_trust:
-        blocked_reasons.append("explicit consent for isolated browser profile trust is required")
     if request.lingering_required and not consent.user_lingering:
         blocked_reasons.append(
             "explicit consent for user lingering is required for boot-before-login activation"
@@ -661,27 +628,14 @@ def plan_webui_setup(
             plan=None,
         )
 
-    browser = environment.browser
-    if browser is None:  # Defensive: the blocker above should make this unreachable.
-        return SetupReceipt(
-            status="BLOCKED",
-            blocked_reasons=("a supported browser is required",),
-            plan=None,
-        )
-    if browser.family != "firefox":
-        return SetupReceipt(
-            status="BLOCKED",
-            blocked_reasons=("Mozilla Firefox or Firefox ESR browser is required for managed Linux WebUI",),
-            plan=None,
-        )
-
+    browser: BrowserInstall | None = None
     hostname = webui_hostname(request.installation_id)
-    origin = f"https://{hostname}:{request.saved_port}"
+    origin = f"http://127.0.0.1:{request.saved_port}"
     caddy_path = environment.caddy_path
     if caddy_path is None:  # Defensive: dependency blockers above make this unreachable.
         return SetupReceipt(
             status="BLOCKED",
-            blocked_reasons=("Caddy is required for the installation-private HTTPS gateway",),
+            blocked_reasons=("Caddy is required for the installation-private loopback gateway",),
             plan=None,
         )
     runtime_config = WebUIRuntimeConfig(
@@ -724,50 +678,17 @@ def plan_webui_setup(
         factlane_executable=request.factlane_executable,
         service_config_path=request.service_config_path,
     )
-    public_root = str(
-        PurePosixPath(request.caddy_state_dir)
-        / "pki"
-        / "authorities"
-        / "local"
-        / "root.crt"
-    )
     setup_journal = str(linux_setup_journal_path(request.state_dir))
     journal_state = render_linux_setup_journal(
         request=request,
         browser=browser,
         hostname=hostname,
     )
-    profile_network_policy = render_linux_firefox_network_policy(hostname)
-
     operations: list[PlannedOperation] = [
         PlannedOperation(
             kind="PERSIST_PROVISIONAL_SETUP",
             target=setup_journal,
             desired_state=journal_state,
-        ),
-        PlannedOperation(
-            kind="BOOTSTRAP_CADDY_CA",
-            target=public_root,
-            desired_state=(
-                "Materialize and verify this installation's Caddy local public root in the "
-                "owner-private Caddy state without publishing or claiming the managed endpoint."
-            ),
-            consent_key="browser_profile_trust",
-        ),
-        PlannedOperation(
-            kind="ENSURE_ISOLATED_PROFILE_NETWORK",
-            target=request.browser_profile_dir,
-            desired_state=profile_network_policy,
-            consent_key="hostname_mapping",
-        ),
-        PlannedOperation(
-            kind="ENSURE_ISOLATED_PROFILE_TRUST",
-            target=request.browser_profile_dir,
-            desired_state=(
-                f"Import only public root certificate {public_root} into this isolated "
-                "Firefox profile; leave every other profile and trust entry untouched."
-            ),
-            consent_key="browser_profile_trust",
         ),
         PlannedOperation(
             kind="WRITE_SERVICE_CONFIG",
@@ -852,11 +773,9 @@ def _plan_windows_webui_setup(
             blocked_reasons=("native Windows control endpoint is missing",),
             plan=None,
         )
-    browser = environment.browser
-    if not isinstance(browser, WindowsBrowserInstall) or browser.family != "firefox":
-        return SetupReceipt(status="BLOCKED", blocked_reasons=("Mozilla Firefox is required for managed Windows WebUI",), plan=None)
+    browser: WindowsBrowserInstall | None = None
     hostname = webui_hostname(request.installation_id)
-    origin = f"https://{hostname}:{request.saved_port}"
+    origin = f"http://127.0.0.1:{request.saved_port}"
     managed = WindowsManagedConfig(
         installation_id=request.installation_id,
         origin=origin,
@@ -1402,7 +1321,10 @@ class ProductionLinuxInstallerBackend:
                 # SetupPlan carries browser identity; the exact profile path remains bound in
                 # the durable journal rendered from SetupRequest.
                 profile = Path(str(journal.get("browser_profile_dir")))
-                if ownership.get("profile_preexisting") is None:
+                if (
+                    journal.get("browser_family") is not None
+                    and ownership.get("profile_preexisting") is None
+                ):
                     try:
                         profile_info = _require_owner_private_directory(
                             profile,
@@ -2778,7 +2700,11 @@ class ProductionLinuxInstallerBackend:
                         "user service became enabled without durable setup intent"
                     )
 
-            profile_exists = profile.exists() or profile.is_symlink()
+            profile_exists = (
+                False
+                if journal.get("browser_family") is None
+                else profile.exists() or profile.is_symlink()
+            )
             profile_preexisting = ownership.get("profile_preexisting")
             profile_create_intent = ownership.get("profile_create_intent") is True
             profile_created = ownership.get("profile_created") is True
@@ -3402,10 +3328,10 @@ def _parse_windows_owner_panel_launcher(value: str) -> dict[str, str]:
         payload["working_directory"],
         "Owner Panel shortcut working directory",
     )
-    if PureWindowsPath(payload["target"]).name.casefold() != "pythonw.exe":
+    if PureWindowsPath(payload["target"]).name.casefold() != "python.exe":
         raise WindowsWebUIError(
             "WINDOWS_LAUNCHER_SPEC_INVALID",
-            "Owner Panel shortcut must use pythonw.exe",
+            "Owner Panel shortcut must use the console Python so the connection URL remains visible",
         )
     return {field: str(payload[field]) for field in expected}
 
@@ -3579,8 +3505,11 @@ class ProductionWindowsInstallerBackend:
                     raise WindowsWebUIError("WINDOWS_LAUNCHER_TARGET_INVALID", "Owner Panel shortcut filename changed")
                 payload = _parse_windows_owner_panel_launcher(operation.desired_state)
                 target = Path(payload["target"])
-                if not target.is_file() or target.name.casefold() != "pythonw.exe":
-                    raise WindowsWebUIError("WINDOWS_LAUNCHER_RUNTIME_INVALID", "FactLane pythonw runtime is unavailable")
+                if not target.is_file() or target.name.casefold() != "python.exe":
+                    raise WindowsWebUIError(
+                        "WINDOWS_LAUNCHER_RUNTIME_INVALID",
+                        "FactLane console Python runtime is unavailable",
+                    )
                 destination = validate_windows_path_no_reparse(operation.target)
                 parent = validate_windows_path_no_reparse(destination.parent)
                 if not parent.is_dir():
@@ -3629,7 +3558,7 @@ def _rebind_plan_endpoint(
     state: EndpointState,
 ) -> SetupPlan:
     _validate_saved_port(port)
-    origin = f"https://{plan.hostname}:{port}"
+    origin = f"http://127.0.0.1:{port}"
     caddy_config = render_caddy_config(
         hostname=plan.hostname,
         port=port,
@@ -3671,9 +3600,20 @@ def _saved_endpoint_port_for_plan(saved_endpoint: str, plan: SetupPlan) -> int:
         port = parsed.port
     except ValueError as exc:
         raise ValueError("saved endpoint is invalid; explicit endpoint recovery is required") from exc
+    local_http = (
+        parsed.scheme == "http"
+        and parsed.hostname == "127.0.0.1"
+        and port is not None
+        and saved_endpoint == f"http://127.0.0.1:{port}"
+    )
+    legacy_https = (
+        parsed.scheme == "https"
+        and parsed.hostname == plan.hostname
+        and port is not None
+        and saved_endpoint == f"https://{plan.hostname}:{port}"
+    )
     if (
-        parsed.scheme != "https"
-        or parsed.hostname != plan.hostname
+        not (local_http or legacy_https)
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path
@@ -3681,7 +3621,6 @@ def _saved_endpoint_port_for_plan(saved_endpoint: str, plan: SetupPlan) -> int:
         or parsed.fragment
         or port is None
         or not WEBUI_PORT_MIN <= port <= WEBUI_PORT_MAX
-        or saved_endpoint != f"https://{plan.hostname}:{port}"
     ):
         raise ValueError("saved endpoint is invalid; explicit endpoint recovery is required")
     return port
@@ -3783,11 +3722,9 @@ def render_linux_firefox_network_policy(hostname: str) -> str:
 def render_linux_setup_journal(
     *,
     request: SetupRequest,
-    browser: BrowserInstall,
+    browser: BrowserInstall | None,
     hostname: str,
 ) -> str:
-    if browser.family != "firefox":
-        raise ValueError("Linux managed setup journal requires Firefox")
     _validate_hostname(hostname)
     payload = {
         "version": 1,
@@ -3795,8 +3732,8 @@ def render_linux_setup_journal(
         "installation_id": request.installation_id,
         "hostname": hostname,
         "installing_user": request.installing_user,
-        "browser_family": browser.family,
-        "browser_executable": browser.executable,
+        "browser_family": browser.family if browser is not None else None,
+        "browser_executable": browser.executable if browser is not None else None,
         "browser_profile_dir": request.browser_profile_dir,
         "state_dir": request.state_dir,
         "caddy_state_dir": request.caddy_state_dir,
@@ -4186,19 +4123,31 @@ def _ensure_linux_setup_journal(
         _require_owner_private_directory(path.parent, owner_uid=owner_uid)
         return expected
     current = _parse_linux_setup_journal(path, owner_uid=owner_uid)
-    binding_keys = (
+    stable_binding_keys = (
         "version",
         "installation_id",
         "hostname",
         "installing_user",
-        "browser_family",
-        "browser_executable",
-        "browser_profile_dir",
         "state_dir",
         "caddy_state_dir",
+        "browser_profile_dir",
     )
-    if any(current.get(key) != expected.get(key) for key in binding_keys):
+    if any(current.get(key) != expected.get(key) for key in stable_binding_keys):
         raise LinuxSetupRecoveryRequired("provisional setup journal conflicts with the exact setup target")
+    browser_keys = ("browser_family", "browser_executable")
+    if any(current.get(key) != expected.get(key) for key in browser_keys):
+        # Browser identity was a binding field in the legacy HTTPS/isolated-
+        # Firefox setup.  A successfully CLAIMED legacy installation may be
+        # canonicalized forward to the browser-neutral loopback transport.  Do
+        # not relax this rule for interrupted/provisional/recovery attempts.
+        if current.get("phase") != "CLAIMED" or any(
+            expected.get(key) is not None for key in browser_keys
+        ):
+            raise LinuxSetupRecoveryRequired(
+                "provisional setup journal conflicts with the exact setup target"
+            )
+        for key in browser_keys:
+            current[key] = expected.get(key)
     return current
 
 
@@ -4879,7 +4828,7 @@ def bootstrap_linux_caddy_root(
 def probe_linux_managed_https(
     origin: str,
     *,
-    root_cert_path: str | os.PathLike[str],
+    root_cert_path: str | os.PathLike[str] | None,
     timeout_seconds: float = 1.0,
 ) -> ManagedServiceActivationResult:
     try:
@@ -4888,36 +4837,52 @@ def probe_linux_managed_https(
     except ValueError:
         return ManagedServiceActivationResult(
             status=ManagedServiceActivationStatus.FAILED,
-            detail="managed HTTPS origin is invalid",
+            detail="managed origin is invalid",
         )
     hostname = parsed.hostname
-    if (
-        parsed.scheme != "https"
-        or hostname is None
-        or port is None
-        or origin != f"https://{hostname}:{port}"
-    ):
+    local_http = (
+        parsed.scheme == "http"
+        and hostname == "127.0.0.1"
+        and port is not None
+        and WEBUI_PORT_MIN <= port <= WEBUI_PORT_MAX
+        and origin == f"http://127.0.0.1:{port}"
+    )
+    legacy_https = (
+        parsed.scheme == "https"
+        and hostname is not None
+        and port is not None
+        and origin == f"https://{hostname}:{port}"
+    )
+    if not (local_http or legacy_https):
         return ManagedServiceActivationResult(
             status=ManagedServiceActivationStatus.FAILED,
-            detail="managed HTTPS origin is invalid",
+            detail="managed origin is invalid",
         )
     try:
-        _validate_hostname(hostname)
-        context = ssl.create_default_context(cafile=os.fspath(root_cert_path))
-        context.check_hostname = True
-        context.verify_mode = ssl.CERT_REQUIRED
         with socket.create_connection(("127.0.0.1", port), timeout=timeout_seconds) as raw:
             raw.settimeout(timeout_seconds)
-            with context.wrap_socket(raw, server_hostname=hostname) as tls_socket:
-                tls_socket.settimeout(timeout_seconds)
-                tls_socket.sendall(
+            stream: socket.socket | ssl.SSLSocket = raw
+            wrapped: ssl.SSLSocket | None = None
+            if legacy_https:
+                assert hostname is not None
+                _validate_hostname(hostname)
+                if root_cert_path is None:
+                    raise FileNotFoundError("legacy HTTPS root is unavailable")
+                context = ssl.create_default_context(cafile=os.fspath(root_cert_path))
+                context.check_hostname = True
+                context.verify_mode = ssl.CERT_REQUIRED
+                wrapped = context.wrap_socket(raw, server_hostname=hostname)
+                wrapped.settimeout(timeout_seconds)
+                stream = wrapped
+            try:
+                stream.sendall(
                     (
                         "GET /health HTTP/1.1\r\n"
                         f"Host: {hostname}:{port}\r\n"
                         "Connection: close\r\n\r\n"
                     ).encode("ascii")
                 )
-                response = HTTPResponse(tls_socket)
+                response = HTTPResponse(stream)
                 response.begin()
                 payload = response.read(1024)
                 if response.status == 200 and payload == b'{"status":"OK"}':
@@ -4928,16 +4893,19 @@ def probe_linux_managed_https(
                 if response.status in {502, 503, 504}:
                     return ManagedServiceActivationResult(
                         status=ManagedServiceActivationStatus.PENDING,
-                        detail="managed HTTPS gateway is up but backend health is not ready",
+                        detail="managed loopback gateway is up but backend health is not ready",
                     )
                 return ManagedServiceActivationResult(
-                    status=ManagedServiceActivationStatus.FAILED,
-                    detail="managed HTTPS health response is not the exact backend readiness proof",
+                    status=ManagedServiceActivationStatus.PORT_CONFLICT,
+                    detail="loopback listener did not return the exact FactLane health proof",
                 )
+            finally:
+                if wrapped is not None:
+                    wrapped.close()
     except (FileNotFoundError, ValueError):
         return ManagedServiceActivationResult(
             status=ManagedServiceActivationStatus.FAILED,
-            detail="managed Caddy public root is unavailable or invalid",
+            detail="managed endpoint trust material is unavailable or invalid",
         )
     except ssl.SSLError:
         return ManagedServiceActivationResult(
@@ -4947,7 +4915,7 @@ def probe_linux_managed_https(
     except (HTTPException, OSError, TimeoutError):
         return ManagedServiceActivationResult(
             status=ManagedServiceActivationStatus.PENDING,
-            detail="managed HTTPS endpoint is not ready",
+            detail="managed endpoint is not ready",
         )
 
 
@@ -4981,21 +4949,15 @@ def _environment_blockers(environment: InstallEnvironment) -> tuple[str, ...]:
     if environment.system == "Windows":
         if os.name != "nt":
             reasons.append("native Windows setup is unavailable from this Linux host")
-        if not isinstance(environment.browser, WindowsBrowserInstall) or environment.browser.family != "firefox":
-            reasons.append("Mozilla Firefox is required for managed Windows WebUI")
         return tuple(reasons)
     if environment.system != "Linux":
         reasons.append("Linux is the only supported WebUI service platform")
     if not environment.systemd:
         reasons.append("a running Linux systemd host with systemctl is required")
     if environment.caddy_path is None:
-        reasons.append("Caddy is required for the installation-private HTTPS gateway")
+        reasons.append("Caddy is required for the installation-private loopback gateway")
     if environment.zenity_path is None:
         reasons.append("zenity is required for native setup confirmation")
-    if environment.browser is None:
-        reasons.append("Mozilla Firefox or Firefox ESR browser is required for managed Linux WebUI")
-    elif isinstance(environment.browser, BrowserInstall) and environment.browser.family != "firefox":
-        reasons.append("Mozilla Firefox or Firefox ESR browser is required for managed Linux WebUI")
     if environment.euid == 0:
         reasons.append("WebUI setup must run as the installing user, not root")
     return tuple(reasons)

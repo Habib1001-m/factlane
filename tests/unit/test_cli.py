@@ -226,7 +226,7 @@ def test_setup_webui_calls_pure_planner_and_emits_structured_plan(
     assert payload["status"] == "READY_TO_APPLY"
     assert payload["apply_available"] is True
     assert payload["plan"]["hostname"] == "factlane-abc123.test"
-    assert payload["plan"]["origin"] == "https://factlane-abc123.test:8768"
+    assert payload["plan"]["origin"] == "http://127.0.0.1:8768"
     assert payload["plan"]["operations"]
     assert payload["apply"] == {"ok": True, "status": "APPLIED"}
 
@@ -346,7 +346,7 @@ def test_injected_setup_executor_receives_exact_receipt_and_consent_and_bypasses
     assert result == 0
     assert len(applied) == 1
     assert applied[0][0].plan is not None
-    assert applied[0][0].plan.origin == "https://factlane-abc123.test:8768"
+    assert applied[0][0].plan.origin == "http://127.0.0.1:8768"
     assert applied[0][1] == configuration.consent
     assert payload["apply_available"] is True
     assert payload["apply"] == {"ok": True, "status": "APPLIED"}
@@ -456,6 +456,63 @@ def test_service_actions_without_injection_use_production_default_controller(
     assert result == 1
     assert calls == [action]
     assert json.loads(output.getvalue())["error_code"] == "CONTROL_UNAVAILABLE"
+
+
+def test_open_webui_keeps_final_json_on_output_while_controller_presents_link_on_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FlushTrackingStream(io.StringIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.flushes = 0
+
+        def flush(self) -> None:
+            self.flushes += 1
+            super().flush()
+
+    stderr = FlushTrackingStream()
+    url = "http://127.0.0.1:8765#connect=locator-1"
+
+    class Controller:
+        def dispatch(self, requested: str) -> dict[str, object]:
+            calls.append(requested)
+            assert requested == "open"
+            cli.sys.stderr.write(
+                "Open this URL in any browser:\n"
+                f"{url}\n"
+                "Waiting for browser connection and local approval...\n"
+            )
+            cli.sys.stderr.flush()
+            return {
+                "status": "OK",
+                "state": "OPENED",
+                "origin": "http://127.0.0.1:8765",
+            }
+
+    monkeypatch.setattr(cli, "build_default_platform_controller", lambda: Controller())
+    monkeypatch.setattr(cli.sys, "stderr", stderr)
+    output = io.StringIO()
+
+    result = cli.main(["open", "webui"], output=output)
+
+    assert result == 0
+    assert calls == ["open"]
+    assert output.getvalue().count("\n") == 1
+    assert json.loads(output.getvalue()) == {
+        "command": "open webui",
+        "origin": "http://127.0.0.1:8765",
+        "state": "OPENED",
+        "status": "OK",
+    }
+    assert "#connect=" not in output.getvalue()
+    assert stderr.getvalue() == (
+        "Open this URL in any browser:\n"
+        f"{url}\n"
+        "Waiting for browser connection and local approval...\n"
+    )
+    assert stderr.flushes == 1
 
 
 @pytest.mark.parametrize("action", ["serve", "open", "start", "stop", "status", "restart"])

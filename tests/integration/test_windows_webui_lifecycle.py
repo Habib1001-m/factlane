@@ -17,7 +17,6 @@ import factlane.webui_platform as webui_platform_module
 import factlane.webui_windows as webui_windows_module
 from factlane.owner_auth import PendingEnrollment
 from factlane.webui_install import (
-    BrowserInstall,
     EndpointState,
     InstallEnvironment,
     InstallerStepStatus,
@@ -41,13 +40,10 @@ from factlane.webui_runtime import (
     WebUIRuntimeConfig,
 )
 from factlane.webui_windows import (
-    WindowsBrowserInstall,
-    WindowsBrowserLauncher,
     WindowsWebUIError,
     WindowsTaskObservation,
     WindowsTaskSchedulerSupervisor,
     current_user_sid,
-    discover_windows_browser,
     ensure_windows_owner_paths,
     load_windows_managed_config,
     process_identity,
@@ -782,13 +778,12 @@ def test_windows_setup_plan_and_apply_have_no_linux_caddy_hosts_or_lingering_req
         factlane_executable=executable,
         installation_id_factory=lambda: "a2native123",
     )
-    browser = WindowsBrowserInstall(family="firefox", executable=executable)
     environment = InstallEnvironment(
         system="Windows",
         systemd=False,
         caddy_path=None,
         zenity_path=None,
-        browser=browser,
+        browser=None,
         euid=-1,
     )
     consent = SetupConsent(
@@ -800,6 +795,8 @@ def test_windows_setup_plan_and_apply_have_no_linux_caddy_hosts_or_lingering_req
     receipt = plan_webui_setup(request, environment, consent)
     assert receipt.status == "READY_TO_APPLY"
     assert receipt.plan is not None
+    assert receipt.plan.browser is None
+    assert receipt.plan.origin == "http://127.0.0.1:8765"
     kinds = [operation.kind for operation in receipt.plan.operations]
     assert kinds == [
         "ENSURE_WINDOWS_OWNER_STATE",
@@ -808,7 +805,15 @@ def test_windows_setup_plan_and_apply_have_no_linux_caddy_hosts_or_lingering_req
         "INSTALL_OWNER_LAUNCHER",
     ]
     serialized = repr(receipt.plan)
-    for forbidden in ("/etc/hosts", "systemd", "zenity", "ENABLE_USER_LINGERING", "WRITE_CADDY_CONFIG"):
+    for forbidden in (
+        "/etc/hosts",
+        "systemd",
+        "zenity",
+        "ENABLE_USER_LINGERING",
+        "WRITE_CADDY_CONFIG",
+        "FIREFOX",
+        "TLS",
+    ):
         assert forbidden not in serialized
 
     registered: list[str] = []
@@ -832,8 +837,10 @@ def test_windows_setup_plan_and_apply_have_no_linux_caddy_hosts_or_lingering_req
     assert registered == [expected_base]
     config = load_windows_managed_config(request.service_config_path)
     assert config is not None
-    assert config.origin == "https://factlane-a2native123.test:8765"
+    assert config.origin == "http://127.0.0.1:8765"
     validate_owner_private_path(request.service_config_path, owner_sid=current_user_sid(), directory=False)
+    assert not Path(request.browser_profile_dir).exists()
+    assert not (Path(request.state_dir) / "tls").exists()
     assert request.launcher_path is not None
     launcher = Path(request.launcher_path)
     assert launcher.is_file()
@@ -856,7 +863,7 @@ def test_windows_setup_requires_explicit_native_confirmation(tmp_path: Path) -> 
         systemd=False,
         caddy_path=None,
         zenity_path=None,
-        browser=WindowsBrowserInstall(family="firefox", executable=executable),
+        browser=None,
         euid=-1,
     )
     denied = SetupConsent(False, False, False, windows_native_setup=False)
@@ -866,523 +873,7 @@ def test_windows_setup_requires_explicit_native_confirmation(tmp_path: Path) -> 
     assert any("explicit consent" in reason for reason in receipt.blocked_reasons)
 
 
-def test_windows_browser_launcher_uses_exact_isolated_firefox_profile_without_bypass(tmp_path: Path) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
-
-    class Process:
-        def poll(self):
-            return None
-
-        def wait(self, *, timeout):
-            assert timeout > 0
-            return 0
-
-    def launch(argv, **kwargs):
-        calls.append((tuple(argv), dict(kwargs)))
-        return Process()
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=launch,
-        profile_active_probe=lambda: True,
-    )
-    assert launcher("https://factlane-a2native123.test:8765#connect=locator") is True
-    assert len(calls) == 2
-    probe_argv, probe_kwargs = calls[0]
-    connect_argv, connect_kwargs = calls[1]
-    assert probe_argv == (
-        executable,
-        "-no-remote",
-        "-profile",
-        str(profile),
-        "-new-window",
-        "about:blank",
-    )
-    assert connect_argv == (
-        executable,
-        "-no-remote",
-        "-profile",
-        str(profile),
-        "-new-window",
-        "https://factlane-a2native123.test:8765#connect=locator",
-    )
-    lowered = " ".join(probe_argv + connect_argv).casefold()
-    assert "ignore-certificate" not in lowered
-    assert "accept-insecure" not in lowered
-    assert probe_kwargs["shell"] is False
-    assert connect_kwargs["shell"] is False
-    validate_owner_private_path(profile, owner_sid=current_user_sid(), directory=True)
-
-
-def test_windows_browser_launcher_cold_profile_warms_probes_then_delivers_connect_once(tmp_path: Path) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-    states = iter((False, False, True, True))
-
-    class Process:
-        def __init__(self, *, wait_code: int = 0) -> None:
-            self.wait_code = wait_code
-
-        def poll(self):
-            return None
-
-        def wait(self, *, timeout):
-            assert 0 < timeout <= 10.0
-            return self.wait_code
-
-    def launch(argv, **kwargs):
-        assert kwargs["shell"] is False
-        calls.append(tuple(argv))
-        return Process()
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=launch,
-        profile_active_probe=lambda: next(states),
-        sleep=lambda _seconds: None,
-    )
-
-    connect = "https://factlane-coldready123.test:8765#connect=single-locator"
-    assert launcher(connect) is True
-    assert calls == [
-        (executable, "-no-remote", "-profile", str(profile), "-new-window", "about:blank"),
-        (executable, "-no-remote", "-profile", str(profile), "-new-window", "about:blank"),
-        (executable, "-no-remote", "-profile", str(profile), "-new-window", connect),
-    ]
-    assert sum("#connect=" in " ".join(argv) for argv in calls) == 1
-
-
-def test_windows_browser_launcher_readiness_timeout_never_delivers_locator(tmp_path: Path) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-
-    class Clock:
-        def __init__(self) -> None:
-            self.value = 50.0
-
-        def __call__(self) -> float:
-            return self.value
-
-        def sleep(self, seconds: float) -> None:
-            self.value += seconds
-
-    class Process:
-        def poll(self):
-            return None
-
-    clock = Clock()
-
-    def launch(argv, **_kwargs):
-        calls.append(tuple(argv))
-        return Process()
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=launch,
-        profile_active_probe=lambda: False,
-        clock=clock,
-        sleep=clock.sleep,
-        readiness_timeout=1.0,
-        readiness_poll_interval=0.2,
-    )
-
-    connect = "https://factlane-timeout123.test:8765#connect=must-not-appear"
-    assert launcher(connect) is False
-    assert len(calls) == 1
-    assert calls[0][-1] == "about:blank"
-    assert all("#connect=" not in " ".join(argv) for argv in calls)
-
-
-@pytest.mark.parametrize("probe_exit", [1, 7])
-def test_windows_browser_launcher_probe_failure_never_delivers_locator(tmp_path: Path, probe_exit: int) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-    states = iter((False, True))
-
-    class Process:
-        def __init__(self, role: str) -> None:
-            self.role = role
-
-        def poll(self):
-            return None
-
-        def wait(self, *, timeout):
-            assert timeout > 0
-            return probe_exit if self.role == "probe" else 0
-
-    def launch(argv, **_kwargs):
-        calls.append(tuple(argv))
-        return Process("warm" if len(calls) == 1 else "probe")
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=launch,
-        profile_active_probe=lambda: next(states),
-        sleep=lambda _seconds: None,
-    )
-
-    assert launcher("https://factlane-probefail123.test:8765#connect=must-not-appear") is False
-    assert [argv[-1] for argv in calls] == ["about:blank", "about:blank"]
-    assert all("#connect=" not in " ".join(argv) for argv in calls)
-
-
-def test_windows_browser_launcher_lock_loss_after_probe_never_delivers_locator(tmp_path: Path) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-    states = iter((False, True, False))
-
-    class Process:
-        def poll(self):
-            return None
-
-        def wait(self, *, timeout):
-            assert timeout > 0
-            return 0
-
-    def launch(argv, **_kwargs):
-        calls.append(tuple(argv))
-        return Process()
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=launch,
-        profile_active_probe=lambda: next(states),
-        sleep=lambda _seconds: None,
-    )
-
-    assert launcher("https://factlane-lockloss123.test:8765#connect=must-not-appear") is False
-    assert [argv[-1] for argv in calls] == ["about:blank", "about:blank"]
-
-
-def test_windows_browser_launcher_allows_clean_warm_handoff_before_profile_lock(tmp_path: Path) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-    states = iter((False, False, True, True))
-
-    class Process:
-        def __init__(self, role: str) -> None:
-            self.role = role
-
-        def poll(self):
-            return 0 if self.role == "warm" else None
-
-        def wait(self, *, timeout):
-            assert timeout > 0
-            return 0
-
-    def launch(argv, **_kwargs):
-        calls.append(tuple(argv))
-        role = "warm" if len(calls) == 1 else "probe" if len(calls) == 2 else "connect"
-        return Process(role)
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=launch,
-        profile_active_probe=lambda: next(states),
-        sleep=lambda _seconds: None,
-    )
-
-    connect = "https://factlane-cleanhandoff123.test:8765#connect=single-locator"
-    assert launcher(connect) is True
-    assert [argv[-1] for argv in calls] == ["about:blank", "about:blank", connect]
-    assert sum("#connect=" in " ".join(argv) for argv in calls) == 1
-
-
-def test_windows_browser_launcher_allows_clean_warm_handoff_after_profile_lock(tmp_path: Path) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-    states = iter((False, True, True))
-    warm_polls = iter((None, 0, 0, 0))
-
-    class Process:
-        def __init__(self, role: str) -> None:
-            self.role = role
-
-        def poll(self):
-            if self.role == "warm":
-                return next(warm_polls)
-            return None
-
-        def wait(self, *, timeout):
-            assert timeout > 0
-            return 0
-
-    def launch(argv, **_kwargs):
-        calls.append(tuple(argv))
-        role = "warm" if len(calls) == 1 else "probe" if len(calls) == 2 else "connect"
-        return Process(role)
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=launch,
-        profile_active_probe=lambda: next(states),
-    )
-
-    connect = "https://factlane-postlockhandoff123.test:8765#connect=single-locator"
-    assert launcher(connect) is True
-    assert [argv[-1] for argv in calls] == ["about:blank", "about:blank", connect]
-
-
-@pytest.mark.parametrize("exit_code", [1, 9])
-def test_windows_browser_launcher_nonzero_warm_exit_never_delivers_locator(
-    tmp_path: Path,
-    exit_code: int,
-) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-
-    class Process:
-        def poll(self):
-            return exit_code
-
-    def launch(argv, **_kwargs):
-        calls.append(tuple(argv))
-        return Process()
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=launch,
-        profile_active_probe=lambda: False,
-    )
-
-    assert launcher("https://factlane-warmfail123.test:8765#connect=must-not-appear") is False
-    assert [argv[-1] for argv in calls] == ["about:blank"]
-
-
-def test_windows_browser_launcher_probe_timeout_never_delivers_locator(tmp_path: Path) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-    states = iter((False, True))
-
-    class Process:
-        def poll(self):
-            return None
-
-        def wait(self, *, timeout):
-            raise subprocess.TimeoutExpired("firefox", timeout)
-
-    def launch(argv, **_kwargs):
-        calls.append(tuple(argv))
-        return Process()
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=launch,
-        profile_active_probe=lambda: next(states),
-    )
-
-    assert launcher("https://factlane-probetimeout123.test:8765#connect=must-not-appear") is False
-    assert [argv[-1] for argv in calls] == ["about:blank", "about:blank"]
-
-
-def test_windows_browser_launcher_ambiguous_profile_state_never_spawns_browser(tmp_path: Path) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-
-    def probe():
-        raise WindowsWebUIError("WINDOWS_BROWSER_PROFILE_STATE_UNAVAILABLE", "ambiguous")
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=lambda argv, **_kwargs: calls.append(tuple(argv)),
-        profile_active_probe=probe,
-    )
-
-    assert launcher("https://factlane-ambiguous123.test:8765#connect=must-not-appear") is False
-    assert calls == []
-
-
-def test_windows_browser_launcher_spawn_failure_never_retries_locator(tmp_path: Path) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-
-    class Probe:
-        def poll(self):
-            return None
-
-        def wait(self, *, timeout):
-            assert timeout > 0
-            return 0
-
-    def launch(argv, **_kwargs):
-        calls.append(tuple(argv))
-        if len(calls) == 1:
-            return Probe()
-        raise OSError("spawn failed")
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=launch,
-        profile_active_probe=lambda: True,
-    )
-
-    assert launcher("https://factlane-spawnfail123.test:8765#connect=single-locator") is False
-    assert [argv[-1] for argv in calls] == ["about:blank", "https://factlane-spawnfail123.test:8765#connect=single-locator"]
-    assert sum("#connect=" in " ".join(argv) for argv in calls) == 1
-
-
-def test_windows_browser_launcher_expiry_after_probe_never_delivers_locator(tmp_path: Path) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-
-    class Clock:
-        def __init__(self) -> None:
-            self.value = 100.0
-
-        def __call__(self) -> float:
-            return self.value
-
-    class Probe:
-        def poll(self):
-            return None
-
-        def wait(self, *, timeout):
-            assert timeout == pytest.approx(1.0)
-            clock.value += timeout
-            return 0
-
-    clock = Clock()
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=lambda argv, **_kwargs: calls.append(tuple(argv)) or Probe(),
-        profile_active_probe=lambda: True,
-        clock=clock,
-        readiness_timeout=1.0,
-    )
-
-    assert launcher("https://factlane-expiry123.test:8765#connect=must-not-appear") is False
-    assert [argv[-1] for argv in calls] == ["about:blank"]
-
-
-def test_windows_browser_launcher_clean_warm_exit_without_profile_lock_times_out_without_locator(
-    tmp_path: Path,
-) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-
-    class Clock:
-        def __init__(self) -> None:
-            self.value = 200.0
-
-        def __call__(self) -> float:
-            return self.value
-
-        def sleep(self, seconds: float) -> None:
-            self.value += seconds
-
-    class WarmProcess:
-        def poll(self):
-            return 0
-
-    clock = Clock()
-
-    def launch(argv, **_kwargs):
-        calls.append(tuple(argv))
-        return WarmProcess()
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=launch,
-        profile_active_probe=lambda: False,
-        clock=clock,
-        sleep=clock.sleep,
-        readiness_timeout=1.0,
-        readiness_poll_interval=0.25,
-    )
-
-    connect = "https://factlane-cleanexit-timeout123.test:8765#connect=must-not-appear"
-    assert launcher(connect) is False
-    assert clock.value == pytest.approx(201.0)
-    assert [argv[-1] for argv in calls] == ["about:blank"]
-    assert all("#connect=" not in " ".join(argv) for argv in calls)
-
-
-def test_windows_browser_launcher_warmup_consumes_deadline_and_probe_gets_only_remaining_budget(
-    tmp_path: Path,
-) -> None:
-    executable = str(Path(sys.executable).resolve())
-    profile = tmp_path / "FactLane" / "browser"
-    calls: list[tuple[str, ...]] = []
-    states = iter((False, False, True, True))
-    probe_timeouts: list[float] = []
-
-    class Clock:
-        def __init__(self) -> None:
-            self.value = 300.0
-
-        def __call__(self) -> float:
-            return self.value
-
-        def sleep(self, seconds: float) -> None:
-            self.value += seconds
-
-    class Process:
-        def __init__(self, role: str) -> None:
-            self.role = role
-
-        def poll(self):
-            return None
-
-        def wait(self, *, timeout):
-            assert self.role == "probe"
-            probe_timeouts.append(timeout)
-            return 0
-
-    clock = Clock()
-
-    def launch(argv, **_kwargs):
-        calls.append(tuple(argv))
-        role = "warm" if len(calls) == 1 else "probe" if len(calls) == 2 else "connect"
-        return Process(role)
-
-    launcher = WindowsBrowserLauncher(
-        WindowsBrowserInstall(family="firefox", executable=executable),
-        str(profile),
-        process_factory=launch,
-        profile_active_probe=lambda: next(states),
-        clock=clock,
-        sleep=clock.sleep,
-        readiness_timeout=1.0,
-        readiness_poll_interval=0.4,
-    )
-
-    connect = "https://factlane-remaining-budget123.test:8765#connect=single-locator"
-    assert launcher(connect) is True
-    assert clock.value == pytest.approx(300.4)
-    assert probe_timeouts == [pytest.approx(0.6)]
-    assert [argv[-1] for argv in calls] == ["about:blank", "about:blank", connect]
-    assert sum("#connect=" in " ".join(argv) for argv in calls) == 1
-
-
-def test_windows_managed_setup_rejects_chromium_even_when_present(tmp_path: Path) -> None:
+def test_windows_managed_setup_is_browser_neutral_even_when_non_firefox_is_present(tmp_path: Path) -> None:
     executable = str(Path(sys.executable).resolve())
     request = build_default_setup_request(
         environ={
@@ -1391,14 +882,14 @@ def test_windows_managed_setup_rejects_chromium_even_when_present(tmp_path: Path
         },
         installing_user="test-user",
         factlane_executable=executable,
-        installation_id_factory=lambda: "firefoxrequired123",
+        installation_id_factory=lambda: "browserneutral123",
     )
     environment = InstallEnvironment(
         system="Windows",
         systemd=False,
         caddy_path=None,
         zenity_path=None,
-        browser=WindowsBrowserInstall(family="chromium", executable=executable),
+        browser=webui_windows_module.WindowsBrowserInstall(family="chromium", executable=executable),
         euid=-1,
     )
 
@@ -1408,71 +899,67 @@ def test_windows_managed_setup_rejects_chromium_even_when_present(tmp_path: Path
         SetupConsent(False, False, False, windows_native_setup=True),
     )
 
-    assert receipt.status == "BLOCKED"
-    assert receipt.plan is None
-    assert receipt.blocked_reasons == ("Mozilla Firefox is required for managed Windows WebUI",)
+    assert receipt.status == "READY_TO_APPLY"
+    assert receipt.blocked_reasons == ()
+    assert receipt.plan is not None
+    assert receipt.plan.browser is None
+    assert receipt.plan.origin == "http://127.0.0.1:8765"
+    serialized = repr(receipt.plan)
+    assert "FIREFOX" not in serialized
+    assert "BROWSER_PROFILE_TRUST" not in serialized
 
 
-def test_windows_browser_discovery_does_not_fall_back_to_edge_or_chrome() -> None:
-    executable = str(Path(sys.executable).resolve())
-
-    browser = discover_windows_browser(
-        environ={},
-        which=lambda name: executable if name in {"msedge.exe", "chrome.exe"} else None,
-    )
-
-    assert browser is None
-
-
-def test_windows_production_browser_resolver_loads_live_tls_and_provisions_firefox_profile(
+def test_windows_legacy_https_config_remains_loadable_but_new_plan_canonicalizes_to_http(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executable = str(Path(sys.executable).resolve())
-    state_dir = tmp_path / "FactLane" / "state"
-    profile_dir = tmp_path / "FactLane" / "browser"
-    material = object()
-    calls: list[tuple[str, object]] = []
-    browser = WindowsBrowserInstall(family="firefox", executable=executable)
-
-    monkeypatch.setattr(webui_platform_module, "discover_windows_browser", lambda **_kwargs: browser)
-    monkeypatch.setattr(
-        webui_platform_module,
-        "load_windows_tls_material",
-        lambda root, hostname: calls.append(("load", (Path(root), hostname))) or material,
+    environ = {
+        "LOCALAPPDATA": str(tmp_path / "LocalAppData"),
+        "APPDATA": str(tmp_path / "RoamingAppData"),
+    }
+    native = windows_owner_paths(environ=environ)
+    ensure_windows_owner_paths(native)
+    legacy = webui_windows_module.WindowsManagedConfig(
+        installation_id="legacy123",
+        origin="https://factlane-legacy123.test:8765",
+        native_control_pipe=native.native_control_socket,
+        runtime_dir=native.runtime_dir,
+        state_dir=native.state_dir,
+        browser_profile_dir=native.browser_profile_dir,
     )
-    monkeypatch.setattr(
-        webui_platform_module,
-        "ensure_firefox_profile_network_policy",
-        lambda **kwargs: calls.append(("network", kwargs)) or Path(kwargs["profile_dir"]) / "user.js",
-    )
-    monkeypatch.setattr(
-        webui_platform_module,
-        "ensure_firefox_profile_trust",
-        lambda **kwargs: calls.append(("trust", kwargs)) or object(),
+    write_owner_private_text_atomic(
+        native.service_config_path,
+        webui_windows_module.render_windows_managed_config(legacy),
     )
 
-    launcher = webui_platform_module._resolve_production_browser_launcher(
-        origin="https://factlane-resolver123.test:8765",
-        state_dir=str(state_dir),
-        profile_dir=str(profile_dir),
+    loaded = load_windows_managed_config(native.service_config_path)
+    assert loaded == legacy
+
+    request = build_default_setup_request(
+        environ=environ,
+        installing_user="test-user",
+        factlane_executable=_factlane_executable(),
+        installation_id_factory=lambda: pytest.fail("legacy config must preserve installation identity"),
+    )
+    receipt = plan_webui_setup(
+        request,
+        InstallEnvironment(
+            system="Windows",
+            systemd=False,
+            caddy_path=None,
+            zenity_path=None,
+            browser=None,
+            euid=-1,
+        ),
+        SetupConsent(False, False, False, windows_native_setup=True),
     )
 
-    assert isinstance(launcher, WindowsBrowserLauncher)
-    assert launcher.browser == browser
-    assert launcher.profile_dir == str(profile_dir)
-    assert calls[0] == ("load", (state_dir / "tls", "factlane-resolver123.test"))
-    assert calls[1] == (
-        "network",
-        {"profile_dir": str(profile_dir), "hostname": "factlane-resolver123.test"},
-    )
-    assert calls[2][0] == "trust"
-    assert calls[2][1]["firefox_executable"] == executable
-    assert calls[2][1]["profile_dir"] == str(profile_dir)
-    assert calls[2][1]["tls_material"] is material
+    assert request.installation_id == "legacy123"
+    assert receipt.status == "READY_TO_APPLY"
+    assert receipt.plan is not None
+    assert receipt.plan.origin == "http://127.0.0.1:8765"
 
 
-def test_windows_open_passes_exact_origin_state_and_profile_to_production_resolver(
+def test_windows_open_presents_exact_loopback_connect_url_without_resolving_or_launching_browser(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1490,9 +977,8 @@ def test_windows_open_passes_exact_origin_state_and_profile_to_production_resolv
         caddy_state_dir=str(Path(native.state_dir) / "transport"),
         browser_profile_dir=native.browser_profile_dir,
     )
-    origin = "https://factlane-open123.test:8765"
-    resolver_calls: list[dict[str, str | None]] = []
-    opened: list[str] = []
+    origin = "http://127.0.0.1:8765"
+    presented: list[str] = []
 
     class Client:
         def status(self):
@@ -1513,29 +999,27 @@ def test_windows_open_passes_exact_origin_state_and_profile_to_production_resolv
             assert locator == "local-locator"
             return None
 
-    def resolve(**kwargs):
-        resolver_calls.append(dict(kwargs))
-        return lambda url: opened.append(url) or True
+    def browser_resolution_must_not_run(**_kwargs):
+        pytest.fail("browser resolution must not run from open")
 
-    monkeypatch.setattr(webui_platform_module, "_resolve_production_browser_launcher", resolve)
+    monkeypatch.setattr(
+        webui_platform_module,
+        "_resolve_production_browser_launcher",
+        browser_resolution_must_not_run,
+    )
     controller = ProductionWebUIController(
         paths=paths,
         platform_system="Windows",
         service_manager=_FakeSupervisor(identity),
         windows_control_client_factory=lambda _path, _process: Client(),
+        browser_launcher=lambda _url: pytest.fail("browser launcher must not run from open"),
+        open_link_presenter=presented.append,
     )
 
     result = controller.dispatch("open")
 
     assert result == {"status": "OK", "state": "OPENED", "origin": origin}
-    assert resolver_calls == [
-        {
-            "origin": origin,
-            "state_dir": paths.state_dir,
-            "profile_dir": paths.browser_profile_dir,
-        }
-    ]
-    assert opened == [f"{origin}#connect=local-locator"]
+    assert presented == [f"{origin}#connect=local-locator"]
 
 
 def test_windows_open_accepts_inflight_human_approval_after_more_than_ten_seconds(
@@ -1555,8 +1039,8 @@ def test_windows_open_accepts_inflight_human_approval_after_more_than_ten_second
         caddy_state_dir=str(Path(native.state_dir) / "transport"),
         browser_profile_dir=native.browser_profile_dir,
     )
-    origin = "https://factlane-delay123.test:8765"
-    opened: list[str] = []
+    origin = "http://127.0.0.1:8765"
+    presented: list[str] = []
     approvals: list[str] = []
 
     class Clock:
@@ -1593,7 +1077,8 @@ def test_windows_open_accepts_inflight_human_approval_after_more_than_ten_second
         platform_system="Windows",
         service_manager=_FakeSupervisor(identity),
         windows_control_client_factory=lambda _path, _process: Client(),
-        browser_launcher=lambda url: opened.append(url) or True,
+        browser_launcher=lambda _url: pytest.fail("browser launcher must not run from open"),
+        open_link_presenter=presented.append,
         clock=clock,
     )
 
@@ -1602,7 +1087,7 @@ def test_windows_open_accepts_inflight_human_approval_after_more_than_ten_second
     assert result == {"status": "OK", "state": "OPENED", "origin": origin}
     assert approvals == ["delayed-locator"]
     assert clock.value == 111.0
-    assert opened == [f"{origin}#connect=delayed-locator"]
+    assert presented == [f"{origin}#connect=delayed-locator"]
 
 
 def test_windows_open_does_not_retry_ambiguous_approval_timeout(
@@ -1622,7 +1107,7 @@ def test_windows_open_does_not_retry_ambiguous_approval_timeout(
         caddy_state_dir=str(Path(native.state_dir) / "transport"),
         browser_profile_dir=native.browser_profile_dir,
     )
-    origin = "https://factlane-timeout123.test:8765"
+    origin = "http://127.0.0.1:8765"
     approvals: list[str] = []
 
     class Client:
@@ -1652,7 +1137,8 @@ def test_windows_open_does_not_retry_ambiguous_approval_timeout(
         platform_system="Windows",
         service_manager=_FakeSupervisor(identity),
         windows_control_client_factory=lambda _path, _process: Client(),
-        browser_launcher=lambda _url: True,
+        browser_launcher=lambda _url: pytest.fail("browser launcher must not run from open"),
+        open_link_presenter=lambda _url: None,
     )
 
     result = controller.dispatch("open")
@@ -1662,7 +1148,7 @@ def test_windows_open_does_not_retry_ambiguous_approval_timeout(
     assert approvals == ["timeout-locator"]
 
 
-def test_windows_serve_route_runs_native_backend_owned_https_without_caddy(
+def test_windows_serve_route_runs_native_backend_owned_http_without_tls_or_caddy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1680,7 +1166,7 @@ def test_windows_serve_route_runs_native_backend_owned_https_without_caddy(
         systemd=False,
         caddy_path=None,
         zenity_path=None,
-        browser=WindowsBrowserInstall(family="firefox", executable=executable),
+        browser=None,
         euid=-1,
     )
     consent = SetupConsent(False, False, False, windows_native_setup=True)
@@ -1703,13 +1189,11 @@ def test_windows_serve_route_runs_native_backend_owned_https_without_caddy(
     calls: dict[str, object] = {}
     events: list[str] = []
 
-    def ensure_tls(root, hostname):
-        events.append("ensure_tls")
-        calls["tls_root"] = root
-        calls["tls_hostname"] = hostname
-        return object()
-
-    monkeypatch.setattr(webui_platform_module, "ensure_windows_tls_material", ensure_tls)
+    monkeypatch.setattr(
+        webui_platform_module,
+        "ensure_windows_tls_material",
+        lambda *_args, **_kwargs: pytest.fail("new WINDOWS_HTTP serve must not provision TLS"),
+    )
 
     backend_factory = lambda _spec, _service_state: pytest.fail("fake runner must not launch backend")
 
@@ -1747,14 +1231,12 @@ def test_windows_serve_route_runs_native_backend_owned_https_without_caddy(
     runtime_config = calls["config"]
     assert isinstance(runtime_config, WebUIRuntimeConfig)
     assert runtime_config.platform_kind is PlatformKind.WINDOWS
-    assert runtime_config.backend_transport is BackendTransportKind.WINDOWS_HTTPS
+    assert runtime_config.backend_transport is BackendTransportKind.WINDOWS_HTTP
     assert runtime_config.backend_socket is None
     assert runtime_config.caddy_path is None
     assert runtime_config.caddyfile is None
-    assert runtime_config.origin == "https://factlane-a2serve123.test:8765"
+    assert runtime_config.origin == "http://127.0.0.1:8765"
     assert calls["backend_factory"] is backend_factory
     assert calls["process_factory"] is None
     assert calls["external_gateway_required"] is False
-    assert calls["tls_root"] == Path(paths.state_dir) / "tls"
-    assert calls["tls_hostname"] == "factlane-a2serve123.test"
-    assert events == ["ensure_tls", "runner_init", "runner_run"]
+    assert events == ["runner_init", "runner_run"]

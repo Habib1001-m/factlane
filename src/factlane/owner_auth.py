@@ -492,16 +492,18 @@ class OwnerAuthState:
         *,
         session_secret: str,
         origin: str,
+        csrf_secret: str,
     ) -> SessionResumeCredentials:
         origin = self._validate_origin(origin)
         digest = self._secret_digest(session_secret)
         now = self._clock()
         with self._lock:
             session = self._session_for_use(digest, origin, now)
-            csrf_secret = self._new_secret()
-            session.csrf_digest = self._secret_digest(csrf_secret)
+            self._validate_csrf(session, csrf_secret, required=True)
+            rotated_csrf = self._new_secret()
+            session.csrf_digest = self._secret_digest(rotated_csrf)
             return SessionResumeCredentials(
-                csrf_secret=csrf_secret,
+                csrf_secret=rotated_csrf,
                 idle_remaining_seconds=max(0.0, session.expires_at() - now),
                 absolute_remaining_seconds=max(0.0, session.absolute_expires_at - now),
                 auth_epoch=session.auth_epoch,
@@ -1142,20 +1144,35 @@ class OwnerAuthState:
         origin = cls._bounded_text(origin, "origin", 2048)
         parsed = urlsplit(origin)
         try:
-            parsed.port
+            port = parsed.port
         except ValueError as exc:
             raise ValueError("origin must contain a valid port when a port is present") from exc
-        if (
-            parsed.scheme != "https"
-            or not parsed.netloc
+        common_invalid = (
+            not parsed.netloc
             or parsed.hostname is None
             or parsed.username is not None
             or parsed.password is not None
             or parsed.path
             or parsed.query
             or parsed.fragment
-        ):
-            raise ValueError("origin must be an exact HTTPS origin without path, query, or fragment")
+        )
+        local_http = (
+            parsed.scheme == "http"
+            and parsed.hostname == "127.0.0.1"
+            and port is not None
+            and 8765 <= port <= 8774
+            and origin == f"http://127.0.0.1:{port}"
+        )
+        exact_https = (
+            parsed.scheme == "https"
+            and parsed.hostname is not None
+            and origin
+            == f"https://{parsed.hostname}" + (f":{port}" if port is not None else "")
+        )
+        if common_invalid or not (local_http or exact_https):
+            raise ValueError(
+                "origin must be exact HTTPS or the canonical FactLane loopback HTTP origin"
+            )
         return origin
 
     @staticmethod
