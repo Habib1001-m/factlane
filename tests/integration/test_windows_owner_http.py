@@ -286,7 +286,7 @@ def test_windows_tls_preserves_exact_host_origin_auth_cookie_and_forwarded_heade
             server,
             "POST",
             "/auth/session/resume",
-            body=b"{}",
+            body=json.dumps({"csrf": csrf}, separators=(",", ":")).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "Origin": server.origin,
