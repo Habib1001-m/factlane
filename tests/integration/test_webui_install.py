@@ -1002,6 +1002,89 @@ def test_production_backend_managed_activation_uses_exact_start_stop_argv_and_se
     assert probe_calls
 
 
+@pytest.mark.parametrize("legacy_status", [ServiceStatus.STARTING, ServiceStatus.READY])
+def test_production_backend_waits_through_exact_legacy_endpoint_migration(
+    legacy_status: ServiceStatus,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    clock = _InstallClock()
+    receipt = plan_webui_setup(_request(), _environment(), _consent())
+    assert receipt.plan is not None
+    legacy_origin = f"https://{receipt.plan.hostname}:{receipt.plan.saved_port}"
+    snapshots = iter(
+        [
+            _service_snapshot(legacy_status, legacy_origin),
+            _service_snapshot(ServiceStatus.READY, receipt.plan.origin),
+        ]
+    )
+    current = _service_snapshot(legacy_status, legacy_origin)
+
+    def state_reader() -> ServiceSnapshot:
+        nonlocal current
+        try:
+            current = next(snapshots)
+        except StopIteration:
+            pass
+        return current
+
+    probe_calls: list[str] = []
+
+    def probe(origin: str) -> ManagedServiceActivationResult:
+        probe_calls.append(origin)
+        return ManagedServiceActivationResult(
+            status=(
+                ManagedServiceActivationStatus.PENDING
+                if len(probe_calls) == 1
+                else ManagedServiceActivationStatus.READY
+            ),
+        )
+
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/opt/systemd/bin/systemctl",
+        owner_uid=1000,
+        command_runner=lambda argv: calls.append(argv) or 0,
+        service_state_reader=state_reader,
+        activation_probe=probe,
+        clock=clock,
+        sleep=clock.sleep,
+        poll_interval=0.1,
+    )
+
+    activated = backend.activate_candidate(plan=receipt.plan)
+
+    assert activated == ManagedServiceActivationResult(
+        status=ManagedServiceActivationStatus.READY,
+        saved_endpoint=receipt.plan.origin,
+    )
+    assert calls == [
+        ("/opt/systemd/bin/systemctl", "--user", "restart", WEBUI_SERVICE_NAME),
+    ]
+    assert probe_calls == [receipt.plan.origin, receipt.plan.origin]
+
+
+def test_production_backend_still_rejects_foreign_same_port_saved_endpoint() -> None:
+    receipt = plan_webui_setup(_request(), _environment(), _consent())
+    assert receipt.plan is not None
+    backend = ProductionLinuxInstallerBackend(
+        systemctl_path="/opt/systemd/bin/systemctl",
+        owner_uid=1000,
+        command_runner=lambda _argv: 0,
+        service_state_reader=lambda: _service_snapshot(
+            ServiceStatus.STARTING,
+            f"https://factlane-foreign.test:{receipt.plan.saved_port}",
+        ),
+        activation_probe=lambda _origin: ManagedServiceActivationResult(
+            status=ManagedServiceActivationStatus.PENDING,
+        ),
+    )
+
+    activated = backend.activate_candidate(plan=receipt.plan)
+
+    assert activated.status is ManagedServiceActivationStatus.FAILED
+    assert activated.saved_endpoint == f"https://factlane-foreign.test:{receipt.plan.saved_port}"
+    assert activated.detail == "service state saved endpoint differs from the candidate origin"
+
+
 def test_production_backend_port_conflict_comes_only_from_typed_probe_not_stderr() -> None:
     calls: list[tuple[str, ...]] = []
     receipt = plan_webui_setup(_request(), _environment(), _consent())

@@ -22,7 +22,12 @@ from typing import Callable, Protocol
 from urllib.parse import urlsplit
 
 from .webui_runtime import WebUIRuntimeConfig
-from .webui_service import ServiceSnapshot, ServiceStatus, service_state_file_guard
+from .webui_service import (
+    ServiceSnapshot,
+    ServiceStatus,
+    is_legacy_endpoint_canonicalization,
+    service_state_file_guard,
+)
 from .webui_windows import (
     WINDOWS_TASK_NAME,
     WindowsBrowserInstall,
@@ -3171,11 +3176,20 @@ class ProductionLinuxInstallerBackend:
 
             snapshot = self._service_state_reader()
             if snapshot.saved_endpoint is not None and snapshot.saved_endpoint != plan.origin:
-                return finish(ManagedServiceActivationResult(
-                    status=ManagedServiceActivationStatus.FAILED,
-                    saved_endpoint=snapshot.saved_endpoint,
-                    detail="service state saved endpoint differs from the candidate origin",
-                ))
+                migration_pending = (
+                    snapshot.status in {ServiceStatus.STARTING, ServiceStatus.READY}
+                    and is_legacy_endpoint_canonicalization(
+                        snapshot.saved_endpoint,
+                        plan.origin,
+                        expected_legacy_hostname=plan.hostname,
+                    )
+                )
+                if not migration_pending:
+                    return finish(ManagedServiceActivationResult(
+                        status=ManagedServiceActivationStatus.FAILED,
+                        saved_endpoint=snapshot.saved_endpoint,
+                        detail="service state saved endpoint differs from the candidate origin",
+                    ))
             if snapshot.status is ServiceStatus.READY and snapshot.saved_endpoint == plan.origin:
                 if (
                     probed is not None
