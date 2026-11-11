@@ -811,7 +811,12 @@ class WindowsTaskSchedulerSupervisor:
             before = self._snapshot_task_with_service(service)
             if before["exists"]:
                 task = service.GetFolder("\\").GetTask(self.task_name)
-                self._validate_registered_task(task, plan, allow_disabled=True)
+                self._validate_registered_task(
+                    task,
+                    plan,
+                    allow_disabled=True,
+                    expected_definition=self._task_definition(service, plan),
+                )
                 if int(task.State) in {_TASK_STATE_RUNNING, _TASK_STATE_QUEUED}:
                     raise WindowsWebUIError("WINDOWS_SETUP_BUSY", "managed task must be quiescent before setup")
             definition = self._task_definition(service, plan)
@@ -868,8 +873,12 @@ class WindowsTaskSchedulerSupervisor:
         return source or None
 
     @staticmethod
-    def _task_behavior_xml_signature(xml: str) -> tuple[Any, ...]:
-        """Canonicalize complete behavioral task XML, excluding admin metadata."""
+    def _task_xml_signature(
+        xml: str,
+        *,
+        exclude_registration_info: bool,
+    ) -> tuple[Any, ...]:
+        """Canonicalize task XML for same-stage recipe comparison."""
         if not isinstance(xml, str) or not xml or len(xml.encode("utf-8")) > 262144:
             raise WindowsWebUIError(
                 "WINDOWS_TASK_DEFINITION_UNSAFE",
@@ -888,7 +897,7 @@ class WindowsTaskSchedulerSupervisor:
 
         def canonical(element: Any) -> tuple[Any, ...] | None:
             name = local(element.tag)
-            if name == "RegistrationInfo":
+            if exclude_registration_info and name == "RegistrationInfo":
                 return None
             attributes = tuple(
                 sorted(
@@ -916,6 +925,16 @@ class WindowsTaskSchedulerSupervisor:
                 "scheduled task XML has no behavioral definition",
             )
         return signature
+
+    @classmethod
+    def _task_behavior_xml_signature(cls, xml: str) -> tuple[Any, ...]:
+        """Canonicalize behavioral task XML, excluding Scheduler/admin metadata."""
+        return cls._task_xml_signature(xml, exclude_registration_info=True)
+
+    @classmethod
+    def _prepared_task_xml_signature(cls, xml: str) -> tuple[Any, ...]:
+        """Canonicalize the complete pre-registration recipe, including RegistrationInfo."""
+        return cls._task_xml_signature(xml, exclude_registration_info=False)
 
     @staticmethod
     def _normalized_sddl_signature(
@@ -966,6 +985,7 @@ class WindowsTaskSchedulerSupervisor:
         *,
         intended: dict[str, Any],
         observed: dict[str, Any],
+        expected_definition: Any | None = None,
         allow_disabled: bool = False,
         expected_source: str | None = None,
     ) -> None:
@@ -973,6 +993,7 @@ class WindowsTaskSchedulerSupervisor:
             task,
             self.plan(self.expected_executable),
             allow_disabled=allow_disabled,
+            expected_definition=expected_definition,
         )
         self._validate_task_security(task)
         if expected_source is None:
@@ -983,13 +1004,11 @@ class WindowsTaskSchedulerSupervisor:
                 "WINDOWS_SETUP_RECOVERY_REQUIRED",
                 "scheduled task registration source differs from the prepared transaction",
             )
-        if self._task_behavior_xml_signature(str(observed["xml"])) != self._task_behavior_xml_signature(
-            str(intended["xml"])
-        ):
-            raise WindowsWebUIError(
-                "WINDOWS_SETUP_RECOVERY_REQUIRED",
-                "scheduled task behavior differs from the prepared transaction",
-            )
+        # Task Scheduler canonicalizes the serialized XML representation when a
+        # task is registered (including optional/default elements).  Behavioral
+        # custody is therefore proved from the live COM definition above, while
+        # the prepared XML recipe is proved independently *before* publication.
+        # Do not compare pre-registration XmlText with Scheduler-exported XML.
         if self._normalized_sddl_signature(str(observed["sddl"])) != self._normalized_sddl_signature(
             str(intended["sddl"])
         ):
@@ -1001,6 +1020,45 @@ class WindowsTaskSchedulerSupervisor:
             raise WindowsWebUIError(
                 "WINDOWS_SETUP_RECOVERY_REQUIRED",
                 "scheduled task enabled state differs from the prepared transaction",
+            )
+
+    def _validate_prepared_task_recipe(
+        self,
+        service: Any,
+        intended: dict[str, Any],
+        *,
+        transaction_id: str,
+    ) -> None:
+        """Fail closed on a changed prepared recipe before Task Scheduler mutation."""
+
+        plan = self.plan(self.expected_executable)
+        definition = self._task_definition(service, plan)
+        expected_source = self._setup_registration_source(transaction_id)
+        definition.RegistrationInfo.Source = expected_source
+        expected_xml = str(definition.XmlText)
+        expected_sddl = f"O:{self.owner_sid}G:{self.owner_sid}D:P(A;;GA;;;{self.owner_sid})(A;;GA;;;SY)"
+        try:
+            intended_source = self._registration_source_from_xml(str(intended["xml"]))
+            intended_recipe = self._prepared_task_xml_signature(str(intended["xml"]))
+            expected_recipe = self._prepared_task_xml_signature(expected_xml)
+            intended_security = self._normalized_sddl_signature(str(intended["sddl"]))
+            expected_security = self._normalized_sddl_signature(expected_sddl)
+            intended_enabled = intended["enabled"]
+        except (KeyError, TypeError) as exc:
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_RECOVERY_REQUIRED",
+                "prepared scheduled task recipe is incomplete",
+            ) from exc
+        if (
+            intended_source != expected_source
+            or intended_recipe != expected_recipe
+            or intended_security != expected_security
+            or type(intended_enabled) is not bool
+            or intended_enabled is not True
+        ):
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_RECOVERY_REQUIRED",
+                "prepared scheduled task recipe differs from the fixed lifecycle policy",
             )
 
     def _validated_registration_snapshot(
@@ -1017,10 +1075,15 @@ class WindowsTaskSchedulerSupervisor:
                 "scheduled task registration disappeared before validation",
             )
         task = service.GetFolder("\\").GetTask(self.task_name)
+        expected_definition = self._task_definition(
+            service,
+            self.plan(self.expected_executable),
+        )
         self._validate_registration_boundary(
             task,
             intended=intended,
             observed=observed,
+            expected_definition=expected_definition,
             expected_source=expected_source,
         )
         if self._snapshot_task_with_service(service) != observed:
@@ -1040,6 +1103,11 @@ class WindowsTaskSchedulerSupervisor:
         def publish(service):
             if self._snapshot_task_with_service(service) != expected:
                 raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task changed before registration")
+            self._validate_prepared_task_recipe(
+                service,
+                intended,
+                transaction_id=transaction_id,
+            )
             root = service.GetFolder("\\")
             root.RegisterTask(self.task_name, intended["xml"], _TASK_CREATE_OR_UPDATE | 0x10,
                               self.user_id, None, _TASK_LOGON_INTERACTIVE_TOKEN, intended["sddl"])
@@ -1153,7 +1221,12 @@ class WindowsTaskSchedulerSupervisor:
                     "WINDOWS_TASK_UNAVAILABLE",
                     "FactLane current-user scheduled task is not registered",
                 ) from exc
-            self._validate_registered_task(task, self.plan(self.expected_executable))
+            plan = self.plan(self.expected_executable)
+            self._validate_registered_task(
+                task,
+                plan,
+                expected_definition=self._task_definition(service, plan),
+            )
             self._validate_task_security(task)
             state = int(task.State)
             state_name = {
@@ -1212,7 +1285,12 @@ class WindowsTaskSchedulerSupervisor:
             root = service.GetFolder("\\")
             try:
                 task = root.GetTask(self.task_name)
-                self._validate_registered_task(task, self.plan(self.expected_executable))
+                plan = self.plan(self.expected_executable)
+                self._validate_registered_task(
+                    task,
+                    plan,
+                    expected_definition=self._task_definition(service, plan),
+                )
                 self._validate_task_security(task)
                 task.Run("")
             except WindowsWebUIError:
@@ -1303,30 +1381,153 @@ class WindowsTaskSchedulerSupervisor:
             raise WindowsWebUIError(*error_data)
         return result
 
-    def _validate_registered_task(self, task: Any, plan: WindowsTaskPlan, *, allow_disabled: bool = False) -> None:
+    @staticmethod
+    def _query_task_scheduler_extension(value: Any, iid_text: str) -> Any | None:
+        """Query an exact Task Scheduler extension interface without mutating it."""
+        try:
+            import pythoncom
+            import win32com.client
+        except ImportError as exc:  # pragma: no cover - native-Windows packaging guard
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "Task Scheduler extended definition interfaces are unavailable",
+            ) from exc
+        try:
+            dispatch = value._oleobj_.QueryInterface(
+                pythoncom.MakeIID(iid_text),
+                pythoncom.IID_IDispatch,
+            )
+        except pythoncom.com_error as exc:
+            hresult = getattr(exc, "hresult", exc.args[0] if exc.args else None)
+            e_nointerface = getattr(pythoncom, "E_NOINTERFACE", -2147467262)
+            if hresult == e_nointerface:
+                return None
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "Task Scheduler extended definition interface could not be verified",
+            ) from exc
+        except Exception as exc:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "Task Scheduler extended definition interface could not be verified",
+            ) from exc
+        return win32com.client.Dispatch(dispatch)
+
+    @classmethod
+    def _principal2_signature(cls, principal: Any) -> tuple[int, int]:
+        extension = cls._query_task_scheduler_extension(
+            principal,
+            "{248919AE-E345-4A6D-8AEB-E0D3165C904E}",
+        )
+        if extension is None:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task principal extension is unavailable",
+            )
+        try:
+            count = int(extension.RequiredPrivilegeCount)
+            if count != 0:
+                raise WindowsWebUIError(
+                    "WINDOWS_TASK_DEFINITION_UNSAFE",
+                    "scheduled task principal requested additional privileges",
+                )
+            return (int(extension.ProcessTokenSidType), count)
+        except WindowsWebUIError:
+            raise
+        except Exception as exc:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task principal extension could not be verified",
+            ) from exc
+
+    @classmethod
+    def _settings3_signature(cls, settings: Any) -> tuple[Any, ...] | None:
+        extension = cls._query_task_scheduler_extension(
+            settings,
+            "{0AD9D0D7-0C7F-4EBB-9A5F-D1C648DCA528}",
+        )
+        if extension is None:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task settings extension is unavailable",
+            )
+        try:
+            maintenance = extension.MaintenanceSettings
+            if maintenance is None:
+                maintenance_signature = ("", "", False)
+            else:
+                maintenance_signature = (
+                    str(maintenance.Period or "").upper(),
+                    str(maintenance.Deadline or "").upper(),
+                    bool(maintenance.Exclusive),
+                )
+            return (
+                bool(extension.DisallowStartOnRemoteAppSession),
+                bool(extension.UseUnifiedSchedulingEngine),
+                bool(extension.Volatile),
+                *maintenance_signature,
+            )
+        except Exception as exc:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task maintenance settings could not be verified",
+            ) from exc
+
+    def _validate_registered_task(
+        self,
+        task: Any,
+        plan: WindowsTaskPlan,
+        *,
+        allow_disabled: bool = False,
+        expected_definition: Any | None = None,
+    ) -> None:
         try:
             definition = task.Definition
+            expected = expected_definition
+            if expected is None:
+                raise WindowsWebUIError(
+                    "WINDOWS_TASK_DEFINITION_UNSAFE",
+                    "scheduled task expected lifecycle definition is unavailable",
+                )
             if str(definition.RegistrationInfo.Description) != "FactLane Owner WebUI current-user managed runtime":
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task description changed")
             principal = definition.Principal
+            expected_principal = expected.Principal
             if int(principal.LogonType) != plan.logon_type or int(principal.RunLevel) != plan.run_level:
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task principal is not interactive least-privilege")
+            if str(getattr(principal, "GroupId", "") or ""):
+                raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task principal group scope changed")
             _pywintypes, _win32api, _win32con, win32security = _require_windows()
             principal_sid = win32security.LookupAccountName(None, str(principal.UserId))[0]
             principal_sid_text = str(win32security.ConvertSidToStringSid(principal_sid))
             if principal_sid_text.casefold() != self.owner_sid.casefold():
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task principal is not the current Owner")
+            if self._principal2_signature(principal) != self._principal2_signature(expected_principal):
+                raise WindowsWebUIError(
+                    "WINDOWS_TASK_DEFINITION_UNSAFE",
+                    "scheduled task principal extended policy changed",
+                )
             if int(definition.Actions.Count) != 1:
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task must contain one exact action")
             action = definition.Actions.Item(1)
+            expected_action = expected.Actions.Item(1)
             if int(action.Type) != _TASK_ACTION_EXEC:
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task action type is not executable")
             if str(action.Path).casefold() != plan.executable.casefold() or str(action.Arguments) != plan.arguments:
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task executable or arguments changed")
+            if str(getattr(action, "WorkingDirectory", "") or "") != str(
+                getattr(expected_action, "WorkingDirectory", "") or ""
+            ):
+                raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task working directory changed")
+            action_context = str(getattr(definition.Actions, "Context", "") or "")
+            principal_id = str(getattr(principal, "Id", "") or "")
+            if action_context and (not principal_id or action_context.casefold() != principal_id.casefold()):
+                raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task action context changed principal scope")
             triggers = definition.Triggers
             if int(triggers.Count) != 1:
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task trigger set changed")
             trigger = triggers.Item(1)
+            expected_trigger = expected.Triggers.Item(1)
             if (
                 int(trigger.Type) != _TASK_TRIGGER_LOGON
                 or not bool(trigger.Enabled)
@@ -1334,7 +1535,30 @@ class WindowsTaskSchedulerSupervisor:
                 or str(trigger.Id) != "FactLaneOwnerLogon"
             ):
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task logon trigger is not exact current-user scope")
+            for attribute in ("StartBoundary", "EndBoundary"):
+                if str(getattr(trigger, attribute, "") or "") != str(getattr(expected_trigger, attribute, "") or ""):
+                    raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task trigger boundary changed")
+
+            def normalized_zero_duration(value: Any) -> str:
+                text = str(value or "").strip().upper()
+                return "PT0S" if text in {"", "PT0S"} else text
+
+            for attribute in ("Delay", "ExecutionTimeLimit"):
+                if normalized_zero_duration(getattr(trigger, attribute, "")) != normalized_zero_duration(
+                    getattr(expected_trigger, attribute, "")
+                ):
+                    raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task trigger timing changed")
+            repetition = trigger.Repetition
+            expected_repetition = expected_trigger.Repetition
+            for attribute in ("Interval", "Duration"):
+                if normalized_zero_duration(getattr(repetition, attribute, "")) != normalized_zero_duration(
+                    getattr(expected_repetition, attribute, "")
+                ):
+                    raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task repetition changed")
+            if bool(repetition.StopAtDurationEnd) != bool(expected_repetition.StopAtDurationEnd):
+                raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task repetition stop policy changed")
             settings = definition.Settings
+            expected_settings = expected.Settings
             if (
                 (not allow_disabled and not bool(settings.Enabled))
                 or not bool(settings.AllowDemandStart)
@@ -1347,6 +1571,23 @@ class WindowsTaskSchedulerSupervisor:
                 or str(settings.ExecutionTimeLimit).upper() != plan.execution_time_limit
             ):
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task settings differ from the fixed lifecycle policy")
+            for attribute in (
+                "AllowHardTerminate",
+                "RunOnlyIfNetworkAvailable",
+                "WakeToRun",
+                "RestartCount",
+                "RestartInterval",
+                "DeleteExpiredTaskAfter",
+                "Priority",
+                "Compatibility",
+            ):
+                if getattr(settings, attribute) != getattr(expected_settings, attribute):
+                    raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task extended settings changed")
+            if self._settings3_signature(settings) != self._settings3_signature(expected_settings):
+                raise WindowsWebUIError(
+                    "WINDOWS_TASK_DEFINITION_UNSAFE",
+                    "scheduled task host or maintenance policy changed",
+                )
         except WindowsWebUIError:
             raise
         except Exception as exc:

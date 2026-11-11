@@ -1299,9 +1299,9 @@ def test_task_snapshot_and_conditional_restore_plain_data():
     supervisor._run_with_service_unlocked = lambda callback: callback(service)
     supervisor._run_with_service = lambda callback: callback(service)
     supervisor._validate_task_security = lambda task: None
-    supervisor._validate_registered_task = lambda task, plan: None
+    supervisor._validate_registered_task = lambda task, plan, **kwargs: None
     supervisor._validate_registration_boundary = (
-        lambda task, *, intended, allow_disabled=False, expected_source=None:
+        lambda task, *, intended, observed=None, expected_definition=None, allow_disabled=False, expected_source=None:
         pytest.fail("rollback restore must not reinterpret the original task against successor semantics")
     )
     before = supervisor.snapshot_task()
@@ -1520,7 +1520,7 @@ def test_windows_task_registration_boundary_requires_exact_transaction_source(mo
     supervisor.task_name = windows.WINDOWS_TASK_NAME
     supervisor.user_id = 'Alice'
     supervisor.owner_sid = 'S-1-5-21-1'
-    supervisor._validate_registered_task = lambda task, plan, allow_disabled=False: None
+    supervisor._validate_registered_task = lambda task, plan, allow_disabled=False, expected_definition=None: None
     supervisor._validate_task_security = lambda task: None
     supervisor._normalized_sddl_signature = lambda value: ('semantic', value.casefold().replace('normalized-', ''))
     intended = {
@@ -1559,7 +1559,7 @@ def test_windows_task_registration_boundary_accepts_semantic_sddl_normalization(
     supervisor.task_name = windows.WINDOWS_TASK_NAME
     supervisor.user_id = 'Alice'
     supervisor.owner_sid = 'S-1-5-21-1'
-    supervisor._validate_registered_task = lambda task, plan, allow_disabled=False: None
+    supervisor._validate_registered_task = lambda task, plan, allow_disabled=False, expected_definition=None: None
     supervisor._validate_task_security = lambda task: None
     supervisor._normalized_sddl_signature = lambda value: ('semantic', value.casefold().replace('normalized-', ''))
     source = 'FactLane setup 11111111-1111-1111-1111-111111111111'
@@ -1576,12 +1576,318 @@ def test_windows_task_registration_boundary_accepts_semantic_sddl_normalization(
     )
     observed = {
         'exists': True,
-        'xml': f'<Task><RegistrationInfo><Source>{source}</Source></RegistrationInfo></Task>',
+        'xml': (
+            f'<Task><RegistrationInfo><Source>{source}</Source></RegistrationInfo>'
+            '<Settings><SchedulerCanonicalDefault>true</SchedulerCanonicalDefault></Settings></Task>'
+        ),
         'sddl': 'normalized-private',
         'enabled': True,
     }
 
     supervisor._validate_registration_boundary(task, intended=intended, observed=observed)
+
+
+def test_windows_prepared_task_recipe_rejects_behavior_drift_before_registration(monkeypatch):
+    from types import SimpleNamespace
+    import factlane.webui_windows as windows
+
+    supervisor = object.__new__(windows.WindowsTaskSchedulerSupervisor)
+    supervisor.expected_executable = r'C:\Python\python.exe'
+    supervisor.environment_executable = r'C:\FactLane\python.exe'
+    supervisor.user_id = 'Alice'
+    supervisor.owner_sid = 'S-1-5-21-1'
+    source = 'FactLane setup 11111111-1111-1111-1111-111111111111'
+    expected_xml = (
+        f'<Task><RegistrationInfo><Source>{source}</Source></RegistrationInfo>'
+        '<Actions><Exec><Path>C:\\Python\\python.exe</Path></Exec></Actions></Task>'
+    )
+    definition = SimpleNamespace(
+        RegistrationInfo=SimpleNamespace(Source=None),
+        XmlText=expected_xml,
+    )
+    supervisor.plan = lambda _executable: object()
+    supervisor._task_definition = lambda _service, _plan: definition
+    supervisor._normalized_sddl_signature = lambda value: ('semantic', value.casefold())
+    intended = {
+        'exists': True,
+        'xml': (
+            f'<Task><RegistrationInfo><Source>{source}</Source></RegistrationInfo>'
+            '<Actions><Exec><Path>C:\\Other\\python.exe</Path></Exec></Actions></Task>'
+        ),
+        'sddl': 'O:S-1-5-21-1G:S-1-5-21-1D:P(A;;GA;;;S-1-5-21-1)(A;;GA;;;SY)',
+        'enabled': True,
+    }
+
+    with pytest.raises(windows.WindowsWebUIError) as caught:
+        supervisor._validate_prepared_task_recipe(
+            object(),
+            intended,
+            transaction_id='11111111-1111-1111-1111-111111111111',
+        )
+
+    assert caught.value.code == 'WINDOWS_SETUP_RECOVERY_REQUIRED'
+
+
+def test_windows_prepared_task_recipe_rejects_registration_description_drift(monkeypatch):
+    from types import SimpleNamespace
+    import factlane.webui_windows as windows
+
+    supervisor = object.__new__(windows.WindowsTaskSchedulerSupervisor)
+    supervisor.expected_executable = r'C:\Python\python.exe'
+    supervisor.environment_executable = r'C:\FactLane\python.exe'
+    supervisor.user_id = 'Alice'
+    supervisor.owner_sid = 'S-1-5-21-1'
+    source = 'FactLane setup 11111111-1111-1111-1111-111111111111'
+    expected_xml = (
+        f'<Task><RegistrationInfo><Description>FactLane Owner WebUI current-user managed runtime</Description>'
+        f'<Source>{source}</Source></RegistrationInfo></Task>'
+    )
+    definition = SimpleNamespace(
+        RegistrationInfo=SimpleNamespace(Source=None),
+        XmlText=expected_xml,
+    )
+    supervisor.plan = lambda _executable: object()
+    supervisor._task_definition = lambda _service, _plan: definition
+    supervisor._normalized_sddl_signature = lambda value: ('semantic', value.casefold())
+    intended = {
+        'exists': True,
+        'xml': (
+            f'<Task><RegistrationInfo><Description>FOREIGN</Description>'
+            f'<Source>{source}</Source></RegistrationInfo></Task>'
+        ),
+        'sddl': 'O:S-1-5-21-1G:S-1-5-21-1D:P(A;;GA;;;S-1-5-21-1)(A;;GA;;;SY)',
+        'enabled': True,
+    }
+
+    with pytest.raises(windows.WindowsWebUIError) as caught:
+        supervisor._validate_prepared_task_recipe(
+            object(),
+            intended,
+            transaction_id='11111111-1111-1111-1111-111111111111',
+        )
+
+    assert caught.value.code == 'WINDOWS_SETUP_RECOVERY_REQUIRED'
+
+
+@pytest.mark.parametrize(
+    ('target', 'attribute', 'value'),
+    [
+        ('action', 'WorkingDirectory', r'C:\\foreign'),
+        ('actions', 'Context', 'ForeignPrincipal'),
+        ('trigger', 'StartBoundary', '2026-11-11T00:00:00'),
+        ('trigger', 'EndBoundary', '2026-11-12T00:00:00'),
+        ('trigger', 'Delay', 'PT1M'),
+        ('trigger', 'ExecutionTimeLimit', 'PT1H'),
+        ('repetition', 'Interval', 'PT5M'),
+        ('repetition', 'Duration', 'PT1H'),
+        ('repetition', 'StopAtDurationEnd', True),
+        ('settings', 'AllowHardTerminate', False),
+        ('settings', 'RunOnlyIfNetworkAvailable', True),
+        ('settings', 'WakeToRun', True),
+        ('settings', 'RestartCount', 1),
+        ('settings', 'RestartInterval', 'PT1M'),
+        ('settings', 'DeleteExpiredTaskAfter', 'PT1H'),
+        ('settings', 'Priority', 4),
+        ('settings', 'Compatibility', 1),
+        ('principal', '_principal2', (1, 0)),
+        ('settings', '_settings3', (True, False, False, '', '', False)),
+        ('settings', '_settings3', (False, True, False, '', '', False)),
+        ('settings', '_settings3', (False, False, True, '', '', False)),
+        ('settings', '_settings3', (False, False, False, 'P1D', '', False)),
+    ],
+)
+def test_windows_registered_task_rejects_extended_behavior_drift(monkeypatch, target, attribute, value):
+    from copy import deepcopy
+    from types import SimpleNamespace
+    import factlane.webui_windows as windows
+
+    owner_sid = 'S-1-5-21-1'
+    plan = windows.WindowsTaskPlan(
+        task_name=windows.WINDOWS_TASK_NAME,
+        executable=r'C:\\Python\\python.exe',
+        arguments='-E -P -S',
+        user_id='Alice',
+    )
+
+    def make_definition():
+        repetition = SimpleNamespace(Interval='', Duration='', StopAtDurationEnd=False)
+        trigger = SimpleNamespace(
+            Type=9,
+            Enabled=True,
+            UserId='Alice',
+            Id='FactLaneOwnerLogon',
+            StartBoundary='',
+            EndBoundary='',
+            Delay='',
+            ExecutionTimeLimit='',
+            Repetition=repetition,
+        )
+        action = SimpleNamespace(
+            Type=0,
+            Path=plan.executable,
+            Arguments=plan.arguments,
+            WorkingDirectory='',
+        )
+        actions = SimpleNamespace(Count=1, Context='Author', Item=lambda _index: action)
+        triggers = SimpleNamespace(Count=1, Item=lambda _index: trigger)
+        settings = SimpleNamespace(
+            Enabled=True,
+            AllowDemandStart=True,
+            StartWhenAvailable=True,
+            DisallowStartIfOnBatteries=False,
+            StopIfGoingOnBatteries=False,
+            RunOnlyIfIdle=False,
+            Hidden=False,
+            MultipleInstances=2,
+            ExecutionTimeLimit='PT0S',
+            AllowHardTerminate=True,
+            RunOnlyIfNetworkAvailable=False,
+            WakeToRun=False,
+            RestartCount=0,
+            RestartInterval='',
+            DeleteExpiredTaskAfter='',
+            Priority=7,
+            Compatibility=2,
+            DisallowStartOnRemoteAppSession=False,
+            UseUnifiedSchedulingEngine=False,
+            Volatile=False,
+        )
+        principal = SimpleNamespace(
+            LogonType=3,
+            RunLevel=0,
+            UserId='Alice',
+            GroupId='',
+            Id='Author',
+        )
+        definition = SimpleNamespace(
+            RegistrationInfo=SimpleNamespace(Description='FactLane Owner WebUI current-user managed runtime'),
+            Principal=principal,
+            Actions=actions,
+            Triggers=triggers,
+            Settings=settings,
+        )
+        return definition, action, actions, trigger, repetition, settings, principal
+
+    expected, *_ = make_definition()
+    observed, action, actions, trigger, repetition, settings, principal = make_definition()
+    selected = {
+        'action': action,
+        'actions': actions,
+        'trigger': trigger,
+        'repetition': repetition,
+        'settings': settings,
+        'principal': principal,
+    }[target]
+    setattr(selected, attribute, value)
+    task = SimpleNamespace(Definition=observed)
+
+    class Security:
+        @staticmethod
+        def LookupAccountName(_system, _name):
+            return owner_sid, None, None
+
+        @staticmethod
+        def ConvertSidToStringSid(value):
+            return value
+
+    monkeypatch.setattr(windows, '_require_windows', lambda: (None, None, None, Security))
+    supervisor = object.__new__(windows.WindowsTaskSchedulerSupervisor)
+    supervisor.owner_sid = owner_sid
+    supervisor._principal2_signature = lambda value: getattr(value, '_principal2', (0, 0))
+    supervisor._settings3_signature = lambda value: getattr(
+        value,
+        '_settings3',
+        (False, False, False, '', '', False),
+    )
+
+    with pytest.raises(windows.WindowsWebUIError) as caught:
+        supervisor._validate_registered_task(
+            task,
+            plan,
+            expected_definition=expected,
+        )
+
+    assert caught.value.code == 'WINDOWS_TASK_DEFINITION_UNSAFE'
+
+
+def test_windows_principal2_signature_requires_zero_additional_privileges(monkeypatch):
+    from types import SimpleNamespace
+    import factlane.webui_windows as windows
+
+    extension = SimpleNamespace(
+        RequiredPrivilegeCount=0,
+        ProcessTokenSidType=1,
+    )
+    monkeypatch.setattr(
+        windows.WindowsTaskSchedulerSupervisor,
+        '_query_task_scheduler_extension',
+        staticmethod(lambda _value, _iid: extension),
+    )
+
+    signature = windows.WindowsTaskSchedulerSupervisor._principal2_signature(object())
+
+    assert signature == (1, 0)
+
+
+def test_windows_principal2_signature_rejects_additional_privileges(monkeypatch):
+    from types import SimpleNamespace
+    import factlane.webui_windows as windows
+
+    extension = SimpleNamespace(
+        RequiredPrivilegeCount=1,
+        ProcessTokenSidType=0,
+    )
+    monkeypatch.setattr(
+        windows.WindowsTaskSchedulerSupervisor,
+        '_query_task_scheduler_extension',
+        staticmethod(lambda _value, _iid: extension),
+    )
+
+    with pytest.raises(windows.WindowsWebUIError) as caught:
+        windows.WindowsTaskSchedulerSupervisor._principal2_signature(object())
+
+    assert caught.value.code == 'WINDOWS_TASK_DEFINITION_UNSAFE'
+
+
+def test_windows_settings3_signature_reads_host_and_maintenance_policy(monkeypatch):
+    from types import SimpleNamespace
+    import factlane.webui_windows as windows
+
+    extension = SimpleNamespace(
+        DisallowStartOnRemoteAppSession=True,
+        UseUnifiedSchedulingEngine=False,
+        Volatile=True,
+        MaintenanceSettings=SimpleNamespace(
+            Period='p1d',
+            Deadline='pt2h',
+            Exclusive=True,
+        ),
+    )
+    monkeypatch.setattr(
+        windows.WindowsTaskSchedulerSupervisor,
+        '_query_task_scheduler_extension',
+        staticmethod(lambda _value, _iid: extension),
+    )
+
+    signature = windows.WindowsTaskSchedulerSupervisor._settings3_signature(object())
+
+    assert signature == (True, False, True, 'P1D', 'PT2H', True)
+
+
+@pytest.mark.parametrize('method_name', ['_principal2_signature', '_settings3_signature'])
+def test_windows_task_extended_interface_absence_fails_closed(monkeypatch, method_name):
+    import factlane.webui_windows as windows
+
+    monkeypatch.setattr(
+        windows.WindowsTaskSchedulerSupervisor,
+        '_query_task_scheduler_extension',
+        staticmethod(lambda _value, _iid: None),
+    )
+
+    with pytest.raises(windows.WindowsWebUIError) as caught:
+        getattr(windows.WindowsTaskSchedulerSupervisor, method_name)(object())
+
+    assert caught.value.code == 'WINDOWS_TASK_DEFINITION_UNSAFE'
 
 
 def test_task_scheduler_operations_participate_in_mutation_guard(monkeypatch):
@@ -1852,9 +2158,12 @@ def test_windows_launcher_partial_staging_leaves_destination_untouched(monkeypat
     operation = SimpleNamespace(desired_state=payload, target=install.WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME)
     monkeypatch.setattr(install.Path, 'is_file', lambda path: True)
     partial = {}
+    def precreate(path, _content, *, owner_sid):
+        assert owner_sid == 'owner'
+        partial[path] = {'exists': True, 'identity': [1, 98], 'content': '', 'sddl': 'private'}
+    monkeypatch.setattr(install.windows, 'write_owner_private_text_atomic', precreate)
     def writer(path, *args):
         assert path != operation.target
-        partial[path] = {'exists': True, 'identity': [1, 99], 'content': 'eA==', 'sddl': 'private'}
         raise RuntimeError('partial staging write')
     backend._shortcut_writer = writer
     monkeypatch.setattr(install.windows, 'snapshot_windows_setup_file', lambda path, **kwargs: partial.get(path, {'exists': False}))
@@ -1865,6 +2174,69 @@ def test_windows_launcher_partial_staging_leaves_destination_untouched(monkeypat
     with pytest.raises(RuntimeError, match='partial staging'):
         backend._stage_launcher_bytes(operation)
     assert partial == {}
+
+
+def test_windows_launcher_stage_is_owner_private_before_shell_save_and_rejects_replacement(monkeypatch):
+    from types import SimpleNamespace
+    import factlane.webui_install as install
+
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    backend.request = SimpleNamespace(state_dir='state')
+    backend._owner_sid = 'owner'
+    payload = install.render_windows_owner_panel_launcher(
+        factlane_executable=r'C:\Python\python.exe',
+        owner_config_home=r'C:\Local\FactLane\config',
+    )
+    operation = SimpleNamespace(
+        desired_state=payload,
+        target=install.WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME,
+    )
+    monkeypatch.setattr(install.Path, 'is_file', lambda path: True)
+    state = {}
+    events = []
+
+    def precreate(path, content, *, owner_sid):
+        assert content == '' and owner_sid == 'owner'
+        events.append('precreate')
+        state[path] = {
+            'exists': True,
+            'identity': [1, 41],
+            'content': '',
+            'sddl': 'owner-private',
+        }
+
+    def writer(path, *_args):
+        assert state[path]['identity'] == [1, 41]
+        events.append('shell-save')
+        state[path] = {
+            'exists': True,
+            'identity': [1, 42],
+            'content': 'shortcut',
+            'sddl': 'owner-private',
+        }
+
+    def snapshot(path, **_kwargs):
+        events.append('snapshot')
+        return dict(state.get(path, {'exists': False}))
+
+    def delete(path, *, expected, **_kwargs):
+        assert state[path] == expected
+        events.append('delete')
+        del state[path]
+
+    backend._shortcut_writer = writer
+    monkeypatch.setattr(install.windows, 'write_owner_private_text_atomic', precreate)
+    monkeypatch.setattr(install.windows, 'snapshot_windows_setup_file', snapshot)
+    monkeypatch.setattr(install.windows, 'delete_windows_setup_file', delete)
+
+    with pytest.raises(install.WindowsWebUIError, match='identity changed'):
+        backend._stage_launcher_bytes(operation)
+
+    assert events[:3] == ['precreate', 'snapshot', 'shell-save']
+    assert 'delete' not in events
+    assert len(state) == 1
+    replacement = next(iter(state.values()))
+    assert replacement['identity'] == [1, 42]
 
 
 def test_windows_setup_refuses_unknown_config_before_journaling_credentials():
