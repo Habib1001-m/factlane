@@ -3904,44 +3904,13 @@ class ProductionWindowsInstallerBackend:
         if PureWindowsPath(operation.target).name != WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME:
             raise WindowsWebUIError("WINDOWS_LAUNCHER_TARGET_INVALID", "Owner Panel shortcut filename changed")
         stage_path = str(PureWindowsPath(self.request.state_dir) / (".launcher-" + uuid.uuid4().hex + ".lnk"))
-        stage_pre = None
-        try:
-            # Create the exact staging path under FactLane's owner-only write
-            # contract before Shell COM ever sees it.  The parent DACL is
-            # intentionally non-inheritable, so allowing IPersistFile.Save to
-            # create the path would leave a window where the file is not yet
-            # proven owner-private.
-            windows.write_owner_private_text_atomic(
-                stage_path,
-                "",
-                owner_sid=self._owner_sid,
-            )
-            stage_pre = windows.snapshot_windows_setup_file(
-                stage_path,
-                owner_sid=self._owner_sid,
-            )
+        def write_shortcut(destination: str) -> None:
             self._shortcut_writer(stage_path, payload["target"], payload["arguments"], payload["working_directory"])
-            staged = windows.snapshot_windows_setup_file(stage_path, owner_sid=self._owner_sid)
-            if staged.get("identity") != stage_pre.get("identity"):
-                raise WindowsWebUIError(
-                    "WINDOWS_LAUNCHER_WRITE_FAILED",
-                    "staged Owner Panel shortcut identity changed during Shell save",
-                )
-            if not staged["exists"]:
-                raise WindowsWebUIError("WINDOWS_LAUNCHER_WRITE_FAILED", "staged launcher is missing")
-            return base64.b64decode(staged["content"])
-        finally:
-            # Never delete a path whose identity escaped this transaction.  Shell
-            # COM is expected to update the precreated owner-private file in
-            # place; a replacement is rejected above and preserved for explicit
-            # recovery rather than being mistaken for disposable staging output.
-            partial = windows.snapshot_windows_setup_file(stage_path, owner_sid=self._owner_sid)
-            if (
-                partial["exists"]
-                and stage_pre is not None
-                and partial.get("identity") == stage_pre.get("identity")
-            ):
-                windows.delete_windows_setup_file(stage_path, expected=partial, owner_sid=self._owner_sid)
+        return windows.write_windows_setup_file_under_custody(
+            stage_path,
+            write_shortcut,
+            owner_sid=self._owner_sid,
+        )
 
     def apply_operation(self, operation, *, plan):
         if not self._journal or self._journal["phase"] not in {"PREPARED", "APPLYING"}:

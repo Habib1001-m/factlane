@@ -2158,25 +2158,24 @@ def test_windows_launcher_partial_staging_leaves_destination_untouched(monkeypat
     operation = SimpleNamespace(desired_state=payload, target=install.WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME)
     monkeypatch.setattr(install.Path, 'is_file', lambda path: True)
     partial = {}
-    def precreate(path, _content, *, owner_sid):
-        assert owner_sid == 'owner'
-        partial[path] = {'exists': True, 'identity': [1, 98], 'content': '', 'sddl': 'private'}
-    monkeypatch.setattr(install.windows, 'write_owner_private_text_atomic', precreate)
     def writer(path, *args):
         assert path != operation.target
         raise RuntimeError('partial staging write')
     backend._shortcut_writer = writer
-    monkeypatch.setattr(install.windows, 'snapshot_windows_setup_file', lambda path, **kwargs: partial.get(path, {'exists': False}))
-    def delete(path, *, expected, **kwargs):
-        assert path != operation.target and partial[path] == expected
-        del partial[path]
-    monkeypatch.setattr(install.windows, 'delete_windows_setup_file', delete)
+    def guarded(path, callback, *, owner_sid):
+        assert owner_sid == 'owner' and path != operation.target
+        partial[path] = {'guarded': True}
+        try:
+            return callback(path)
+        finally:
+            del partial[path]
+    monkeypatch.setattr(install.windows, 'write_windows_setup_file_under_custody', guarded)
     with pytest.raises(RuntimeError, match='partial staging'):
         backend._stage_launcher_bytes(operation)
     assert partial == {}
 
 
-def test_windows_launcher_stage_is_owner_private_before_shell_save_and_rejects_replacement(monkeypatch):
+def test_windows_launcher_stage_retains_anti_replacement_custody_across_shell_save(monkeypatch):
     from types import SimpleNamespace
     import factlane.webui_install as install
 
@@ -2192,51 +2191,21 @@ def test_windows_launcher_stage_is_owner_private_before_shell_save_and_rejects_r
         target=install.WINDOWS_OWNER_PANEL_LAUNCHER_FILENAME,
     )
     monkeypatch.setattr(install.Path, 'is_file', lambda path: True)
-    state = {}
     events = []
-
-    def precreate(path, content, *, owner_sid):
-        assert content == '' and owner_sid == 'owner'
-        events.append('precreate')
-        state[path] = {
-            'exists': True,
-            'identity': [1, 41],
-            'content': '',
-            'sddl': 'owner-private',
-        }
-
     def writer(path, *_args):
-        assert state[path]['identity'] == [1, 41]
         events.append('shell-save')
-        state[path] = {
-            'exists': True,
-            'identity': [1, 42],
-            'content': 'shortcut',
-            'sddl': 'owner-private',
-        }
-
-    def snapshot(path, **_kwargs):
-        events.append('snapshot')
-        return dict(state.get(path, {'exists': False}))
-
-    def delete(path, *, expected, **_kwargs):
-        assert state[path] == expected
-        events.append('delete')
-        del state[path]
 
     backend._shortcut_writer = writer
-    monkeypatch.setattr(install.windows, 'write_owner_private_text_atomic', precreate)
-    monkeypatch.setattr(install.windows, 'snapshot_windows_setup_file', snapshot)
-    monkeypatch.setattr(install.windows, 'delete_windows_setup_file', delete)
+    def guarded(path, callback, *, owner_sid):
+        assert owner_sid == 'owner'
+        events.append('guard-open')
+        callback(path)
+        events.append('guard-close')
+        return b'shortcut'
+    monkeypatch.setattr(install.windows, 'write_windows_setup_file_under_custody', guarded)
 
-    with pytest.raises(install.WindowsWebUIError, match='identity changed'):
-        backend._stage_launcher_bytes(operation)
-
-    assert events[:3] == ['precreate', 'snapshot', 'shell-save']
-    assert 'delete' not in events
-    assert len(state) == 1
-    replacement = next(iter(state.values()))
-    assert replacement['identity'] == [1, 42]
+    assert backend._stage_launcher_bytes(operation) == b'shortcut'
+    assert events == ['guard-open', 'shell-save', 'guard-close']
 
 
 def test_windows_setup_refuses_unknown_config_before_journaling_credentials():

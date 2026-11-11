@@ -549,6 +549,12 @@ def test_windows_scheduler_observation_binds_engine_pid_and_process_identity() -
         user_id=user_id,
         service_factory=lambda: _FakeTaskService(task),
     )
+    # This test is specifically the runtime-observation/process-identity lane.
+    # Full registered-task semantic/security validation has dedicated native and
+    # integration coverage; do not make this fake COM fixture emulate every
+    # Task Scheduler extension interface merely to reach the PID assertions.
+    supervisor._task_definition = lambda _service, _plan: definition
+    supervisor._validate_registered_task = lambda _task, _plan, **_kwargs: None
 
     observed = supervisor.observe()
     assert observed.active is True
@@ -598,11 +604,27 @@ def test_windows_scheduler_rejects_tampered_same_name_task_executable() -> None:
         user_id=user_id,
         service_factory=lambda: _FakeTaskService(task),
     )
+    expected_action = SimpleNamespace(Type=0, Path=executable, Arguments=arguments)
+    expected_definition = SimpleNamespace(
+        RegistrationInfo=SimpleNamespace(
+            Description="FactLane Owner WebUI current-user managed runtime"
+        ),
+        Principal=principal,
+        Actions=_Collection([expected_action]),
+        Triggers=_Collection([trigger]),
+        Settings=settings,
+    )
+    supervisor._task_definition = lambda _service, _plan: expected_definition
+    # This negative test is about executable/argument drift specifically.
+    # Keep unrelated IPrincipal2 extension plumbing out of the fake fixture so
+    # the asserted failure is proven to come from the action comparison.
+    supervisor._principal2_signature = lambda _principal: (0, 0)
 
     with pytest.raises(WindowsWebUIError) as caught:
         supervisor.observe()
 
     assert caught.value.code == "WINDOWS_TASK_DEFINITION_UNSAFE"
+    assert caught.value.safe_message == "scheduled task executable or arguments changed"
 
 
 def test_windows_scheduler_registers_exact_disposable_current_user_task_and_deletes_it() -> None:

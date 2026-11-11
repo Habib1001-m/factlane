@@ -2185,6 +2185,96 @@ def snapshot_windows_setup_file(
         handle.Close()
 
 
+def write_windows_setup_file_under_custody(
+    path: str,
+    writer: Callable[[str], Any],
+    *,
+    owner_sid: str,
+    limit: int = WINDOWS_SETUP_FILE_LIMIT,
+) -> bytes:
+    """Run a pathname writer while retaining anti-replacement custody.
+
+    Some Windows APIs (notably IPersistFile.Save for .lnk files) accept only a
+    pathname.  Create the unique owner-private destination ourselves and retain
+    a handle that intentionally omits FILE_SHARE_DELETE while the external
+    writer runs.  That prevents rename/delete/repoint replacement across the
+    pathname call without denying ordinary read/write opens needed by the
+    writer.  The parent directory is retained under the same no-delete custody.
+    """
+    _api, con, files = _require_win32file()
+    target = Path(path)
+    guard = _open_windows_parent_guard(target.parent, owner_sid=owner_sid)
+    retained = None
+    pre: dict[str, Any] | None = None
+    try:
+        _revalidate_windows_parent_guard(guard, owner_sid=owner_sid)
+        validate_windows_path_no_reparse(target)
+        retained = files.CreateFile(
+            str(target),
+            0x00020000,  # READ_CONTROL only; do not constrain the writer's share mode.
+            int(con.FILE_SHARE_READ) | int(con.FILE_SHARE_WRITE),
+            owner_only_security_attributes(owner_sid),
+            int(con.CREATE_NEW),
+            int(con.FILE_ATTRIBUTE_NORMAL) | 0x00200000,
+            None,
+        )
+        validate_owner_only_kernel_object(retained, owner_sid)
+        identity = _windows_handle_identity(retained, expected_path=str(target), directory=False)
+        pre = snapshot_windows_setup_file(
+            str(target),
+            owner_sid=owner_sid,
+            limit=limit,
+        )
+        if pre.get("identity") != [identity.volume_serial_number, identity.file_index]:
+            raise WindowsWebUIError(
+                "WINDOWS_OWNER_PRIVATE_WRITE_UNSAFE",
+                "owner-private Windows guarded file identity changed before write",
+            )
+        writer(str(target))
+        _revalidate_windows_parent_guard(guard, owner_sid=owner_sid)
+        post = snapshot_windows_setup_file(
+            str(target),
+            owner_sid=owner_sid,
+            limit=limit,
+        )
+        retained_identity = _windows_handle_identity(
+            retained,
+            expected_path=str(target),
+            directory=False,
+        )
+        expected_identity = [identity.volume_serial_number, identity.file_index]
+        if (
+            post.get("identity") != expected_identity
+            or [
+                retained_identity.volume_serial_number,
+                retained_identity.file_index,
+            ]
+            != expected_identity
+        ):
+            raise WindowsWebUIError(
+                "WINDOWS_OWNER_PRIVATE_WRITE_UNSAFE",
+                "owner-private Windows guarded file identity changed during write",
+            )
+        return base64.b64decode(post["content"])
+    finally:
+        if retained is not None:
+            retained.Close()
+        try:
+            current = snapshot_windows_setup_file(
+                str(target),
+                owner_sid=owner_sid,
+                limit=limit,
+            )
+            if pre is not None and current.get("identity") == pre.get("identity"):
+                delete_windows_setup_file(
+                    str(target),
+                    expected=current,
+                    owner_sid=owner_sid,
+                )
+        finally:
+            guard.close()
+
+
 def stage_windows_setup_file(path: str, content: bytes, *, owner_sid: str,
                              private_parent: bool, sddl: str | None = None,
                              owner_private: bool = True):
