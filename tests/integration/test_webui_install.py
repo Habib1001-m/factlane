@@ -1285,7 +1285,12 @@ def test_task_snapshot_and_conditional_restore_plain_data():
     supervisor.user_id = 'Alice'
     supervisor.expected_executable = r'C:\Python\python.exe'
     supervisor.environment_executable = r'C:\FactLane\python.exe'
-    task = SimpleNamespace(Xml='<Task/>', Enabled=False, State=1)
+    task = SimpleNamespace(
+        Xml='<Task><RegistrationInfo><Description>Legacy task</Description></RegistrationInfo></Task>',
+        Enabled=False,
+        State=1,
+        Definition=SimpleNamespace(RegistrationInfo=SimpleNamespace(Description='Legacy task')),
+    )
     task.GetSecurityDescriptor = lambda flags: 'O:ownerG:groupD:P(A;;GA;;;owner)'
     task.SetSecurityDescriptor = lambda sddl, flags: None
     calls = []
@@ -1305,13 +1310,23 @@ def test_task_snapshot_and_conditional_restore_plain_data():
         pytest.fail("rollback restore must not reinterpret the original task against successor semantics")
     )
     before = supervisor.snapshot_task()
-    assert before == {'exists': True, 'xml': '<Task/>', 'sddl': 'O:ownerG:groupD:P(A;;GA;;;owner)', 'enabled': False}
-    task.Xml = '<Task updated="yes"/>'
+    assert before == {
+        'exists': True,
+        'xml': '<Task><RegistrationInfo><Description>Legacy task</Description></RegistrationInfo></Task>',
+        'sddl': 'O:ownerG:groupD:P(A;;GA;;;owner)',
+        'enabled': False,
+    }
+    task.Xml = '<Task updated="yes"><RegistrationInfo><Description>Legacy task</Description></RegistrationInfo></Task>'
     post = supervisor.snapshot_task()
-    supervisor.restore_task(before, expected=post)
+    restored = supervisor.restore_task(before, expected=post)
+    assert restored == before
     assert supervisor.snapshot_task() == before
-    assert calls[0][1] == '<Task/>'
+    assert calls[0][1] == '<Task><RegistrationInfo><Description>Legacy task</Description></RegistrationInfo></Task>'
     assert calls[0][-1] == before['sddl']
+    task.Definition.RegistrationInfo.Description = 'Foreign task'
+    with pytest.raises(windows.WindowsWebUIError, match='registration description'):
+        supervisor._validated_restored_snapshot(service, original=before)
+    task.Definition.RegistrationInfo.Description = 'Legacy task'
     foreign = deepcopy(post)
     foreign['xml'] = 'foreign'
     with pytest.raises(windows.WindowsWebUIError, match='changed'):
@@ -2130,11 +2145,13 @@ def test_windows_setup_journal_faults_restore_exact_owned_state(tmp_path, monkey
         assert task == expected
         task.clear()
         task.update(deepcopy(before))
+        return deepcopy(task)
     def matches_prepared_task(intended, observed, *, transaction_id):
         return observed == intended and f'FactLane setup {transaction_id}' in intended['xml']
     backend.supervisor = SimpleNamespace(prepare_task=prepare_task, snapshot_task=lambda: deepcopy(task),
                                         publish_task=publish_task, restore_task=restore_task,
-                                        matches_prepared_task=matches_prepared_task, verify_quiescent=lambda: None)
+                                        matches_prepared_task=matches_prepared_task,
+                                        verify_quiescent=lambda: None)
     backend._expected_precondition = backend.capture_precondition()
     def journal_write(path, content, **kwargs):
         payload = json.loads(content)
@@ -2192,15 +2209,16 @@ def test_windows_task_recovery_preserves_stop_intent_without_replaying_service_s
     backend.request = SimpleNamespace(state_dir='state')
     backend._owner_sid = 'owner'
     restored = []
+    canonical = {'exists': True, 'xml': 'old-canonical', 'sddl': 'private-canonical', 'enabled': True}
     backend.supervisor = SimpleNamespace(
-        restore_task=lambda original, *, expected: restored.append((original, expected))
+        restore_task=lambda original, *, expected: restored.append((original, expected)) or canonical
     )
     intent = json.dumps({'status': ServiceStatus.STOPPED_UNTIL_REBOOT.value, 'intent_revision': 99}).encode()
     monkeypatch.setattr(install.windows, 'snapshot_windows_setup_file',
                         lambda *args, **kwargs: {'exists': True, 'content': base64.b64encode(intent).decode()})
     original = {'exists': True, 'xml': 'old', 'sddl': 'private', 'enabled': True}
     current = dict(original, xml='new')
-    assert backend._restore_record({'kind': 'REGISTER_WINDOWS_TASK', 'before': original}, current) == original
+    assert backend._restore_record({'kind': 'REGISTER_WINDOWS_TASK', 'before': original}, current) == canonical
     assert restored == [(original, current)]
 
 

@@ -79,7 +79,11 @@ class _SetupSupervisor:
         self.prepared.append(executable)
         return {
             "exists": True,
-            "xml": transaction_id,
+            "xml": (
+                "<Task><RegistrationInfo><Source>"
+                f"FactLane setup {transaction_id}"
+                "</Source></RegistrationInfo></Task>"
+            ),
             "sddl": "test-owner",
             "enabled": True,
         }
@@ -96,9 +100,10 @@ class _SetupSupervisor:
         self.task = dict(intended)
         return dict(self.task)
 
-    def restore_task(self, original: dict[str, object], *, expected: dict[str, object]) -> None:
+    def restore_task(self, original: dict[str, object], *, expected: dict[str, object]) -> dict[str, object]:
         assert self.task == expected
         self.task = dict(original)
+        return dict(self.task)
 
     def verify_quiescent(self) -> None:
         return None
@@ -650,8 +655,8 @@ def test_windows_scheduler_registers_exact_disposable_current_user_task_and_dele
         supervisor.delete()
 
 
-def test_windows_scheduler_restore_roundtrip_is_exact_after_scheduler_canonicalization() -> None:
-    """A Scheduler-observed snapshot must restore byte-for-byte after re-registration."""
+def test_windows_scheduler_restore_roundtrip_retains_semantics_and_adopts_stable_canonical_postimage() -> None:
+    """Rollback preserves trusted semantics while exact custody follows Scheduler's stable postimage."""
     task_name = f"FactLane A2 Restore Roundtrip {os.getpid()} {time.time_ns()}"
     executable, environment_executable = windows_managed_python_executables()
     supervisor = WindowsTaskSchedulerSupervisor(
@@ -672,8 +677,13 @@ def test_windows_scheduler_restore_roundtrip_is_exact_after_scheduler_canonicali
         assert successor["exists"] is True
         assert successor != original
 
-        supervisor.restore_task(original, expected=successor)
-        assert supervisor.snapshot_task() == original
+        restored = supervisor.restore_task(original, expected=successor)
+        assert restored["exists"] is True
+        assert supervisor._task_behavior_xml_signature(restored["xml"]) == supervisor._task_behavior_xml_signature(original["xml"])
+        assert supervisor._registration_source_from_xml(restored["xml"]) == supervisor._registration_source_from_xml(original["xml"])
+        assert supervisor._registration_description_from_xml(restored["xml"]) == supervisor._registration_description_from_xml(original["xml"])
+        assert restored["enabled"] is original["enabled"]
+        assert supervisor.snapshot_task() == restored
     finally:
         supervisor.delete()
 

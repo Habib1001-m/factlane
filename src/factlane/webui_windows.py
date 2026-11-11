@@ -873,6 +873,38 @@ class WindowsTaskSchedulerSupervisor:
         return source or None
 
     @staticmethod
+    def _registration_description_from_xml(xml: str) -> str | None:
+        if not isinstance(xml, str) or not xml or len(xml.encode("utf-8")) > 262144:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task registration description is unavailable",
+            )
+        try:
+            root = ElementTree.fromstring(xml)
+        except ElementTree.ParseError as exc:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task XML could not be verified",
+            ) from exc
+        local_name = lambda element: str(element.tag).rsplit("}", 1)[-1]
+        registration_info = [element for element in root.iter() if local_name(element) == "RegistrationInfo"]
+        if len(registration_info) != 1:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task registration description is missing or ambiguous",
+            )
+        direct = [child for child in list(registration_info[0]) if local_name(child) == "Description"]
+        if len(direct) > 1:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task registration description is ambiguous",
+            )
+        if not direct:
+            return None
+        description = (direct[0].text or "").strip()
+        return description or None
+
+    @staticmethod
     def _task_xml_signature(
         xml: str,
         *,
@@ -1192,15 +1224,46 @@ class WindowsTaskSchedulerSupervisor:
         # snapshot under the mutation guard after Owner consent.
         return self._run_with_service_unlocked(self._snapshot_task_with_service)
 
-    def restore_task(self, original: dict[str, Any], *, expected: dict[str, Any]) -> None:
-        """Conditionally restore exact registration state without activating the task."""
-        def restore(service: Any) -> None:
+    def _validated_restored_snapshot(
+        self,
+        service: Any,
+        *,
+        original: dict[str, Any],
+    ) -> dict[str, Any]:
+        restored = self._snapshot_task_with_service(service)
+        if not restored.get("exists"):
+            raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task restoration disappeared before validation")
+        if self._task_behavior_xml_signature(str(restored["xml"])) != self._task_behavior_xml_signature(
+            str(original["xml"])
+        ):
+            raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task restored behavior differs from the trusted preimage")
+        if self._registration_source_from_xml(str(restored["xml"])) != self._registration_source_from_xml(
+            str(original["xml"])
+        ):
+            raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task restored registration source differs from the trusted preimage")
+        task = service.GetFolder("\\").GetTask(self.task_name)
+        live_description = str(getattr(task.Definition.RegistrationInfo, "Description", "") or "").strip() or None
+        if live_description != self._registration_description_from_xml(str(original["xml"])):
+            raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task restored registration description differs from the trusted preimage")
+        if bool(restored["enabled"]) is not bool(original["enabled"]):
+            raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task restored enabled state differs from the trusted preimage")
+        if self._snapshot_task_with_service(service) != restored:
+            raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task changed during restore validation")
+        return restored
+
+    def restore_task(self, original: dict[str, Any], *, expected: dict[str, Any]) -> dict[str, Any]:
+        """Conditionally restore trusted task semantics and return the exact stable postimage."""
+        def restore(service: Any) -> dict[str, Any]:
             if self._snapshot_task_with_service(service) != expected:
                 raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task changed outside setup")
             root = service.GetFolder("\\")
             if not original["exists"]:
                 if expected["exists"]:
                     root.DeleteTask(self.task_name, 0)
+                restored = self._snapshot_task_with_service(service)
+                if restored != original:
+                    raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task absence restoration could not be verified")
+                return restored
             else:
                 task = root.RegisterTask(
                     self.task_name, original["xml"], _TASK_CREATE_OR_UPDATE | 0x10,
@@ -1208,9 +1271,8 @@ class WindowsTaskSchedulerSupervisor:
                 )
                 task.SetSecurityDescriptor(original["sddl"], 0x10)
                 task.Enabled = original["enabled"]
-            if self._snapshot_task_with_service(service) != original:
-                raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task exact restoration could not be verified")
-        self._run_with_service(restore)
+            return self._validated_restored_snapshot(service, original=original)
+        return self._run_with_service(restore)
 
     def observe(self) -> WindowsTaskObservation:
         def observe(service: Any) -> WindowsTaskObservation:

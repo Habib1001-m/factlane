@@ -3969,8 +3969,7 @@ class ProductionWindowsInstallerBackend:
                     }
                         and record["before"].get("enabled") is True):
                     raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "current owner intent prevents task enable restoration")
-            self.supervisor.restore_task(record["before"], expected=expected)
-            return record["before"]
+            return self.supervisor.restore_task(record["before"], expected=expected)
         original = record["before"]
         if not original["exists"]:
             windows.delete_windows_setup_file(
