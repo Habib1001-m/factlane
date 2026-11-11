@@ -1009,13 +1009,14 @@ class WindowsTaskSchedulerSupervisor:
         # custody is therefore proved from the live COM definition above, while
         # the prepared XML recipe is proved independently *before* publication.
         # Do not compare pre-registration XmlText with Scheduler-exported XML.
-        if self._normalized_sddl_signature(str(observed["sddl"])) != self._normalized_sddl_signature(
-            str(intended["sddl"])
-        ):
-            raise WindowsWebUIError(
-                "WINDOWS_SETUP_RECOVERY_REQUIRED",
-                "scheduled task security differs from the prepared transaction",
-            )
+        # Task Scheduler owns the serialized post-registration security
+        # descriptor and may canonicalize the fixed SDDL recipe just as it
+        # canonicalizes task XML.  The pre-registration recipe is validated
+        # exactly by _validate_prepared_task_recipe; the live postimage is
+        # validated against the fixed security policy by _validate_task_security
+        # above and then retained verbatim in the stable transaction snapshot.
+        # Do not compare pre-registration SDDL bytes/shape to Scheduler-exported
+        # SDDL.
         if bool(observed["enabled"]) is not bool(intended["enabled"]):
             raise WindowsWebUIError(
                 "WINDOWS_SETUP_RECOVERY_REQUIRED",
@@ -1603,21 +1604,58 @@ class WindowsTaskSchedulerSupervisor:
             )
             owner = win32security.ConvertSidToStringSid(descriptor.GetSecurityDescriptorOwner())
             dacl = descriptor.GetSecurityDescriptorDacl()
+            control = int(descriptor.GetSecurityDescriptorControl()[0])
         except Exception as exc:
             raise WindowsWebUIError("WINDOWS_TASK_SECURITY_UNAVAILABLE", "scheduled task security descriptor could not be verified") from exc
         if owner.casefold() != self.owner_sid.casefold() or dacl is None:
             raise WindowsWebUIError("WINDOWS_TASK_SECURITY_UNSAFE", "scheduled task is not owned by the current Windows Owner")
+        if not bool(control & 0x1000):  # SE_DACL_PROTECTED
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_SECURITY_UNSAFE",
+                "scheduled task DACL is not protected from inheritance",
+            )
         allowed = {
             self.owner_sid.casefold(),
             "s-1-5-18",  # LocalSystem
         }
+        # Task Scheduler may preserve GENERIC_ALL or map it to the concrete
+        # task-object full-control mask when serializing the registered task.
+        # Accept exactly those two full-control forms; weaker or unrelated
+        # masks must fail closed.
+        generic_all = 0x10000000
+        task_full_control = 0x001F01FF
+        observed_allowed: set[str] = set()
         for index in range(dacl.GetAceCount()):
-            header, _mask, ace_sid = dacl.GetAce(index)
-            if int(header[0]) != win32security.ACCESS_ALLOWED_ACE_TYPE:
-                continue
+            header, mask, ace_sid = dacl.GetAce(index)
             principal = str(win32security.ConvertSidToStringSid(ace_sid)).casefold()
+            if int(header[0]) != win32security.ACCESS_ALLOWED_ACE_TYPE:
+                raise WindowsWebUIError(
+                    "WINDOWS_TASK_SECURITY_UNSAFE",
+                    "scheduled task DACL contains an unexpected ACE type",
+                )
+            if int(header[1]) != 0:
+                raise WindowsWebUIError(
+                    "WINDOWS_TASK_SECURITY_UNSAFE",
+                    "scheduled task DACL contains inheritance or unsupported ACE flags",
+                )
             if principal not in allowed:
                 raise WindowsWebUIError("WINDOWS_TASK_SECURITY_UNSAFE", "scheduled task grants control to an unexpected principal")
+            if principal in observed_allowed:
+                raise WindowsWebUIError(
+                    "WINDOWS_TASK_SECURITY_UNSAFE",
+                    "scheduled task DACL contains a duplicate fixed principal",
+                )
+            if int(mask) not in {generic_all, task_full_control}:
+                raise WindowsWebUIError(
+                    "WINDOWS_TASK_SECURITY_UNSAFE",
+                    "scheduled task DACL does not grant fixed principals full control",
+                )
+            observed_allowed.add(principal)
+        if observed_allowed != allowed:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_SECURITY_UNSAFE",
+                "scheduled task DACL does not retain the fixed Owner and LocalSystem principals",
+            )
 
 
 @dataclass(frozen=True)

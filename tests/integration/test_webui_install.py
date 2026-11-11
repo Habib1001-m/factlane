@@ -1549,7 +1549,7 @@ def test_windows_task_registration_boundary_requires_exact_transaction_source(mo
     assert caught.value.code == 'WINDOWS_SETUP_RECOVERY_REQUIRED'
 
 
-def test_windows_task_registration_boundary_accepts_semantic_sddl_normalization(monkeypatch):
+def test_windows_task_registration_boundary_accepts_scheduler_security_canonicalization_after_live_validation(monkeypatch):
     from types import SimpleNamespace
     import factlane.webui_windows as windows
 
@@ -1560,8 +1560,11 @@ def test_windows_task_registration_boundary_accepts_semantic_sddl_normalization(
     supervisor.user_id = 'Alice'
     supervisor.owner_sid = 'S-1-5-21-1'
     supervisor._validate_registered_task = lambda task, plan, allow_disabled=False, expected_definition=None: None
-    supervisor._validate_task_security = lambda task: None
-    supervisor._normalized_sddl_signature = lambda value: ('semantic', value.casefold().replace('normalized-', ''))
+    validated = []
+    supervisor._validate_task_security = lambda task: validated.append(task)
+    supervisor._normalized_sddl_signature = lambda _value: (_ for _ in ()).throw(
+        AssertionError('post-registration SDDL must not be compared to the prepared recipe')
+    )
     source = 'FactLane setup 11111111-1111-1111-1111-111111111111'
     intended = {
         'exists': True,
@@ -1585,6 +1588,136 @@ def test_windows_task_registration_boundary_accepts_semantic_sddl_normalization(
     }
 
     supervisor._validate_registration_boundary(task, intended=intended, observed=observed)
+    assert validated == [task]
+
+
+def test_windows_task_security_requires_protected_owner_system_only_dacl(monkeypatch):
+    from types import SimpleNamespace
+    import factlane.webui_windows as windows
+
+    owner = 'S-1-5-21-1'
+    system = 'S-1-5-18'
+
+    class Dacl:
+        def __init__(self, aces):
+            self.aces = list(aces)
+
+        def GetAceCount(self):
+            return len(self.aces)
+
+        def GetAce(self, index):
+            return self.aces[index]
+
+    class Descriptor:
+        def __init__(self, *, protected=True, aces=()):
+            self.protected = protected
+            self.dacl = Dacl(aces)
+
+        def GetSecurityDescriptorOwner(self):
+            return owner
+
+        def GetSecurityDescriptorDacl(self):
+            return self.dacl
+
+        def GetSecurityDescriptorControl(self):
+            return (0x1000 if self.protected else 0, 1)
+
+    class Security:
+        SDDL_REVISION_1 = 1
+        ACCESS_ALLOWED_ACE_TYPE = 0
+
+        descriptor = Descriptor(
+            aces=[
+                ((0, 0), 0x10000000, owner),
+                ((0, 0), 0x10000000, system),
+            ]
+        )
+
+        @classmethod
+        def ConvertStringSecurityDescriptorToSecurityDescriptor(cls, _sddl, _revision):
+            return cls.descriptor
+
+        @staticmethod
+        def ConvertSidToStringSid(sid):
+            return sid
+
+    monkeypatch.setattr(windows, '_require_windows', lambda: (None, None, None, Security))
+    supervisor = object.__new__(windows.WindowsTaskSchedulerSupervisor)
+    supervisor.owner_sid = owner
+    task = SimpleNamespace(GetSecurityDescriptor=lambda _flags: 'scheduler-canonical')
+
+    supervisor._validate_task_security(task)
+
+    Security.descriptor = Descriptor(
+        protected=False,
+        aces=[
+            ((0, 0), 0x10000000, owner),
+            ((0, 0), 0x10000000, system),
+        ],
+    )
+    with pytest.raises(windows.WindowsWebUIError, match='DACL is not protected'):
+        supervisor._validate_task_security(task)
+
+    Security.descriptor = Descriptor(
+        aces=[
+            ((1, 0), 0x10000000, owner),
+            ((0, 0), 0x10000000, system),
+        ],
+    )
+    with pytest.raises(windows.WindowsWebUIError, match='unexpected ACE type'):
+        supervisor._validate_task_security(task)
+
+    Security.descriptor = Descriptor(
+        aces=[
+            ((0, 0), 0x10000000, owner),
+            ((0, 0), 0x10000000, 'S-1-5-32-545'),
+            ((0, 0), 0x10000000, system),
+        ],
+    )
+    with pytest.raises(windows.WindowsWebUIError, match='unexpected principal'):
+        supervisor._validate_task_security(task)
+
+    Security.descriptor = Descriptor(
+        aces=[((0, 0), 0x10000000, owner)],
+    )
+    with pytest.raises(windows.WindowsWebUIError, match='Owner and LocalSystem'):
+        supervisor._validate_task_security(task)
+
+    Security.descriptor = Descriptor(
+        aces=[
+            ((0, 0), 0x001F01FF, owner),
+            ((0, 0), 0x001F01FF, system),
+        ],
+    )
+    supervisor._validate_task_security(task)
+
+    Security.descriptor = Descriptor(
+        aces=[
+            ((0, 0x10), 0x10000000, owner),
+            ((0, 0), 0x10000000, system),
+        ],
+    )
+    with pytest.raises(windows.WindowsWebUIError, match='inheritance or unsupported ACE flags'):
+        supervisor._validate_task_security(task)
+
+    Security.descriptor = Descriptor(
+        aces=[
+            ((0, 0), 0x10000000, owner),
+            ((0, 0), 0x10000000, owner),
+            ((0, 0), 0x10000000, system),
+        ],
+    )
+    with pytest.raises(windows.WindowsWebUIError, match='duplicate fixed principal'):
+        supervisor._validate_task_security(task)
+
+    Security.descriptor = Descriptor(
+        aces=[
+            ((0, 0), 0x00020000, owner),
+            ((0, 0), 0x10000000, system),
+        ],
+    )
+    with pytest.raises(windows.WindowsWebUIError, match='full control'):
+        supervisor._validate_task_security(task)
 
 
 def test_windows_prepared_task_recipe_rejects_behavior_drift_before_registration(monkeypatch):
