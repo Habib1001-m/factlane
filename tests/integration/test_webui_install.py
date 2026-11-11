@@ -1296,6 +1296,7 @@ def test_task_snapshot_and_conditional_restore_plain_data():
         return task
     root.RegisterTask = register
     service = SimpleNamespace(GetFolder=lambda path: root)
+    supervisor._run_with_service_unlocked = lambda callback: callback(service)
     supervisor._run_with_service = lambda callback: callback(service)
     supervisor._validate_task_security = lambda task: None
     supervisor._validate_registered_task = lambda task, plan: None
@@ -1618,13 +1619,26 @@ def test_windows_task_snapshot_only_treats_not_found_as_absence(code, absent):
     def get_task(name):
         raise ComFailure()
     service = SimpleNamespace(GetFolder=lambda path: SimpleNamespace(GetTask=get_task))
-    supervisor._run_with_service = lambda callback: callback(service)
+    supervisor._run_with_service_unlocked = lambda callback: callback(service)
     if absent:
         assert supervisor.snapshot_task() == {'exists': False}
     else:
         with pytest.raises(windows.WindowsWebUIError) as error:
             supervisor.snapshot_task()
         assert error.value.code == 'WINDOWS_TASK_SNAPSHOT_UNAVAILABLE'
+
+
+def test_windows_task_snapshot_is_observational_and_skips_mutation_guard(monkeypatch):
+    import factlane.webui_windows as windows
+
+    supervisor = object.__new__(windows.WindowsTaskSchedulerSupervisor)
+    calls = []
+    supervisor._snapshot_task_with_service = lambda service: calls.append(('snapshot', service)) or {'exists': False}
+    supervisor._run_with_service_unlocked = lambda callback: calls.append(('unlocked',)) or callback('service')
+    supervisor._run_with_service = lambda callback: pytest.fail('read-only snapshot entered mutation guard')
+
+    assert supervisor.snapshot_task() == {'exists': False}
+    assert calls == [('unlocked',), ('snapshot', 'service')]
 
 
 def test_windows_conditional_file_publication_rejects_equal_bytes_foreign_custody(monkeypatch):
@@ -1778,7 +1792,7 @@ def test_windows_task_snapshot_recognizes_wrapped_com_not_found():
     def get_task(name):
         raise ComFailure()
     service = SimpleNamespace(GetFolder=lambda path: SimpleNamespace(GetTask=get_task))
-    supervisor._run_with_service = lambda callback: callback(service)
+    supervisor._run_with_service_unlocked = lambda callback: callback(service)
     assert supervisor.snapshot_task() == {'exists': False}
 
 

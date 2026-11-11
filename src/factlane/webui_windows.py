@@ -872,7 +872,13 @@ class WindowsTaskSchedulerSupervisor:
 
     def snapshot_task(self) -> dict[str, Any]:
         """Return bounded plain data; never return a COM proxy outside its apartment."""
-        return self._run_with_service(self._snapshot_task_with_service)
+        # Pre-consent setup custody must be observational only.  The mutation
+        # runner acquires windows_mutation_guard(), which may create FactLane's
+        # owner-private state/lock substrate on a first install.  A task
+        # snapshot itself needs no mutation serialization, so keep this path
+        # strictly read-only and let later setup mutation revalidate the exact
+        # snapshot under the mutation guard after Owner consent.
+        return self._run_with_service_unlocked(self._snapshot_task_with_service)
 
     def restore_task(self, original: dict[str, Any], *, expected: dict[str, Any]) -> None:
         """Conditionally restore exact registration state without activating the task."""
