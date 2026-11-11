@@ -3563,6 +3563,15 @@ def _decode_windows_setup_journal(raw: bytes, *, installation_id: str, owner_sid
                 if value is None and field in {"after", "restore"}:
                     continue
                 _validate_windows_setup_snapshot(value, task=kind == "REGISTER_WINDOWS_TASK")
+            if kind == "REGISTER_WINDOWS_TASK":
+                try:
+                    source = windows.WindowsTaskSchedulerSupervisor._registration_source_from_xml(
+                        record["intended"]["xml"]
+                    )
+                except WindowsWebUIError:
+                    reject()
+                if source != "FactLane setup " + payload["transaction_id"]:
+                    reject("Windows setup task recipe is not bound to its transaction")
             if record["status"] == "APPLIED" and record["after"] is None:
                 reject()
         if seen != set(targets) or [r["kind"] for r in operations] != list(targets):
@@ -3917,16 +3926,26 @@ class ProductionWindowsInstallerBackend:
             raise WindowsWebUIError("WINDOWS_SETUP_PATH_INVALID", "prepared target changed")
         self._journal["phase"] = "APPLYING"
         self._persist_journal()  # Includes the current PREPARED op before any publication.
+        task_post = None
         if record["intended"] != record["before"]:
             if operation.kind == "REGISTER_WINDOWS_TASK":
-                self.supervisor.publish_task(record["intended"], expected=record["before"])
+                task_post = self.supervisor.publish_task(
+                    record["intended"],
+                    expected=record["before"],
+                    transaction_id=self._journal["transaction_id"],
+                )
             else:
                 windows.publish_windows_setup_file(record["target"], self._stages[operation.kind],
                                                    expected=record["before"], owner_sid=self._owner_sid,
                                                    owner_private=operation.kind != "INSTALL_OWNER_LAUNCHER")
                 windows.close_windows_setup_stage(self._stages.pop(operation.kind), owner_sid=self._owner_sid)
         post = self._snapshot_target(record["kind"], record["target"])
-        if post != record["intended"]:
+        if operation.kind == "REGISTER_WINDOWS_TASK":
+            if task_post is None:
+                task_post = record["before"]
+            if post != task_post:
+                raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "setup task postimage changed after registration")
+        elif post != record["intended"]:
             raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "setup postimage could not be verified")
         record["after"] = post
         record["status"] = "APPLIED"
@@ -3982,16 +4001,18 @@ class ProductionWindowsInstallerBackend:
         finally:
             windows.close_windows_setup_stage(staged, owner_sid=self._owner_sid)
 
-    @staticmethod
-    def _owned_task_intermediate(record, current):
+    def _owned_task_intermediate(self, record, current):
         if record["kind"] != "REGISTER_WINDOWS_TASK" or not current.get("exists"):
             return False
-        before, intended = record["before"], record["intended"]
-        # The prepared XML carries a unique transaction source. Only the two
-        # anticipated security/enabled values qualify as partial publication.
-        return (current.get("xml") == intended["xml"]
-                and current.get("sddl") in {intended["sddl"], before.get("sddl")}
-                and current.get("enabled") in {intended["enabled"], before.get("enabled")})
+        matcher = getattr(self.supervisor, "matches_prepared_task", None)
+        return bool(
+            matcher is not None
+            and matcher(
+                record["intended"],
+                current,
+                transaction_id=self._journal["transaction_id"],
+            )
+        )
 
     def _assert_recovery_quiescent(self):
         state_path = str(PureWindowsPath(self.request.state_dir) / "webui-service.json")
@@ -4016,8 +4037,18 @@ class ProductionWindowsInstallerBackend:
                 current = self._snapshot_target(record["kind"], record["target"])
                 if current == record["before"] or (record["restore"] is not None and current == record["restore"]):
                     record["status"] = "RESTORED"
-                elif (current == record["intended"] or (record["after"] is not None and current == record["after"])
-                      or self._owned_task_intermediate(record, current)):
+                elif record["after"] is not None and current == record["after"]:
+                    record["restore"] = self._restore_record(record, current)
+                    if self._snapshot_target(record["kind"], record["target"]) != record["restore"]:
+                        raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "rollback postimage changed")
+                    record["status"] = "RESTORED"
+                elif record["after"] is None and (
+                    (
+                        record["kind"] != "REGISTER_WINDOWS_TASK"
+                        and current == record["intended"]
+                    )
+                    or self._owned_task_intermediate(record, current)
+                ):
                     record["restore"] = self._restore_record(record, current)
                     if self._snapshot_target(record["kind"], record["target"]) != record["restore"]:
                         raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "rollback postimage changed")

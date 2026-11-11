@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import threading
+import xml.etree.ElementTree as ElementTree
 from contextlib import contextmanager
 import uuid
 from dataclasses import dataclass
@@ -800,6 +801,10 @@ class WindowsTaskSchedulerSupervisor:
         settings.ExecutionTimeLimit = plan.execution_time_limit
         return definition
 
+    @staticmethod
+    def _setup_registration_source(transaction_id: str) -> str:
+        return "FactLane setup " + str(uuid.UUID(transaction_id))
+
     def prepare_task(self, executable: str, *, transaction_id: str) -> dict[str, Any]:
         plan = self.plan(executable)
         def prepare(service):
@@ -810,32 +815,270 @@ class WindowsTaskSchedulerSupervisor:
                 if int(task.State) in {_TASK_STATE_RUNNING, _TASK_STATE_QUEUED}:
                     raise WindowsWebUIError("WINDOWS_SETUP_BUSY", "managed task must be quiescent before setup")
             definition = self._task_definition(service, plan)
-            definition.RegistrationInfo.Source = "FactLane setup " + str(uuid.UUID(transaction_id))
+            definition.RegistrationInfo.Source = self._setup_registration_source(transaction_id)
             return {"exists": True, "xml": str(definition.XmlText),
                     "sddl": f"O:{self.owner_sid}G:{self.owner_sid}D:P(A;;GA;;;{self.owner_sid})(A;;GA;;;SY)",
                     "enabled": True}
         return self._run_with_service(prepare)
 
-    def publish_task(self, intended: dict[str, Any], *, expected: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _registration_source_from_xml(xml: str) -> str | None:
+        if not isinstance(xml, str) or not xml or len(xml.encode("utf-8")) > 262144:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task registration source is unavailable",
+            )
+        try:
+            root = ElementTree.fromstring(xml)
+        except ElementTree.ParseError as exc:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task XML could not be verified",
+            ) from exc
+        local_name = lambda element: str(element.tag).rsplit("}", 1)[-1]
+        registration_info = [
+            element for element in root.iter()
+            if local_name(element) == "RegistrationInfo"
+        ]
+        all_sources = [
+            element for element in root.iter()
+            if local_name(element) == "Source"
+        ]
+        direct_sources = (
+            [
+                child for child in list(registration_info[0])
+                if local_name(child) == "Source"
+            ]
+            if len(registration_info) == 1
+            else []
+        )
+        if (
+            len(registration_info) != 1
+            or len(direct_sources) > 1
+            or {id(element) for element in all_sources}
+            != {id(element) for element in direct_sources}
+        ):
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task registration source is missing, ambiguous, or misplaced",
+            )
+        if not direct_sources:
+            return None
+        source = (direct_sources[0].text or "").strip()
+        return source or None
+
+    @staticmethod
+    def _task_behavior_xml_signature(xml: str) -> tuple[Any, ...]:
+        """Canonicalize complete behavioral task XML, excluding admin metadata."""
+        if not isinstance(xml, str) or not xml or len(xml.encode("utf-8")) > 262144:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task XML could not be compared",
+            )
+        try:
+            root = ElementTree.fromstring(xml)
+        except ElementTree.ParseError as exc:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task XML could not be compared",
+            ) from exc
+
+        def local(value: str) -> str:
+            return str(value).rsplit("}", 1)[-1]
+
+        def canonical(element: Any) -> tuple[Any, ...] | None:
+            name = local(element.tag)
+            if name == "RegistrationInfo":
+                return None
+            attributes = tuple(
+                sorted(
+                    (local(key), str(value).strip())
+                    for key, value in element.attrib.items()
+                )
+            )
+            children = [
+                value
+                for child in list(element)
+                if (value := canonical(child)) is not None
+            ]
+            children.sort(key=repr)
+            return (
+                name,
+                attributes,
+                (element.text or "").strip(),
+                tuple(children),
+            )
+
+        signature = canonical(root)
+        if signature is None:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_DEFINITION_UNSAFE",
+                "scheduled task XML has no behavioral definition",
+            )
+        return signature
+
+    @staticmethod
+    def _normalized_sddl_signature(
+        sddl: str,
+    ) -> tuple[str, str | None, bool, tuple[tuple[int, int, int, str], ...]]:
+        _pywintypes, _win32api, _win32con, win32security = _require_windows()
+        try:
+            descriptor = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+                sddl,
+                win32security.SDDL_REVISION_1,
+            )
+            owner = win32security.ConvertSidToStringSid(descriptor.GetSecurityDescriptorOwner())
+            group_sid = descriptor.GetSecurityDescriptorGroup()
+            group = (
+                str(win32security.ConvertSidToStringSid(group_sid))
+                if group_sid is not None
+                else None
+            )
+            dacl = descriptor.GetSecurityDescriptorDacl()
+            if dacl is None:
+                raise ValueError("missing DACL")
+            control = int(descriptor.GetSecurityDescriptorControl()[0])
+            dacl_protected = bool(control & 0x1000)  # SE_DACL_PROTECTED
+            aces: list[tuple[int, int, int, str]] = []
+            for index in range(dacl.GetAceCount()):
+                header, mask, ace_sid = dacl.GetAce(index)
+                aces.append(
+                    (
+                        int(header[0]),
+                        int(header[1]),
+                        int(mask),
+                        str(win32security.ConvertSidToStringSid(ace_sid)),
+                    )
+                )
+        except Exception as exc:
+            raise WindowsWebUIError(
+                "WINDOWS_TASK_SECURITY_UNAVAILABLE",
+                "scheduled task security descriptor could not be compared",
+            ) from exc
+        normalized_aces = tuple(
+            sorted((ace_type, ace_flags, mask, sid.casefold()) for ace_type, ace_flags, mask, sid in aces)
+        )
+        return owner.casefold(), group.casefold() if group else None, dacl_protected, normalized_aces
+
+    def _validate_registration_boundary(
+        self,
+        task: Any,
+        *,
+        intended: dict[str, Any],
+        observed: dict[str, Any],
+        allow_disabled: bool = False,
+        expected_source: str | None = None,
+    ) -> None:
+        self._validate_registered_task(
+            task,
+            self.plan(self.expected_executable),
+            allow_disabled=allow_disabled,
+        )
+        self._validate_task_security(task)
+        if expected_source is None:
+            expected_source = self._registration_source_from_xml(str(intended["xml"]))
+        observed_source = self._registration_source_from_xml(str(observed["xml"]))
+        if observed_source != expected_source:
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_RECOVERY_REQUIRED",
+                "scheduled task registration source differs from the prepared transaction",
+            )
+        if self._task_behavior_xml_signature(str(observed["xml"])) != self._task_behavior_xml_signature(
+            str(intended["xml"])
+        ):
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_RECOVERY_REQUIRED",
+                "scheduled task behavior differs from the prepared transaction",
+            )
+        if self._normalized_sddl_signature(str(observed["sddl"])) != self._normalized_sddl_signature(
+            str(intended["sddl"])
+        ):
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_RECOVERY_REQUIRED",
+                "scheduled task security differs from the prepared transaction",
+            )
+        if bool(observed["enabled"]) is not bool(intended["enabled"]):
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_RECOVERY_REQUIRED",
+                "scheduled task enabled state differs from the prepared transaction",
+            )
+
+    def _validated_registration_snapshot(
+        self,
+        service: Any,
+        *,
+        intended: dict[str, Any],
+        expected_source: str,
+    ) -> dict[str, Any]:
+        observed = self._snapshot_task_with_service(service)
+        if not observed.get("exists"):
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_RECOVERY_REQUIRED",
+                "scheduled task registration disappeared before validation",
+            )
+        task = service.GetFolder("\\").GetTask(self.task_name)
+        self._validate_registration_boundary(
+            task,
+            intended=intended,
+            observed=observed,
+            expected_source=expected_source,
+        )
+        if self._snapshot_task_with_service(service) != observed:
+            raise WindowsWebUIError(
+                "WINDOWS_SETUP_RECOVERY_REQUIRED",
+                "scheduled task changed during registration validation",
+            )
+        return observed
+
+    def publish_task(
+        self,
+        intended: dict[str, Any],
+        *,
+        expected: dict[str, Any],
+        transaction_id: str,
+    ) -> dict[str, Any]:
         def publish(service):
             if self._snapshot_task_with_service(service) != expected:
                 raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task changed before registration")
             root = service.GetFolder("\\")
-            task = root.RegisterTask(self.task_name, intended["xml"], _TASK_CREATE_OR_UPDATE | 0x10,
-                                     self.user_id, None, _TASK_LOGON_INTERACTIVE_TOKEN, intended["sddl"])
-            self._validate_registered_task(task, self.plan(self.expected_executable))
-            self._validate_task_security(task)
-            post = self._snapshot_task_with_service(service)
-            if post != intended:
-                raise WindowsWebUIError("WINDOWS_SETUP_RECOVERY_REQUIRED", "scheduled task postimage differs from prepared registration")
-            return post
+            root.RegisterTask(self.task_name, intended["xml"], _TASK_CREATE_OR_UPDATE | 0x10,
+                              self.user_id, None, _TASK_LOGON_INTERACTIVE_TOKEN, intended["sddl"])
+            return self._validated_registration_snapshot(
+                service,
+                intended=intended,
+                expected_source=self._setup_registration_source(transaction_id),
+            )
         return self._run_with_service(publish)
+
+    def matches_prepared_task(
+        self,
+        intended: dict[str, Any],
+        observed: dict[str, Any],
+        *,
+        transaction_id: str,
+    ) -> bool:
+        """Recognize only this prepared transaction across Scheduler XML/SDDL normalization."""
+        def matches(service: Any) -> bool:
+            if not observed.get("exists"):
+                return False
+            try:
+                validated = self._validated_registration_snapshot(
+                    service,
+                    intended=intended,
+                    expected_source=self._setup_registration_source(transaction_id),
+                )
+            except WindowsWebUIError:
+                return False
+            return validated == observed
+
+        return bool(self._run_with_service(matches))
 
     def register_or_update(self, executable: str) -> WindowsTaskPlan:
         with windows_mutation_guard():
             before = self.snapshot_task()
-            intended = self.prepare_task(executable, transaction_id=str(uuid.uuid4()))
-            self.publish_task(intended, expected=before)
+            transaction_id = str(uuid.uuid4())
+            intended = self.prepare_task(executable, transaction_id=transaction_id)
+            self.publish_task(intended, expected=before, transaction_id=transaction_id)
         self.expected_executable = executable
         return self.plan(executable)
 
@@ -1063,6 +1306,8 @@ class WindowsTaskSchedulerSupervisor:
     def _validate_registered_task(self, task: Any, plan: WindowsTaskPlan, *, allow_disabled: bool = False) -> None:
         try:
             definition = task.Definition
+            if str(definition.RegistrationInfo.Description) != "FactLane Owner WebUI current-user managed runtime":
+                raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task description changed")
             principal = definition.Principal
             if int(principal.LogonType) != plan.logon_type or int(principal.RunLevel) != plan.run_level:
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task principal is not interactive least-privilege")
@@ -1079,17 +1324,25 @@ class WindowsTaskSchedulerSupervisor:
             if str(action.Path).casefold() != plan.executable.casefold() or str(action.Arguments) != plan.arguments:
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task executable or arguments changed")
             triggers = definition.Triggers
-            logon_users = [
-                str(triggers.Item(index).UserId)
-                for index in range(1, int(triggers.Count) + 1)
-                if int(triggers.Item(index).Type) == _TASK_TRIGGER_LOGON and bool(triggers.Item(index).Enabled)
-            ]
-            if len(logon_users) != 1 or logon_users[0].casefold() != plan.user_id.casefold():
+            if int(triggers.Count) != 1:
+                raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task trigger set changed")
+            trigger = triggers.Item(1)
+            if (
+                int(trigger.Type) != _TASK_TRIGGER_LOGON
+                or not bool(trigger.Enabled)
+                or str(trigger.UserId).casefold() != plan.user_id.casefold()
+                or str(trigger.Id) != "FactLaneOwnerLogon"
+            ):
                 raise WindowsWebUIError("WINDOWS_TASK_DEFINITION_UNSAFE", "scheduled task logon trigger is not exact current-user scope")
             settings = definition.Settings
             if (
                 (not allow_disabled and not bool(settings.Enabled))
                 or not bool(settings.AllowDemandStart)
+                or not bool(settings.StartWhenAvailable)
+                or bool(settings.DisallowStartIfOnBatteries)
+                or bool(settings.StopIfGoingOnBatteries)
+                or bool(settings.RunOnlyIfIdle)
+                or bool(settings.Hidden)
                 or int(settings.MultipleInstances) != plan.multiple_instances
                 or str(settings.ExecutionTimeLimit).upper() != plan.execution_time_limit
             ):

@@ -84,9 +84,17 @@ class _SetupSupervisor:
             "enabled": True,
         }
 
-    def publish_task(self, intended: dict[str, object], *, expected: dict[str, object]) -> None:
+    def publish_task(
+        self,
+        intended: dict[str, object],
+        *,
+        expected: dict[str, object],
+        transaction_id: str,
+    ) -> dict[str, object]:
         assert self.task == expected
+        assert transaction_id
         self.task = dict(intended)
+        return dict(self.task)
 
     def restore_task(self, original: dict[str, object], *, expected: dict[str, object]) -> None:
         assert self.task == expected
@@ -504,10 +512,23 @@ def test_windows_scheduler_observation_binds_engine_pid_and_process_identity() -
     user_id = os.environ.get("USERNAME") or "moham"
     arguments = windows_managed_python_arguments(environment_executable, "serve")
     action = SimpleNamespace(Type=0, Path=executable, Arguments=arguments)
-    trigger = SimpleNamespace(Type=9, UserId=user_id, Enabled=True)
-    settings = SimpleNamespace(Enabled=True, AllowDemandStart=True, MultipleInstances=2, ExecutionTimeLimit="PT0S")
+    trigger = SimpleNamespace(Type=9, UserId=user_id, Enabled=True, Id="FactLaneOwnerLogon")
+    settings = SimpleNamespace(
+        Enabled=True,
+        AllowDemandStart=True,
+        StartWhenAvailable=True,
+        DisallowStartIfOnBatteries=False,
+        StopIfGoingOnBatteries=False,
+        RunOnlyIfIdle=False,
+        Hidden=False,
+        MultipleInstances=2,
+        ExecutionTimeLimit="PT0S",
+    )
     principal = SimpleNamespace(UserId=user_id, LogonType=3, RunLevel=0)
     definition = SimpleNamespace(
+        RegistrationInfo=SimpleNamespace(
+            Description="FactLane Owner WebUI current-user managed runtime"
+        ),
         Principal=principal,
         Actions=_Collection([action]),
         Triggers=_Collection([trigger]),
@@ -541,11 +562,24 @@ def test_windows_scheduler_rejects_tampered_same_name_task_executable() -> None:
     user_id = os.environ.get("USERNAME") or "moham"
     arguments = windows_managed_python_arguments(environment_executable, "serve")
     action = SimpleNamespace(Type=0, Path=r"C:\Windows\System32\cmd.exe", Arguments=arguments)
-    trigger = SimpleNamespace(Type=9, UserId=user_id, Enabled=True)
-    settings = SimpleNamespace(Enabled=True, AllowDemandStart=True, MultipleInstances=2, ExecutionTimeLimit="PT0S")
+    trigger = SimpleNamespace(Type=9, UserId=user_id, Enabled=True, Id="FactLaneOwnerLogon")
+    settings = SimpleNamespace(
+        Enabled=True,
+        AllowDemandStart=True,
+        StartWhenAvailable=True,
+        DisallowStartIfOnBatteries=False,
+        StopIfGoingOnBatteries=False,
+        RunOnlyIfIdle=False,
+        Hidden=False,
+        MultipleInstances=2,
+        ExecutionTimeLimit="PT0S",
+    )
     principal = SimpleNamespace(UserId=user_id, LogonType=3, RunLevel=0)
     task = SimpleNamespace(
         Definition=SimpleNamespace(
+            RegistrationInfo=SimpleNamespace(
+                Description="FactLane Owner WebUI current-user managed runtime"
+            ),
             Principal=principal,
             Actions=_Collection([action]),
             Triggers=_Collection([trigger]),
@@ -590,6 +624,34 @@ def test_windows_scheduler_registers_exact_disposable_current_user_task_and_dele
         assert observed.enabled is True
         assert observed.active is False
         assert observed.engine_pid is None
+    finally:
+        supervisor.delete()
+
+
+def test_windows_scheduler_restore_roundtrip_is_exact_after_scheduler_canonicalization() -> None:
+    """A Scheduler-observed snapshot must restore byte-for-byte after re-registration."""
+    task_name = f"FactLane A2 Restore Roundtrip {os.getpid()} {time.time_ns()}"
+    executable, environment_executable = windows_managed_python_executables()
+    supervisor = WindowsTaskSchedulerSupervisor(
+        task_name=task_name,
+        expected_executable=executable,
+        environment_executable=environment_executable,
+    )
+    try:
+        supervisor.register_or_update(executable)
+        original = supervisor.snapshot_task()
+        assert original["exists"] is True
+
+        # A second registration is behaviorally identical but transaction-bound
+        # registration metadata must differ, giving rollback a distinct exact
+        # postimage to CAS against.
+        supervisor.register_or_update(executable)
+        successor = supervisor.snapshot_task()
+        assert successor["exists"] is True
+        assert successor != original
+
+        supervisor.restore_task(original, expected=successor)
+        assert supervisor.snapshot_task() == original
     finally:
         supervisor.delete()
 
@@ -802,9 +864,14 @@ def test_windows_controller_binds_live_control_to_scheduler_identity_and_restart
     assert service_state.snapshot().status is ServiceStatus.READY
 
 
-def test_windows_setup_plan_and_apply_have_no_linux_caddy_hosts_or_lingering_requirements(tmp_path: Path) -> None:
+def test_windows_setup_plan_and_apply_have_no_linux_caddy_hosts_or_lingering_requirements(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     local_appdata = tmp_path / "LocalAppData"
     appdata = tmp_path / "RoamingAppData"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+    monkeypatch.setenv("APPDATA", str(appdata))
     executable = _factlane_executable()
     request = build_default_setup_request(
         environ={"LOCALAPPDATA": str(local_appdata), "APPDATA": str(appdata)},
@@ -1187,6 +1254,8 @@ def test_windows_serve_route_runs_native_backend_owned_http_without_tls_or_caddy
 ) -> None:
     local_appdata = tmp_path / "LocalAppData"
     appdata = tmp_path / "RoamingAppData"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+    monkeypatch.setenv("APPDATA", str(appdata))
     executable = _factlane_executable()
     request = build_default_setup_request(
         environ={"LOCALAPPDATA": str(local_appdata), "APPDATA": str(appdata)},

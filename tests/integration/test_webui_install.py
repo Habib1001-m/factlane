@@ -1300,6 +1300,10 @@ def test_task_snapshot_and_conditional_restore_plain_data():
     supervisor._run_with_service = lambda callback: callback(service)
     supervisor._validate_task_security = lambda task: None
     supervisor._validate_registered_task = lambda task, plan: None
+    supervisor._validate_registration_boundary = (
+        lambda task, *, intended, allow_disabled=False, expected_source=None:
+        pytest.fail("rollback restore must not reinterpret the original task against successor semantics")
+    )
     before = supervisor.snapshot_task()
     assert before == {'exists': True, 'xml': '<Task/>', 'sddl': 'O:ownerG:groupD:P(A;;GA;;;owner)', 'enabled': False}
     task.Xml = '<Task updated="yes"/>'
@@ -1379,6 +1383,7 @@ def test_windows_recovery_inspects_prepared_and_is_idempotent(current_state):
 
 
 def test_windows_partial_task_enabled_failure_is_recoverable():
+    from types import SimpleNamespace
     import factlane.webui_install as install
     backend = object.__new__(install.ProductionWindowsInstallerBackend)
     original = {'exists': True, 'xml': 'original', 'sddl': 'old-private', 'enabled': False}
@@ -1386,7 +1391,15 @@ def test_windows_partial_task_enabled_failure_is_recoverable():
     intermediate = dict(intended, enabled=False, sddl='old-private')
     record = {'kind': 'REGISTER_WINDOWS_TASK', 'target': 'task', 'status': 'PREPARED',
               'before': original, 'intended': intended, 'after': None, 'restore': None}
-    backend._journal = {'phase': 'APPLYING', 'operations': [record]}
+    transaction_id = '11111111-1111-1111-1111-111111111111'
+    backend._journal = {'phase': 'APPLYING', 'transaction_id': transaction_id, 'operations': [record]}
+    backend.supervisor = SimpleNamespace(
+        matches_prepared_task=lambda candidate, observed, *, transaction_id: (
+            candidate == intended
+            and observed == intermediate
+            and transaction_id == '11111111-1111-1111-1111-111111111111'
+        )
+    )
     current = dict(intermediate)
     backend._snapshot_target = lambda kind, target: dict(current)
     backend._persist_journal = lambda: None
@@ -1401,6 +1414,174 @@ def test_windows_partial_task_enabled_failure_is_recoverable():
     result = backend.rollback_setup(plan=None, completed_operations=())
     assert result.status is InstallerStepStatus.APPLIED
     assert current == original
+
+
+def test_windows_task_apply_adopts_only_verified_scheduler_postimage():
+    from copy import deepcopy
+    from types import SimpleNamespace
+    import factlane.webui_install as install
+
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    before = {'exists': False}
+    intended = {'exists': True, 'xml': '<Task><RegistrationInfo><Source>FactLane setup prepared</Source></RegistrationInfo></Task>',
+                'sddl': 'requested-private', 'enabled': True}
+    normalized = {'exists': True, 'xml': '<Task normalized="yes"><RegistrationInfo><Source>FactLane setup prepared</Source></RegistrationInfo></Task>',
+                  'sddl': 'normalized-private', 'enabled': True}
+    record = {'kind': 'REGISTER_WINDOWS_TASK', 'target': 'task', 'status': 'PREPARED',
+              'before': before, 'intended': intended, 'after': None, 'restore': None}
+    backend._journal = {'phase': 'PREPARED', 'operations': [record]}
+    current = deepcopy(before)
+    persisted = []
+
+    def publish_task(candidate, *, expected, transaction_id):
+        assert candidate == intended
+        assert current == expected == before
+        assert transaction_id == 'transaction-id'
+        current.clear()
+        current.update(deepcopy(normalized))
+        return deepcopy(normalized)
+
+    backend.supervisor = SimpleNamespace(publish_task=publish_task)
+    backend._journal['transaction_id'] = 'transaction-id'
+    backend._snapshot_target = lambda kind, target: deepcopy(current)
+    backend._persist_journal = lambda: persisted.append(deepcopy(backend._journal))
+    operation = SimpleNamespace(kind='REGISTER_WINDOWS_TASK', target='task')
+
+    result = backend.apply_operation(operation, plan=None)
+
+    assert result.status is InstallerStepStatus.APPLIED
+    assert record['after'] == normalized
+    assert record['status'] == 'APPLIED'
+    assert persisted[0]['phase'] == 'APPLYING'
+    assert persisted[-1]['operations'][0]['after'] == normalized
+
+
+def test_windows_task_apply_rejects_drift_after_verified_scheduler_postimage():
+    from copy import deepcopy
+    from types import SimpleNamespace
+    import factlane.webui_install as install
+    from factlane.webui_windows import WindowsWebUIError
+
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    before = {'exists': False}
+    intended = {'exists': True, 'xml': 'prepared', 'sddl': 'requested-private', 'enabled': True}
+    verified = {'exists': True, 'xml': 'scheduler-normalized', 'sddl': 'normalized-private', 'enabled': True}
+    drifted = dict(verified, enabled=False)
+    record = {'kind': 'REGISTER_WINDOWS_TASK', 'target': 'task', 'status': 'PREPARED',
+              'before': before, 'intended': intended, 'after': None, 'restore': None}
+    backend._journal = {'phase': 'PREPARED', 'operations': [record]}
+    backend._journal['transaction_id'] = 'transaction-id'
+    backend.supervisor = SimpleNamespace(
+        publish_task=lambda candidate, *, expected, transaction_id: deepcopy(verified)
+    )
+    backend._snapshot_target = lambda kind, target: deepcopy(drifted)
+    backend._persist_journal = lambda: None
+
+    with pytest.raises(WindowsWebUIError) as caught:
+        backend.apply_operation(SimpleNamespace(kind='REGISTER_WINDOWS_TASK', target='task'), plan=None)
+
+    assert caught.value.code == 'WINDOWS_SETUP_RECOVERY_REQUIRED'
+    assert record['after'] is None
+    assert record['status'] == 'PREPARED'
+
+
+def test_windows_task_crash_gap_uses_live_transaction_matcher_for_scheduler_normalization():
+    from types import SimpleNamespace
+    import factlane.webui_install as install
+
+    backend = object.__new__(install.ProductionWindowsInstallerBackend)
+    intended = {'exists': True, 'xml': 'prepared-xml', 'sddl': 'requested-private', 'enabled': True}
+    normalized = {'exists': True, 'xml': 'scheduler-normalized', 'sddl': 'normalized-private', 'enabled': True}
+    calls = []
+    backend.supervisor = SimpleNamespace(
+        matches_prepared_task=lambda candidate, observed, *, transaction_id: calls.append(
+            (candidate, observed, transaction_id)
+        ) or True
+    )
+    backend._journal = {'transaction_id': '11111111-1111-1111-1111-111111111111'}
+    record = {'kind': 'REGISTER_WINDOWS_TASK', 'before': {'exists': False}, 'intended': intended}
+
+    assert backend._owned_task_intermediate(record, normalized) is True
+    assert calls == [(intended, normalized, '11111111-1111-1111-1111-111111111111')]
+
+    backend.supervisor = SimpleNamespace(
+        matches_prepared_task=lambda candidate, observed, *, transaction_id: False
+    )
+    assert backend._owned_task_intermediate(record, normalized) is False
+
+
+def test_windows_task_registration_boundary_requires_exact_transaction_source(monkeypatch):
+    from types import SimpleNamespace
+    import factlane.webui_windows as windows
+
+    supervisor = object.__new__(windows.WindowsTaskSchedulerSupervisor)
+    supervisor.expected_executable = r'C:\Python\python.exe'
+    supervisor.environment_executable = r'C:\FactLane\python.exe'
+    supervisor.task_name = windows.WINDOWS_TASK_NAME
+    supervisor.user_id = 'Alice'
+    supervisor.owner_sid = 'S-1-5-21-1'
+    supervisor._validate_registered_task = lambda task, plan, allow_disabled=False: None
+    supervisor._validate_task_security = lambda task: None
+    supervisor._normalized_sddl_signature = lambda value: ('semantic', value.casefold().replace('normalized-', ''))
+    intended = {
+        'exists': True,
+        'xml': '<Task><RegistrationInfo><Source>FactLane setup 11111111-1111-1111-1111-111111111111</Source></RegistrationInfo></Task>',
+        'sddl': 'PRIVATE',
+        'enabled': True,
+    }
+    task = SimpleNamespace(
+        Definition=SimpleNamespace(
+            RegistrationInfo=SimpleNamespace(Source='FactLane setup 22222222-2222-2222-2222-222222222222')
+        ),
+        GetSecurityDescriptor=lambda _flags: 'normalized-private',
+        Enabled=True,
+    )
+    observed = {
+        'exists': True,
+        'xml': '<Task><RegistrationInfo><Source>FactLane setup 22222222-2222-2222-2222-222222222222</Source></RegistrationInfo></Task>',
+        'sddl': 'normalized-private',
+        'enabled': True,
+    }
+
+    with pytest.raises(windows.WindowsWebUIError) as caught:
+        supervisor._validate_registration_boundary(task, intended=intended, observed=observed)
+
+    assert caught.value.code == 'WINDOWS_SETUP_RECOVERY_REQUIRED'
+
+
+def test_windows_task_registration_boundary_accepts_semantic_sddl_normalization(monkeypatch):
+    from types import SimpleNamespace
+    import factlane.webui_windows as windows
+
+    supervisor = object.__new__(windows.WindowsTaskSchedulerSupervisor)
+    supervisor.expected_executable = r'C:\Python\python.exe'
+    supervisor.environment_executable = r'C:\FactLane\python.exe'
+    supervisor.task_name = windows.WINDOWS_TASK_NAME
+    supervisor.user_id = 'Alice'
+    supervisor.owner_sid = 'S-1-5-21-1'
+    supervisor._validate_registered_task = lambda task, plan, allow_disabled=False: None
+    supervisor._validate_task_security = lambda task: None
+    supervisor._normalized_sddl_signature = lambda value: ('semantic', value.casefold().replace('normalized-', ''))
+    source = 'FactLane setup 11111111-1111-1111-1111-111111111111'
+    intended = {
+        'exists': True,
+        'xml': f'<Task><RegistrationInfo><Source>{source}</Source></RegistrationInfo></Task>',
+        'sddl': 'PRIVATE',
+        'enabled': True,
+    }
+    task = SimpleNamespace(
+        Definition=SimpleNamespace(RegistrationInfo=SimpleNamespace(Source=source)),
+        GetSecurityDescriptor=lambda _flags: 'normalized-private',
+        Enabled=True,
+    )
+    observed = {
+        'exists': True,
+        'xml': f'<Task><RegistrationInfo><Source>{source}</Source></RegistrationInfo></Task>',
+        'sddl': 'normalized-private',
+        'enabled': True,
+    }
+
+    supervisor._validate_registration_boundary(task, intended=intended, observed=observed)
 
 
 def test_task_scheduler_operations_participate_in_mutation_guard(monkeypatch):
@@ -1491,20 +1672,30 @@ def test_windows_setup_journal_faults_restore_exact_owned_state(tmp_path, monkey
     monkeypatch.setattr(windows, 'delete_windows_setup_file', delete)
     backend._stage_launcher_bytes = lambda operation: b'new-link'
     def prepare_task(executable, *, transaction_id):
-        return {'exists': True, 'xml': transaction_id, 'sddl': 'private', 'enabled': True}
-    def publish_task(intended, *, expected):
+        return {
+            'exists': True,
+            'xml': f'<Task><RegistrationInfo><Source>FactLane setup {transaction_id}</Source></RegistrationInfo></Task>',
+            'sddl': 'private',
+            'enabled': True,
+        }
+    def publish_task(intended, *, expected, transaction_id):
         assert task == expected
+        assert transaction_id == backend._journal['transaction_id']
         fail('before', 'REGISTER_WINDOWS_TASK')
         events.append(('publish', 'REGISTER_WINDOWS_TASK'))
         task.clear()
         task.update(deepcopy(intended))
         fail('after', 'REGISTER_WINDOWS_TASK')
+        return deepcopy(task)
     def restore_task(before, *, expected):
         assert task == expected
         task.clear()
         task.update(deepcopy(before))
+    def matches_prepared_task(intended, observed, *, transaction_id):
+        return observed == intended and f'FactLane setup {transaction_id}' in intended['xml']
     backend.supervisor = SimpleNamespace(prepare_task=prepare_task, snapshot_task=lambda: deepcopy(task),
-                                        publish_task=publish_task, restore_task=restore_task, verify_quiescent=lambda: None)
+                                        publish_task=publish_task, restore_task=restore_task,
+                                        matches_prepared_task=matches_prepared_task, verify_quiescent=lambda: None)
     backend._expected_precondition = backend.capture_precondition()
     def journal_write(path, content, **kwargs):
         payload = json.loads(content)
