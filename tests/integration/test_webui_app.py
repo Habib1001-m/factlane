@@ -974,6 +974,79 @@ def test_windows_setup_composition_uses_sid_pipe_loaded_tls_and_exact_readiness_
         assert backend.wait_stopped(2.0) is True
 
 
+def test_windows_http_setup_composition_skips_tls_and_uses_none_readiness_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = "S-1-5-21-100-200-300-1001"
+    pipe = r"\\.\pipe\factlane-owner-http-deadbeefdeadbeef"
+    spec = replace(
+        _windows_spec(normal=False),
+        expected_origin="http://127.0.0.1:8766",
+        backend_transport=BackendTransportKind.WINDOWS_HTTP,
+    )
+    config_path = r"C:\Users\Owner\AppData\Local\FactLane\config\webui.json"
+    browser_profile_dir = r"C:\Users\Owner\AppData\Local\FactLane\browser"
+    managed = WindowsManagedConfig(
+        installation_id="compose-http-123",
+        origin=spec.expected_origin,
+        native_control_pipe=pipe,
+        runtime_dir=spec.runtime_dir,
+        state_dir=spec.state_dir,
+        browser_profile_dir=browser_profile_dir,
+    )
+
+    monkeypatch.setattr("factlane.webui_app.current_user_sid", lambda: sid)
+    monkeypatch.setattr(
+        "factlane.webui_app.windows_owner_paths",
+        lambda *, owner_sid: SimpleNamespace(
+            native_control_socket=pipe,
+            service_config_path=config_path,
+            browser_profile_dir=browser_profile_dir,
+        ),
+    )
+    monkeypatch.setattr(
+        "factlane.webui_app.load_windows_managed_config",
+        lambda path, *, owner_sid=None: managed,
+    )
+    monkeypatch.setattr(
+        "factlane.webui_app.load_windows_tls_material",
+        lambda *_args, **_kwargs: pytest.fail("Windows HTTP composition must not load TLS material"),
+    )
+    monkeypatch.setattr(
+        "factlane.webui_app.build_windows_server_ssl_context",
+        lambda *_args, **_kwargs: pytest.fail("Windows HTTP composition must not build a server TLS context"),
+    )
+    monkeypatch.setattr(
+        "factlane.webui_app.build_windows_client_ssl_context",
+        lambda *_args, **_kwargs: pytest.fail("Windows HTTP composition must not build a client TLS context"),
+    )
+    monkeypatch.setattr("factlane.webui_app.WindowsOwnerHTTPServer", _FakeWindowsHTTPServer)
+    monkeypatch.setattr("factlane.webui_app.WindowsOwnerNativeControlServer", _FakeWindowsNativeControlServer)
+
+    backend = create_owner_runtime_backend(
+        spec,
+        _service_state(tmp_path),
+        owner_uid=777,
+    )
+    try:
+        assert backend.auth_state._owner_uid == 0
+        assert isinstance(backend.http_server, _FakeWindowsHTTPServer)
+        assert backend.http_server.tls_context is None
+        assert backend.http_server.setup_service is not None
+        assert isinstance(backend.native_server, _FakeWindowsNativeControlServer)
+        assert backend.native_server.pipe_name == pipe
+
+        backend.start()
+        assert backend.http_server.started.wait(1.0)
+        assert backend.native_server.started.wait(1.0)
+        assert backend.is_ready() is True
+        assert backend.http_server.probe_calls[-1] == (None, 1.0)
+    finally:
+        backend.begin_drain()
+        assert backend.wait_stopped(2.0) is True
+
+
 def test_windows_capability_projection_matches_only_the_proven_normal_panel_contract(tmp_path: Path) -> None:
     assert _owner_capabilities_for_spec(_windows_spec(normal=True)) == {
         "database_management": True,

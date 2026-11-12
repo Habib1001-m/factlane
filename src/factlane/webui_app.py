@@ -2121,8 +2121,6 @@ def _build_maintenance(
     runtime_root, barrier_root = _database_runtime_roots(spec, database_path)
     windows_backend = _is_windows_backend_spec(spec)
     owner_sid: str | None = None
-    server_tls_context: ssl.SSLContext | None = None
-    client_tls_context: ssl.SSLContext | None = None
     if windows_backend:
         owner_sid = current_user_sid()
         registry = RuntimeRegistry(
@@ -2454,6 +2452,8 @@ def create_owner_runtime_backend(
     if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
         raise ValueError("owner_uid must be a non-negative integer")
     owner_sid: str | None = None
+    server_tls_context: ssl.SSLContext | None = None
+    client_tls_context: ssl.SSLContext | None = None
     owner_paths: Any | None = None
     setup_service: _WindowsSetupBindingService | _LinuxSetupBindingService | None = None
     readiness_probe: Callable[[], bool] | None = None
