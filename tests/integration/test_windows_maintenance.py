@@ -1182,7 +1182,12 @@ def test_runtime_family_custody_preserves_existing_wal_and_securely_creates_miss
 def test_runtime_family_custody_rejects_unsafe_existing_sidecar_before_creating_missing_peer(tmp_path: Path) -> None:
     import win32security
 
-    from factlane.windows_security import current_user_sid, ensure_owner_private_directory, validate_owner_private_path
+    from factlane.windows_security import (
+        WindowsSecurityError,
+        current_user_sid,
+        ensure_owner_private_directory,
+        validate_owner_private_path,
+    )
 
     sid = current_user_sid()
     private = tmp_path / "private-unsafe-family"

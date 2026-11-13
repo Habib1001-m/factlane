@@ -632,6 +632,8 @@ def _acquire_runtime_maintenance_lease(db_path: str, *, owner_sid: str | None = 
         from .windows_maintenance import WindowsMaintenanceError, WindowsRuntimeDBLease
 
         try:
+            if owner_sid is None:
+                return WindowsRuntimeDBLease.open(db_path)
             return WindowsRuntimeDBLease.open(db_path, owner_sid=owner_sid)
         except WindowsMaintenanceError as exc:
             if exc.code == "MAINTENANCE_IN_PROGRESS":
