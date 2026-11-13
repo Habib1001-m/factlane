@@ -973,6 +973,7 @@ class MemoryAdapter:
         tokenizer_path: str | None = None,
         runtime_agent_id: str = "factlane-local",
         trusted_write_context: TrustedWriteContext,
+        windows_owner_private: bool = False,
     ) -> MemoryAdapter:
         try:
             definition = PROFILE_DEFINITIONS[profile_name]
@@ -991,7 +992,14 @@ class MemoryAdapter:
             minimum_context_window=definition["minimum_context_window"],
             base_url=ollama_url,
         )
-        engine = SQLiteVecEngine(db_path, provider.profile)
+        if windows_owner_private:
+            engine = SQLiteVecEngine(
+                db_path,
+                provider.profile,
+                windows_owner_private=True,
+            )
+        else:
+            engine = SQLiteVecEngine(db_path, provider.profile)
         try:
             database_preexisted = os.path.isfile(db_path)
             if not database_preexisted:

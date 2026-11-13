@@ -18,6 +18,7 @@ from factlane.windows_maintenance import (
     WindowsInPlaceMaintenanceLease,
     WindowsMigrationArtifactCustody,
     WindowsMaintenanceError,
+    WindowsRuntimeDBFamilyCustody,
     WindowsRuntimeDBLease,
     WindowsStagedMigrationLease,
 )
@@ -897,7 +898,12 @@ def test_staged_migration_mutation_transition_failure_retains_sqlite_exclusion(
 
 @native_windows
 def test_migration_artifact_custody_is_owner_private_create_new_and_verifiable(tmp_path: Path) -> None:
-    from factlane.windows_security import current_user_sid, ensure_owner_private_directory, validate_owner_private_path
+    from factlane.windows_security import (
+        WindowsSecurityError,
+        current_user_sid,
+        ensure_owner_private_directory,
+        validate_owner_private_path,
+    )
 
     sid = current_user_sid()
     private = tmp_path / "migration-artifacts"
@@ -1115,6 +1121,106 @@ def test_runtime_shared_lease_can_create_main_database_file(tmp_path: Path) -> N
 
     _make_db(db, "created")
     assert _read_marker(db) == "created"
+
+
+@native_windows
+def test_runtime_shared_lease_secure_mode_creates_owner_private_main_database(tmp_path: Path) -> None:
+    from factlane.windows_security import current_user_sid, ensure_owner_private_directory, validate_owner_private_path
+
+    sid = current_user_sid()
+    private = tmp_path / "private-runtime"
+    ensure_owner_private_directory(private, owner_sid=sid)
+    db = private / "created.db"
+
+    lease = WindowsRuntimeDBLease.open(db, owner_sid=sid)
+    try:
+        validate_owner_private_path(db, owner_sid=sid, directory=False)
+        assert lease.revalidate().file_id == lease.identity.file_id
+    finally:
+        lease.close()
+
+
+@native_windows
+def test_runtime_family_custody_preserves_existing_wal_and_securely_creates_missing_shm(tmp_path: Path) -> None:
+    from factlane.windows_security import (
+        current_user_sid,
+        ensure_owner_private_directory,
+        protect_owner_private_path,
+        validate_owner_private_path,
+    )
+
+    sid = current_user_sid()
+    private = tmp_path / "private-family"
+    ensure_owner_private_directory(private, owner_sid=sid)
+    db = private / "memory.db"
+    lease = WindowsRuntimeDBLease.open(db, owner_sid=sid)
+    wal = Path(str(db) + "-wal")
+    shm = Path(str(db) + "-shm")
+    wal.write_bytes(b"non-empty-wal-sentinel")
+    protect_owner_private_path(wal, owner_sid=sid, directory=False)
+    wal_before = wal.read_bytes()
+    wal_identity_before = windows_maintenance._probe_identity(str(wal))
+
+    custody = WindowsRuntimeDBFamilyCustody.acquire_existing(db, lease, owner_sid=sid)
+    try:
+        custody.create_missing()
+        custody.revalidate()
+        validate_owner_private_path(wal, owner_sid=sid, directory=False)
+        validate_owner_private_path(shm, owner_sid=sid, directory=False)
+        assert wal.read_bytes() == wal_before
+        assert windows_maintenance._same_file(
+            windows_maintenance._probe_identity(str(wal)),
+            wal_identity_before,
+        )
+        assert shm.read_bytes() == b""
+    finally:
+        custody.close()
+        lease.close()
+
+
+@native_windows
+def test_runtime_family_custody_rejects_unsafe_existing_sidecar_before_creating_missing_peer(tmp_path: Path) -> None:
+    import win32security
+
+    from factlane.windows_security import current_user_sid, ensure_owner_private_directory, validate_owner_private_path
+
+    sid = current_user_sid()
+    private = tmp_path / "private-unsafe-family"
+    ensure_owner_private_directory(private, owner_sid=sid)
+    db = private / "memory.db"
+    lease = WindowsRuntimeDBLease.open(db, owner_sid=sid)
+    wal = Path(str(db) + "-wal")
+    shm = Path(str(db) + "-shm")
+    wal.write_bytes(b"unsafe-wal-sentinel")
+    owner = win32security.ConvertStringSidToSid(sid)
+    descriptor = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+        f"O:{sid}D:(A;;GA;;;{sid})",
+        win32security.SDDL_REVISION_1,
+    )
+    win32security.SetNamedSecurityInfo(
+        str(wal),
+        win32security.SE_FILE_OBJECT,
+        win32security.OWNER_SECURITY_INFORMATION
+        | win32security.DACL_SECURITY_INFORMATION
+        | getattr(win32security, "UNPROTECTED_DACL_SECURITY_INFORMATION", 0x20000000),
+        owner,
+        None,
+        descriptor.GetSecurityDescriptorDacl(),
+        None,
+    )
+    with pytest.raises(WindowsSecurityError) as unsafe:
+        validate_owner_private_path(wal, owner_sid=sid, directory=False)
+    assert unsafe.value.code == "WINDOWS_DACL_UNSAFE"
+    before = wal.read_bytes()
+
+    try:
+        with pytest.raises(WindowsMaintenanceError) as caught:
+            WindowsRuntimeDBFamilyCustody.acquire_existing(db, lease, owner_sid=sid)
+        assert caught.value.code == "RUNTIME_DATABASE_PATH_UNSAFE"
+        assert wal.read_bytes() == before
+        assert not shm.exists()
+    finally:
+        lease.close()
 
 
 @native_windows

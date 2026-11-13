@@ -626,13 +626,13 @@ def _cleanup_new_lease_anchor(db_path: str, handle: Any, *, created: bool) -> No
         pass
 
 
-def _acquire_runtime_maintenance_lease(db_path: str) -> Any:
+def _acquire_runtime_maintenance_lease(db_path: str, *, owner_sid: str | None = None) -> Any:
     """Hold a shared lease while a normal runtime engine is attached to one DB."""
     if os.name == "nt":
         from .windows_maintenance import WindowsMaintenanceError, WindowsRuntimeDBLease
 
         try:
-            return WindowsRuntimeDBLease.open(db_path)
+            return WindowsRuntimeDBLease.open(db_path, owner_sid=owner_sid)
         except WindowsMaintenanceError as exc:
             if exc.code == "MAINTENANCE_IN_PROGRESS":
                 raise AdapterError(
@@ -830,10 +830,17 @@ _RECORD_COLUMNS = (
 class SQLiteVecEngine:
     """Small adapter-owned repository over the pinned SQLite-vec schema."""
 
-    def __init__(self, db_path: str, profile: EmbeddingProfile) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        profile: EmbeddingProfile,
+        *,
+        windows_owner_private: bool = False,
+    ) -> None:
         # Resolve aliases once so the lease and backend always open the same path.
         self.db_path = os.path.realpath(os.path.abspath(db_path))
         self.profile = profile
+        self.windows_owner_private = bool(windows_owner_private)
         self.storage: Any = None
         self.conn: sqlite3.Connection | None = None
         self.native_columns: set[str] = set()
@@ -872,6 +879,23 @@ class SQLiteVecEngine:
             raise AdapterError("ADMIN_OPERATION_DENIED", "external embedding providers are disabled")
         _assert_required_sqlite_pragma_environment()
         assert_supported_sqlite_runtime()
+        windows_owner_sid: str | None = None
+        windows_family_custody: Any = None
+        if os.name == "nt" and self._maintenance_capability is None and self.windows_owner_private:
+            from .windows_maintenance import (
+                WindowsMaintenanceError,
+                validate_windows_runtime_database_family,
+            )
+            from .windows_security import current_user_sid
+
+            try:
+                windows_owner_sid = current_user_sid()
+                validate_windows_runtime_database_family(self.db_path, owner_sid=windows_owner_sid)
+            except (WindowsMaintenanceError, OSError) as exc:
+                raise AdapterError(
+                    "BACKEND_UNAVAILABLE",
+                    "Windows database custody is unsafe for runtime open",
+                ) from exc
         existing_contract = inspect_storage_contract_version(self.db_path)
         if existing_contract == 2:
             raise AdapterError(
@@ -886,10 +910,38 @@ class SQLiteVecEngine:
         # before acquiring the platform maintenance lease.
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         if self._maintenance_capability is None:
-            self._maintenance_lease_handle = _acquire_runtime_maintenance_lease(self.db_path)
+            self._maintenance_lease_handle = _acquire_runtime_maintenance_lease(
+                self.db_path,
+                owner_sid=windows_owner_sid,
+            )
         else:
             _validate_maintenance_capability(self.db_path, self._maintenance_capability)
         try:
+            if os.name == "nt" and self._maintenance_capability is None and self.windows_owner_private:
+                from .windows_maintenance import WindowsRuntimeDBFamilyCustody
+
+                assert windows_owner_sid is not None
+                try:
+                    windows_family_custody = WindowsRuntimeDBFamilyCustody.acquire_existing(
+                        self.db_path,
+                        self._maintenance_lease_handle,
+                        owner_sid=windows_owner_sid,
+                    )
+                    leased_contract = inspect_storage_contract_version(self.db_path)
+                    if leased_contract != existing_contract:
+                        raise AdapterError(
+                            "BACKEND_UNAVAILABLE",
+                            "Windows database contract changed during runtime custody acquisition",
+                        )
+                    windows_family_custody.create_missing()
+                    windows_family_custody.revalidate()
+                except AdapterError:
+                    raise
+                except Exception as exc:
+                    raise AdapterError(
+                        "BACKEND_UNAVAILABLE",
+                        "Windows database family could not be secured for runtime open",
+                    ) from exc
             if self._maintenance_capability is None:
                 _assert_sensitive_recovery_interlock_clear(self.db_path)
             # Do not write MCP_* process environment here. The pinned backend
@@ -918,6 +970,18 @@ class SQLiteVecEngine:
             self.conn = storage.conn
             if self.conn is None:
                 raise AdapterError("BACKEND_UNAVAILABLE", "SQLite-vec backend did not expose a connection")
+            if windows_family_custody is not None:
+                try:
+                    windows_family_custody.revalidate()
+                    self._maintenance_lease_handle.revalidate()
+                except Exception as exc:
+                    raise AdapterError(
+                        "BACKEND_UNAVAILABLE",
+                        "Windows database family custody changed during SQLite initialization",
+                    ) from exc
+                finally:
+                    windows_family_custody.close()
+                    windows_family_custody = None
             _assert_required_sqlite_pragmas(self.conn)
             register_storage_v3_writer(self.conn)
             self.vector_dimension = await self._run(self._read_dimension)
@@ -940,6 +1004,9 @@ class SQLiteVecEngine:
         except Exception as exc:
             await self.close()
             raise AdapterError("BACKEND_UNAVAILABLE", "SQLite-vec backend could not be initialized") from exc
+        finally:
+            if windows_family_custody is not None:
+                windows_family_custody.close()
 
     async def _run(self, operation: Callable[..., Any], *args: Any) -> Any:
         if self.conn is None or self.storage is None:

@@ -2448,6 +2448,19 @@ def create_owner_runtime_backend(
     if not isinstance(service_state, WebUIServiceState):
         raise TypeError("service_state must be the runtime WebUIServiceState")
     windows_backend = _is_windows_backend_spec(spec)
+    runtime_adapter_factory = adapter_factory
+    default_adapter_func = getattr(MemoryAdapter.create, "__func__", None)
+    if (
+        windows_backend
+        and getattr(adapter_factory, "__self__", None) is MemoryAdapter
+        and getattr(adapter_factory, "__func__", None) is default_adapter_func
+    ):
+        async def runtime_adapter_factory(*args: Any, **kwargs: Any) -> MemoryAdapter:
+            return await MemoryAdapter.create(
+                *args,
+                **kwargs,
+                windows_owner_private=True,
+            )
     uid = 0 if windows_backend else (os.getuid() if owner_uid is None else owner_uid)
     if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
         raise ValueError("owner_uid must be a non-negative integer")
@@ -2583,7 +2596,7 @@ def create_owner_runtime_backend(
                 trusted_write_context=owner_context,
             )
             adapter = http_server.run_service_coroutine(
-                lambda: adapter_factory(
+                lambda: runtime_adapter_factory(
                     launch.database_path,
                     launch.profile,
                     runtime_agent_id=launch.host_id,
@@ -2595,7 +2608,7 @@ def create_owner_runtime_backend(
             gate = OwnerAdapterMaintenanceGate()
             owner_adapter_participant = _OwnerAdapterMaintenanceParticipant(
                 adapter=adapter,
-                adapter_factory=adapter_factory,
+                adapter_factory=runtime_adapter_factory,
                 launch=launch,
                 gate=gate,
             )

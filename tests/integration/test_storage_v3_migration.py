@@ -382,6 +382,28 @@ def test_v2_open_fails_before_backend_initialization_and_preserves_bytes(tmp_pat
     assert engine.conn is None
 
 
+@native_windows
+def test_owner_private_windows_v2_gate_creates_no_runtime_sidecars(tmp_path: Path) -> None:
+    from factlane.windows_security import current_user_sid, ensure_owner_private_directory, protect_owner_private_path
+
+    sid = current_user_sid()
+    private = tmp_path / "owner-private-v2"
+    ensure_owner_private_directory(private, owner_sid=sid)
+    db = _copy_frozen_v014_v2_fixture(private)
+    protect_owner_private_path(db, owner_sid=sid, directory=False)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(db) + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+
+    engine = SQLiteVecEngine(str(db), _profile(), windows_owner_private=True)
+    with pytest.raises(AdapterError) as exc_info:
+        asyncio.run(engine.open())
+    assert exc_info.value.code == "MIGRATION_REQUIRED"
+    assert not Path(str(db) + "-wal").exists()
+    assert not Path(str(db) + "-shm").exists()
+
+
 @pytest.mark.parametrize("version", [1, 4, 99])
 def test_unknown_or_unsupported_contract_fails_before_backend(tmp_path: Path, monkeypatch, version: int) -> None:
     db = tmp_path / f"unsupported-{version}.db"

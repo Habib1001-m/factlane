@@ -18,6 +18,7 @@ from .windows_security import (
     current_user_sid,
     ensure_owner_private_directory,
     protect_owner_private_path,
+    validate_owner_only_kernel_object,
     validate_owner_private_path,
 )
 
@@ -1020,6 +1021,67 @@ def _current_owner_sid(requested: str | None) -> str:
     return actual
 
 
+def validate_windows_runtime_database_family(
+    db_path: str | os.PathLike[str],
+    *,
+    owner_sid: str,
+) -> str:
+    """Validate strict Owner custody for a Windows runtime DB family without mutation."""
+
+    canonical = _canonical_native_path(db_path, label="database")
+    _reject_reparse_components(canonical, label="database")
+    sid = _current_owner_sid(owner_sid)
+    parent = str(PureWindowsPath(canonical).parent)
+    try:
+        validate_owner_private_path(parent, owner_sid=sid, directory=True)
+    except WindowsSecurityError as exc:
+        raise WindowsMaintenanceError(
+            "RUNTIME_DATABASE_PATH_UNSAFE",
+            "database parent is not protected owner-private state",
+        ) from exc
+
+    api = _require_windows()
+    main_attributes = _get_file_attributes(api, canonical)
+    sidecars = tuple(canonical + suffix for suffix in ("-wal", "-shm"))
+    if main_attributes is None:
+        if any(_get_file_attributes(api, path) is not None for path in sidecars):
+            raise WindowsMaintenanceError(
+                "RUNTIME_DATABASE_PATH_UNSAFE",
+                "database sidecar exists without the main database",
+            )
+        return canonical
+    if main_attributes & (_FILE_ATTRIBUTE_REPARSE_POINT | _FILE_ATTRIBUTE_DIRECTORY):
+        raise WindowsMaintenanceError(
+            "RUNTIME_DATABASE_PATH_UNSAFE",
+            "database file path is unsafe",
+        )
+    try:
+        validate_owner_private_path(canonical, owner_sid=sid, directory=False)
+    except WindowsSecurityError as exc:
+        raise WindowsMaintenanceError(
+            "RUNTIME_DATABASE_PATH_UNSAFE",
+            "database file is not protected owner-private state",
+        ) from exc
+
+    for sidecar_path in sidecars:
+        attributes = _get_file_attributes(api, sidecar_path)
+        if attributes is None:
+            continue
+        if attributes & (_FILE_ATTRIBUTE_REPARSE_POINT | _FILE_ATTRIBUTE_DIRECTORY):
+            raise WindowsMaintenanceError(
+                "RUNTIME_DATABASE_PATH_UNSAFE",
+                "database sidecar path is unsafe",
+            )
+        try:
+            validate_owner_private_path(sidecar_path, owner_sid=sid, directory=False)
+        except WindowsSecurityError as exc:
+            raise WindowsMaintenanceError(
+                "RUNTIME_DATABASE_PATH_UNSAFE",
+                "database sidecar is not protected owner-private state",
+            ) from exc
+    return canonical
+
+
 def _require_identity(path: str, expected: WindowsFileIdentity, *, code: str, message: str) -> WindowsFileIdentity:
     current = _probe_identity(path)
     if not _same_file(current, expected):
@@ -1406,9 +1468,15 @@ class WindowsRuntimeDBLease:
         self._closed = False
 
     @classmethod
-    def open(cls, db_path: str | os.PathLike[str]) -> WindowsRuntimeDBLease:
+    def open(
+        cls,
+        db_path: str | os.PathLike[str],
+        *,
+        owner_sid: str | None = None,
+    ) -> WindowsRuntimeDBLease:
         canonical = _canonical_native_path(db_path, label="database")
         _reject_reparse_components(canonical, label="database")
+        sid = _current_owner_sid(owner_sid) if owner_sid is not None else None
         sentinel = _WindowsDBCoordinationSentinel.acquire(canonical, exclusive=False)
         try:
             parent, parent_handle, parent_identity = _open_parent_guard(
@@ -1418,17 +1486,42 @@ class WindowsRuntimeDBLease:
                 contention_message="database parent cannot be guarded safely",
             )
             try:
+                if sid is not None:
+                    try:
+                        validate_owner_private_path(parent, owner_sid=sid, directory=True)
+                    except WindowsSecurityError as exc:
+                        raise WindowsMaintenanceError(
+                            "RUNTIME_DATABASE_PATH_UNSAFE",
+                            "database parent is not protected owner-private state",
+                        ) from exc
+                    if _get_file_attributes(_require_windows(), canonical) is not None:
+                        try:
+                            validate_owner_private_path(canonical, owner_sid=sid, directory=False)
+                        except WindowsSecurityError as exc:
+                            raise WindowsMaintenanceError(
+                                "RUNTIME_DATABASE_PATH_UNSAFE",
+                                "database file is not protected owner-private state",
+                            ) from exc
                 handle = _open_relative_open_always(
                     parent_handle,
                     canonical,
                     desired_access=_GENERIC_READ,
                     share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
-                    owner_sid=None,
+                    owner_sid=sid,
                     contention_code="MAINTENANCE_IN_PROGRESS",
                     contention_message="exclusive database maintenance is in progress",
                 )
                 try:
                     identity = _handle_identity(handle)
+                    if sid is not None:
+                        try:
+                            validate_owner_only_kernel_object(int(handle), sid)
+                            validate_owner_private_path(canonical, owner_sid=sid, directory=False)
+                        except WindowsSecurityError as exc:
+                            raise WindowsMaintenanceError(
+                                "RUNTIME_DATABASE_PATH_UNSAFE",
+                                "database file is not protected owner-private state",
+                            ) from exc
                     _require_parent_guard(
                         parent,
                         parent_handle,
@@ -1489,6 +1582,232 @@ class WindowsRuntimeDBLease:
             sentinel.close()
 
     def __enter__(self) -> WindowsRuntimeDBLease:
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+        self.close()
+
+
+class WindowsRuntimeDBFamilyCustody:
+    """Retain strict main/WAL/SHM pathname custody across SQLite initialization."""
+
+    def __init__(
+        self,
+        db_path: str,
+        runtime_lease: WindowsRuntimeDBLease,
+        owner_sid: str,
+        parent_path: str,
+        parent_handle: Any,
+        parent_identity: WindowsFileIdentity,
+        sidecars: dict[str, tuple[Any, WindowsFileIdentity]],
+        missing: tuple[str, ...],
+    ) -> None:
+        self.db_path = db_path
+        self.runtime_lease = runtime_lease
+        self.owner_sid = owner_sid
+        self.parent_path = parent_path
+        self.parent_identity = parent_identity
+        self._parent_handle = parent_handle
+        self._sidecars = sidecars
+        self._missing = missing
+        self._closed = False
+
+    @classmethod
+    def acquire_existing(
+        cls,
+        db_path: str | os.PathLike[str],
+        runtime_lease: WindowsRuntimeDBLease,
+        *,
+        owner_sid: str,
+    ) -> WindowsRuntimeDBFamilyCustody:
+        canonical = _canonical_native_path(db_path, label="database")
+        sid = _current_owner_sid(owner_sid)
+        if _path_key(runtime_lease.path) != _path_key(canonical):
+            raise WindowsMaintenanceError(
+                "RUNTIME_DATABASE_IDENTITY_DRIFT",
+                "runtime database lease belongs to another path",
+            )
+        runtime_lease.revalidate()
+        parent, parent_handle, parent_identity = _open_parent_guard(
+            canonical,
+            label="runtime database family",
+            contention_code="RUNTIME_DATABASE_PATH_UNSAFE",
+            contention_message="runtime database parent cannot be guarded safely",
+        )
+        retained: dict[str, tuple[Any, WindowsFileIdentity]] = {}
+        try:
+            try:
+                validate_owner_private_path(parent, owner_sid=sid, directory=True)
+                validate_owner_private_path(canonical, owner_sid=sid, directory=False)
+            except WindowsSecurityError as exc:
+                raise WindowsMaintenanceError(
+                    "RUNTIME_DATABASE_PATH_UNSAFE",
+                    "runtime database family is not protected owner-private state",
+                ) from exc
+            missing: list[str] = []
+            api = _require_windows()
+            for suffix in ("-wal", "-shm"):
+                sidecar_path = canonical + suffix
+                attributes = _get_file_attributes(api, sidecar_path)
+                if attributes is None:
+                    missing.append(sidecar_path)
+                    continue
+                if attributes & (_FILE_ATTRIBUTE_REPARSE_POINT | _FILE_ATTRIBUTE_DIRECTORY):
+                    raise WindowsMaintenanceError(
+                        "RUNTIME_DATABASE_PATH_UNSAFE",
+                        "runtime database sidecar path is unsafe",
+                    )
+                try:
+                    validate_owner_private_path(sidecar_path, owner_sid=sid, directory=False)
+                except WindowsSecurityError as exc:
+                    raise WindowsMaintenanceError(
+                        "RUNTIME_DATABASE_PATH_UNSAFE",
+                        "runtime database sidecar is not protected owner-private state",
+                    ) from exc
+                handle = _open_relative_open_always(
+                    parent_handle,
+                    sidecar_path,
+                    desired_access=_GENERIC_READ,
+                    share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+                    owner_sid=None,
+                    contention_code="RUNTIME_DATABASE_BUSY",
+                    contention_message="runtime database sidecar is held by an incompatible process",
+                    nt_create_disposition=_FILE_OPEN,
+                )
+                try:
+                    identity = _handle_identity(handle, expected_path=sidecar_path)
+                    validate_owner_only_kernel_object(int(handle), sid)
+                    _require_identity(
+                        sidecar_path,
+                        identity,
+                        code="RUNTIME_DATABASE_IDENTITY_DRIFT",
+                        message="runtime database sidecar path changed during custody acquisition",
+                    )
+                    retained[sidecar_path] = (handle, identity)
+                except BaseException:
+                    _close_handle(handle)
+                    raise
+            _require_parent_guard(
+                parent,
+                parent_handle,
+                parent_identity,
+                code="RUNTIME_DATABASE_IDENTITY_DRIFT",
+                message="runtime database parent changed during family custody acquisition",
+            )
+            runtime_lease.revalidate()
+            return cls(
+                canonical,
+                runtime_lease,
+                sid,
+                parent,
+                parent_handle,
+                parent_identity,
+                retained,
+                tuple(missing),
+            )
+        except BaseException:
+            for handle, _identity in retained.values():
+                _close_handle(handle)
+            _close_handle(parent_handle)
+            raise
+
+    def create_missing(self) -> None:
+        if self._closed:
+            raise WindowsMaintenanceError(
+                "RUNTIME_DATABASE_CUSTODY_CLOSED",
+                "runtime database family custody is already closed",
+            )
+        self.revalidate()
+        api = _require_windows()
+        for sidecar_path in self._missing:
+            if _get_file_attributes(api, sidecar_path) is not None:
+                raise WindowsMaintenanceError(
+                    "RUNTIME_DATABASE_IDENTITY_DRIFT",
+                    "runtime database sidecar appeared before secure creation",
+                )
+        for sidecar_path in self._missing:
+            handle = _open_relative_open_always(
+                self._parent_handle,
+                sidecar_path,
+                desired_access=_GENERIC_READ | _GENERIC_WRITE,
+                share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+                owner_sid=self.owner_sid,
+                contention_code="RUNTIME_DATABASE_BUSY",
+                contention_message="runtime database sidecar could not be created safely",
+                nt_create_disposition=_FILE_CREATE,
+            )
+            try:
+                identity = _handle_identity(handle, expected_path=sidecar_path)
+                validate_owner_only_kernel_object(int(handle), self.owner_sid)
+                validate_owner_private_path(sidecar_path, owner_sid=self.owner_sid, directory=False)
+                _require_identity(
+                    sidecar_path,
+                    identity,
+                    code="RUNTIME_DATABASE_IDENTITY_DRIFT",
+                    message="runtime database sidecar path changed during secure creation",
+                )
+                self._sidecars[sidecar_path] = (handle, identity)
+            except BaseException:
+                _close_handle(handle)
+                raise
+        self._missing = ()
+        self.revalidate()
+
+    def revalidate(self) -> None:
+        if self._closed:
+            raise WindowsMaintenanceError(
+                "RUNTIME_DATABASE_CUSTODY_CLOSED",
+                "runtime database family custody is already closed",
+            )
+        self.runtime_lease.revalidate()
+        _require_parent_guard(
+            self.parent_path,
+            self._parent_handle,
+            self.parent_identity,
+            code="RUNTIME_DATABASE_IDENTITY_DRIFT",
+            message="runtime database parent changed while family custody was held",
+        )
+        try:
+            validate_owner_private_path(self.parent_path, owner_sid=self.owner_sid, directory=True)
+            validate_owner_private_path(self.db_path, owner_sid=self.owner_sid, directory=False)
+        except WindowsSecurityError as exc:
+            raise WindowsMaintenanceError(
+                "RUNTIME_DATABASE_PATH_UNSAFE",
+                "runtime database family lost protected owner-private state",
+            ) from exc
+        for sidecar_path, (handle, identity) in self._sidecars.items():
+            try:
+                validate_owner_only_kernel_object(int(handle), self.owner_sid)
+                validate_owner_private_path(sidecar_path, owner_sid=self.owner_sid, directory=False)
+            except WindowsSecurityError as exc:
+                raise WindowsMaintenanceError(
+                    "RUNTIME_DATABASE_PATH_UNSAFE",
+                    "runtime database sidecar lost protected owner-private state",
+                ) from exc
+            retained = _handle_identity(handle, expected_path=sidecar_path)
+            if not _same_file(retained, identity):
+                raise WindowsMaintenanceError(
+                    "RUNTIME_DATABASE_IDENTITY_DRIFT",
+                    "runtime database sidecar identity changed while custody was held",
+                )
+            _require_identity(
+                sidecar_path,
+                identity,
+                code="RUNTIME_DATABASE_IDENTITY_DRIFT",
+                message="runtime database sidecar path changed while custody was held",
+            )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for handle, _identity in self._sidecars.values():
+            _close_handle(handle)
+        self._sidecars.clear()
+        _close_handle(self._parent_handle)
+        self._parent_handle = None
+
+    def __enter__(self) -> WindowsRuntimeDBFamilyCustody:
         return self
 
     def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:

@@ -284,6 +284,31 @@ def test_open_close_preserves_absent_backend_environment(tmp_path, monkeypatch) 
     assert all(key not in os.environ for key in _FACTLANE_BACKEND_ENV_KEYS)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows owner-private storage qualification only")
+def test_owner_private_windows_engine_secures_db_family_across_clean_reopen(tmp_path: Path) -> None:
+    from factlane.windows_security import current_user_sid, ensure_owner_private_directory, validate_owner_private_path
+
+    sid = current_user_sid()
+    private = tmp_path / "owner-private-engine"
+    ensure_owner_private_directory(private, owner_sid=sid)
+    db = private / "memory.db"
+
+    async def open_and_verify() -> None:
+        engine = SQLiteVecEngine(str(db), profile(), windows_owner_private=True)
+        await engine.open()
+        try:
+            validate_owner_private_path(db, owner_sid=sid, directory=False)
+            validate_owner_private_path(Path(str(db) + "-wal"), owner_sid=sid, directory=False)
+            validate_owner_private_path(Path(str(db) + "-shm"), owner_sid=sid, directory=False)
+        finally:
+            await engine.close()
+
+    asyncio.run(open_and_verify())
+    assert not Path(str(db) + "-wal").exists()
+    assert not Path(str(db) + "-shm").exists()
+    asyncio.run(open_and_verify())
+
+
 def test_open_close_preserves_preexisting_backend_environment(tmp_path, monkeypatch) -> None:
     hostile = {
         "MCP_MEMORY_STORAGE_BACKEND": "cloudflare",
