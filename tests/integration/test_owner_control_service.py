@@ -51,6 +51,12 @@ class _Provider:
         return {"local_only": True}
 
 
+class _FailDocumentProvider(_Provider):
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.document_calls += len(texts)
+        raise AdapterError("EMBEDDING_UNAVAILABLE", "test replacement embedding unavailable")
+
+
 class _BeginImmediateProbe:
     def __init__(self, connection: sqlite3.Connection, attempted: threading.Event) -> None:
         self._connection = connection
@@ -1673,6 +1679,140 @@ def test_replace_requires_inspected_group_token_and_delegates_to_governed_update
     asyncio.run(run())
 
 
+def test_replace_embedding_failure_is_atomic_and_keeps_reviewed_record_current(tmp_path) -> None:
+    async def run() -> None:
+        engine = SQLiteVecEngine(str(tmp_path / "owner-replace-embedding-failure.db"), _profile())
+        await engine.open()
+        adapter = MemoryAdapter(
+            engine,
+            _FailDocumentProvider(),
+            trusted_write_context=trusted_write_context_for_profile("owner-current", contributor_ref="owner-test"),
+        )
+        service = OwnerControlService(adapter)
+        try:
+            row = _record(
+                marker="a",
+                project_id="project-a",
+                lifecycle="VALIDATED_CURRENT",
+                contradiction_key="owner-replace-embedding-failure",
+            )
+            await engine.write_record(row, [1.0] + [0.0] * 255)
+            scope = validate_scope("PROJECT", project_id="project-a")
+            token = (await engine.group_observation(scope, "owner-replace-embedding-failure"))["public"][
+                "observed_group_token"
+            ]
+            before_records = await engine._run(
+                lambda: engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0]
+            )
+            before_operations = await engine._run(
+                lambda: engine.conn.execute("SELECT COUNT(*) FROM lifecycle_operations").fetchone()[0]
+            )
+
+            with pytest.raises(AdapterError) as failed:
+                await service.replace(
+                    memory_id=row["memory_id"],
+                    expected_record_id=row["record_id"],
+                    expected_revision=1,
+                    observed_group_token=token,
+                    idempotency_key="owner-replace-embedding-failure",
+                    replacement={
+                        "fact": "Replacement that cannot be embedded",
+                        "source_provenance": {
+                            "source_class": "TEST",
+                            "source_ref": "owner-replace-embedding-failure",
+                            "source_hash": "8" * 64,
+                            "review_ref": "owner-replace-embedding-failure",
+                            "extraction_method": "owner-check",
+                        },
+                        "freshness_policy": {"kind": "manual"},
+                        "source_timestamp": "2026-10-31T20:05:00Z",
+                        "verified_by": "OWNER",
+                    },
+                    scope="PROJECT",
+                    project_id="project-a",
+                )
+            assert failed.value.code == "EMBEDDING_UNAVAILABLE"
+            current = await engine.get_record(row["memory_id"], scope, history=True)
+            assert [item["record_id"] for item in current] == [row["record_id"]]
+            assert current[0]["lifecycle_state"] == "VALIDATED_CURRENT"
+            assert await engine._run(
+                lambda: engine.conn.execute("SELECT COUNT(*) FROM adapter_records").fetchone()[0]
+            ) == before_records
+            assert await engine._run(
+                lambda: engine.conn.execute("SELECT COUNT(*) FROM lifecycle_operations").fetchone()[0]
+            ) == before_operations
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_activity_lists_lifecycle_audit_without_content_and_filters_exact_scope(tmp_path) -> None:
+    async def run() -> None:
+        engine, service = await _service(tmp_path)
+        adapter = service._adapter
+        try:
+            candidate = await service.create_candidate(
+                fact="Activity audit secret content must not be projected.",
+                memory_type="PROJECT_LEARNED_FACT",
+                scope="PROJECT",
+                project_id="project-a",
+                source_provenance={
+                    "source_class": "TEST",
+                    "source_ref": "activity-audit",
+                    "source_hash": "7" * 64,
+                    "review_ref": "activity-audit",
+                    "extraction_method": "owner-check",
+                },
+                freshness_policy={"kind": "manual"},
+                idempotency_key=str(uuid.uuid4()),
+                source_timestamp="2026-10-31T20:05:00Z",
+            )
+            candidate = candidate["results"][0]
+            detail = await service.detail(
+                memory_id=candidate["memory_id"],
+                scope="PROJECT",
+                project_id="project-a",
+            )
+            await service.reject(
+                memory_id=candidate["memory_id"],
+                expected_record_id=candidate["record_id"],
+                expected_revision=1,
+                observed_group_token=detail["group_cas"]["observed_group_token"],
+                reason_code="INSUFFICIENT_EVIDENCE",
+                idempotency_key=str(uuid.uuid4()),
+                scope="PROJECT",
+                project_id="project-a",
+                request_id="activity-correlation-a",
+            )
+
+            all_activity = await service.activity(limit=10)
+            row = next(item for item in all_activity["items"] if item["operation"] == "REJECT")
+            assert row["actor"] == "OWNER"
+            assert row["correlation_reference"] == "activity-correlation-a"
+            assert row["scope"]["scope"] == "PROJECT"
+            assert row["scope"]["project_id"] == "project-a"
+            assert row["target"]["memory_id"] == candidate["memory_id"]
+            assert row["result"]["lifecycle_state"] == "REJECTED"
+            assert "secret content" not in repr(all_activity)
+            assert "source_provenance" not in repr(all_activity)
+
+            scoped = await service.activity(
+                scope="PROJECT",
+                project_id="project-a",
+                operation_kind="REJECT",
+                actor_class="OWNER",
+                limit=1,
+            )
+            assert len(scoped["items"]) == 1
+            assert scoped["items"][0]["operation"] == "REJECT"
+            assert scoped["filters"]["scope"]["project_id"] == "project-a"
+        finally:
+            await adapter.close()
+
+    asyncio.run(run())
+
+
 def test_reverify_replay_precedes_stale_group_cas_and_changed_payload_conflicts(tmp_path) -> None:
     async def run() -> None:
         engine, service = await _service(tmp_path)
@@ -1909,7 +2049,7 @@ def test_candidate_reverify_rechecks_group_arrival_inside_storage_transaction(tm
                     expected_revision=1,
                     observed_group_token=token,
                     idempotency_key="owner-candidate-race-reverify",
-                    verification={"source_timestamp": "2026-10-31T20:02:00Z", "verified_by": "OWNER"},
+                    verification={"source_provenance": row["source_provenance"], "freshness_policy": row["freshness_policy"], "source_timestamp": "2026-10-31T20:02:00Z", "verified_by": "OWNER"},
                     scope="PROJECT",
                     project_id="project-a",
                 )

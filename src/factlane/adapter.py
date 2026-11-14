@@ -7,6 +7,7 @@ import os
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .contract import (
@@ -18,11 +19,14 @@ from .contract import (
     SCOPES,
     UPDATE_MODES,
     MEMORY_TYPES,
+    LIFECYCLE_STATES,
+    VERIFIED_BY,
     AdapterError,
     ScopeContext,
     canonical_json,
     contains_sensitive,
     digest,
+    finite_vector,
     is_fresh,
     iso_now,
     native_hash,
@@ -969,6 +973,7 @@ class MemoryAdapter:
         tokenizer_path: str | None = None,
         runtime_agent_id: str = "factlane-local",
         trusted_write_context: TrustedWriteContext,
+        windows_owner_private: bool = False,
     ) -> MemoryAdapter:
         try:
             definition = PROFILE_DEFINITIONS[profile_name]
@@ -987,7 +992,14 @@ class MemoryAdapter:
             minimum_context_window=definition["minimum_context_window"],
             base_url=ollama_url,
         )
-        engine = SQLiteVecEngine(db_path, provider.profile)
+        if windows_owner_private:
+            engine = SQLiteVecEngine(
+                db_path,
+                provider.profile,
+                windows_owner_private=True,
+            )
+        else:
+            engine = SQLiteVecEngine(db_path, provider.profile)
         try:
             database_preexisted = os.path.isfile(db_path)
             if not database_preexisted:
@@ -1176,6 +1188,44 @@ class MemoryAdapter:
             "relevance_score": relevance_score,
             "retrieval_rank": retrieval_rank,
         }
+
+    async def logical_export_records(
+        self,
+        scope_context: ScopeContext,
+        *,
+        lifecycle_states: Sequence[str],
+        max_records: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Read exact persisted records for governed logical export.
+
+        Returned lifecycle and authority metadata remain source evidence. This read-only
+        selector does not grant Current authority or perform any provider/storage mutation.
+        """
+
+        if not isinstance(scope_context, ScopeContext):
+            raise AdapterError("INVALID_ENVELOPE", "logical export requires one exact ScopeContext")
+        exact_scope = self._safe_scope(
+            scope_context.scope,
+            scope_context.project_id,
+            scope_context.worktree_id,
+            scope_context.workflow_id,
+            scope_context.agent_id,
+        )
+        if exact_scope != scope_context:
+            raise AdapterError("CROSS_SCOPE_DENIED", "logical export scope identity is not exact")
+        return await self.engine.select_logical_export_records(
+            exact_scope,
+            lifecycle_states=lifecycle_states,
+            max_records=max_records,
+        )
+
+    async def resolve_permanent_purge_targets(
+        self,
+        identities: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Resolve exact purge identities into read-only persisted target facts."""
+
+        return await self.engine.resolve_permanent_purge_targets(identities)
 
     def _base_envelope(self, request_id: str, operation: str, scope: ScopeContext | None) -> dict[str, Any]:
         return {
@@ -1407,6 +1457,582 @@ class MemoryAdapter:
         envelope["contradictions"] = await self.engine.contradiction_summary(scope_context)
         envelope["audit"]["local_embedding_calls"] = self.provider.document_calls + self.provider.query_calls
         return envelope
+
+    async def prepare_logical_import_candidate_vectors(
+        self,
+        admissions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Prepare one bounded logical-import vector batch without mutating storage."""
+
+        if not isinstance(admissions, list) or not admissions or len(admissions) > 1000:
+            raise AdapterError("INVALID_ENVELOPE", "logical import Candidate batch is invalid")
+        source_ids: list[str] = []
+        facts: list[str] = []
+        for admission in admissions:
+            if not isinstance(admission, dict):
+                raise AdapterError("INVALID_ENVELOPE", "logical import Candidate must be an object")
+            source_record_id = validate_identifier(
+                admission.get("source_record_id"),
+                "source_record_id",
+                required=True,
+            )
+            assert source_record_id is not None
+            if source_record_id in source_ids:
+                raise AdapterError("INVALID_ENVELOPE", "logical import Candidate source identities must be unique")
+            source_ids.append(source_record_id)
+            facts.append(validate_fact(admission.get("fact")))
+
+        embedding_runtime_fingerprint = await self._ensure_embedding_compatibility()
+        vectors = await asyncio.to_thread(self.provider.embed_documents, facts)
+        if not isinstance(vectors, list) or len(vectors) != len(admissions):
+            raise AdapterError("EMBEDDING_UNAVAILABLE", "embedding provider returned an incomplete logical import batch")
+        profile = await self._require_embedding_runtime_stable(embedding_runtime_fingerprint)
+        if profile is None:
+            raise AdapterError("PROFILE_MISMATCH", "embedding provider did not expose bounded profile provenance")
+
+        prepared_vectors: dict[str, list[float]] = {}
+        for source_record_id, vector in zip(source_ids, vectors, strict=True):
+            if not isinstance(vector, list):
+                raise AdapterError("EMBEDDING_UNAVAILABLE", "logical import embedding is not a vector")
+            finite_vector(vector)
+            if len(vector) != profile.output_dimension:
+                raise AdapterError("PROFILE_MISMATCH", "logical import vector dimension does not match embedding profile")
+            prepared_vectors[source_record_id] = [float(value) for value in vector]
+        return {"profile": profile.to_dict(), "vectors": prepared_vectors}
+
+    async def logical_import_candidate_batch_replay(
+        self,
+        binding: dict[str, str],
+    ) -> dict[str, Any] | None:
+        """Reconcile a durable logical-import receipt before new embedding work."""
+
+        if self._trusted_write_context.authorization_class != "DIRECT_OWNER_OPERATOR":
+            raise AdapterError(
+                "WRITE_AUTHORIZATION_DENIED",
+                "logical import Candidate admission requires direct Owner operator authority",
+            )
+        if not isinstance(binding, dict) or set(binding) != {
+            "operation_id",
+            "file_digest",
+            "scope_identity_digest",
+            "idempotency_key",
+        }:
+            raise AdapterError("INVALID_ENVELOPE", "logical import operation binding is invalid")
+        operation_id = validate_identifier(binding.get("operation_id"), "operation_id", required=True)
+        file_digest = validate_identifier(binding.get("file_digest"), "file_digest", required=True)
+        scope_identity_digest = validate_identifier(
+            binding.get("scope_identity_digest"),
+            "scope_identity_digest",
+            required=True,
+        )
+        batch_key = validate_identifier(binding.get("idempotency_key"), "idempotency_key", required=True)
+        assert operation_id is not None and file_digest is not None and scope_identity_digest is not None and batch_key is not None
+        if batch_key != digest(
+            {
+                "operation_id": operation_id,
+                "file_digest": file_digest,
+                "scope_identity_digest": scope_identity_digest,
+            }
+        ):
+            raise AdapterError("IDEMPOTENCY_CONFLICT", "logical import binding does not match its governed identity")
+        return await self.engine.logical_import_replay(batch_key, operation_id)
+
+    @staticmethod
+    def _logical_import_source_claim(source_record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "source_memory_id": source_record["source_memory_id"],
+            "source_record_id": source_record["source_record_id"],
+            "source_revision": source_record["source_revision"],
+            "source_lifecycle": source_record["source_lifecycle"],
+            "source_verified_by": source_record["source_verified_by"],
+            "source_provenance": source_record["source_provenance"],
+            "freshness_policy": source_record["freshness_policy"],
+            "source_timestamp": source_record["source_timestamp"],
+            "parent_source_record_id": source_record["parent_source_record_id"],
+            "supersedes_source_memory_ids": source_record["supersedes_source_memory_ids"],
+        }
+
+    @staticmethod
+    def _logical_import_uuid(value: Any, field: str) -> str:
+        if not isinstance(value, str):
+            raise AdapterError("INVALID_ENVELOPE", f"logical import {field} must be a canonical UUID")
+        try:
+            parsed = uuid.UUID(value)
+        except (ValueError, AttributeError) as exc:
+            raise AdapterError("INVALID_ENVELOPE", f"logical import {field} must be a canonical UUID") from exc
+        if str(parsed) != value:
+            raise AdapterError("INVALID_ENVELOPE", f"logical import {field} must use canonical UUID spelling")
+        return value
+
+    def _normalize_logical_import_source_records(
+        self,
+        source_records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        fields = {
+            "source_memory_id",
+            "source_record_id",
+            "source_revision",
+            "scope",
+            "memory_type",
+            "fact",
+            "tags",
+            "source_provenance",
+            "freshness_policy",
+            "source_timestamp",
+            "source_lifecycle",
+            "source_verified_by",
+            "parent_source_record_id",
+            "supersedes_source_memory_ids",
+            "active",
+        }
+        scope_fields = {"scope", "project_id", "worktree_id", "workflow_id", "agent_id"}
+        if not isinstance(source_records, list) or not source_records or len(source_records) > 1000:
+            raise AdapterError("INVALID_ENVELOPE", "logical import source evidence must contain 1 to 1000 records")
+        if len(canonical_json(source_records).encode("utf-8")) > 10 * 1024 * 1024:
+            raise AdapterError("LIMIT_EXCEEDED", "logical import source evidence exceeds 10 MiB")
+
+        normalized: list[dict[str, Any]] = []
+        seen_record_ids: set[str] = set()
+        seen_memory_revisions: set[tuple[str, int]] = set()
+        for raw in source_records:
+            if not isinstance(raw, dict) or set(raw) != fields:
+                raise AdapterError("INVALID_ENVELOPE", "logical import source evidence record shape is invalid")
+            source_memory_id = self._logical_import_uuid(raw.get("source_memory_id"), "source_memory_id")
+            source_record_id = self._logical_import_uuid(raw.get("source_record_id"), "source_record_id")
+            revision = raw.get("source_revision")
+            if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+                raise AdapterError("INVALID_ENVELOPE", "logical import source_revision must be a positive integer")
+            if source_record_id in seen_record_ids or (source_memory_id, revision) in seen_memory_revisions:
+                raise AdapterError("INVALID_ENVELOPE", "logical import source evidence contains duplicate identities")
+            seen_record_ids.add(source_record_id)
+            seen_memory_revisions.add((source_memory_id, revision))
+
+            raw_scope = raw.get("scope")
+            if not isinstance(raw_scope, dict) or "scope" not in raw_scope or set(raw_scope) - scope_fields:
+                raise AdapterError("INVALID_ENVELOPE", "logical import source evidence scope is invalid")
+            scope_name = raw_scope.get("scope")
+            if scope_name == "CROSS_PROJECT_WORKFLOW" and set(raw_scope).intersection(
+                {"project_id", "worktree_id", "workflow_id", "agent_id"}
+            ):
+                raise AdapterError(
+                    "CROSS_SCOPE_DENIED",
+                    "logical import CROSS_PROJECT_WORKFLOW evidence identity keys must be absent",
+                )
+            scope = validate_scope(
+                scope_name,
+                raw_scope.get("project_id"),
+                raw_scope.get("worktree_id"),
+                raw_scope.get("workflow_id"),
+                raw_scope.get("agent_id"),
+            )
+            normalized_scope: dict[str, Any] = {"scope": scope.scope}
+            for field in ("project_id", "worktree_id", "workflow_id", "agent_id"):
+                value = getattr(scope, field)
+                if value is not None:
+                    normalized_scope[field] = value
+
+            memory_type = raw.get("memory_type")
+            if memory_type not in MEMORY_TYPES:
+                raise AdapterError("INVALID_ENUM", "logical import evidence memory_type is unsupported")
+            fact = validate_fact(raw.get("fact"))
+            tags = self._tags(raw.get("tags"))
+            provenance = validate_provenance(raw.get("source_provenance"))
+            freshness = validate_freshness(raw.get("freshness_policy"))
+            self._validate_on_change_freshness(provenance, freshness)
+            if scope.scope == "CROSS_PROJECT_WORKFLOW":
+                if memory_type not in {"WORKFLOW_RULE", "DECISION_RATIONALE"}:
+                    raise AdapterError("SCOPE_TYPE_MISMATCH", "memory_type is incompatible with CROSS_PROJECT_WORKFLOW")
+                self._validate_cross_project_freshness(provenance, freshness)
+
+            lifecycle = raw.get("source_lifecycle")
+            verified_by = raw.get("source_verified_by")
+            if lifecycle not in LIFECYCLE_STATES or verified_by not in VERIFIED_BY:
+                raise AdapterError("INVALID_ENUM", "logical import source authority claim enum is unsupported")
+            raw_timestamp = raw.get("source_timestamp")
+            if raw_timestamp is None:
+                if verified_by != "UNVERIFIED":
+                    raise AdapterError(
+                        "INVALID_TIMESTAMP",
+                        "logical import verified source evidence requires source_timestamp",
+                    )
+                source_timestamp = None
+            else:
+                source_timestamp = self._normalize_timestamp(raw_timestamp, required=True)
+
+            parent = raw.get("parent_source_record_id")
+            if parent is not None:
+                parent = self._logical_import_uuid(parent, "parent_source_record_id")
+                if parent == source_record_id or revision == 1:
+                    raise AdapterError("INVALID_ENVELOPE", "logical import source evidence lineage is invalid")
+            supersedes = raw.get("supersedes_source_memory_ids")
+            if not isinstance(supersedes, list) or len(supersedes) > 1000:
+                raise AdapterError("INVALID_ENVELOPE", "logical import supersedes evidence is invalid")
+            normalized_supersedes: list[str] = []
+            for value in supersedes:
+                item = self._logical_import_uuid(value, "supersedes_source_memory_ids")
+                if item == source_memory_id or item in normalized_supersedes:
+                    raise AdapterError("INVALID_ENVELOPE", "logical import supersedes evidence is invalid")
+                normalized_supersedes.append(item)
+            active = raw.get("active")
+            if not isinstance(active, bool):
+                raise AdapterError("INVALID_ENVELOPE", "logical import evidence active must be boolean")
+            if active and lifecycle not in {"CANDIDATE", "VALIDATED_CURRENT"}:
+                raise AdapterError("INVALID_ENVELOPE", "only source Candidate/current evidence may be active")
+
+            normalized.append(
+                {
+                    "source_memory_id": source_memory_id,
+                    "source_record_id": source_record_id,
+                    "source_revision": revision,
+                    "scope": normalized_scope,
+                    "memory_type": memory_type,
+                    "fact": fact,
+                    "tags": tags,
+                    "source_provenance": provenance,
+                    "freshness_policy": freshness,
+                    "source_timestamp": source_timestamp,
+                    "source_lifecycle": lifecycle,
+                    "source_verified_by": verified_by,
+                    "parent_source_record_id": parent,
+                    "supersedes_source_memory_ids": normalized_supersedes,
+                    "active": active,
+                }
+            )
+
+        by_record_id = {record["source_record_id"]: record for record in normalized}
+        for record in normalized:
+            parent_id = record["parent_source_record_id"]
+            if parent_id is None or parent_id not in by_record_id:
+                continue
+            parent_record = by_record_id[parent_id]
+            if (
+                parent_record["source_memory_id"] != record["source_memory_id"]
+                or parent_record["source_revision"] != record["source_revision"] - 1
+            ):
+                raise AdapterError("INVALID_ENVELOPE", "logical import included source lineage is contradictory")
+        return normalized
+
+    async def retrieve_logical_import_evidence(self, operation_id: str) -> dict[str, Any]:
+        """Read one durable non-authoritative logical-import evidence receipt."""
+
+        if self._trusted_write_context.authorization_class != "DIRECT_OWNER_OPERATOR":
+            raise AdapterError(
+                "WRITE_AUTHORIZATION_DENIED",
+                "logical import evidence retrieval requires direct Owner operator authority",
+            )
+        normalized_operation_id = validate_identifier(operation_id, "operation_id", required=True)
+        assert normalized_operation_id is not None
+        result = await self.engine.logical_import_receipt(normalized_operation_id)
+        if result is None:
+            raise AdapterError("NOT_FOUND", "logical import evidence receipt was not found")
+        return result
+
+    async def admit_logical_import_candidate_batch(
+        self,
+        admissions: list[dict[str, Any]],
+        prepared: dict[str, Any],
+        binding: dict[str, str],
+        *,
+        source_records: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Govern and atomically admit precomputed logical-import Candidates.
+
+        This is an internal Owner/database path, not an MCP operation. Authority still
+        comes only from the adapter's immutable trusted-write context; imported source
+        claims can never manufacture Current authority.
+        """
+
+        if self._trusted_write_context.authorization_class != "DIRECT_OWNER_OPERATOR":
+            raise AdapterError(
+                "WRITE_AUTHORIZATION_DENIED",
+                "logical import Candidate admission requires direct Owner operator authority",
+            )
+        if not isinstance(admissions, list) or not admissions or len(admissions) > 1000:
+            raise AdapterError("INVALID_ENVELOPE", "logical import Candidate batch is invalid")
+        if not isinstance(binding, dict) or set(binding) != {
+            "operation_id",
+            "file_digest",
+            "scope_identity_digest",
+            "idempotency_key",
+        }:
+            raise AdapterError("INVALID_ENVELOPE", "logical import operation binding is invalid")
+        operation_id = validate_identifier(binding.get("operation_id"), "operation_id", required=True)
+        file_digest = validate_identifier(binding.get("file_digest"), "file_digest", required=True)
+        scope_identity_digest = validate_identifier(
+            binding.get("scope_identity_digest"),
+            "scope_identity_digest",
+            required=True,
+        )
+        batch_key = validate_identifier(binding.get("idempotency_key"), "idempotency_key", required=True)
+        assert operation_id is not None and file_digest is not None and scope_identity_digest is not None and batch_key is not None
+        expected_batch_key = digest(
+            {
+                "operation_id": operation_id,
+                "file_digest": file_digest,
+                "scope_identity_digest": scope_identity_digest,
+            }
+        )
+        if batch_key != expected_batch_key:
+            raise AdapterError("IDEMPOTENCY_CONFLICT", "logical import binding does not match its governed identity")
+
+        if not isinstance(prepared, dict) or set(prepared) != {"profile", "vectors"}:
+            raise AdapterError("IMPORT_VECTOR_PREPARATION_INVALID", "prepared logical import vectors are invalid")
+        profile = prepared.get("profile")
+        vectors = prepared.get("vectors")
+        if not isinstance(profile, dict) or not isinstance(vectors, dict):
+            raise AdapterError("IMPORT_VECTOR_PREPARATION_INVALID", "prepared logical import vectors are invalid")
+        await self._ensure_embedding_compatibility()
+        self.engine.require_embedding_compatibility()
+        if profile != self.engine.profile.to_dict():
+            raise AdapterError("PROFILE_MISMATCH", "logical import embedding profile changed before admission")
+
+        normalized_source_records = self._normalize_logical_import_source_records(source_records)
+        source_by_id = {record["source_record_id"]: record for record in normalized_source_records}
+        eligible_source_ids = {
+            record["source_record_id"]
+            for record in normalized_source_records
+            if record["active"] and record["source_lifecycle"] in {"CANDIDATE", "VALIDATED_CURRENT"}
+        }
+
+        allowed_admission_fields = {
+            "source_record_id",
+            "scope",
+            "memory_type",
+            "fact",
+            "tags",
+            "target_lifecycle",
+            "target_verified_by",
+            "target_authority",
+            "external_source_claim",
+            "source_provenance",
+            "freshness_policy",
+            "source_timestamp",
+        }
+        scope_fields = {"scope", "project_id", "worktree_id", "workflow_id", "agent_id"}
+        stable_requests: list[dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
+        ordered_vectors: list[list[float]] = []
+        seen_sources: set[str] = set()
+        committed_at = iso_now()
+        contribution_origin = self._contribution_origin()
+
+        for admission in admissions:
+            if not isinstance(admission, dict) or set(admission) != allowed_admission_fields:
+                raise AdapterError("INVALID_ENVELOPE", "logical import Candidate admission shape is invalid")
+            source_record_id = validate_identifier(
+                admission.get("source_record_id"),
+                "source_record_id",
+                required=True,
+            )
+            assert source_record_id is not None
+            if source_record_id in seen_sources:
+                raise AdapterError("INVALID_ENVELOPE", "logical import Candidate source identities must be unique")
+            seen_sources.add(source_record_id)
+
+            source_record = source_by_id.get(source_record_id)
+            if source_record is None or source_record_id not in eligible_source_ids:
+                raise AdapterError(
+                    "INVALID_ENVELOPE",
+                    "logical import Candidate is not backed by one eligible active source evidence record",
+                )
+
+            raw_scope = admission.get("scope")
+            if not isinstance(raw_scope, dict) or "scope" not in raw_scope or set(raw_scope) - scope_fields:
+                raise AdapterError("INVALID_ENVELOPE", "logical import Candidate exact scope is invalid")
+            scope_name = raw_scope.get("scope")
+            if scope_name == "CROSS_PROJECT_WORKFLOW" and set(raw_scope).intersection(
+                {"project_id", "worktree_id", "workflow_id", "agent_id"}
+            ):
+                raise AdapterError(
+                    "CROSS_SCOPE_DENIED",
+                    "logical import CROSS_PROJECT_WORKFLOW identity keys must be absent",
+                )
+            scope_context = self._safe_scope(
+                scope_name,
+                raw_scope.get("project_id"),
+                raw_scope.get("worktree_id"),
+                raw_scope.get("workflow_id"),
+                raw_scope.get("agent_id"),
+            )
+            if raw_scope != source_record["scope"]:
+                raise AdapterError("CROSS_SCOPE_DENIED", "logical import Candidate scope diverges from source evidence")
+            self._authorize_write(
+                "memory_store",
+                scope_context,
+                {"requested_lifecycle_state": "CANDIDATE", "verified_by": "UNVERIFIED"},
+            )
+            if (
+                admission.get("target_lifecycle") != "CANDIDATE"
+                or admission.get("target_verified_by") != "UNVERIFIED"
+                or admission.get("target_authority") != "UNRESOLVED"
+            ):
+                raise AdapterError(
+                    "WRITE_AUTHORIZATION_DENIED",
+                    "logical import can only admit CANDIDATE/UNVERIFIED authority",
+                )
+
+            fact = validate_fact(admission.get("fact"))
+            memory_type = admission.get("memory_type")
+            if memory_type not in MEMORY_TYPES:
+                raise AdapterError("INVALID_ENUM", "memory_type is not supported")
+            if (
+                fact != source_record["fact"]
+                or memory_type != source_record["memory_type"]
+                or admission.get("tags") != source_record["tags"]
+            ):
+                raise AdapterError(
+                    "SEMANTIC_IDENTITY_MISMATCH",
+                    "logical import Candidate content diverges from source evidence",
+                )
+            provenance = validate_provenance(admission.get("source_provenance"))
+            if (
+                provenance.get("source_class") != "LOGICAL_IMPORT"
+                or provenance.get("source_hash") != file_digest
+                or provenance.get("review_ref") != f"operation:{operation_id}"
+            ):
+                raise AdapterError(
+                    "PROVENANCE_REQUIRED",
+                    "logical import operational provenance must be bound to the source file and operation",
+                )
+            freshness = validate_freshness(admission.get("freshness_policy"))
+            if freshness.get("kind") != "manual":
+                raise AdapterError("INVALID_FRESHNESS", "logical import Candidate freshness must be manual")
+            self._validate_on_change_freshness(provenance, freshness)
+            if scope_context.scope == "CROSS_PROJECT_WORKFLOW":
+                if memory_type not in {"WORKFLOW_RULE", "DECISION_RATIONALE"}:
+                    raise AdapterError("SCOPE_TYPE_MISMATCH", "memory_type is incompatible with CROSS_PROJECT_WORKFLOW")
+                self._validate_cross_project_freshness(provenance, freshness)
+            tags = self._tags(admission.get("tags"))
+            subject = self._subject(None, tags, fact)
+            source_timestamp = self._normalize_timestamp(admission.get("source_timestamp"), required=True)
+            source_claim = admission.get("external_source_claim")
+            if (
+                not isinstance(source_claim, dict)
+                or source_claim != self._logical_import_source_claim(source_record)
+            ):
+                raise AdapterError("INVALID_ENVELOPE", "logical import external source claim is invalid")
+
+            vector = vectors.get(source_record_id)
+            if not isinstance(vector, list):
+                raise AdapterError(
+                    "IMPORT_VECTOR_PREPARATION_INVALID",
+                    "prepared vectors do not match the complete logical import batch",
+                )
+            finite_vector(vector)
+            if len(vector) != self.engine.profile.output_dimension:
+                raise AdapterError("PROFILE_MISMATCH", "logical import vector dimension does not match profile")
+            ordered_vectors.append([float(value) for value in vector])
+
+            per_record_key = digest(
+                {"logical_import_batch": batch_key, "source_record_id": source_record_id}
+            )
+            fingerprint_input = {
+                "fact": fact,
+                "scope": scope_context.to_dict(),
+                "memory_type": memory_type,
+                "source_provenance": provenance,
+                "source_timestamp": source_timestamp,
+                "freshness_policy": freshness,
+                "verified_by": "UNVERIFIED",
+                "authority_role": "UNRESOLVED",
+                "requested_lifecycle_state": "CANDIDATE",
+                "confidence": 0.5,
+                "tags": tags,
+                "subject": subject,
+                "contribution_origin": contribution_origin,
+            }
+            payload_fingerprint = self._payload_fingerprint(fingerprint_input)
+            record = {
+                "record_id": str(uuid.uuid4()),
+                "memory_id": str(uuid.uuid4()),
+                "revision": 1,
+                "parent_record_id": None,
+                "scope": scope_context.scope,
+                "project_id": scope_context.project_id,
+                "worktree_id": scope_context.worktree_id,
+                "workflow_id": scope_context.workflow_id,
+                "agent_id": scope_context.agent_id,
+                "memory_type": memory_type,
+                "fact": fact,
+                "source_provenance": provenance,
+                "source_timestamp": source_timestamp,
+                "created_at": committed_at,
+                "last_verified_at": None,
+                "verified_by": "UNVERIFIED",
+                "authority_role": "UNRESOLVED",
+                "contribution_origin": contribution_origin,
+                "freshness_policy": freshness,
+                "supersedes": [],
+                "contradiction_key": self._contradiction_identity_key(scope_context, memory_type, subject),
+                "contradiction_state": "NONE",
+                "confidence": 0.5,
+                "tags": tags,
+                "lifecycle_state": "CANDIDATE",
+                "native_content_hash": native_hash(scope_context, fact),
+                "payload_fingerprint": payload_fingerprint,
+                "idempotency_key": per_record_key,
+                "embedding_profile_id": self.engine.profile.profile_id,
+                "embedding_model_digest": self.engine.profile.model_digest,
+                "embedding_output_dimension": self.engine.profile.output_dimension,
+                "import_source_record_id": source_record_id,
+                "external_source_claim_digest": digest(source_record),
+            }
+            records.append(record)
+            stable_requests.append(
+                {
+                    "source_record_id": source_record_id,
+                    "source_claim_digest": record["external_source_claim_digest"],
+                    "payload_fingerprint": payload_fingerprint,
+                    "record_idempotency_key": per_record_key,
+                }
+            )
+
+        if seen_sources != eligible_source_ids:
+            raise AdapterError(
+                "INVALID_ENVELOPE",
+                "logical import Candidate admissions do not match the eligible active source evidence set",
+            )
+        if set(vectors) != seen_sources:
+            raise AdapterError(
+                "IMPORT_VECTOR_PREPARATION_INVALID",
+                "prepared vectors do not match the complete logical import batch",
+            )
+        request_fingerprint = digest(
+            {
+                "operation": "LOGICAL_IMPORT",
+                "binding": binding,
+                "actor": contribution_origin,
+                "grant_ref_digest": digest(self._trusted_write_context.grant_ref),
+                "embedding_profile": profile,
+                "records": stable_requests,
+                "source_evidence_digest": digest(normalized_source_records),
+            }
+        )
+        source_evidence = [
+            {
+                "evidence_class": "NON_AUTHORITATIVE_SOURCE_RECORD",
+                "authority_effect": "NONE",
+                "source_record": record,
+                "source_claim_digest": digest(record),
+            }
+            for record in normalized_source_records
+        ]
+        actor_ref = self._trusted_write_context.contributor_ref
+        async with self._get_write_lock():
+            return await self.engine.write_logical_import_candidate_batch(
+                records,
+                ordered_vectors,
+                source_evidence=source_evidence,
+                idempotency_key=batch_key,
+                request_fingerprint=request_fingerprint,
+                operation_id=operation_id,
+                request_id=operation_id,
+                scope_identity_digest=scope_identity_digest,
+                actor_class=self._trusted_write_context.contributor_class,
+                actor_ref_digest=digest(actor_ref) if actor_ref is not None else None,
+                grant_ref_digest=digest(self._trusted_write_context.grant_ref),
+                committed_at=committed_at,
+            )
 
     async def _get(
         self,

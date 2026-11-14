@@ -29,9 +29,18 @@ from .storage import (
     _WRITER_FUNCTION,
     _expected_v3_table_sql,
     _normalize_schema_sql,
+    _validate_existing_v3_schema,
     inspect_storage_contract_version,
     register_storage_legacy_maintenance_writer,
 )
+
+_WINDOWS_MIGRATION_BINDING_KEY = "windows_v2_v3_migration_binding"
+_WINDOWS_MANIFEST_SCHEMA_VERSION = 2
+_WINDOWS_ROLLBACK_INTENT_SCHEMA_VERSION = 1
+
+
+def _windows_migration_checkpoint(_name: str) -> None:
+    """Private fault-injection seam for native migration crash acceptance."""
 
 
 class MigrationHold(AdapterError):
@@ -56,6 +65,13 @@ def _integrity(conn: sqlite3.Connection) -> None:
     row = conn.execute("PRAGMA integrity_check").fetchone()
     if row is None or str(row[0]).lower() != "ok":
         raise MigrationHold("MIGRATION_HOLD", "database integrity check failed")
+
+
+def _quick_integrity(conn: sqlite3.Connection) -> None:
+    row = conn.execute("PRAGMA quick_check").fetchone()
+    if row is None or str(row[0]).lower() != "ok":
+        raise MigrationHold("MIGRATION_HOLD", "database quick check failed")
+    _integrity(conn)
 
 
 def _require_v2_schema(conn: sqlite3.Connection) -> None:
@@ -189,23 +205,30 @@ def _require_v2_native_profile_parity(conn: sqlite3.Connection) -> None:
             raise MigrationHold("MIGRATION_HOLD", "storage v2 native/vector identity does not match adapter state")
 
 
-def _logical_parity_snapshot(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+def _logical_parity_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    excluded_meta_keys: tuple[str, ...] = (),
+) -> dict[str, dict[str, Any]]:
     snapshot: dict[str, dict[str, Any]] = {}
     table_rows = conn.execute(
         "SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
     ).fetchall()
-    excluded = {"lifecycle_events", "lifecycle_operations"}
+    excluded_tables = {"lifecycle_events", "lifecycle_operations"}
     for raw_name, raw_sql in table_rows:
         name = str(raw_name)
         sql = str(raw_sql or "")
-        if name in excluded or _normalize_schema_sql(sql).startswith("createvirtualtable"):
+        if name in excluded_tables or _normalize_schema_sql(sql).startswith("createvirtualtable"):
             continue
         columns = [str(row[1]) for row in conn.execute(f'PRAGMA table_info("{name}")').fetchall()]
         if not columns:
             continue
         if name == "adapter_meta":
+            excluded_meta = ("contract_version", "trust_clock_high_water_at", *excluded_meta_keys)
+            placeholders = ",".join("?" for _ in excluded_meta)
             rows = conn.execute(
-                "SELECT key,value FROM adapter_meta WHERE key NOT IN ('contract_version','trust_clock_high_water_at') ORDER BY key"
+                f"SELECT key,value FROM adapter_meta WHERE key NOT IN ({placeholders}) ORDER BY key",
+                excluded_meta,
             ).fetchall()
         else:
             quoted = ",".join(f'"{column}"' for column in columns)
@@ -214,6 +237,25 @@ def _logical_parity_snapshot(conn: sqlite3.Connection) -> dict[str, dict[str, An
         digest = hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()
         snapshot[name] = {"rows": len(rows), "sha256": digest}
     return snapshot
+
+
+def _requested_windows_path(path: str, *, label: str) -> Path:
+    requested = Path(os.path.abspath(path))
+    if not requested.name or requested.name in {".", ".."}:
+        raise MigrationHold("MIGRATION_HOLD", f"{label} must name one file")
+    return requested
+
+
+def _trust_clock_high_water(conn: sqlite3.Connection) -> str:
+    highwater_text = "1970-01-01T00:00:00Z"
+    highwater_dt = parse_iso(highwater_text, required=True)
+    for (created_at,) in conn.execute("SELECT created_at FROM adapter_records"):
+        candidate_text = str(created_at)
+        candidate_dt = parse_iso(candidate_text, required=True)
+        if candidate_dt > highwater_dt:
+            highwater_text = candidate_text
+            highwater_dt = candidate_dt
+    return highwater_text
 
 
 def _canonical_backup_target(backup_path: str) -> Path:
@@ -533,6 +575,568 @@ def _verify_backup_manifest(backup_path: Path, *, source_db: Path, snapshot: dic
     return backup_sha256
 
 
+def _windows_migration_classes() -> tuple[type[Any], type[Any], type[BaseException]]:
+    try:
+        from .windows_maintenance import (
+            WindowsMaintenanceError,
+            WindowsMigrationArtifactCustody,
+            WindowsStagedMigrationLease,
+        )
+    except Exception as exc:
+        raise MigrationHold("MIGRATION_HOLD", "native Windows migration custody is unavailable") from exc
+    return WindowsStagedMigrationLease, WindowsMigrationArtifactCustody, WindowsMaintenanceError
+
+
+def _windows_existing_sqlite_uri(path: Path) -> str:
+    normalized = str(path).replace("\\", "/")
+    return "file:" + urllib.parse.quote(normalized, safe="/:") + "?mode=rw"
+
+
+def _windows_readonly_sqlite_uri(path: Path) -> str:
+    normalized = str(path).replace("\\", "/")
+    return "file:" + urllib.parse.quote(normalized, safe="/:") + "?mode=ro"
+
+
+def _require_windows_migration_capacity(db: Path, backup: Path) -> None:
+    if not db.is_file() or not os.access(db, os.R_OK | os.W_OK):
+        raise MigrationHold("MIGRATION_HOLD", "storage database is not readable and writable by the migration operator")
+    if not backup.parent.is_dir() or not os.access(backup.parent, os.R_OK | os.W_OK):
+        raise MigrationHold("MIGRATION_HOLD", "backup parent must already exist and be writable by the migration operator")
+    source_bytes = db.stat().st_size + sum(
+        sidecar.stat().st_size for sidecar in (Path(str(db) + "-wal"), Path(str(db) + "-shm")) if sidecar.exists()
+    )
+    required_free = max(source_bytes * 2, 16 * 1024 * 1024)
+    if shutil.disk_usage(db.parent).free < required_free or shutil.disk_usage(backup.parent).free < source_bytes:
+        raise MigrationHold("MIGRATION_HOLD", "insufficient free capacity for verified migration and backup")
+
+
+def _windows_manifest_payload(
+    *,
+    operation_id: str,
+    source_db: Path,
+    source_identity: Any,
+    backup_receipt: dict[str, Any],
+    source_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": _WINDOWS_MANIFEST_SCHEMA_VERSION,
+        "kind": "FACTLANE_PRE_V3_BACKUP",
+        "platform": "windows",
+        "operation_id": operation_id,
+        "source_path_sha256": hashlib.sha256(str(source_db).encode("utf-8")).hexdigest(),
+        "source_volume_serial_number": int(source_identity.volume_serial_number),
+        "source_file_id": str(source_identity.file_id_hex),
+        "backup_sha256": str(backup_receipt["sha256"]),
+        "backup_size": int(backup_receipt["size"]),
+        "backup_volume_serial_number": int(backup_receipt["volume_serial_number"]),
+        "backup_file_id": str(backup_receipt["file_id"]),
+        "logical_snapshot_sha256": hashlib.sha256(canonical_json(source_snapshot).encode("utf-8")).hexdigest(),
+        "created_at": iso_now(),
+    }
+
+
+def _windows_binding_from_manifest(manifest: dict[str, Any], *, manifest_sha256: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "FACTLANE_WINDOWS_V2_V3_MIGRATION_BINDING",
+        "operation_id": manifest["operation_id"],
+        "source_path_sha256": manifest["source_path_sha256"],
+        "source_volume_serial_number": manifest["source_volume_serial_number"],
+        "source_file_id": manifest["source_file_id"],
+        "backup_sha256": manifest["backup_sha256"],
+        "backup_size": manifest["backup_size"],
+        "backup_volume_serial_number": manifest["backup_volume_serial_number"],
+        "backup_file_id": manifest["backup_file_id"],
+        "logical_snapshot_sha256": manifest["logical_snapshot_sha256"],
+        "manifest_sha256": manifest_sha256,
+    }
+
+
+def _windows_backup_database(
+    conn: sqlite3.Connection,
+    lease: Any,
+    backup_path: Path,
+    *,
+    operation_id: str,
+    source_snapshot: dict[str, Any],
+) -> tuple[str, int, dict[str, Any], str, Any, Any]:
+    _, ArtifactCustody, WindowsMaintenanceError = _windows_migration_classes()
+    manifest_path = _backup_manifest_path(backup_path)
+    if backup_path.exists() or manifest_path.exists():
+        raise MigrationHold("BACKUP_EXISTS", "backup destination or verification manifest already exists")
+
+    backup_artifact: Any = None
+    manifest_artifact: Any = None
+    backup_guard: Any = None
+    manifest_guard: Any = None
+    backup_conn: sqlite3.Connection | None = None
+    try:
+        try:
+            backup_artifact = ArtifactCustody.create(backup_path)
+        except WindowsMaintenanceError as exc:
+            code = "BACKUP_EXISTS" if getattr(exc, "code", "") == "MIGRATION_ARTIFACT_EXISTS" else "MIGRATION_HOLD"
+            raise MigrationHold(code, exc.safe_message) from exc
+
+        try:
+            backup_conn = sqlite3.connect(_windows_existing_sqlite_uri(backup_path), uri=True, timeout=5.0)
+            conn.backup(backup_conn)
+            backup_conn.commit()
+            _quick_integrity(backup_conn)
+            _require_v2_schema(backup_conn)
+            _require_lineage_compatibility(backup_conn)
+            _require_v2_native_profile_parity(backup_conn)
+            if _logical_parity_snapshot(backup_conn) != source_snapshot:
+                raise MigrationHold("BACKUP_INVALID", "pre-v3 backup does not preserve the source logical state")
+        finally:
+            if backup_conn is not None:
+                backup_conn.close()
+                backup_conn = None
+
+        backup_sha256 = _sha256(backup_path)
+        backup_size = int(backup_path.stat().st_size)
+        try:
+            backup_receipt = backup_artifact.verify(expected_sha256=backup_sha256, expected_size=backup_size)
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("BACKUP_INVALID", exc.safe_message) from exc
+        _windows_migration_checkpoint("after_backup_publication")
+
+        manifest = _windows_manifest_payload(
+            operation_id=operation_id,
+            source_db=Path(lease.db_path),
+            source_identity=lease.identity,
+            backup_receipt=backup_receipt,
+            source_snapshot=source_snapshot,
+        )
+        manifest_bytes = (canonical_json(manifest) + "\n").encode("utf-8")
+        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+        try:
+            manifest_artifact = ArtifactCustody.create(manifest_path)
+            manifest_artifact.write_bytes(manifest_bytes)
+            manifest_artifact.verify(expected_sha256=manifest_sha256, expected_size=len(manifest_bytes))
+        except WindowsMaintenanceError as exc:
+            code = "BACKUP_EXISTS" if getattr(exc, "code", "") == "MIGRATION_ARTIFACT_EXISTS" else "BACKUP_INVALID"
+            raise MigrationHold(code, exc.safe_message) from exc
+        _windows_migration_checkpoint("after_manifest_publication")
+
+        # Writable publication custody is intentionally replaced with
+        # restrictive read-only custody before the source can mutate.  The
+        # second verification closes the publish->mutation substitution gap.
+        manifest_artifact.close()
+        manifest_artifact = None
+        backup_artifact.close()
+        backup_artifact = None
+        try:
+            backup_guard = ArtifactCustody.open_existing(backup_path)
+            guarded_backup = backup_guard.verify(
+                expected_sha256=backup_sha256,
+                expected_size=backup_size,
+            )
+            manifest_guard = ArtifactCustody.open_existing(manifest_path)
+            guarded_manifest = manifest_guard.verify(
+                expected_sha256=manifest_sha256,
+                expected_size=len(manifest_bytes),
+            )
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("BACKUP_INVALID", exc.safe_message) from exc
+        if (
+            int(guarded_backup["volume_serial_number"]) != int(backup_receipt["volume_serial_number"])
+            or str(guarded_backup["file_id"]).casefold() != str(backup_receipt["file_id"]).casefold()
+            or str(guarded_manifest["sha256"]).casefold() != manifest_sha256.casefold()
+        ):
+            raise MigrationHold("BACKUP_INVALID", "migration artifacts changed before restrictive custody was established")
+        lease.revalidate()
+        returned_backup_guard, backup_guard = backup_guard, None
+        returned_manifest_guard, manifest_guard = manifest_guard, None
+        return (
+            backup_sha256,
+            backup_size,
+            manifest,
+            manifest_sha256,
+            returned_backup_guard,
+            returned_manifest_guard,
+        )
+    finally:
+        if backup_conn is not None:
+            backup_conn.close()
+        if manifest_guard is not None:
+            manifest_guard.close()
+        if backup_guard is not None:
+            backup_guard.close()
+        if manifest_artifact is not None:
+            manifest_artifact.close()
+        if backup_artifact is not None:
+            backup_artifact.close()
+
+
+def _require_windows_migration_binding_source_absent(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT 1 FROM adapter_meta WHERE key=?", (_WINDOWS_MIGRATION_BINDING_KEY,)).fetchone() is not None:
+        raise MigrationHold("MIGRATION_HOLD", "storage v2 source already contains a Windows migration binding")
+
+
+def _require_windows_immediate_migrated_v3(
+    conn: sqlite3.Connection,
+    *,
+    manifest: dict[str, Any],
+    manifest_sha256: str,
+    backup_snapshot: dict[str, Any],
+) -> None:
+    try:
+        _validate_existing_v3_schema(conn)
+    except AdapterError as exc:
+        raise MigrationHold("ROLLBACK_HOLD", "rollback target is not an exact storage-v3 database") from exc
+    row = conn.execute("SELECT value FROM adapter_meta WHERE key='contract_version'").fetchone()
+    if row is None or str(row[0]) != str(STORAGE_CONTRACT_VERSION):
+        raise MigrationHold("ROLLBACK_HOLD", "rollback target is not storage contract v3")
+    expected_binding = canonical_json(_windows_binding_from_manifest(manifest, manifest_sha256=manifest_sha256))
+    binding_rows = conn.execute(
+        "SELECT value FROM adapter_meta WHERE key=?",
+        (_WINDOWS_MIGRATION_BINDING_KEY,),
+    ).fetchall()
+    if binding_rows != [(expected_binding,)]:
+        raise MigrationHold("ROLLBACK_HOLD", "rollback target is not bound to the requested pre-v3 backup")
+    if _logical_parity_snapshot(conn, excluded_meta_keys=(_WINDOWS_MIGRATION_BINDING_KEY,)) != backup_snapshot:
+        raise MigrationHold("ROLLBACK_HOLD", "rollback target has accepted changes after migration")
+    for table in ("lifecycle_events", "lifecycle_operations"):
+        if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None:
+            raise MigrationHold("ROLLBACK_HOLD", "rollback target has lifecycle activity after migration")
+    highwater = conn.execute(
+        "SELECT value FROM adapter_meta WHERE key='trust_clock_high_water_at'"
+    ).fetchone()
+    if highwater is None or str(highwater[0]) != _trust_clock_high_water(conn):
+        raise MigrationHold("ROLLBACK_HOLD", "rollback target trust-clock state is not the immediate migration result")
+    _quick_integrity(conn)
+    try:
+        SensitiveMemoryRecoveryOperator._require_known_recovery_schema(conn)
+    except RecoveryHold as exc:
+        raise MigrationHold("ROLLBACK_HOLD", "rollback target Recovery schema is not exact") from exc
+
+
+def _parse_windows_backup_manifest(data: bytes) -> dict[str, Any]:
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MigrationHold("BACKUP_INVALID", "pre-v3 backup manifest is invalid") from exc
+    if not isinstance(payload, dict):
+        raise MigrationHold("BACKUP_INVALID", "pre-v3 backup manifest is invalid")
+    exact_keys = {
+        "schema_version",
+        "kind",
+        "platform",
+        "operation_id",
+        "source_path_sha256",
+        "source_volume_serial_number",
+        "source_file_id",
+        "backup_sha256",
+        "backup_size",
+        "backup_volume_serial_number",
+        "backup_file_id",
+        "logical_snapshot_sha256",
+        "created_at",
+    }
+    if set(payload) != exact_keys:
+        raise MigrationHold("BACKUP_INVALID", "pre-v3 backup manifest field set is not exact")
+    if (
+        payload.get("schema_version") != _WINDOWS_MANIFEST_SCHEMA_VERSION
+        or payload.get("kind") != "FACTLANE_PRE_V3_BACKUP"
+        or payload.get("platform") != "windows"
+    ):
+        raise MigrationHold("BACKUP_INVALID", "pre-v3 backup manifest contract is not supported")
+    try:
+        uuid.UUID(str(payload["operation_id"]))
+        parse_iso(str(payload["created_at"]), required=True)
+        source_volume = int(payload["source_volume_serial_number"])
+        backup_volume = int(payload["backup_volume_serial_number"])
+        backup_size = int(payload["backup_size"])
+    except (ValueError, TypeError, AdapterError) as exc:
+        raise MigrationHold("BACKUP_INVALID", "pre-v3 backup manifest identity fields are invalid") from exc
+    if source_volume < 0 or backup_volume < 0 or backup_size <= 0:
+        raise MigrationHold("BACKUP_INVALID", "pre-v3 backup manifest numeric identity fields are invalid")
+    for key in (
+        "source_path_sha256",
+        "backup_sha256",
+        "logical_snapshot_sha256",
+    ):
+        value = str(payload[key])
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.casefold()):
+            raise MigrationHold("BACKUP_INVALID", f"pre-v3 backup manifest {key} is invalid")
+    for key in ("source_file_id", "backup_file_id"):
+        value = str(payload[key])
+        if not value or any(character not in "0123456789abcdef" for character in value.casefold()):
+            raise MigrationHold("BACKUP_INVALID", f"pre-v3 backup manifest {key} is invalid")
+    return payload
+
+
+def _open_verified_windows_backup(
+    backup: Path,
+) -> tuple[Any, Any, dict[str, Any], str, dict[str, Any]]:
+    _, ArtifactCustody, WindowsMaintenanceError = _windows_migration_classes()
+    manifest_path = _backup_manifest_path(backup)
+    manifest_artifact: Any = None
+    backup_artifact: Any = None
+    try:
+        try:
+            manifest_artifact = ArtifactCustody.open_existing(manifest_path)
+            manifest_receipt = manifest_artifact.read_exact()
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("BACKUP_INVALID", exc.safe_message) from exc
+        manifest = _parse_windows_backup_manifest(bytes(manifest_receipt["data"]))
+        manifest_sha256 = str(manifest_receipt["sha256"])
+
+        try:
+            backup_artifact = ArtifactCustody.open_existing(backup)
+            backup_receipt = backup_artifact.verify(
+                expected_sha256=str(manifest["backup_sha256"]),
+                expected_size=int(manifest["backup_size"]),
+            )
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("BACKUP_INVALID", exc.safe_message) from exc
+        if (
+            int(backup_receipt["volume_serial_number"]) != int(manifest["backup_volume_serial_number"])
+            or str(backup_receipt["file_id"]).casefold() != str(manifest["backup_file_id"]).casefold()
+        ):
+            raise MigrationHold("BACKUP_INVALID", "pre-v3 backup file identity does not match its manifest")
+
+        backup_conn = sqlite3.connect(_windows_readonly_sqlite_uri(backup), uri=True, timeout=5.0)
+        try:
+            _quick_integrity(backup_conn)
+            _require_v2_schema(backup_conn)
+            _require_lineage_compatibility(backup_conn)
+            _require_v2_native_profile_parity(backup_conn)
+            backup_snapshot = _logical_parity_snapshot(backup_conn)
+        finally:
+            backup_conn.close()
+        snapshot_sha256 = hashlib.sha256(canonical_json(backup_snapshot).encode("utf-8")).hexdigest()
+        if snapshot_sha256 != str(manifest["logical_snapshot_sha256"]):
+            raise MigrationHold("BACKUP_INVALID", "pre-v3 backup logical state does not match its manifest")
+        return manifest_artifact, backup_artifact, manifest, manifest_sha256, backup_snapshot
+    except BaseException:
+        if backup_artifact is not None:
+            backup_artifact.close()
+        if manifest_artifact is not None:
+            manifest_artifact.close()
+        raise
+
+
+def _require_windows_manifest_target_identity(lease: Any, manifest: dict[str, Any]) -> None:
+    expected_path = hashlib.sha256(str(lease.db_path).encode("utf-8")).hexdigest()
+    if expected_path != str(manifest["source_path_sha256"]):
+        raise MigrationHold("ROLLBACK_HOLD", "pre-v3 backup manifest is bound to a different database path")
+    if (
+        int(lease.identity.volume_serial_number) != int(manifest["source_volume_serial_number"])
+        or str(lease.identity.file_id_hex).casefold() != str(manifest["source_file_id"]).casefold()
+    ):
+        raise MigrationHold("ROLLBACK_HOLD", "pre-v3 backup manifest is bound to a different database file identity")
+
+
+def _active_file_matches_verified_backup(lease: Any, manifest: dict[str, Any]) -> bool:
+    lease.revalidate()
+    path = Path(lease.db_path)
+    if path.stat().st_size != int(manifest["backup_size"]):
+        lease.revalidate()
+        return False
+    matches = _sha256(path).casefold() == str(manifest["backup_sha256"]).casefold()
+    lease.revalidate()
+    return matches
+
+
+def _windows_rollback_intent_path(db: Path) -> Path:
+    try:
+        from .windows_maintenance import windows_migration_rollback_intent_path
+    except Exception as exc:
+        raise MigrationHold("ROLLBACK_HOLD", "native Windows rollback-intent custody is unavailable") from exc
+    return Path(windows_migration_rollback_intent_path(db))
+
+
+def _windows_rollback_intent_payload(
+    *,
+    operation_id: str,
+    lease: Any,
+    manifest: dict[str, Any],
+    manifest_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _WINDOWS_ROLLBACK_INTENT_SCHEMA_VERSION,
+        "kind": "FACTLANE_PRE_V3_ROLLBACK_INTENT",
+        "platform": "windows",
+        "operation_id": operation_id,
+        "migration_operation_id": str(manifest["operation_id"]),
+        "target_path_sha256": hashlib.sha256(str(lease.db_path).encode("utf-8")).hexdigest(),
+        "target_volume_serial_number": int(lease.identity.volume_serial_number),
+        "target_file_id": str(lease.identity.file_id_hex),
+        "backup_sha256": str(manifest["backup_sha256"]),
+        "backup_size": int(manifest["backup_size"]),
+        "backup_volume_serial_number": int(manifest["backup_volume_serial_number"]),
+        "backup_file_id": str(manifest["backup_file_id"]),
+        "manifest_sha256": manifest_sha256,
+        "restored_contract": 2,
+        "created_at": iso_now(),
+    }
+
+
+def _parse_windows_rollback_intent(data: bytes) -> dict[str, Any]:
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MigrationHold("ROLLBACK_HOLD", "rollback intent is invalid") from exc
+    if not isinstance(payload, dict):
+        raise MigrationHold("ROLLBACK_HOLD", "rollback intent is invalid")
+    exact_keys = {
+        "schema_version",
+        "kind",
+        "platform",
+        "operation_id",
+        "migration_operation_id",
+        "target_path_sha256",
+        "target_volume_serial_number",
+        "target_file_id",
+        "backup_sha256",
+        "backup_size",
+        "backup_volume_serial_number",
+        "backup_file_id",
+        "manifest_sha256",
+        "restored_contract",
+        "created_at",
+    }
+    if set(payload) != exact_keys:
+        raise MigrationHold("ROLLBACK_HOLD", "rollback intent field set is not exact")
+    if (
+        payload.get("schema_version") != _WINDOWS_ROLLBACK_INTENT_SCHEMA_VERSION
+        or payload.get("kind") != "FACTLANE_PRE_V3_ROLLBACK_INTENT"
+        or payload.get("platform") != "windows"
+        or payload.get("restored_contract") != 2
+    ):
+        raise MigrationHold("ROLLBACK_HOLD", "rollback intent contract is not supported")
+    try:
+        uuid.UUID(str(payload["operation_id"]))
+        uuid.UUID(str(payload["migration_operation_id"]))
+        parse_iso(str(payload["created_at"]), required=True)
+        target_volume = int(payload["target_volume_serial_number"])
+        backup_volume = int(payload["backup_volume_serial_number"])
+        backup_size = int(payload["backup_size"])
+    except (ValueError, TypeError, AdapterError) as exc:
+        raise MigrationHold("ROLLBACK_HOLD", "rollback intent identity fields are invalid") from exc
+    if target_volume < 0 or backup_volume < 0 or backup_size <= 0:
+        raise MigrationHold("ROLLBACK_HOLD", "rollback intent numeric identity fields are invalid")
+    for key in ("target_path_sha256", "backup_sha256", "manifest_sha256"):
+        value = str(payload[key])
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.casefold()):
+            raise MigrationHold("ROLLBACK_HOLD", f"rollback intent {key} is invalid")
+    for key in ("target_file_id", "backup_file_id"):
+        value = str(payload[key])
+        if not value or any(character not in "0123456789abcdef" for character in value.casefold()):
+            raise MigrationHold("ROLLBACK_HOLD", f"rollback intent {key} is invalid")
+    return payload
+
+
+def _require_windows_rollback_intent_binding(
+    payload: dict[str, Any],
+    *,
+    lease: Any,
+    manifest: dict[str, Any],
+    manifest_sha256: str,
+) -> None:
+    expected_path_sha256 = hashlib.sha256(str(lease.db_path).encode("utf-8")).hexdigest()
+    if (
+        str(payload["migration_operation_id"]) != str(manifest["operation_id"])
+        or str(payload["target_path_sha256"]) != expected_path_sha256
+        or int(payload["target_volume_serial_number"]) != int(lease.identity.volume_serial_number)
+        or str(payload["target_file_id"]).casefold() != str(lease.identity.file_id_hex).casefold()
+        or str(payload["backup_sha256"]).casefold() != str(manifest["backup_sha256"]).casefold()
+        or int(payload["backup_size"]) != int(manifest["backup_size"])
+        or int(payload["backup_volume_serial_number"]) != int(manifest["backup_volume_serial_number"])
+        or str(payload["backup_file_id"]).casefold() != str(manifest["backup_file_id"]).casefold()
+        or str(payload["manifest_sha256"]).casefold() != manifest_sha256.casefold()
+    ):
+        raise MigrationHold("ROLLBACK_HOLD", "rollback intent is not bound to this verified backup and target")
+
+
+def _publish_windows_rollback_intent(
+    backup: Path,
+    *,
+    operation_id: str,
+    lease: Any,
+    manifest: dict[str, Any],
+    manifest_sha256: str,
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    _, ArtifactCustody, WindowsMaintenanceError = _windows_migration_classes()
+    intent_path = _windows_rollback_intent_path(Path(lease.db_path))
+    payload = _windows_rollback_intent_payload(
+        operation_id=operation_id,
+        lease=lease,
+        manifest=manifest,
+        manifest_sha256=manifest_sha256,
+    )
+    intent_bytes = (canonical_json(payload) + "\n").encode("utf-8")
+    intent_sha256 = hashlib.sha256(intent_bytes).hexdigest()
+    writable: Any = None
+    guard: Any = None
+    try:
+        try:
+            writable = ArtifactCustody.create(intent_path)
+            writable.write_bytes(intent_bytes)
+            first_receipt = writable.verify(expected_sha256=intent_sha256, expected_size=len(intent_bytes))
+        except WindowsMaintenanceError as exc:
+            code = "ROLLBACK_HOLD"
+            if getattr(exc, "code", "") == "MIGRATION_ARTIFACT_EXISTS":
+                code = "ROLLBACK_HOLD"
+            raise MigrationHold(code, exc.safe_message) from exc
+        writable.close()
+        writable = None
+        try:
+            guard = ArtifactCustody.open_existing(intent_path)
+            guarded_receipt = guard.verify(expected_sha256=intent_sha256, expected_size=len(intent_bytes))
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+        if (
+            int(guarded_receipt["volume_serial_number"]) != int(first_receipt["volume_serial_number"])
+            or str(guarded_receipt["file_id"]).casefold() != str(first_receipt["file_id"]).casefold()
+        ):
+            raise MigrationHold("ROLLBACK_HOLD", "rollback intent changed before restrictive custody was established")
+        _require_windows_rollback_intent_binding(
+            payload,
+            lease=lease,
+            manifest=manifest,
+            manifest_sha256=manifest_sha256,
+        )
+        returned_guard, guard = guard, None
+        return returned_guard, payload, guarded_receipt
+    finally:
+        if guard is not None:
+            guard.close()
+        if writable is not None:
+            writable.close()
+
+
+def _open_verified_windows_rollback_intent(
+    backup: Path,
+    *,
+    lease: Any,
+    manifest: dict[str, Any],
+    manifest_sha256: str,
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    _, ArtifactCustody, WindowsMaintenanceError = _windows_migration_classes()
+    intent_path = _windows_rollback_intent_path(Path(lease.db_path))
+    guard: Any = None
+    try:
+        try:
+            guard = ArtifactCustody.open_existing(intent_path)
+            receipt = guard.read_exact()
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+        payload = _parse_windows_rollback_intent(bytes(receipt["data"]))
+        _require_windows_rollback_intent_binding(
+            payload,
+            lease=lease,
+            manifest=manifest,
+            manifest_sha256=manifest_sha256,
+        )
+        returned_guard, guard = guard, None
+        return returned_guard, payload, receipt
+    finally:
+        if guard is not None:
+            guard.close()
+
+
 def _require_lineage_compatibility(conn: sqlite3.Connection) -> None:
     duplicate_revision = conn.execute(
         "SELECT memory_id,revision FROM adapter_records GROUP BY memory_id,revision HAVING COUNT(*)>1 LIMIT 1"
@@ -785,7 +1389,489 @@ def _backup_database(
     return backup_sha256
 
 
+def _require_windows_frozen_v3_stage(
+    stage_path: str,
+    *,
+    manifest: dict[str, Any],
+    manifest_sha256: str,
+    backup_snapshot: dict[str, Any],
+) -> None:
+    """Re-prove the exact frozen private v3 image without opening the active DB."""
+
+    stage = Path(stage_path)
+    conn = sqlite3.connect(_windows_readonly_sqlite_uri(stage), uri=True, timeout=5.0)
+    try:
+        _require_windows_immediate_migrated_v3(
+            conn,
+            manifest=manifest,
+            manifest_sha256=manifest_sha256,
+            backup_snapshot=backup_snapshot,
+        )
+    finally:
+        conn.close()
+
+
+def _publish_and_promote_windows_v3_stage(
+    lease: Any,
+    backup: Path,
+    *,
+    operation_id: str,
+    manifest: dict[str, Any],
+    manifest_sha256: str,
+    backup_snapshot: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    """Freeze/verify stage, publish rollback intent, then raw-promote in place."""
+
+    _StagedLease, ArtifactCustody, WindowsMaintenanceError = _windows_migration_classes()
+    try:
+        stage_receipt = lease.freeze_staged_image()
+    except WindowsMaintenanceError as exc:
+        raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
+    _require_windows_frozen_v3_stage(
+        str(stage_receipt["path"]),
+        manifest=manifest,
+        manifest_sha256=manifest_sha256,
+        backup_snapshot=backup_snapshot,
+    )
+    _windows_migration_checkpoint("after_migration_post_verification")
+
+    intent_guard, _intent, intent_receipt = _publish_windows_rollback_intent(
+        backup,
+        operation_id=operation_id,
+        lease=lease,
+        manifest=manifest,
+        manifest_sha256=manifest_sha256,
+    )
+    _windows_migration_checkpoint("after_rollback_intent_publication")
+    try:
+        lease.promote_frozen_stage(
+            rollback_intent_verified=True,
+            expected_sha256=str(stage_receipt["sha256"]),
+            expected_size=int(stage_receipt["size"]),
+        )
+        _windows_migration_checkpoint("after_sidecar_cleanup")
+        lease.prepare_runtime_activation()
+    except WindowsMaintenanceError as exc:
+        raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
+
+    return intent_guard, intent_receipt
+
+
+def _consume_windows_rollback_intent(
+    intent_guard: Any,
+    intent_receipt: dict[str, Any],
+    intent_path: Path,
+) -> None:
+    _StagedLease, ArtifactCustody, WindowsMaintenanceError = _windows_migration_classes()
+    intent_guard.close()
+    try:
+        ArtifactCustody.delete_existing_verified(
+            intent_path,
+            expected_sha256=str(intent_receipt["sha256"]),
+            expected_size=int(intent_receipt["size"]),
+            expected_volume_serial_number=int(intent_receipt["volume_serial_number"]),
+            expected_file_id=str(intent_receipt["file_id"]),
+        )
+    except WindowsMaintenanceError as exc:
+        raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
+
+
+def _resume_storage_v3_windows(db: Path, backup: Path) -> dict[str, Any]:
+    StagedLease, _, WindowsMaintenanceError = _windows_migration_classes()
+    (
+        manifest_artifact,
+        backup_artifact,
+        manifest,
+        manifest_sha256,
+        backup_snapshot,
+    ) = _open_verified_windows_backup(backup)
+    operation_id = str(manifest["operation_id"])
+    lease: Any = None
+    intent_guard: Any = None
+    intent_receipt: dict[str, Any] | None = None
+    intent_path = _windows_rollback_intent_path(db)
+    try:
+        try:
+            lease = StagedLease.acquire(db)
+            _require_windows_manifest_target_identity(lease, manifest)
+            recovery_conn = lease.open_verified_recovery_source(recovery_proof_verified=True)
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
+
+        contract_row = recovery_conn.execute("SELECT value FROM adapter_meta WHERE key='contract_version'").fetchone()
+        contract = str(contract_row[0]) if contract_row is not None else ""
+        if contract == str(STORAGE_CONTRACT_VERSION):
+            _require_windows_immediate_migrated_v3(
+                recovery_conn,
+                manifest=manifest,
+                manifest_sha256=manifest_sha256,
+                backup_snapshot=backup_snapshot,
+            )
+            try:
+                lease.release_verified_recovery_guard_unmutated()
+                lease = None
+            except WindowsMaintenanceError as exc:
+                raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
+        elif contract == "2":
+            _quick_integrity(recovery_conn)
+            _require_v2_schema(recovery_conn)
+            _require_lineage_compatibility(recovery_conn)
+            _require_v2_native_profile_parity(recovery_conn)
+            _require_windows_migration_binding_source_absent(recovery_conn)
+            if _logical_parity_snapshot(recovery_conn) != backup_snapshot:
+                raise MigrationHold("MIGRATION_HOLD", "interrupted migration v2 state differs from its verified backup")
+        else:
+            raise MigrationHold("MIGRATION_HOLD", "interrupted migration target is neither verified v2 nor bound v3")
+
+        if contract == "2":
+            assert lease is not None
+            try:
+                conn = lease.transition_verified_recovery_guard_to_mutation(recovery_target_verified=True)
+            except WindowsMaintenanceError as exc:
+                raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
+            register_storage_legacy_maintenance_writer(conn)
+            binding = _windows_binding_from_manifest(manifest, manifest_sha256=manifest_sha256)
+            committed = False
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                _create_v3_governance_schema(conn)
+                _windows_migration_checkpoint("after_schema_transaction")
+                if _logical_parity_snapshot(conn) != backup_snapshot:
+                    raise MigrationHold("MIGRATION_HOLD", "resumed migration changed historical native/vector/adapter rows")
+                conn.execute(
+                    "INSERT INTO adapter_meta(key,value) VALUES (?,?)",
+                    (_WINDOWS_MIGRATION_BINDING_KEY, canonical_json(binding)),
+                )
+                # Contract version is the final database write in the schema transaction.
+                conn.execute(
+                    "UPDATE adapter_meta SET value=? WHERE key='contract_version'",
+                    (str(STORAGE_CONTRACT_VERSION),),
+                )
+                _windows_migration_checkpoint("after_contract_version_write")
+                _validate_existing_v3_schema(conn)
+                _quick_integrity(conn)
+                if _logical_parity_snapshot(
+                    conn,
+                    excluded_meta_keys=(_WINDOWS_MIGRATION_BINDING_KEY,),
+                ) != backup_snapshot:
+                    raise MigrationHold("MIGRATION_HOLD", "resumed pre-commit migration parity verification failed")
+                try:
+                    SensitiveMemoryRecoveryOperator._require_known_recovery_schema(conn)
+                except RecoveryHold as exc:
+                    raise MigrationHold("MIGRATION_HOLD", "resumed pre-commit Recovery schema verification failed") from exc
+                conn.commit()
+                committed = True
+                _windows_migration_checkpoint("after_v3_commit")
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                if not committed:
+                    try:
+                        _quick_integrity(conn)
+                        _require_v2_schema(conn)
+                        _require_lineage_compatibility(conn)
+                        _require_v2_native_profile_parity(conn)
+                        if _logical_parity_snapshot(conn) != backup_snapshot:
+                            raise MigrationHold("MIGRATION_HOLD", "resumed failed migration did not roll back to verified v2 state")
+                        lease.release_staged_mutation_unmutated()
+                        lease = None
+                    except BaseException:
+                        if lease is not None:
+                            lease.retain_fail_closed()
+                        raise
+                raise
+            _require_windows_immediate_migrated_v3(
+                conn,
+                manifest=manifest,
+                manifest_sha256=manifest_sha256,
+                backup_snapshot=backup_snapshot,
+            )
+            intent_guard, intent_receipt = _publish_and_promote_windows_v3_stage(
+                lease,
+                backup,
+                operation_id=operation_id,
+                manifest=manifest,
+                manifest_sha256=manifest_sha256,
+                backup_snapshot=backup_snapshot,
+            )
+            try:
+                backup_artifact.verify(
+                    expected_sha256=str(manifest["backup_sha256"]),
+                    expected_size=int(manifest["backup_size"]),
+                )
+                manifest_artifact.revalidate()
+            except WindowsMaintenanceError as exc:
+                raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
+            assert intent_receipt is not None
+            _consume_windows_rollback_intent(intent_guard, intent_receipt, intent_path)
+            intent_guard = None
+            try:
+                lease.close()
+                lease = None
+            except WindowsMaintenanceError as exc:
+                raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
+    except BaseException:
+        if lease is not None:
+            try:
+                phase = getattr(lease, "phase", None)
+                if phase in {
+                    getattr(lease, "PHASE_CUSTODY", object()),
+                    getattr(lease, "PHASE_BACKUP_GUARD", object()),
+                    getattr(lease, "PHASE_RECOVERY_GUARD", object()),
+                }:
+                    lease.release_unmutated()
+                elif phase == getattr(lease, "PHASE_MUTATION", object()) and not getattr(
+                    lease, "_active_overwrite_started", True
+                ):
+                    lease.release_staged_mutation_unmutated()
+                else:
+                    lease.retain_fail_closed()
+            except Exception:
+                try:
+                    lease.retain_fail_closed()
+                except Exception:
+                    pass
+        raise
+    finally:
+        if intent_guard is not None:
+            intent_guard.close()
+        backup_artifact.close()
+        manifest_artifact.close()
+    return {
+        "status": "OK",
+        "operation": "MIGRATE_STORAGE_V3",
+        "operation_id": operation_id,
+        "database": str(db),
+        "from_contract": 2,
+        "to_contract": STORAGE_CONTRACT_VERSION,
+        "backup": str(backup),
+        "backup_sha256": str(manifest["backup_sha256"]),
+        "backup_size": int(manifest["backup_size"]),
+        "backup_manifest_sha256": manifest_sha256,
+        "resumed": True,
+        "completed_at": iso_now(),
+    }
+
+
+def _migrate_storage_v3_windows(db_path: str, backup_path: str) -> dict[str, Any]:
+    db = _requested_windows_path(db_path, label="database")
+    backup = _requested_windows_path(backup_path, label="backup destination")
+    manifest_path = _backup_manifest_path(backup)
+    intent_path = _windows_rollback_intent_path(db)
+    if intent_path.exists():
+        if backup.is_file() and manifest_path.is_file():
+            # A raw staged promotion may have crashed with a partially written
+            # target that is not SQLite-openable.  The durable intent is the
+            # authority to restore exact verified v2 bytes first; only then is
+            # migration resumed on a new private stage.
+            _restore_pre_v3_backup_windows(str(db), str(backup))
+            return _resume_storage_v3_windows(db, backup)
+        raise MigrationHold(
+            "MIGRATION_HOLD",
+            "storage migration is blocked by an unresolved exact-rollback intent with incomplete artifacts",
+        )
+    if backup.exists() or manifest_path.exists():
+        if backup.is_file() and manifest_path.is_file():
+            return _resume_storage_v3_windows(db, backup)
+        raise MigrationHold("BACKUP_INVALID", "interrupted migration artifacts are incomplete")
+    operation_id = str(uuid.uuid4())
+    StagedLease, _, WindowsMaintenanceError = _windows_migration_classes()
+    _require_windows_migration_capacity(db, backup)
+
+    lease: Any = None
+    backup_sha256 = ""
+    backup_size = 0
+    manifest: dict[str, Any] | None = None
+    manifest_sha256 = ""
+    source_snapshot: dict[str, Any] | None = None
+    backup_guard: Any = None
+    manifest_guard: Any = None
+    intent_guard: Any = None
+    intent_receipt: dict[str, Any] | None = None
+    committed = False
+    try:
+        try:
+            lease = StagedLease.acquire(db)
+            source = lease.open_backup_source()
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
+
+        register_storage_legacy_maintenance_writer(source)
+        _quick_integrity(source)
+        _require_v2_schema(source)
+        _require_lineage_compatibility(source)
+        _require_v2_native_profile_parity(source)
+        _require_windows_migration_binding_source_absent(source)
+        source_snapshot = _logical_parity_snapshot(source)
+        (
+            backup_sha256,
+            backup_size,
+            manifest,
+            manifest_sha256,
+            backup_guard,
+            manifest_guard,
+        ) = _windows_backup_database(
+            source,
+            lease,
+            backup,
+            operation_id=operation_id,
+            source_snapshot=source_snapshot,
+        )
+        _windows_migration_checkpoint("after_backup_manifest")
+
+        try:
+            conn = lease.transition_to_mutation(backup_manifest_verified=True)
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
+        _windows_migration_checkpoint("after_transition_to_mutation")
+        _windows_migration_checkpoint("after_sidecar_cleanup")
+        register_storage_legacy_maintenance_writer(conn)
+        binding = _windows_binding_from_manifest(manifest, manifest_sha256=manifest_sha256)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _create_v3_governance_schema(conn)
+            _windows_migration_checkpoint("after_schema_transaction")
+            if _logical_parity_snapshot(conn) != source_snapshot:
+                raise MigrationHold("MIGRATION_HOLD", "migration changed historical native/vector/adapter rows")
+            conn.execute(
+                "INSERT INTO adapter_meta(key,value) VALUES (?,?)",
+                (_WINDOWS_MIGRATION_BINDING_KEY, canonical_json(binding)),
+            )
+            # Contract version is the final database write in the schema transaction.
+            conn.execute(
+                "UPDATE adapter_meta SET value=? WHERE key='contract_version'",
+                (str(STORAGE_CONTRACT_VERSION),),
+            )
+            _windows_migration_checkpoint("after_contract_version_write")
+            _validate_existing_v3_schema(conn)
+            _quick_integrity(conn)
+            if _logical_parity_snapshot(
+                conn,
+                excluded_meta_keys=(_WINDOWS_MIGRATION_BINDING_KEY,),
+            ) != source_snapshot:
+                raise MigrationHold("MIGRATION_HOLD", "pre-commit migration parity verification failed")
+            try:
+                SensitiveMemoryRecoveryOperator._require_known_recovery_schema(conn)
+            except RecoveryHold as exc:
+                raise MigrationHold("MIGRATION_HOLD", "pre-commit Recovery schema verification failed") from exc
+            conn.commit()
+            committed = True
+            _windows_migration_checkpoint("after_v3_commit")
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            if not committed:
+                try:
+                    _quick_integrity(conn)
+                    _require_v2_schema(conn)
+                    _require_lineage_compatibility(conn)
+                    _require_v2_native_profile_parity(conn)
+                    if _logical_parity_snapshot(conn) != source_snapshot:
+                        raise MigrationHold("MIGRATION_HOLD", "failed migration did not roll back to the exact v2 logical state")
+                    lease.release_staged_mutation_unmutated()
+                    lease = None
+                except BaseException:
+                    if lease is not None:
+                        lease.retain_fail_closed()
+                    raise
+            raise
+
+        _validate_existing_v3_schema(conn)
+        _quick_integrity(conn)
+        if _logical_parity_snapshot(
+            conn,
+            excluded_meta_keys=(_WINDOWS_MIGRATION_BINDING_KEY,),
+        ) != source_snapshot:
+            raise MigrationHold("MIGRATION_HOLD", "post-migration native/vector/adapter parity check failed")
+        expected_binding = canonical_json(binding)
+        if conn.execute(
+            "SELECT value FROM adapter_meta WHERE key=?",
+            (_WINDOWS_MIGRATION_BINDING_KEY,),
+        ).fetchall() != [(expected_binding,)]:
+            raise MigrationHold("MIGRATION_HOLD", "post-migration backup binding verification failed")
+        try:
+            SensitiveMemoryRecoveryOperator._require_known_recovery_schema(conn)
+        except RecoveryHold as exc:
+            raise MigrationHold("MIGRATION_HOLD", "post-migration Recovery schema preflight failed") from exc
+        assert manifest is not None
+        assert source_snapshot is not None
+        intent_guard, intent_receipt = _publish_and_promote_windows_v3_stage(
+            lease,
+            backup,
+            operation_id=operation_id,
+            manifest=manifest,
+            manifest_sha256=manifest_sha256,
+            backup_snapshot=source_snapshot,
+        )
+        try:
+            assert backup_guard is not None and manifest_guard is not None
+            backup_guard.verify(expected_sha256=backup_sha256, expected_size=backup_size)
+            manifest_guard.revalidate()
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
+        assert intent_receipt is not None
+        _consume_windows_rollback_intent(intent_guard, intent_receipt, intent_path)
+        intent_guard = None
+        try:
+            lease.close()
+            lease = None
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("MIGRATION_HOLD", exc.safe_message) from exc
+    except BaseException:
+        if lease is not None:
+            phase = getattr(lease, "phase", None)
+            try:
+                if phase in {
+                    getattr(lease, "PHASE_CUSTODY", object()),
+                    getattr(lease, "PHASE_BACKUP_GUARD", object()),
+                }:
+                    lease.release_unmutated()
+                elif phase == getattr(lease, "PHASE_MUTATION", object()) and not getattr(
+                    lease, "_active_overwrite_started", True
+                ):
+                    lease.release_staged_mutation_unmutated()
+                else:
+                    lease.retain_fail_closed()
+            except Exception:
+                try:
+                    lease.retain_fail_closed()
+                except Exception:
+                    pass
+        if manifest_guard is not None:
+            manifest_guard.close()
+            manifest_guard = None
+        if backup_guard is not None:
+            backup_guard.close()
+            backup_guard = None
+        if intent_guard is not None:
+            intent_guard.close()
+            intent_guard = None
+        raise
+
+    if manifest_guard is not None:
+        manifest_guard.close()
+        manifest_guard = None
+    if backup_guard is not None:
+        backup_guard.close()
+        backup_guard = None
+    return {
+        "status": "OK",
+        "operation": "MIGRATE_STORAGE_V3",
+        "operation_id": operation_id,
+        "database": str(db),
+        "from_contract": 2,
+        "to_contract": STORAGE_CONTRACT_VERSION,
+        "backup": str(backup),
+        "backup_sha256": backup_sha256,
+        "backup_size": backup_size,
+        "backup_manifest_sha256": manifest_sha256,
+        "completed_at": iso_now(),
+    }
+
+
 def migrate_storage_v3(db_path: str, backup_path: str) -> dict[str, Any]:
+    if os.name == "nt":
+        return _migrate_storage_v3_windows(db_path, backup_path)
     db = Path(db_path).resolve()
     backup = _canonical_backup_target(backup_path)
     if inspect_storage_contract_version(str(db)) != 2:
@@ -854,7 +1940,244 @@ def migrate_storage_v3(db_path: str, backup_path: str) -> dict[str, Any]:
     }
 
 
+def _restore_pre_v3_backup_windows(db_path: str, backup_path: str) -> dict[str, Any]:
+    db = _requested_windows_path(db_path, label="database")
+    backup = _requested_windows_path(backup_path, label="backup")
+    StagedLease, ArtifactCustody, WindowsMaintenanceError = _windows_migration_classes()
+    (
+        manifest_artifact,
+        backup_artifact,
+        manifest,
+        manifest_sha256,
+        backup_snapshot,
+    ) = _open_verified_windows_backup(backup)
+    operation_id = str(uuid.uuid4())
+    lease: Any = None
+    intent_guard: Any = None
+    intent_receipt: dict[str, Any] | None = None
+    intent_path = _windows_rollback_intent_path(db)
+    try:
+        try:
+            lease = StagedLease.acquire(db)
+            _require_windows_manifest_target_identity(lease, manifest)
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+
+        if intent_path.exists():
+            intent_guard, _intent, intent_receipt = _open_verified_windows_rollback_intent(
+                backup,
+                lease=lease,
+                manifest=manifest,
+                manifest_sha256=manifest_sha256,
+            )
+
+        exact_already_restored = _active_file_matches_verified_backup(lease, manifest)
+        if exact_already_restored and (
+            Path(str(db) + "-wal").exists() or Path(str(db) + "-shm").exists()
+        ):
+            # Without durable intent, unexpected sidecars are a no-mutation
+            # HOLD.  With intent, route through raw retry so retained native
+            # custody invalidates them before exact v2 is released.
+            if intent_guard is not None:
+                exact_already_restored = False
+        if exact_already_restored:
+            try:
+                lease.prepare_verified_exact_restore_release(
+                    recovery_proof_verified=True,
+                    expected_sha256=str(manifest["backup_sha256"]),
+                    expected_size=int(manifest["backup_size"]),
+                )
+            except WindowsMaintenanceError as exc:
+                raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+
+        if lease is not None and not exact_already_restored:
+            raw_retry_from_intent = False
+            recovery_conn: sqlite3.Connection | None = None
+            try:
+                recovery_conn = lease.open_verified_recovery_source(recovery_proof_verified=True)
+            except WindowsMaintenanceError as exc:
+                if intent_guard is not None and getattr(exc, "code", "") == "MIGRATION_RECOVERY_STAGE_UNPROVEN":
+                    raw_retry_from_intent = True
+                else:
+                    raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+
+            if not raw_retry_from_intent:
+                try:
+                    assert recovery_conn is not None
+                    contract_row = recovery_conn.execute(
+                        "SELECT value FROM adapter_meta WHERE key='contract_version'"
+                    ).fetchone()
+                    contract = str(contract_row[0]) if contract_row is not None else ""
+                    if contract == str(STORAGE_CONTRACT_VERSION):
+                        _require_windows_immediate_migrated_v3(
+                            recovery_conn,
+                            manifest=manifest,
+                            manifest_sha256=manifest_sha256,
+                            backup_snapshot=backup_snapshot,
+                        )
+                    elif contract == "2":
+                        _quick_integrity(recovery_conn)
+                        _require_v2_schema(recovery_conn)
+                        _require_lineage_compatibility(recovery_conn)
+                        _require_v2_native_profile_parity(recovery_conn)
+                        _require_windows_migration_binding_source_absent(recovery_conn)
+                        if _logical_parity_snapshot(recovery_conn) != backup_snapshot:
+                            if intent_guard is not None:
+                                raw_retry_from_intent = True
+                            else:
+                                raise MigrationHold(
+                                    "ROLLBACK_HOLD",
+                                    "rollback target v2 state differs from the verified pre-v3 backup",
+                                )
+                    else:
+                        raise MigrationHold(
+                            "ROLLBACK_HOLD",
+                            "rollback target is neither the verified v2 source nor its immediate v3 migration",
+                        )
+                except sqlite3.DatabaseError:
+                    if intent_guard is None:
+                        raise MigrationHold("ROLLBACK_HOLD", "rollback target cannot be proven recovery-eligible")
+                    raw_retry_from_intent = True
+                except MigrationHold as exc:
+                    structural_interrupted_restore = (
+                        exc.code == "ROLLBACK_HOLD"
+                        and exc.safe_message == "rollback target is not an exact storage-v3 database"
+                    )
+                    if intent_guard is None or (exc.code == "ROLLBACK_HOLD" and not structural_interrupted_restore):
+                        raise
+                    raw_retry_from_intent = True
+
+            if raw_retry_from_intent:
+                if getattr(lease, "phase", None) == getattr(lease, "PHASE_RECOVERY_GUARD", object()):
+                    try:
+                        lease.release_verified_recovery_guard_unmutated()
+                    except WindowsMaintenanceError as exc:
+                        raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+                    lease = None
+                if lease is None or getattr(lease, "_closed", False):
+                    try:
+                        lease = StagedLease.acquire(db)
+                        _require_windows_manifest_target_identity(lease, manifest)
+                    except WindowsMaintenanceError as exc:
+                        raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+                assert intent_guard is not None
+                _require_windows_rollback_intent_binding(
+                    _parse_windows_rollback_intent(bytes(intent_guard.read_exact()["data"])),
+                    lease=lease,
+                    manifest=manifest,
+                    manifest_sha256=manifest_sha256,
+                )
+                try:
+                    lease.restore_exact_from_backup_from_custody(
+                        backup,
+                        recovery_proof_verified=True,
+                        expected_sha256=str(manifest["backup_sha256"]),
+                        expected_size=int(manifest["backup_size"]),
+                    )
+                except WindowsMaintenanceError as exc:
+                    raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+            else:
+                try:
+                    lease.transition_verified_recovery_guard_to_mutation(recovery_target_verified=True)
+                except WindowsMaintenanceError as exc:
+                    raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+
+                if intent_guard is None:
+                    intent_guard, _intent, intent_receipt = _publish_windows_rollback_intent(
+                        backup,
+                        operation_id=operation_id,
+                        lease=lease,
+                        manifest=manifest,
+                        manifest_sha256=manifest_sha256,
+                    )
+                    _windows_migration_checkpoint("after_rollback_intent_publication")
+                try:
+                    lease.restore_exact_from_backup(
+                        backup,
+                        rollback_intent_verified=True,
+                        expected_sha256=str(manifest["backup_sha256"]),
+                        expected_size=int(manifest["backup_size"]),
+                    )
+                except WindowsMaintenanceError as exc:
+                    raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+                _windows_migration_checkpoint("after_sidecar_cleanup")
+            _windows_migration_checkpoint("after_exact_restore")
+            try:
+                lease.prepare_exact_restore_release()
+            except WindowsMaintenanceError as exc:
+                raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+
+        assert lease is not None
+        if not _active_file_matches_verified_backup(lease, manifest):
+            raise MigrationHold("ROLLBACK_HOLD", "restored database bytes do not exactly match the verified pre-v3 backup")
+        try:
+            backup_artifact.verify(
+                expected_sha256=str(manifest["backup_sha256"]),
+                expected_size=int(manifest["backup_size"]),
+            )
+            manifest_artifact.revalidate()
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+        _windows_migration_checkpoint("after_restore_post_verification")
+
+        if intent_guard is not None:
+            assert intent_receipt is not None
+            intent_guard.close()
+            intent_guard = None
+            try:
+                ArtifactCustody.delete_existing_verified(
+                    intent_path,
+                    expected_sha256=str(intent_receipt["sha256"]),
+                    expected_size=int(intent_receipt["size"]),
+                    expected_volume_serial_number=int(intent_receipt["volume_serial_number"]),
+                    expected_file_id=str(intent_receipt["file_id"]),
+                )
+            except WindowsMaintenanceError as exc:
+                raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+        try:
+            lease.close()
+            lease = None
+        except WindowsMaintenanceError as exc:
+            raise MigrationHold("ROLLBACK_HOLD", exc.safe_message) from exc
+    except BaseException:
+        if lease is not None:
+            try:
+                phase = getattr(lease, "phase", None)
+                if phase in {
+                    getattr(lease, "PHASE_CUSTODY", object()),
+                    getattr(lease, "PHASE_BACKUP_GUARD", object()),
+                    getattr(lease, "PHASE_RECOVERY_GUARD", object()),
+                }:
+                    lease.release_unmutated()
+                else:
+                    lease.retain_fail_closed()
+            except Exception:
+                try:
+                    lease.retain_fail_closed()
+                except Exception:
+                    pass
+        raise
+    finally:
+        if intent_guard is not None:
+            intent_guard.close()
+        backup_artifact.close()
+        manifest_artifact.close()
+    return {
+        "status": "OK",
+        "operation": "RESTORE_PRE_V3_BACKUP",
+        "operation_id": operation_id,
+        "database": str(db),
+        "restored_contract": 2,
+        "backup": str(backup),
+        "backup_sha256": str(manifest["backup_sha256"]),
+        "backup_manifest_sha256": manifest_sha256,
+        "completed_at": iso_now(),
+    }
+
+
 def restore_pre_v3_backup(db_path: str, backup_path: str) -> dict[str, Any]:
+    if os.name == "nt":
+        return _restore_pre_v3_backup_windows(db_path, backup_path)
     db = Path(db_path).resolve()
     backup = Path(backup_path).resolve()
     if not backup.is_file() or inspect_storage_contract_version(str(backup)) != 2:

@@ -29,7 +29,7 @@
 
 ## `memory_get`
 
-اقرأ ذاكرة منطقية واحدة عبر هويتها المنضبطة وافحص منشأها ودورة حياتها ومراجعتها وحداثتها والبيانات الوصفية المرتبطة بها.
+اقرأ ذاكرة منطقية واحدة عبر هويتها المنضبطة وافحص منشأها ودورة حياتها ورقم `revision` وحداثتها والبيانات الوصفية المرتبطة بها.
 
 استخدمها عندما تحتاج إلى السجل الدقيق بدل البحث المرتب حسب الصلة.
 
@@ -50,16 +50,16 @@
 
 ## `memory_update`
 
-نفّذ تحديثًا منضبطًا تحت فحوص دقيقة للمراجعة/idempotency.
+نفّذ تحديثًا منضبطًا تحت فحوص دقيقة لرقم `revision` وidempotency.
 
 الأوضاع الأساسية هي:
 
 - `REVERIFY` — أعد التحقق من الذاكرة المنطقية نفسها؛ تستخدم ترقية Candidate قيمة `expected_record_id` الدقيقة؛
-- `REPLACE` — أنشئ successor عندما تتغير الهوية الدلالية؛
+- `REPLACE` — أنشئ سجلًا لاحقًا منضبطًا لذاكرة منطقية Current مؤهلة؛ وليس مسارًا لتعديل Candidate؛
 - `REVOKE` — disposition مباشر بصلاحية Owner لسجل `VALIDATED_CURRENT` مؤهل؛
 - `REJECT` — disposition مباشر بصلاحية Owner لـ`CANDIDATE`.
 
-يتطلب `REVOKE` و`REJECT` أيضًا `observed_group_token` المعروض بدقة وreason code محدودًا ومسموحًا. وهما حالتان منطقيتان لدورة الحياة وليستا محوًا ماديًا.
+يتطلب `REVOKE` و`REJECT` أيضًا قيمة `expected_record_id` الحالية الدقيقة، و`observed_group_token` المعروض، ورمز سبب محدودًا ومسموحًا. وهما حالتان منطقيتان لدورة الحياة وليستا محوًا ماديًا.
 
 لا يكتسب وكيل مفوض صلاحية verifier أو Owner لمجرد ظهور `memory_update`.
 
@@ -87,7 +87,9 @@
 
 استخدم `factlane-owner --help` لمعرفة عقد CLI الحالي.
 
-استخدم `factlane-owner-webui --help` لمعرفة launcher الحالي لواجهة Owner عبر loopback. يرتبط WebUI بـ`127.0.0.1` ويستخدم تبادل bootstrap لمرة واحدة، وجلسة موثقة، وحماية CSRF. وهو ليس نقل MCP عبر HTTP.
+استخدم `factlane-owner-webui --help` لمعرفة مشغّل واجهة Owner المباشرة عبر loopback. وهو منفصل عن دورة الحياة المُدارة `factlane setup|serve|open|start|stop|status|restart webui`. ولا تمثل أي من واجهتي Owner نقل MCP عبر HTTP.
+
+في مصدر التطوير الحالي، يمكن لـOwner Panel المُدارة أيضًا عرض عمليات قاعدة بيانات بحسب الإمكانات المتاحة، مثل backup artifacts الصريحة، والاستيراد/التصدير، وfull restore، وpermanent purge الخاصة بالمنصة. هذه عمليات Owner/operator وليست أدوات MCP؛ راجع [البدء السريع](QUICKSTART.md) لحدودها الموجهة للمستخدم.
 
 ## حالات الفشل المنضبطة
 
@@ -108,19 +110,21 @@
 طلب status بسيط لمستخدم عام:
 
 ```json
-{"scope":"GLOBAL_USER"}
+{"request":{"scope":"GLOBAL_USER"}}
 ```
 
 قد يبدو بحث Current بالكلمات المفتاحية ضمن نطاق مشروع كما يلي:
 
 ```json
 {
-  "scope": "PROJECT",
-  "project_id": "example-project",
-  "intent_class": "CURRENT_PROJECT_STATE",
-  "query": "What release constraints are recorded?",
-  "retrieval_mode": "CURRENT",
-  "retrieval_mode_kind": "KEYWORD"
+  "request": {
+    "scope": "PROJECT",
+    "project_id": "example-project",
+    "intent_class": "CURRENT_PROJECT_STATE",
+    "query": "What release constraints are recorded?",
+    "retrieval_mode": "CURRENT",
+    "retrieval_mode_kind": "KEYWORD"
+  }
 }
 ```
 

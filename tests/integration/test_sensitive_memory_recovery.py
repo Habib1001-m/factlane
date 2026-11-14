@@ -22,7 +22,7 @@ if os.name == "nt":
 from factlane.adapter import MemoryAdapter, _establish_embedding_compatibility, trusted_write_context_for_profile
 from factlane.contract import AdapterError, PUBLIC_TOOL_NAMES, ScopeContext
 from factlane.embeddings import EmbeddingProfile
-from factlane.recovery import MaintenanceLease, PM0, PM1, RecoveryHold, RecoveryPlan, RecoveryScope, RecoveryTarget, SensitiveMemoryRecoveryOperator
+from factlane.recovery import MaintenanceLease, PM0, PM1, RecoveryActivationHooks, RecoveryHold, RecoveryPlan, RecoveryScope, RecoveryTarget, SensitiveMemoryRecoveryOperator, resolve_permanent_purge_targets_exclusive
 from factlane.storage import SQLiteVecEngine, register_storage_v2_writer
 
 
@@ -133,6 +133,132 @@ def _fact(db: Path, record_id: str) -> str:
         return str(conn.execute("SELECT fact FROM adapter_records WHERE record_id = ?", (record_id,)).fetchone()[0])
     finally:
         conn.close()
+
+
+def test_exclusive_purge_target_resolver_reuses_governed_storage_semantics_and_releases_lease(tmp_path: Path) -> None:
+    async def prepare() -> tuple[dict[str, Any], Path]:
+        engine, adapter = await _open_adapter(tmp_path)
+        item = await _store(
+            adapter,
+            key="exclusive-purge-resolver",
+            fact="Exclusive purge resolver target.",
+            marker="e",
+        )
+        row = await _target_row(engine, item["memory_id"])
+        db = Path(engine.db_path)
+        await adapter.close()
+        return row, db
+
+    row, db = asyncio.run(prepare())
+    identity = {
+        "scope": row["scope"],
+        "project_id": row["project_id"],
+        "worktree_id": row["worktree_id"],
+        "workflow_id": row["workflow_id"],
+        "agent_id": row["agent_id"],
+        "memory_id": row["memory_id"],
+        "record_id": row["record_id"],
+        "revision": row["revision"],
+    }
+
+    resolved = asyncio.run(
+        resolve_permanent_purge_targets_exclusive(
+            operation_id="exclusive-purge-resolver",
+            db_path=str(db),
+            profile=profile(),
+            identities=(identity,),
+        )
+    )
+
+    assert resolved == (
+        RecoveryTarget(
+            record_id=row["record_id"],
+            memory_id=row["memory_id"],
+            revision=int(row["revision"]),
+            scope=RecoveryScope("PROJECT", project_id="factlane"),
+            expected_lifecycle=row["lifecycle_state"],
+            expected_materialization=PM1,
+            expected_native_hash=row["native_content_hash"],
+        ),
+    )
+    with MaintenanceLease(str(db), "exclusive-resolver-released"):
+        pass
+
+    with MaintenanceLease(str(db), "exclusive-resolver-competing"):
+        with pytest.raises(RecoveryHold) as locked:
+            asyncio.run(
+                resolve_permanent_purge_targets_exclusive(
+                    operation_id="exclusive-purge-resolver-locked",
+                    db_path=str(db),
+                    profile=profile(),
+                    identities=(identity,),
+                )
+            )
+    assert locked.value.code == "HOLD_NONQUIESCENT_NO_MUTATION"
+
+
+def test_exclusive_purge_target_resolver_fails_closed_on_identity_and_materialization_drift(tmp_path: Path) -> None:
+    async def prepare() -> tuple[dict[str, Any], Path]:
+        engine, adapter = await _open_adapter(tmp_path)
+        item = await _store(
+            adapter,
+            key="exclusive-purge-drift",
+            fact="Exclusive purge drift target.",
+            marker="f",
+        )
+        row = await _target_row(engine, item["memory_id"])
+        db = Path(engine.db_path)
+        await adapter.close()
+        return row, db
+
+    row, db = asyncio.run(prepare())
+    identity = {
+        "scope": row["scope"],
+        "project_id": row["project_id"],
+        "worktree_id": row["worktree_id"],
+        "workflow_id": row["workflow_id"],
+        "agent_id": row["agent_id"],
+        "memory_id": row["memory_id"],
+        "record_id": row["record_id"],
+        "revision": int(row["revision"]) + 1,
+    }
+    with pytest.raises(RecoveryHold) as identity_drift:
+        asyncio.run(
+            resolve_permanent_purge_targets_exclusive(
+                operation_id="exclusive-purge-identity-drift",
+                db_path=str(db),
+                profile=profile(),
+                identities=(identity,),
+            )
+        )
+    assert identity_drift.value.code == "HOLD_TARGET_DRIFT_NO_MUTATION"
+
+    identity["revision"] = row["revision"]
+    async def remove_vector() -> None:
+        engine, adapter = await _open_adapter(tmp_path)
+        try:
+            assert engine.conn is not None
+            native_id = engine.conn.execute(
+                "SELECT id FROM memories WHERE content_hash=?",
+                (row["native_content_hash"],),
+            ).fetchone()[0]
+            engine.conn.execute("DELETE FROM memory_embeddings WHERE rowid=?", (native_id,))
+            engine.conn.commit()
+        finally:
+            await adapter.close()
+
+    asyncio.run(remove_vector())
+
+    with pytest.raises(RecoveryHold) as materialization_drift:
+        asyncio.run(
+            resolve_permanent_purge_targets_exclusive(
+                operation_id="exclusive-purge-materialization-drift",
+                db_path=str(db),
+                profile=profile(),
+                identities=(identity,),
+            )
+        )
+    assert materialization_drift.value.code == "HOLD_PARTIAL_MATERIALIZATION_NO_MUTATION"
 
 
 def test_unknown_propagation_is_u1_and_cannot_construct_mutating_plan(tmp_path: Path) -> None:
@@ -753,6 +879,110 @@ asyncio.run(run())
         await engine.close()
 
     asyncio.run(normal_runtime_reopens_after_recovery())
+
+
+def test_activation_hooks_observe_interlock_before_clear_and_running_publish_after_clear(tmp_path: Path) -> None:
+    async def prepare() -> dict[str, Any]:
+        engine, adapter = await _open_adapter(tmp_path)
+        item = await _store(adapter, key="activation-hook", fact="Activation hook target.", marker="5")
+        row = await _target_row(engine, item["memory_id"])
+        await adapter.close()
+        return row
+
+    row = asyncio.run(prepare())
+    db = tmp_path / "memory.db"
+    plan = _plan(db, row, operation="activation-hook-op")
+    events: list[str] = []
+
+    async def activation_ready(result, maintenance_lease) -> None:
+        assert result.operation_id == plan.operation_id
+        assert maintenance_lease.capability is not None
+        conn = sqlite3.connect(db)
+        try:
+            assert conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='sensitive_recovery_interlock'"
+            ).fetchone() == (plan.operation_id,)
+        finally:
+            conn.close()
+        events.append("activation-ready")
+
+    async def publish_running(result, maintenance_lease) -> None:
+        assert result.operation_id == plan.operation_id
+        assert maintenance_lease.capability is not None
+        conn = sqlite3.connect(db)
+        try:
+            assert conn.execute(
+                "SELECT value FROM adapter_meta WHERE key='sensitive_recovery_interlock'"
+            ).fetchone() is None
+        finally:
+            conn.close()
+        events.append("publish-running")
+
+    result = asyncio.run(
+        SensitiveMemoryRecoveryOperator(foreign_handle_provider=lambda _: []).execute(
+            plan,
+            receipt_path=str(tmp_path / "activation-hook.receipt.json"),
+            activation_hooks=RecoveryActivationHooks(
+                operation_id=plan.operation_id,
+                activation_ready=activation_ready,
+                publish_running=publish_running,
+            ),
+        )
+    )
+    assert result.state == "S1_LOCAL_FACTLANE_PURGE_VERIFIED"
+    assert events == ["activation-ready", "publish-running"]
+    state = json.loads((tmp_path / "activation-hook.receipt.json.state.json").read_text())
+    assert state["phase"] == "S1_LOCAL_FACTLANE_PURGE_VERIFIED"
+
+
+def test_activation_publish_failure_restores_interlock_before_lease_release(tmp_path: Path) -> None:
+    async def prepare() -> dict[str, Any]:
+        engine, adapter = await _open_adapter(tmp_path)
+        item = await _store(adapter, key="activation-publish-fail", fact="Activation publish failure target.", marker="6")
+        row = await _target_row(engine, item["memory_id"])
+        await adapter.close()
+        return row
+
+    row = asyncio.run(prepare())
+    db = tmp_path / "memory.db"
+    plan = _plan(db, row, operation="activation-publish-fail-op")
+
+    async def activation_ready(_result, _lease) -> None:
+        return None
+
+    async def publish_running(_result, _lease) -> None:
+        raise RuntimeError("synthetic publish failure")
+
+    with pytest.raises(RecoveryHold) as caught:
+        asyncio.run(
+            SensitiveMemoryRecoveryOperator(foreign_handle_provider=lambda _: []).execute(
+                plan,
+                receipt_path=str(tmp_path / "activation-publish-fail.receipt.json"),
+                activation_hooks=RecoveryActivationHooks(
+                    operation_id=plan.operation_id,
+                    activation_ready=activation_ready,
+                    publish_running=publish_running,
+                ),
+            )
+        )
+    assert caught.value.code == "S1_LOGICAL_PURGE_COMMITTED_SEALING_INCOMPLETE"
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute(
+            "SELECT value FROM adapter_meta WHERE key='sensitive_recovery_interlock'"
+        ).fetchone() == (plan.operation_id,)
+    finally:
+        conn.close()
+    state = json.loads((tmp_path / "activation-publish-fail.receipt.json.state.json").read_text())
+    assert state["phase"] == "S1_LOCAL_FACTLANE_ACTIVATION_READY"
+
+    async def normal_runtime_is_blocked() -> None:
+        engine = SQLiteVecEngine(str(db), profile())
+        with pytest.raises(AdapterError) as blocked:
+            await engine.open()
+        assert blocked.value.code == "MAINTENANCE_IN_PROGRESS"
+
+    asyncio.run(normal_runtime_is_blocked())
 
 
 

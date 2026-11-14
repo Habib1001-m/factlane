@@ -88,9 +88,19 @@ A project fact does not silently fan out into another project merely because the
 
 ## Use the Owner control plane when review matters
 
-The local Owner CLI and loopback Owner WebUI make the governance layer visible instead of hiding it behind raw database access. They provide bounded views for Current, Candidates, conflicts, history, health, and retention plus the governed lifecycle operations above.
+The local Owner CLI and Owner WebUI surfaces make the governance layer visible instead of hiding it
+behind raw database access. The direct `factlane-owner-webui` launcher is a loopback presentation
+surface; the current development source also has a separately managed Owner Panel lifecycle.
+Together with the Owner service they expose bounded memory/review/conflict/history/health operations,
+while the managed panel can additionally expose capability-gated database workflows such as backup
+artifacts, import/export, full restore, and permanent purge.
 
-The Owner WebUI is a local operator surface, not an HTTP MCP server and not a sixth public tool.
+In the current unreleased development surface, an Owner can start from an Owner-wide read-only
+Memories view or Candidate Review queue instead of knowing scope identifiers in advance. Selecting a
+record preserves its exact scope for any later mutation. Candidate approval uses local date/time plus
+the browser timezone while record/revision/CAS concurrency details remain internal to the normal flow.
+
+These are local operator surfaces, not HTTP MCP servers and not a sixth public tool.
 
 ## Next: check fit before setup
 

@@ -666,12 +666,14 @@ wheels = [
 
 [[package]]
 name = "factlane"
-version = "0.1.6"
+version = "0.1.7"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography", marker = "sys_platform == 'win32'" },
     { name = "mcp" },
     { name = "mcp-memory-service" },
     { name = "pydantic" },
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "sqlite-vec" },
     { name = "tokenizers" },
     { name = "typing-extensions" },
@@ -684,9 +686,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", marker = "sys_platform == 'win32'", specifier = "==50.0.1" },
     { name = "mcp", specifier = "==1.30.0" },
     { name = "mcp-memory-service", specifier = "==11.10.0" },
     { name = "pydantic", specifier = "==2.13.5" },
+    { name = "pywin32", marker = "sys_platform == 'win32'", specifier = "==312" },
     { name = "sqlite-vec", specifier = "==0.1.9" },
     { name = "tokenizers", specifier = "==0.23.1" },
     { name = "typing-extensions", specifier = "==4.16.0" },

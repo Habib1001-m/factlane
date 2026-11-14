@@ -46,4 +46,4 @@ The live MCP schema and `factlane --help-tools` are authoritative for exact publ
 
 ## Release status without coupling product docs to a version
 
-Evergreen product and installation documentation intentionally does not embed a specific FactLane release number. For the current published release, exact tag/tree, hashes, and release-status truth, use [Release operations](RELEASE_OPERATIONS.md). For what changed, use the [Changelog](CHANGELOG.md).
+Evergreen product and installation documentation intentionally does not treat a moving source version as release authority. For the released baseline recorded by this repository, exact tag/tree, hashes, and release-status truth, use [Release operations](RELEASE_OPERATIONS.md). For release and development changes, use the [Changelog](CHANGELOG.md).

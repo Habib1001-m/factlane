@@ -5,7 +5,7 @@ portable `using-factlane` Skill available to that host. It is deliberately host-
 the installed host before changing machine or host configuration, and use only that host's
 supported MCP and Skill mechanisms.
 
-Resolve the FactLane runtime from the current published release recorded in the official repository's
+Resolve the FactLane runtime from the released baseline recorded in the official repository's
 `docs/RELEASE_OPERATIONS.md`. Use that release's exact tag or verified published artifact identity;
 do not substitute the moving `main` branch or infer release authority from an arbitrary source
 checkout. A packaged Skill may not have the repository documentation beside it, so resolve that
@@ -72,6 +72,8 @@ skills/using-factlane/
 
 For a wheel installation, derive the interpreter's data prefix rather than guessing a host path:
 
+POSIX shell:
+
 ```bash
 python - <<'PY'
 from pathlib import Path
@@ -82,6 +84,12 @@ print(root)
 print(root / "SKILL.md")
 print(root / "references" / "host-bootstrap.md")
 PY
+```
+
+PowerShell:
+
+```powershell
+python -c "from pathlib import Path; import sysconfig; root = Path(sysconfig.get_path('data')) / 'share' / 'factlane' / 'skills' / 'using-factlane'; print(root); print(root / 'SKILL.md'); print(root / 'references' / 'host-bootstrap.md')"
 ```
 
 Both files must be present before reporting `Skill present`.
@@ -137,11 +145,30 @@ successful MCP calls.
 
 ## 5. Use Owner control only as an optional trusted-operator path
 
-If the selected published release documents local Owner control surfaces such as `factlane-owner`
-or `factlane-owner-webui`, they remain separate trusted-operator interfaces. Their presence does not
-add an MCP tool, does not convert the loopback WebUI into an HTTP MCP transport, and does not grant an
-ordinary delegated agent Owner authority. Use them only with the exact trusted scope and the current
+If the selected release documents local Owner control surfaces such as `factlane-owner`, the direct
+`factlane-owner-webui` launcher, or a managed `factlane ... webui` lifecycle, they remain separate
+trusted-operator interfaces. Their presence does not add an MCP tool and does not grant an ordinary
+delegated agent Owner authority. Use them only with the exact trusted scope and the current
 revision/Group-CAS evidence required by that release.
+
+When the selected source/release provides `factlane doctor webui`, use that read-only report before
+asking the operator to reconstruct installation topology manually. It can report the resolved
+FactLane executable/interpreter, managed database/profile binding (or supported profiles when still
+unconfigured), packaged Skill path, Owner Panel launcher presence, service observation, and a
+host-neutral read-only MCP argv recipe. Treat its MCP `host_id` as `EXPLICIT_REQUIRED` and its scope
+as `EXPLICIT_PER_REQUEST`: do not copy the Owner Panel host identity into an MCP host, auto-register
+the Skill, edit host configuration, install models/packages, or migrate storage from this discovery
+step.
+
+When the selected source/release provides `factlane launch webui`, prefer it for normal managed-panel
+opening after setup: it checks service state, starts the service when needed, then uses the trusted
+open flow. If setup installs an Owner Panel desktop/Start Menu launcher, treat that as another entry
+to the same trusted launch flow, not as a bypass around managed authentication or service control.
+
+If that exact source/release documents managed-panel database workflows, describe only the supported
+backup/import/export/full-restore/permanent-purge capabilities and point the operator to its Quick
+Start/Security guidance. Do not infer Windows support for the separate general
+`SensitiveMemoryRecoveryOperator` from managed-panel purge or restore support.
 
 If the selected release does not document or install an Owner surface, do not invent one from this
 reference. Follow that release's Owner and security documentation for exact commands and boundaries.
@@ -173,7 +200,7 @@ Record observed facts, not inferred success. A minimal report should contain:
 ```text
 FactLane source/package identity: <observed>
 FactLane executable: <observed absolute path>
-Python / linked SQLite: <observed>
+CPython / linked SQLite: <observed>
 Embedding profile / Ollama endpoint: <observed>
 Database path / existing storage: <observed; absent|present>
 Storage compatibility: compatible|migration-required|unproven
@@ -186,7 +213,7 @@ Skill loaded: yes|no|unproven
 Tool set: <observed names>
 Exactly five tools: yes|no
 memory_status read-only smoke: pass|fail|not-run
-Launcher write profile: read-only|delegated-candidate|trusted-verifier-profile|unproven
+Launcher write profile: read-only|delegated-candidate|owner-current|repo-verifier|automated-verifier|unproven
 Machine/host mutations performed: <list or none>
 Remaining blockers: <list or none>
 ```

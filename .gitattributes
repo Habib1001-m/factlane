@@ -1,3 +1,6 @@
 # Integrity-bound embedding compatibility material must be byte-stable across
 # native Git checkouts, including Git for Windows with core.autocrlf=true.
 src/factlane/data/embedding_compatibility/*.json -text
+
+src/factlane/webui/** text eol=lf
+docs/assets/brand/logo/factlane-mark.svg text eol=lf

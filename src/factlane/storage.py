@@ -11,7 +11,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .backend_compat import (
@@ -23,10 +23,13 @@ from .contract import (
     AdapterError,
     ScopeContext,
     canonical_json,
+    digest,
+    finite_vector,
     is_fresh,
     iso_now,
     native_hash,
     parse_iso,
+    validate_identifier,
     validate_freshness,
     validate_scope,
 )
@@ -63,6 +66,22 @@ _ADVERSE_FRESHNESS_GATES = {
 }
 MAX_TRUST_RENEWAL_EVIDENCE_AGE_SECONDS = 86_400
 MAX_FUTURE_EVIDENCE_SKEW_SECONDS = 300
+MAX_LOGICAL_EXPORT_RECORDS = 1000
+MAX_PERMANENT_PURGE_TARGETS = 50
+LOGICAL_EXPORT_LIFECYCLE_STATES = frozenset(
+    {
+        "CANDIDATE",
+        "VALIDATED_CURRENT",
+        "SUPERSEDED",
+        "STALE",
+        "QUARANTINED",
+        "HISTORICAL",
+        "REVOKED",
+        "REJECTED",
+    }
+)
+_PURGE_PM0 = "PM0_ADAPTER_ONLY_EXPECTED"
+_PURGE_PM1 = "PM1_FULL_NATIVE_MATERIALIZATION"
 
 _LIFECYCLE_EVENT_COLUMNS = (
     "event_id", "operation_id", "memory_id", "record_id", "target_record_id", "target_revision",
@@ -399,7 +418,7 @@ def _validate_existing_v3_schema(conn: sqlite3.Connection) -> None:
 def inspect_storage_contract_version(db_path: str) -> int | None:
     """Read FactLane contract metadata from a disposable byte copy, never the live DB.
 
-    Copying the main/WAL/SHM trio before SQLite inspection keeps ordinary v0.1.6
+    Copying the main/WAL/SHM trio before SQLite inspection keeps ordinary v0.1.7
     launch from creating/checkpointing sidecars or otherwise mutating a v2 database.
     """
     canonical = os.path.realpath(os.path.abspath(db_path))
@@ -607,8 +626,26 @@ def _cleanup_new_lease_anchor(db_path: str, handle: Any, *, created: bool) -> No
         pass
 
 
-def _acquire_runtime_maintenance_lease(db_path: str) -> Any:
+def _acquire_runtime_maintenance_lease(db_path: str, *, owner_sid: str | None = None) -> Any:
     """Hold a shared lease while a normal runtime engine is attached to one DB."""
+    if os.name == "nt":
+        from .windows_maintenance import WindowsMaintenanceError, WindowsRuntimeDBLease
+
+        try:
+            if owner_sid is None:
+                return WindowsRuntimeDBLease.open(db_path)
+            return WindowsRuntimeDBLease.open(db_path, owner_sid=owner_sid)
+        except WindowsMaintenanceError as exc:
+            if exc.code == "MAINTENANCE_IN_PROGRESS":
+                raise AdapterError(
+                    "MAINTENANCE_IN_PROGRESS",
+                    "database maintenance is in progress; retry after maintenance completes",
+                ) from exc
+            raise AdapterError(
+                "BACKEND_UNAVAILABLE",
+                "database maintenance coordination is unavailable",
+            ) from exc
+
     try:
         import fcntl
     except ImportError:
@@ -659,6 +696,9 @@ def _acquire_runtime_maintenance_lease(db_path: str) -> Any:
 
 def _release_runtime_maintenance_lease(handle: Any) -> None:
     if handle is None:
+        return
+    if os.name == "nt":
+        handle.close()
         return
     try:
         import fcntl
@@ -792,10 +832,17 @@ _RECORD_COLUMNS = (
 class SQLiteVecEngine:
     """Small adapter-owned repository over the pinned SQLite-vec schema."""
 
-    def __init__(self, db_path: str, profile: EmbeddingProfile) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        profile: EmbeddingProfile,
+        *,
+        windows_owner_private: bool = False,
+    ) -> None:
         # Resolve aliases once so the lease and backend always open the same path.
         self.db_path = os.path.realpath(os.path.abspath(db_path))
         self.profile = profile
+        self.windows_owner_private = bool(windows_owner_private)
         self.storage: Any = None
         self.conn: sqlite3.Connection | None = None
         self.native_columns: set[str] = set()
@@ -834,25 +881,74 @@ class SQLiteVecEngine:
             raise AdapterError("ADMIN_OPERATION_DENIED", "external embedding providers are disabled")
         _assert_required_sqlite_pragma_environment()
         assert_supported_sqlite_runtime()
+        windows_owner_sid: str | None = None
+        windows_family_custody: Any = None
+        if os.name == "nt" and self._maintenance_capability is None and self.windows_owner_private:
+            from .windows_maintenance import (
+                WindowsMaintenanceError,
+                validate_windows_runtime_database_family,
+            )
+            from .windows_security import current_user_sid
+
+            try:
+                windows_owner_sid = current_user_sid()
+                validate_windows_runtime_database_family(self.db_path, owner_sid=windows_owner_sid)
+            except (WindowsMaintenanceError, OSError) as exc:
+                raise AdapterError(
+                    "BACKEND_UNAVAILABLE",
+                    "Windows database custody is unsafe for runtime open",
+                ) from exc
         existing_contract = inspect_storage_contract_version(self.db_path)
         if existing_contract == 2:
             raise AdapterError(
                 "MIGRATION_REQUIRED",
-                "storage contract v2 requires the explicit migrate-storage-v3 operator before v0.1.6 runtime can open it",
+                "storage contract v2 requires the explicit migrate-storage-v3 operator before v0.1.7 runtime can open it",
             )
         if existing_contract is not None and existing_contract != STORAGE_CONTRACT_VERSION:
-            raise AdapterError("SCHEMA_MISMATCH", "storage contract version is unsupported by v0.1.6")
+            raise AdapterError("SCHEMA_MISMATCH", "storage contract version is unsupported by v0.1.7")
+        # Native Windows runtime custody requires the database parent to exist
+        # before it can retain a safe directory/file handle. Match the existing
+        # first-open semantics on POSIX by creating only the parent directory
+        # before acquiring the platform maintenance lease.
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         if self._maintenance_capability is None:
-            self._maintenance_lease_handle = _acquire_runtime_maintenance_lease(self.db_path)
+            self._maintenance_lease_handle = _acquire_runtime_maintenance_lease(
+                self.db_path,
+                owner_sid=windows_owner_sid,
+            )
         else:
             _validate_maintenance_capability(self.db_path, self._maintenance_capability)
         try:
+            if os.name == "nt" and self._maintenance_capability is None and self.windows_owner_private:
+                from .windows_maintenance import WindowsRuntimeDBFamilyCustody
+
+                assert windows_owner_sid is not None
+                try:
+                    windows_family_custody = WindowsRuntimeDBFamilyCustody.acquire_existing(
+                        self.db_path,
+                        self._maintenance_lease_handle,
+                        owner_sid=windows_owner_sid,
+                    )
+                    leased_contract = inspect_storage_contract_version(self.db_path)
+                    if leased_contract != existing_contract:
+                        raise AdapterError(
+                            "BACKEND_UNAVAILABLE",
+                            "Windows database contract changed during runtime custody acquisition",
+                        )
+                    windows_family_custody.create_missing()
+                    windows_family_custody.revalidate()
+                except AdapterError:
+                    raise
+                except Exception as exc:
+                    raise AdapterError(
+                        "BACKEND_UNAVAILABLE",
+                        "Windows database family could not be secured for runtime open",
+                    ) from exc
             if self._maintenance_capability is None:
                 _assert_sensitive_recovery_interlock_clear(self.db_path)
             # Do not write MCP_* process environment here. The pinned backend
             # caches environment-backed config at import time; FactLane binds
             # the storage class and the behavior it uses explicitly below.
-            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             SqliteVecMemoryStorage = load_pinned_sqlite_vec_storage()
             storage = SqliteVecMemoryStorage(
                 self.db_path,
@@ -876,6 +972,18 @@ class SQLiteVecEngine:
             self.conn = storage.conn
             if self.conn is None:
                 raise AdapterError("BACKEND_UNAVAILABLE", "SQLite-vec backend did not expose a connection")
+            if windows_family_custody is not None:
+                try:
+                    windows_family_custody.revalidate()
+                    self._maintenance_lease_handle.revalidate()
+                except Exception as exc:
+                    raise AdapterError(
+                        "BACKEND_UNAVAILABLE",
+                        "Windows database family custody changed during SQLite initialization",
+                    ) from exc
+                finally:
+                    windows_family_custody.close()
+                    windows_family_custody = None
             _assert_required_sqlite_pragmas(self.conn)
             register_storage_v3_writer(self.conn)
             self.vector_dimension = await self._run(self._read_dimension)
@@ -898,6 +1006,9 @@ class SQLiteVecEngine:
         except Exception as exc:
             await self.close()
             raise AdapterError("BACKEND_UNAVAILABLE", "SQLite-vec backend could not be initialized") from exc
+        finally:
+            if windows_family_custody is not None:
+                windows_family_custody.close()
 
     async def _run(self, operation: Callable[..., Any], *args: Any) -> Any:
         if self.conn is None or self.storage is None:
@@ -1354,6 +1465,251 @@ class SQLiteVecEngine:
 
         return await self._run(query)
 
+    async def select_logical_export_records(
+        self,
+        scope: ScopeContext,
+        *,
+        lifecycle_states: Sequence[str],
+        max_records: int = MAX_LOGICAL_EXPORT_RECORDS,
+    ) -> list[dict[str, Any]]:
+        """Return one exact-scope, explicitly selected logical-export record set."""
+
+        if not isinstance(scope, ScopeContext):
+            raise AdapterError("INVALID_ENVELOPE", "logical export requires one exact ScopeContext")
+        exact_scope = validate_scope(
+            scope.scope,
+            scope.project_id,
+            scope.worktree_id,
+            scope.workflow_id,
+            scope.agent_id,
+        )
+        if exact_scope != scope:
+            raise AdapterError("CROSS_SCOPE_DENIED", "logical export scope identity is not exact")
+        if (
+            isinstance(lifecycle_states, (str, bytes, bytearray))
+            or not isinstance(lifecycle_states, Sequence)
+            or not lifecycle_states
+            or len(lifecycle_states) > len(LOGICAL_EXPORT_LIFECYCLE_STATES)
+        ):
+            raise AdapterError("INVALID_ENVELOPE", "logical export lifecycle selection is invalid or unbounded")
+
+        normalized_states: list[str] = []
+        for state in lifecycle_states:
+            if not isinstance(state, str) or state not in LOGICAL_EXPORT_LIFECYCLE_STATES:
+                raise AdapterError("INVALID_ENUM", "logical export lifecycle selection contains an unsupported state")
+            if state not in normalized_states:
+                normalized_states.append(state)
+        if isinstance(max_records, bool) or not isinstance(max_records, int) or not 1 <= max_records <= MAX_LOGICAL_EXPORT_RECORDS:
+            raise AdapterError(
+                "INVALID_ENVELOPE",
+                f"logical export max_records must be between 1 and {MAX_LOGICAL_EXPORT_RECORDS}",
+            )
+
+        where, params = self._scope_where(exact_scope)
+        selected_states = sorted(normalized_states)
+        marks = ",".join("?" for _ in selected_states)
+
+        def query() -> list[dict[str, Any]]:
+            assert self.conn is not None
+            rows = self.conn.execute(
+                self._select_sql(
+                    f"WHERE {where} AND a.lifecycle_state IN ({marks}) "
+                    "ORDER BY a.memory_id ASC, a.revision ASC, a.record_id ASC LIMIT ?"
+                ),
+                [*params, *selected_states, max_records + 1],
+            ).fetchall()
+            if len(rows) > max_records:
+                raise AdapterError(
+                    "LIMIT_EXCEEDED",
+                    f"logical export selection exceeds the {max_records} record limit",
+                )
+            return [self._row_to_dict(row) for row in rows]
+
+        return await self._run(query)
+
+    async def resolve_permanent_purge_targets(
+        self,
+        identities: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Resolve exact permanent-purge identities into bounded persisted target facts."""
+
+        if (
+            isinstance(identities, (str, bytes, bytearray))
+            or not isinstance(identities, Sequence)
+            or not 1 <= len(identities) <= MAX_PERMANENT_PURGE_TARGETS
+        ):
+            raise AdapterError(
+                "PURGE_TARGET_INVALID",
+                f"permanent purge requires 1 to {MAX_PERMANENT_PURGE_TARGETS} exact targets",
+            )
+
+        normalized: list[tuple[ScopeContext, str, str, int]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for raw in identities:
+            if not isinstance(raw, Mapping) or set(raw) != {"scope", "memory_id", "record_id", "revision"}:
+                raise AdapterError("PURGE_TARGET_INVALID", "permanent purge target identity is malformed")
+            scope = raw.get("scope")
+            if not isinstance(scope, ScopeContext):
+                raise AdapterError("PURGE_TARGET_INVALID", "permanent purge target requires one exact ScopeContext")
+            exact_scope = validate_scope(
+                scope.scope,
+                scope.project_id,
+                scope.worktree_id,
+                scope.workflow_id,
+                scope.agent_id,
+            )
+            if exact_scope != scope:
+                raise AdapterError("PURGE_TARGET_INVALID", "permanent purge target scope identity is not exact")
+            memory_id = validate_identifier(raw.get("memory_id"), "memory_id", required=True)
+            record_id = validate_identifier(raw.get("record_id"), "record_id", required=True)
+            revision = raw.get("revision")
+            if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+                raise AdapterError("PURGE_TARGET_INVALID", "permanent purge target revision is invalid")
+            assert memory_id is not None and record_id is not None
+            key = (
+                exact_scope.scope,
+                exact_scope.project_id,
+                exact_scope.worktree_id,
+                exact_scope.workflow_id,
+                exact_scope.agent_id,
+                memory_id,
+                record_id,
+                revision,
+            )
+            if key in seen:
+                raise AdapterError("PURGE_TARGET_INVALID", "permanent purge target set contains duplicates")
+            seen.add(key)
+            normalized.append((exact_scope, memory_id, record_id, revision))
+
+        def belief_refs_hash(content_hash: str) -> bool:
+            assert self.conn is not None
+            table = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='beliefs'"
+            ).fetchone()
+            if table is None:
+                return False
+            for row in self.conn.execute("SELECT derived_from, contradicted_by FROM beliefs").fetchall():
+                for raw in (row[0], row[1]):
+                    try:
+                        values = json.loads(raw or "[]")
+                    except json.JSONDecodeError:
+                        return True
+                    if not isinstance(values, list):
+                        return True
+                    for value in values:
+                        if (
+                            not isinstance(value, str)
+                            or len(value) != 64
+                            or any(character not in "0123456789abcdefABCDEF" for character in value)
+                        ):
+                            return True
+                    if content_hash in values:
+                        return True
+            return False
+
+        def query() -> list[dict[str, Any]]:
+            assert self.conn is not None
+            results: list[dict[str, Any]] = []
+            orphan_vectors: int | None = None
+            for scope, memory_id, record_id, revision in normalized:
+                row = self.conn.execute(
+                    self._select_sql("WHERE a.record_id=?"),
+                    (record_id,),
+                ).fetchone()
+                if row is None:
+                    raise AdapterError("PURGE_TARGET_DRIFT", "exact permanent purge target record is missing")
+                record = self._row_to_dict(row)
+                actual_scope = (
+                    record["scope"],
+                    record["project_id"],
+                    record["worktree_id"],
+                    record["workflow_id"],
+                    record["agent_id"],
+                )
+                requested_scope = (
+                    scope.scope,
+                    scope.project_id,
+                    scope.worktree_id,
+                    scope.workflow_id,
+                    scope.agent_id,
+                )
+                if (
+                    record["memory_id"] != memory_id
+                    or int(record["revision"]) != revision
+                    or actual_scope != requested_scope
+                ):
+                    raise AdapterError("PURGE_TARGET_DRIFT", "exact permanent purge target binding changed")
+                lifecycle = record["lifecycle_state"]
+                if lifecycle not in LOGICAL_EXPORT_LIFECYCLE_STATES:
+                    raise AdapterError("PURGE_TARGET_DRIFT", "permanent purge target lifecycle is unsupported")
+                content_hash = record["native_content_hash"]
+                if not isinstance(content_hash, str) or not content_hash:
+                    raise AdapterError("PURGE_TARGET_DRIFT", "permanent purge target native identity is malformed")
+
+                native_rows = self.conn.execute(
+                    "SELECT id, deleted_at FROM memories WHERE content_hash=?",
+                    (content_hash,),
+                ).fetchall()
+                if len(native_rows) > 1:
+                    raise AdapterError("PURGE_TARGET_AMBIGUOUS", "permanent purge native materialization is ambiguous")
+
+                if native_rows:
+                    native_id = int(native_rows[0][0])
+                    if native_rows[0][1] is not None:
+                        raise AdapterError(
+                            "PURGE_TARGET_MATERIALIZATION_UNSUPPORTED",
+                            "permanent purge target has unexpected deleted native materialization",
+                        )
+                    stores = [
+                        str(item[0])
+                        for item in self.conn.execute(
+                            "SELECT store FROM memory_embeddings WHERE rowid=? ORDER BY store",
+                            (native_id,),
+                        ).fetchall()
+                    ]
+                    if stores != [self.embedding_store_key] or belief_refs_hash(content_hash):
+                        raise AdapterError(
+                            "PURGE_TARGET_MATERIALIZATION_UNSUPPORTED",
+                            "permanent purge target has unsupported derived materialization",
+                        )
+                    materialization = _PURGE_PM1
+                    native_materialized = True
+                else:
+                    if orphan_vectors is None:
+                        orphan_vectors = int(
+                            self.conn.execute(
+                                "SELECT COUNT(*) FROM memory_embeddings e WHERE NOT EXISTS "
+                                "(SELECT 1 FROM memories m WHERE m.id=e.rowid)"
+                            ).fetchone()[0]
+                        )
+                    if orphan_vectors or belief_refs_hash(content_hash) or lifecycle != "HISTORICAL":
+                        raise AdapterError(
+                            "PURGE_TARGET_MATERIALIZATION_UNSUPPORTED",
+                            "permanent purge target has unsupported partial materialization",
+                        )
+                    materialization = _PURGE_PM0
+                    native_materialized = False
+
+                results.append(
+                    {
+                        "scope": scope.scope,
+                        "project_id": scope.project_id,
+                        "worktree_id": scope.worktree_id,
+                        "workflow_id": scope.workflow_id,
+                        "agent_id": scope.agent_id,
+                        "memory_id": memory_id,
+                        "record_id": record_id,
+                        "revision": revision,
+                        "lifecycle_state": lifecycle,
+                        "materialization_class": materialization,
+                        "native_materialized": native_materialized,
+                        "native_content_hash": content_hash,
+                    }
+                )
+            return results
+
+        return await self._run(query)
+
     async def memory_exists_outside_scope(self, memory_id: str, scope: ScopeContext) -> bool:
         where, params = self._scope_where(scope)
 
@@ -1602,6 +1958,103 @@ class SQLiteVecEngine:
     ) -> dict[str, Any] | None:
         return await self._run(self._operation_replay_sync, idempotency_key, request_fingerprint)
 
+    def _logical_import_replay_sync(
+        self,
+        idempotency_key: str,
+        operation_id: str,
+        request_fingerprint: str | None = None,
+    ) -> dict[str, Any] | None:
+        assert self.conn is not None
+        operation = self._operation_row_sync(idempotency_key)
+        if operation is not None:
+            if operation["replay_status"] == "RECOVERY_INVALIDATED":
+                raise AdapterError(
+                    "RECOVERY_INVALIDATED_REPLAY",
+                    "logical import replay was invalidated by sensitive Recovery",
+                )
+            if (
+                operation["operation_kind"] != "LOGICAL_IMPORT"
+                or operation["operation_id"] != operation_id
+                or (
+                    request_fingerprint is not None
+                    and operation["request_fingerprint"] != request_fingerprint
+                )
+            ):
+                raise AdapterError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "logical import idempotency key is bound to another governed operation",
+                )
+            return self._operation_result(operation, replay=True)
+
+        columns = ",".join(_LIFECYCLE_OPERATION_COLUMNS)
+        row = self.conn.execute(
+            f"SELECT {columns} FROM lifecycle_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if row is not None:
+            existing = dict(zip(_LIFECYCLE_OPERATION_COLUMNS, row, strict=True))
+            if existing["replay_status"] == "RECOVERY_INVALIDATED":
+                raise AdapterError(
+                    "RECOVERY_INVALIDATED_REPLAY",
+                    "logical import replay was invalidated by sensitive Recovery",
+                )
+            if (
+                existing["idempotency_key"] != idempotency_key
+                or existing["operation_kind"] != "LOGICAL_IMPORT"
+                or (
+                    request_fingerprint is not None
+                    and existing["request_fingerprint"] != request_fingerprint
+                )
+            ):
+                raise AdapterError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "logical import operation identity is already bound to another governed operation",
+                )
+            return self._operation_result(existing, replay=True)
+
+        if self.conn.execute(
+            "SELECT 1 FROM adapter_records WHERE idempotency_key=? LIMIT 1",
+            (idempotency_key,),
+        ).fetchone():
+            raise AdapterError(
+                "IDEMPOTENCY_CONFLICT",
+                "logical import idempotency key is already reserved by another write",
+            )
+        return None
+
+    async def logical_import_replay(
+        self,
+        idempotency_key: str,
+        operation_id: str,
+    ) -> dict[str, Any] | None:
+        """Return an exact logical-import replay before any new embedding work."""
+
+        return await self._run(self._logical_import_replay_sync, idempotency_key, operation_id)
+
+    def _logical_import_receipt_sync(self, operation_id: str) -> dict[str, Any] | None:
+        assert self.conn is not None
+        columns = ",".join(_LIFECYCLE_OPERATION_COLUMNS)
+        row = self.conn.execute(
+            f"SELECT {columns} FROM lifecycle_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        operation = dict(zip(_LIFECYCLE_OPERATION_COLUMNS, row, strict=True))
+        if operation["operation_kind"] != "LOGICAL_IMPORT":
+            return None
+        if operation["replay_status"] == "RECOVERY_INVALIDATED":
+            raise AdapterError(
+                "RECOVERY_INVALIDATED_REPLAY",
+                "logical import evidence receipt was invalidated by sensitive Recovery",
+            )
+        return self._operation_result(operation, replay=False)
+
+    async def logical_import_receipt(self, operation_id: str) -> dict[str, Any] | None:
+        """Read one durable LOGICAL_IMPORT receipt without mutating storage."""
+
+        return await self._run(self._logical_import_receipt_sync, operation_id)
+
     @staticmethod
     def _operation_result(operation: dict[str, Any], *, replay: bool) -> dict[str, Any]:
         if operation["operation_kind"] == "MANUAL_RECHECK" and operation["replay_status"] == "BLOCKED":
@@ -1685,6 +2138,59 @@ class SQLiteVecEngine:
                 "resulting_group_token": operation["result_group_token"],
             }
             return result
+        if operation["operation_kind"] == "LOGICAL_IMPORT":
+            affected = json.loads(operation["affected_members_json"] or "[]")
+            if not isinstance(affected, list) or any(not isinstance(item, dict) for item in affected):
+                raise AdapterError("STORAGE_INTEGRITY", "logical import evidence receipt is malformed")
+            for item in affected:
+                if (
+                    item.get("evidence_class") != "NON_AUTHORITATIVE_SOURCE_RECORD"
+                    or item.get("authority_effect") != "NONE"
+                    or not isinstance(item.get("source_record"), dict)
+                    or item.get("status") not in {"ADMITTED", "EXACT_DUPLICATE", "EQUIVALENT", "HISTORY_ONLY"}
+                ):
+                    raise AdapterError("STORAGE_INTEGRITY", "logical import evidence receipt is malformed")
+                if item["status"] == "HISTORY_ONLY" and any(
+                    item.get(field) is not None
+                    for field in (
+                        "destination_memory_id",
+                        "destination_record_id",
+                        "destination_lifecycle_state",
+                        "destination_verified_by",
+                        "destination_authority_role",
+                    )
+                ):
+                    raise AdapterError("STORAGE_INTEGRITY", "logical import history evidence gained destination authority")
+            event_ids = json.loads(operation["event_ids_json"] or "[]")
+            active_evidence = [item for item in affected if item["status"] != "HISTORY_ONLY"]
+            external_history = [item for item in affected if item["status"] == "HISTORY_ONLY"]
+            return {
+                "status": "OK",
+                "action": "LOGICAL_IMPORT",
+                "operation_id": operation["operation_id"],
+                "request_id": operation["request_id"],
+                "idempotency_key": operation["idempotency_key"],
+                "idempotent_replay": replay,
+                "evidence_policy": "NON_AUTHORITATIVE_IMPORT_EVIDENCE",
+                "admitted": sum(item.get("status") == "ADMITTED" for item in active_evidence),
+                "duplicates": sum(
+                    item.get("status") in {"EXACT_DUPLICATE", "EQUIVALENT"}
+                    for item in active_evidence
+                ),
+                "contradictions": sum(
+                    item.get("status") == "ADMITTED"
+                    and item.get("contradiction_state") == "UNRESOLVED"
+                    for item in active_evidence
+                ),
+                "results": active_evidence,
+                "source_evidence": affected,
+                "active_source_evidence": active_evidence,
+                "active_source_evidence_count": len(active_evidence),
+                "external_history": external_history,
+                "external_history_count": len(external_history),
+                "event_ids": event_ids,
+                "committed_at": operation["commit_timestamp"],
+            }
         return {
             "status": "OK",
             "action": operation["operation_kind"],
@@ -3048,6 +3554,365 @@ class SQLiteVecEngine:
             (cursor.lastrowid, serialize_float32(embedding), self.embedding_store_key),
         )
 
+    async def write_logical_import_candidate_batch(
+        self,
+        records: list[dict[str, Any]],
+        embeddings: list[list[float]],
+        *,
+        source_evidence: list[dict[str, Any]],
+        idempotency_key: str,
+        request_fingerprint: str,
+        operation_id: str,
+        request_id: str,
+        scope_identity_digest: str,
+        actor_class: str,
+        actor_ref_digest: str | None,
+        grant_ref_digest: str,
+        committed_at: str,
+    ) -> dict[str, Any]:
+        """Atomically admit one governed batch of root Candidate records.
+
+        Records are prepared by MemoryAdapter. This storage boundary revalidates the
+        critical Candidate/scope/vector invariants and rechecks duplicate and
+        contradiction state while one BEGIN IMMEDIATE transaction excludes competing
+        writers. One lifecycle_operations row is the durable replay receipt.
+        """
+
+        self.require_embedding_compatibility()
+        if not records or len(records) != len(embeddings) or len(records) > 1000:
+            raise AdapterError("INVALID_ENVELOPE", "Candidate batch shape is invalid")
+        if not isinstance(source_evidence, list) or not source_evidence or len(source_evidence) > 1000:
+            raise AdapterError("INVALID_ENVELOPE", "logical import source evidence shape is invalid")
+
+        def transaction() -> dict[str, Any]:
+            assert self.conn is not None
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                replay = self._logical_import_replay_sync(
+                    idempotency_key,
+                    operation_id,
+                    request_fingerprint,
+                )
+                if replay is not None:
+                    self.conn.rollback()
+                    return replay
+
+                self._sample_trust_clock_sync(iso_now())
+                self._sample_trust_clock_sync(committed_at)
+
+                evidence_by_source: dict[str, dict[str, Any]] = {}
+                evidence_order: list[str] = []
+                active_evidence_ids: set[str] = set()
+                for member in source_evidence:
+                    if not isinstance(member, dict) or set(member) != {
+                        "evidence_class",
+                        "authority_effect",
+                        "source_record",
+                        "source_claim_digest",
+                    }:
+                        raise AdapterError("INVALID_ENVELOPE", "logical import source evidence member is invalid")
+                    if (
+                        member.get("evidence_class") != "NON_AUTHORITATIVE_SOURCE_RECORD"
+                        or member.get("authority_effect") != "NONE"
+                    ):
+                        raise AdapterError("INVALID_ENVELOPE", "logical import evidence cannot claim authority")
+                    source_record = member.get("source_record")
+                    if not isinstance(source_record, dict):
+                        raise AdapterError("INVALID_ENVELOPE", "logical import source evidence record is invalid")
+                    source_record_id = source_record.get("source_record_id")
+                    active = source_record.get("active")
+                    if not isinstance(source_record_id, str) or not isinstance(active, bool):
+                        raise AdapterError("INVALID_ENVELOPE", "logical import source evidence identity is invalid")
+                    if member.get("source_claim_digest") != digest(source_record):
+                        raise AdapterError("INVALID_ENVELOPE", "logical import source evidence digest is invalid")
+                    if source_record_id in evidence_by_source:
+                        raise AdapterError("INVALID_ENVELOPE", "logical import source evidence identity is duplicated")
+                    evidence_by_source[source_record_id] = member
+                    evidence_order.append(source_record_id)
+                    if active:
+                        active_evidence_ids.add(source_record_id)
+
+                seen_record_ids: set[str] = set()
+                seen_memory_ids: set[str] = set()
+                seen_idempotency_keys: set[str] = set()
+                record_source_ids: set[str] = set()
+                checked: list[tuple[dict[str, Any], list[float], ScopeContext]] = []
+                for record, embedding in zip(records, embeddings, strict=True):
+                    scope = validate_scope(
+                        record.get("scope"),
+                        record.get("project_id"),
+                        record.get("worktree_id"),
+                        record.get("workflow_id"),
+                        record.get("agent_id"),
+                    )
+                    if (
+                        record.get("lifecycle_state") != "CANDIDATE"
+                        or record.get("verified_by") != "UNVERIFIED"
+                        or record.get("authority_role") != "UNRESOLVED"
+                        or record.get("last_verified_at") is not None
+                    ):
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "logical import batch accepts only CANDIDATE/UNVERIFIED records",
+                        )
+                    if (
+                        record.get("revision") != 1
+                        or record.get("parent_record_id") is not None
+                        or record.get("supersedes") != []
+                    ):
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "logical import Candidate must have a root lineage shape",
+                        )
+                    _validate_cross_project_storage_semantics(record)
+                    if record.get("native_content_hash") != native_hash(scope, str(record.get("fact", ""))):
+                        raise AdapterError(
+                            "SEMANTIC_IDENTITY_MISMATCH",
+                            "logical import Candidate native identity does not match exact scope and fact",
+                        )
+                    if record.get("embedding_profile_id") != self.profile.profile_id:
+                        raise AdapterError("PROFILE_MISMATCH", "logical import embedding profile changed before commit")
+                    if record.get("embedding_model_digest") != self.profile.model_digest:
+                        raise AdapterError("PROFILE_MISMATCH", "logical import embedding model digest changed before commit")
+                    if record.get("embedding_output_dimension") != self.profile.output_dimension:
+                        raise AdapterError("PROFILE_MISMATCH", "logical import embedding dimension changed before commit")
+                    finite_vector(embedding)
+                    if len(embedding) != self.profile.output_dimension:
+                        raise AdapterError("PROFILE_MISMATCH", "logical import vector dimension does not match profile")
+
+                    record_id = str(record.get("record_id"))
+                    memory_id = str(record.get("memory_id"))
+                    record_key = str(record.get("idempotency_key"))
+                    source_record_id = record.get("import_source_record_id")
+                    if not isinstance(source_record_id, str) or source_record_id in record_source_ids:
+                        raise AdapterError("INVALID_ENVELOPE", "logical import Candidate source identity is invalid")
+                    evidence_member = evidence_by_source.get(source_record_id)
+                    if (
+                        evidence_member is None
+                        or evidence_member.get("source_claim_digest") != record.get("external_source_claim_digest")
+                    ):
+                        raise AdapterError(
+                            "INVALID_ENVELOPE",
+                            "logical import Candidate is not bound to its source evidence",
+                        )
+                    record_source_ids.add(source_record_id)
+                    if record_id in seen_record_ids or memory_id in seen_memory_ids or record_key in seen_idempotency_keys:
+                        raise AdapterError("INVALID_ENVELOPE", "logical import batch contains duplicate generated identities")
+                    if record_key == idempotency_key:
+                        raise AdapterError("IDEMPOTENCY_CONFLICT", "record idempotency key cannot equal batch identity")
+                    seen_record_ids.add(record_id)
+                    seen_memory_ids.add(memory_id)
+                    seen_idempotency_keys.add(record_key)
+                    if self._idempotency_owner_sync(record_key) is not None:
+                        raise AdapterError(
+                            "IDEMPOTENCY_CONFLICT",
+                            "logical import record idempotency key is already globally reserved",
+                        )
+                    checked.append((record, embedding, scope))
+
+                if record_source_ids != active_evidence_ids:
+                    raise AdapterError(
+                        "INVALID_ENVELOPE",
+                        "logical import active source evidence does not match Candidate admissions",
+                    )
+
+                outcomes_by_source: dict[str, dict[str, Any]] = {}
+                touched_groups: dict[tuple[str, str], tuple[ScopeContext, str]] = {}
+                for record, embedding, scope in checked:
+                    exact_row = self.conn.execute(
+                        self._select_sql(
+                            "WHERE a.native_content_hash=? ORDER BY a.revision DESC LIMIT 1"
+                        ),
+                        (record["native_content_hash"],),
+                    ).fetchone()
+                    if exact_row is not None:
+                        exact = self._row_to_dict(exact_row)
+                        source_id = record["import_source_record_id"]
+                        outcomes_by_source[source_id] = {
+                            "source_record_id": source_id,
+                            "source_claim_digest": record["external_source_claim_digest"],
+                            "status": "EXACT_DUPLICATE",
+                            "scope": scope.to_dict(),
+                            "memory_id": exact["memory_id"],
+                            "record_id": exact["record_id"],
+                            "destination_memory_id": exact["memory_id"],
+                            "destination_record_id": exact["record_id"],
+                            "destination_lifecycle_state": exact["lifecycle_state"],
+                            "destination_verified_by": exact["verified_by"],
+                            "destination_authority_role": exact["authority_role"],
+                            "contradiction_state": exact["contradiction_state"],
+                        }
+                        continue
+
+                    where, params = self._scope_where(scope)
+                    marks = ",".join("?" for _ in _GOVERNANCE_ACTIVE_STATES)
+                    active_rows = [
+                        self._row_to_dict(row)
+                        for row in self.conn.execute(
+                            self._select_sql(
+                                f"WHERE a.contradiction_key=? AND {where} "
+                                f"AND a.lifecycle_state IN ({marks}) ORDER BY a.created_at,a.record_id"
+                            ),
+                            [record["contradiction_key"], *params, *sorted(_GOVERNANCE_ACTIVE_STATES)],
+                        ).fetchall()
+                    ]
+                    normalized_fact = self._normalized_fact(record["fact"])
+                    equivalent = next(
+                        (
+                            row
+                            for row in active_rows
+                            if self._normalized_fact(row["fact"]) == normalized_fact
+                        ),
+                        None,
+                    )
+                    if equivalent is not None:
+                        source_id = record["import_source_record_id"]
+                        outcomes_by_source[source_id] = {
+                            "source_record_id": source_id,
+                            "source_claim_digest": record["external_source_claim_digest"],
+                            "status": "EQUIVALENT",
+                            "scope": scope.to_dict(),
+                            "memory_id": equivalent["memory_id"],
+                            "record_id": equivalent["record_id"],
+                            "destination_memory_id": equivalent["memory_id"],
+                            "destination_record_id": equivalent["record_id"],
+                            "destination_lifecycle_state": equivalent["lifecycle_state"],
+                            "destination_verified_by": equivalent["verified_by"],
+                            "destination_authority_role": equivalent["authority_role"],
+                            "contradiction_state": equivalent["contradiction_state"],
+                        }
+                        continue
+
+                    incoming = dict(record)
+                    incoming["contradiction_state"] = (
+                        "UNRESOLVED"
+                        if any(self._normalized_fact(row["fact"]) != normalized_fact for row in active_rows)
+                        else "NONE"
+                    )
+                    self._insert_materialized_record(incoming, embedding)
+                    touched_groups[(scope.key(), incoming["contradiction_key"])] = (
+                        scope,
+                        incoming["contradiction_key"],
+                    )
+                    source_id = incoming["import_source_record_id"]
+                    outcomes_by_source[source_id] = {
+                        "source_record_id": source_id,
+                        "source_claim_digest": incoming["external_source_claim_digest"],
+                        "status": "ADMITTED",
+                        "scope": scope.to_dict(),
+                        "memory_id": incoming["memory_id"],
+                        "record_id": incoming["record_id"],
+                        "destination_memory_id": incoming["memory_id"],
+                        "destination_record_id": incoming["record_id"],
+                        "destination_lifecycle_state": "CANDIDATE",
+                        "destination_verified_by": "UNVERIFIED",
+                        "destination_authority_role": "UNRESOLVED",
+                        "contradiction_state": incoming["contradiction_state"],
+                    }
+
+                event_ids: list[str] = []
+                for scope, contradiction_key in touched_groups.values():
+                    _, group_events = self._recompute_candidate_contradictions_sync(
+                        scope,
+                        contradiction_key,
+                        operation_id=operation_id,
+                        actor_class=actor_class,
+                        actor_ref_digest=actor_ref_digest,
+                        grant_ref_digest=grant_ref_digest,
+                        occurred_at=committed_at,
+                    )
+                    event_ids.extend(group_events)
+
+                for outcome in outcomes_by_source.values():
+                    if outcome["status"] != "ADMITTED":
+                        continue
+                    row = self.conn.execute(
+                        "SELECT contradiction_state FROM adapter_records WHERE record_id=?",
+                        (outcome["destination_record_id"],),
+                    ).fetchone()
+                    if row is None:
+                        raise AdapterError("STORAGE_INTEGRITY", "logical import Candidate disappeared before commit")
+                    outcome["contradiction_state"] = str(row[0])
+
+                receipt_members: list[dict[str, Any]] = []
+                for source_id in evidence_order:
+                    evidence = evidence_by_source[source_id]
+                    outcome = outcomes_by_source.get(source_id)
+                    if outcome is not None:
+                        receipt_members.append({**evidence, **outcome})
+                        continue
+                    source_record = evidence["source_record"]
+                    if source_record.get("active") is True:
+                        raise AdapterError(
+                            "STORAGE_INTEGRITY",
+                            "active logical import source evidence has no Candidate outcome",
+                        )
+                    receipt_members.append(
+                        {
+                            **evidence,
+                            "source_record_id": source_id,
+                            "status": "HISTORY_ONLY",
+                            "scope": source_record.get("scope"),
+                            "memory_id": None,
+                            "record_id": None,
+                            "destination_memory_id": None,
+                            "destination_record_id": None,
+                            "destination_lifecycle_state": None,
+                            "destination_verified_by": None,
+                            "destination_authority_role": None,
+                            "contradiction_state": None,
+                        }
+                    )
+
+                result_outcome = (
+                    "ADMITTED"
+                    if any(item["status"] == "ADMITTED" for item in outcomes_by_source.values())
+                    else "NO_NEW"
+                )
+                self.conn.execute(
+                    "INSERT INTO lifecycle_operations("
+                    "idempotency_key,request_fingerprint,operation_id,request_id,operation_kind,actor_class,"
+                    "actor_ref_digest,grant_ref_digest,scope_digest,result_outcome,affected_members_json,event_ids_json,"
+                    "result_group_count,replay_status,commit_timestamp"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        idempotency_key,
+                        request_fingerprint,
+                        operation_id,
+                        request_id,
+                        "LOGICAL_IMPORT",
+                        actor_class,
+                        actor_ref_digest,
+                        grant_ref_digest,
+                        scope_identity_digest,
+                        result_outcome,
+                        canonical_json(receipt_members),
+                        canonical_json(event_ids),
+                        len(receipt_members),
+                        "COMMITTED",
+                        committed_at,
+                    ),
+                )
+                operation = self._operation_row_sync(idempotency_key)
+                if operation is None:
+                    raise AdapterError("STORAGE_INTEGRITY", "logical import receipt was not persisted")
+                self.conn.commit()
+                return self._operation_result(operation, replay=False)
+            except sqlite3.IntegrityError as exc:
+                self.conn.rollback()
+                message = str(exc)
+                if "FACTLANE_GLOBAL_IDEMPOTENCY_CONFLICT" in message:
+                    raise AdapterError(
+                        "IDEMPOTENCY_CONFLICT",
+                        "logical import identity collided with another governed write",
+                    ) from None
+                raise
+            except BaseException:
+                self.conn.rollback()
+                raise
+
+        return await self._run(transaction)
+
     async def write_record(
         self,
         record: dict[str, Any],
@@ -3511,6 +4376,8 @@ class SQLiteVecEngine:
         *,
         max_records: int,
         required_free_bytes: int,
+        progress_callback: Callable[[int, int], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Compact a bounded set of eligible superseded records under pressure."""
         if isinstance(max_records, bool) or not isinstance(max_records, int) or max_records < 1:
@@ -3619,9 +4486,17 @@ class SQLiteVecEngine:
             )
 
         compacted = 0
+        cancelled = False
+        if progress_callback is not None:
+            progress_callback(compacted, len(selected))
         for record_id in selected:
+            if cancel_requested is not None and cancel_requested():
+                cancelled = True
+                break
             if await self.compact_superseded_record(record_id):
                 compacted += 1
+            if progress_callback is not None:
+                progress_callback(compacted, len(selected))
 
         after = await self.status(scope)
         after_health = await self._housekeeping_health(scope)
@@ -3630,6 +4505,16 @@ class SQLiteVecEngine:
                 "BLOCKED_POST_MAINTENANCE_HEALTH",
                 "REPAIR_POST_MAINTENANCE_HEALTH_BEFORE_MEMORY_MUTATION",
                 mutation="BOUNDED_COMPACTION",
+                selected_records=len(selected),
+                compacted_records=compacted,
+                after=after,
+                health_after=after_health,
+            )
+        if cancelled:
+            return report(
+                "HOUSEKEEPING_CANCELLED",
+                "REVIEW_REMAINING_ELIGIBLE_RECORDS_BEFORE_RETRY",
+                mutation="BOUNDED_COMPACTION" if compacted else "NONE",
                 selected_records=len(selected),
                 compacted_records=compacted,
                 after=after,

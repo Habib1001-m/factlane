@@ -5,11 +5,11 @@ description: Use when an agent needs to search, read, store, or update bounded F
 
 # Using FactLane
 
-FactLane stores bounded provenance-bearing facts, not transcripts. Memory is **supporting evidence**, never execution authority. Current user instructions, live repository/product truth, and verified live sources can outrank remembered facts.
+FactLane stores bounded provenance-bearing facts, not transcripts. Memory is **supporting evidence**, never authority. Current instructions and verified live truth outrank remembered facts.
 
 The public MCP surface is exactly five tools over stdio. Inspect the live MCP schema or `factlane --help-tools` for exact fields and enums; never guess a contract from examples.
 
-For host/bootstrap evidence, read `references/host-bootstrap.md`.
+Packaged Skill bootstrap: `references/host-bootstrap.md`; site: Quick Start.
 
 ## Decide whether memory is needed
 
@@ -42,16 +42,18 @@ Never derive or claim `authority_role`.
 
 For `CROSS_PROJECT_WORKFLOW`, follow the live freshness schema exactly. Do not invent identity or fingerprint fields.
 
-A trusted verifier may use `memory_update` with the current `expected_revision`/identity and a unique idempotency key for `REVERIFY` or `REPLACE`. Candidate promotion requires `REVERIFY` plus the exact `expected_record_id` for the Candidate.
+A trusted verifier may use `memory_update` with current `expected_revision` and a unique idempotency key for `REVERIFY` or `REPLACE`. Candidate promotion requires `REVERIFY` plus exact `expected_record_id`; `REPLACE` targets eligible Current memory, not Candidate editing.
 
 Direct Owner authority may additionally:
 
 - `REVOKE` an eligible Current record;
 - `REJECT` a Candidate.
 
-Those lifecycle actions require the exact current record/group state and an allowed reason. Do not attempt Owner lifecycle actions from a delegated-agent session.
+Those lifecycle actions require the exact current `expected_record_id`, `expected_revision`, displayed `observed_group_token`, and an allowed `reason_code`. Do not attempt Owner lifecycle actions from a delegated-agent session.
 
 `REVOKED` and `REJECTED` are logical states, not physical erasure.
+
+Managed-panel database/restore/purge boundaries are in Quick Start; they do not make the general `SensitiveMemoryRecoveryOperator` a Windows capability.
 
 ## Respect freshness and readmission boundaries
 
@@ -63,4 +65,4 @@ Readmission of eligible `REVOKED` memory is another separate Owner operation wit
 
 Keep each fact bounded, scoped, attributable, and useful across sessions. Recheck the current source of truth before relying on mutable memory.
 
-For installation, release identity, host configuration, Skill registration, and first-run evidence, use `references/host-bootstrap.md` plus the repository Quick Start and Release operations. Do not hard-code or guess a release tag.
+For install/release/host evidence, use packaged `references/host-bootstrap.md`; on the site use Quick Start and Release operations. Never guess release tags.

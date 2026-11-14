@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import re
 import sqlite3
 import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -16,7 +18,7 @@ try:
 except ImportError:  # Windows: sensitive-memory recovery maintenance is POSIX-only.
     _fcntl = None
 
-from .contract import PUBLIC_TOOL_NAMES, AdapterError, canonical_json, iso_now, parse_iso
+from .contract import PUBLIC_TOOL_NAMES, AdapterError, ScopeContext, canonical_json, iso_now, parse_iso
 from .embedding_compatibility import parse_embedding_profile_metadata
 from .embeddings import EmbeddingProfile
 from .storage import (
@@ -48,13 +50,15 @@ _PUBLIC_TOOLS = (
 _RECOVERY_SENTINEL = "[purged-sensitive-memory]"
 _LOGICAL_PURGE_IN_PROGRESS = "S1_LOGICAL_PURGE_IN_PROGRESS"
 _SEALING_INCOMPLETE = "S1_LOGICAL_PURGE_COMMITTED_SEALING_INCOMPLETE"
+_ACTIVATION_READY = "S1_LOCAL_FACTLANE_ACTIVATION_READY"
 _LOCAL_PURGE_VERIFIED = "S1_LOCAL_FACTLANE_PURGE_VERIFIED"
 _RETAINED_MAINTENANCE_EXCLUSIONS: dict[str, list[Any]] = {}
 _STATE_PHASE_RANK = {
     "PREPARED_NO_MUTATION": 0,
     _LOGICAL_PURGE_IN_PROGRESS: 1,
     _SEALING_INCOMPLETE: 2,
-    _LOCAL_PURGE_VERIFIED: 3,
+    _ACTIVATION_READY: 3,
+    _LOCAL_PURGE_VERIFIED: 4,
 }
 _KNOWN_RECOVERY_TABLES = {
     "adapter_meta", "adapter_records", "beliefs", "memories",
@@ -72,6 +76,19 @@ PM3 = "PM3_NATIVE_MISSING_VECTOR_ORPHAN_PRESENT"
 PM4 = "PM4_NATIVE_MISSING_NO_VECTOR_ATTRIBUTABLE"
 PM5 = "PM5_UNEXPECTED_DERIVED_STATE"
 _MATERIALIZATION_CLASSES = {PM0, PM1, PM2, PM3, PM4, PM5}
+_PERMANENT_PURGE_IDENTITY_FIELDS = frozenset(
+    {
+        "scope",
+        "project_id",
+        "worktree_id",
+        "workflow_id",
+        "agent_id",
+        "memory_id",
+        "record_id",
+        "revision",
+    }
+)
+_MAX_PERMANENT_PURGE_TARGETS = 50
 
 
 class RecoveryHold(RuntimeError):
@@ -123,6 +140,201 @@ class RecoveryTarget:
             raise ValueError("PM1 requires expected_native_hash")
 
 
+async def resolve_permanent_purge_targets_exclusive(
+    *,
+    operation_id: str,
+    db_path: str,
+    profile: EmbeddingProfile,
+    identities: Sequence[Mapping[str, Any]],
+) -> tuple[RecoveryTarget, ...]:
+    """Resolve exact purge targets under a short-lived exclusive maintenance lease.
+
+    This is the post-close stale-preview resolver. It intentionally reuses the
+    governed storage selector rather than duplicating target/materialization SQL
+    in OwnerDestructive.
+    """
+
+    if not isinstance(operation_id, str) or _SAFE_OPERATION_RE.fullmatch(operation_id) is None:
+        raise ValueError("operation_id must be a bounded non-secret operator identifier")
+    if not isinstance(db_path, str) or not db_path:
+        raise ValueError("db_path is required")
+    if not isinstance(profile, EmbeddingProfile):
+        raise TypeError("profile must be an EmbeddingProfile")
+    if (
+        isinstance(identities, (str, bytes, bytearray))
+        or not isinstance(identities, Sequence)
+        or not 1 <= len(identities) <= _MAX_PERMANENT_PURGE_TARGETS
+    ):
+        raise ValueError(f"permanent purge requires 1 to {_MAX_PERMANENT_PURGE_TARGETS} exact targets")
+
+    storage_identities: list[dict[str, Any]] = []
+    expected_keys: list[tuple[Any, ...]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for raw in identities:
+        if not isinstance(raw, Mapping) or set(raw) != _PERMANENT_PURGE_IDENTITY_FIELDS:
+            raise ValueError("permanent purge identity mapping is malformed")
+        revision = raw.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ValueError("permanent purge identity revision is invalid")
+        scope = RecoveryScope(
+            raw.get("scope"),
+            project_id=raw.get("project_id"),
+            worktree_id=raw.get("worktree_id"),
+            workflow_id=raw.get("workflow_id"),
+            agent_id=raw.get("agent_id"),
+        )
+        key = (
+            *scope.tuple(),
+            raw.get("memory_id"),
+            raw.get("record_id"),
+            revision,
+        )
+        if key in seen:
+            raise ValueError("permanent purge identity set contains duplicates")
+        seen.add(key)
+        expected_keys.append(key)
+        storage_identities.append(
+            {
+                "scope": ScopeContext(
+                    scope.scope,
+                    project_id=scope.project_id,
+                    worktree_id=scope.worktree_id,
+                    workflow_id=scope.workflow_id,
+                    agent_id=scope.agent_id,
+                ),
+                "memory_id": raw.get("memory_id"),
+                "record_id": raw.get("record_id"),
+                "revision": revision,
+            }
+        )
+
+    canonical_db_path = os.path.realpath(os.path.abspath(db_path))
+    with MaintenanceLease(canonical_db_path, operation_id) as maintenance_lease:
+        capability = maintenance_lease.capability
+        if capability is None:
+            raise RecoveryHold(
+                "HOLD_NONQUIESCENT_NO_MUTATION",
+                "exclusive purge target resolution did not obtain a maintenance capability",
+            )
+        engine = SQLiteVecEngine._for_maintenance(canonical_db_path, profile, capability)
+        try:
+            await engine.open()
+        except RecoveryHold:
+            maintenance_lease.retain_fail_closed()
+            raise
+        except BaseException as exc:
+            maintenance_lease.retain_fail_closed()
+            raise RecoveryHold(
+                "HOLD_PURGE_TARGET_RESOLUTION_NO_MUTATION",
+                "exclusive purge target resolver could not open the governed database",
+            ) from exc
+        try:
+            try:
+                resolved_rows = await engine.resolve_permanent_purge_targets(storage_identities)
+            except AdapterError as exc:
+                code = {
+                    "PURGE_TARGET_DRIFT": "HOLD_TARGET_DRIFT_NO_MUTATION",
+                    "PURGE_TARGET_MATERIALIZATION_UNSUPPORTED": "HOLD_PARTIAL_MATERIALIZATION_NO_MUTATION",
+                    "PURGE_TARGET_AMBIGUOUS": "HOLD_UNEXPECTED_DERIVED_STATE_NO_MUTATION",
+                    "PURGE_TARGET_INVALID": "HOLD_TARGET_DRIFT_NO_MUTATION",
+                }.get(exc.code, "HOLD_PURGE_TARGET_RESOLUTION_NO_MUTATION")
+                raise RecoveryHold(code, "exclusive purge target resolution failed closed") from exc
+
+            if len(resolved_rows) != len(storage_identities):
+                raise RecoveryHold(
+                    "HOLD_TARGET_DRIFT_NO_MUTATION",
+                    "exclusive purge target resolver returned an incomplete target set",
+                )
+            targets: list[RecoveryTarget] = []
+            expected_result_fields = {
+                "scope",
+                "project_id",
+                "worktree_id",
+                "workflow_id",
+                "agent_id",
+                "memory_id",
+                "record_id",
+                "revision",
+                "lifecycle_state",
+                "materialization_class",
+                "native_materialized",
+                "native_content_hash",
+            }
+            for expected, row in zip(expected_keys, resolved_rows, strict=True):
+                if not isinstance(row, Mapping) or set(row) != expected_result_fields:
+                    raise RecoveryHold(
+                        "HOLD_TARGET_DRIFT_NO_MUTATION",
+                        "exclusive purge target resolver returned an invalid governed mapping",
+                    )
+                actual_key = (
+                    row["scope"],
+                    row["project_id"],
+                    row["worktree_id"],
+                    row["workflow_id"],
+                    row["agent_id"],
+                    row["memory_id"],
+                    row["record_id"],
+                    row["revision"],
+                )
+                if actual_key != expected:
+                    raise RecoveryHold(
+                        "HOLD_TARGET_DRIFT_NO_MUTATION",
+                        "exclusive purge target resolver changed exact target identity or ordering",
+                    )
+                materialization = row["materialization_class"]
+                native_materialized = row["native_materialized"]
+                if (
+                    materialization == PM1
+                    and native_materialized is not True
+                ) or (
+                    materialization == PM0
+                    and native_materialized is not False
+                ) or materialization not in {PM0, PM1}:
+                    raise RecoveryHold(
+                        "HOLD_PARTIAL_MATERIALIZATION_NO_MUTATION",
+                        "exclusive purge target materialization is unsupported",
+                    )
+                native_hash = row["native_content_hash"]
+                if not isinstance(native_hash, str) or not native_hash:
+                    raise RecoveryHold(
+                        "HOLD_TARGET_DRIFT_NO_MUTATION",
+                        "exclusive purge target native identity is invalid",
+                    )
+                lifecycle = row["lifecycle_state"]
+                if not isinstance(lifecycle, str) or not lifecycle:
+                    raise RecoveryHold(
+                        "HOLD_TARGET_DRIFT_NO_MUTATION",
+                        "exclusive purge target lifecycle is invalid",
+                    )
+                targets.append(
+                    RecoveryTarget(
+                        record_id=row["record_id"],
+                        memory_id=row["memory_id"],
+                        revision=row["revision"],
+                        scope=RecoveryScope(
+                            row["scope"],
+                            project_id=row["project_id"],
+                            worktree_id=row["worktree_id"],
+                            workflow_id=row["workflow_id"],
+                            agent_id=row["agent_id"],
+                        ),
+                        expected_lifecycle=lifecycle,
+                        expected_materialization=materialization,
+                        expected_native_hash=native_hash,
+                    )
+                )
+            return tuple(targets)
+        finally:
+            try:
+                await engine.close()
+            except BaseException as exc:
+                maintenance_lease.retain_fail_closed()
+                raise RecoveryHold(
+                    "HOLD_NONQUIESCENT_NO_MUTATION",
+                    "exclusive purge target resolver could not close its maintenance engine",
+                ) from exc
+
+
 @dataclass(frozen=True, slots=True)
 class RecoveryPlan:
     operation_id: str
@@ -172,6 +384,27 @@ class RecoveryResult:
     receipt_path: str
     state_path: str
     target_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryActivationHooks:
+    """Optional staged activation handoff executed while MaintenanceLease is held."""
+
+    operation_id: str
+    activation_ready: Callable[[RecoveryResult, "MaintenanceLease"], Any]
+    publish_running: Callable[[RecoveryResult, "MaintenanceLease"], Any]
+
+    def __post_init__(self) -> None:
+        if not _SAFE_OPERATION_RE.fullmatch(self.operation_id):
+            raise ValueError("activation hook operation_id must be a bounded non-secret operator identifier")
+        if not callable(self.activation_ready) or not callable(self.publish_running):
+            raise TypeError("activation hooks must be callable")
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,12 +719,18 @@ class SensitiveMemoryRecoveryOperator:
         *,
         receipt_path: str,
         state_path: str | None = None,
+        activation_hooks: RecoveryActivationHooks | None = None,
     ) -> RecoveryResult:
         db_path = os.path.realpath(os.path.abspath(plan.db_path))
         receipt = Path(receipt_path).absolute()
         state = Path(state_path).absolute() if state_path else receipt.with_suffix(receipt.suffix + ".state.json")
         if os.path.realpath(receipt) == os.path.realpath(db_path) or os.path.realpath(state) == os.path.realpath(db_path):
             raise ValueError("receipt/state must be outside the primary memory DB")
+        if activation_hooks is not None and activation_hooks.operation_id != plan.operation_id:
+            raise RecoveryHold(
+                "HOLD_RECOVERY_STATE_MISMATCH",
+                "activation hooks do not match the exact recovery operation",
+            )
         try:
             assert_supported_sqlite_runtime()
         except AdapterError as exc:
@@ -524,6 +763,7 @@ class SensitiveMemoryRecoveryOperator:
                     if persisted_phase not in {
                         _LOGICAL_PURGE_IN_PROGRESS,
                         _SEALING_INCOMPLETE,
+                        _ACTIVATION_READY,
                         _LOCAL_PURGE_VERIFIED,
                     }:
                         raise RecoveryHold(
@@ -567,31 +807,68 @@ class SensitiveMemoryRecoveryOperator:
                         _SEALING_INCOMPLETE,
                         lifecycle_preservation=lifecycle_preservation,
                     )
-                survivor_snapshot = self._snapshot_survivors(conn, plan)
+                result = RecoveryResult(
+                    plan.operation_id,
+                    _LOCAL_PURGE_VERIFIED,
+                    True,
+                    True,
+                    str(receipt),
+                    str(state),
+                    len(plan.targets),
+                )
+                if persisted_phase != _ACTIVATION_READY:
+                    survivor_snapshot = self._snapshot_survivors(conn, plan)
+                    self._write_state(
+                        state,
+                        plan,
+                        _SEALING_INCOMPLETE,
+                        lifecycle_preservation=lifecycle_preservation,
+                    )
+                    self._require_quiescent(db_path)
+                    self._seal_and_promote(conn, plan, survivor_snapshot, maintenance_lease)
+                    conn = None
+                    assert maintenance_lease.capability is not None
+                    await self._real_engine_postflight(
+                        plan,
+                        survivor_snapshot,
+                        maintenance_lease,
+                    )
+                elif conn is not None:
+                    conn.close()
+                    conn = None
+
+                if activation_hooks is None:
+                    self._clear_recovery_interlock(db_path, plan)
+                    self._write_state(
+                        state,
+                        plan,
+                        _LOCAL_PURGE_VERIFIED,
+                        lifecycle_preservation=lifecycle_preservation,
+                    )
+                    _atomic_json(receipt, self._receipt(plan, inspections))
+                    return result
+
+                await _maybe_await(activation_hooks.activation_ready(result, maintenance_lease))
                 self._write_state(
                     state,
                     plan,
-                    _SEALING_INCOMPLETE,
+                    _ACTIVATION_READY,
                     lifecycle_preservation=lifecycle_preservation,
                 )
-                self._require_quiescent(db_path)
-                self._seal_and_promote(conn, plan, survivor_snapshot, maintenance_lease)
-                conn = None
-                assert maintenance_lease.capability is not None
-                await self._real_engine_postflight(
-                    plan,
-                    survivor_snapshot,
-                    maintenance_lease,
-                )
+                _atomic_json(receipt, self._receipt(plan, inspections))
                 self._clear_recovery_interlock(db_path, plan)
+                try:
+                    await _maybe_await(activation_hooks.publish_running(result, maintenance_lease))
+                except BaseException:
+                    self._restore_recovery_interlock(db_path, plan)
+                    raise
                 self._write_state(
                     state,
                     plan,
                     _LOCAL_PURGE_VERIFIED,
                     lifecycle_preservation=lifecycle_preservation,
                 )
-                _atomic_json(receipt, self._receipt(plan, inspections))
-                return RecoveryResult(plan.operation_id, _LOCAL_PURGE_VERIFIED, True, True, str(receipt), str(state), len(plan.targets))
+                return result
             except RecoveryHold:
                 if logical_committed:
                     self._write_state(
@@ -735,6 +1012,7 @@ class SensitiveMemoryRecoveryOperator:
         if operation_id != plan.operation_id or persisted_phase not in {
             _LOGICAL_PURGE_IN_PROGRESS,
             _SEALING_INCOMPLETE,
+            _ACTIVATION_READY,
         }:
             raise RecoveryHold(
                 "HOLD_RECOVERY_STATE_MISMATCH",
@@ -770,6 +1048,26 @@ class SensitiveMemoryRecoveryOperator:
                 "DELETE FROM adapter_meta WHERE key = ? AND value = ?",
                 (_SENSITIVE_RECOVERY_INTERLOCK_KEY, plan.operation_id),
             )
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @classmethod
+    def _restore_recovery_interlock(cls, db_path: str, plan: RecoveryPlan) -> None:
+        conn = cls._open_maintenance_connection(db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            operation_id = cls._recovery_interlock_operation(conn)
+            if operation_id not in {None, plan.operation_id}:
+                raise RecoveryHold(
+                    _SEALING_INCOMPLETE,
+                    "database recovery interlock changed while restoring failed activation",
+                )
+            cls._ensure_recovery_interlock(conn, plan)
             conn.commit()
         except BaseException:
             if conn.in_transaction:

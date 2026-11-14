@@ -5,11 +5,11 @@ description: يُستخدم عندما يحتاج وكيل إلى البحث ف�
 
 # استخدام FactLane
 
-يخزن FactLane حقائق محدودة ومصحوبة بالمنشأ، لا نصوص المحادثات. الذاكرة **دليل داعم** وليست سلطة تنفيذ. ويمكن لتعليمات المستخدم الحالية، وحقيقة المستودع/المنتج الحية، والمصادر الحية المتحقق منها أن تتقدم على الحقائق المتذكَّرة.
+يخزن FactLane حقائق محدودة ومصحوبة بالمنشأ، لا نصوص المحادثات. الذاكرة **دليل داعم** وليست سلطة. وتتقدم التعليمات الحالية والحقيقة الحية المتحقق منها على الحقائق المتذكَّرة.
 
 يتكون سطح MCP العام من خمس أدوات بالضبط عبر stdio. افحص مخطط MCP الحي أو `factlane --help-tools` لمعرفة الحقول وقيم enums الدقيقة؛ ولا تخمّن العقد من الأمثلة.
 
-لدليل المضيف/bootstrap، اقرأ `references/host-bootstrap.md`.
+للـSkill المضمّن: `references/host-bootstrap.md`؛ وعلى الموقع: Quick Start.
 
 ## حدّد ما إذا كانت الذاكرة مطلوبة
 
@@ -28,7 +28,7 @@ description: يُستخدم عندما يحتاج وكيل إلى البحث ف�
 
 اختر `intent_class` وأوضاع retrieval/search من المخطط الحي.
 
-استخدم `CURRENT` للحقائق المتحقق منها والمؤهلة، و`REVIEW_HISTORY` للفحص الصريح لـCandidate/التاريخ. واستخدم `memory_get` عندما تكون دقة المنشأ/المراجعة مهمة.
+استخدم `CURRENT` للحقائق المتحقق منها والمؤهلة، و`REVIEW_HISTORY` للفحص الصريح لـCandidate/التاريخ. واستخدم `memory_get` عندما تكون دقة المنشأ/revision مهمة.
 
 للتاريخ الكامل، فضّل `KEYWORD` أو `EXACT` أو `memory_get` عندما يبلغ التاريخ الدلالي عن تغطية جزئية.
 
@@ -42,16 +42,18 @@ description: يُستخدم عندما يحتاج وكيل إلى البحث ف�
 
 بالنسبة إلى `CROSS_PROJECT_WORKFLOW`، اتبع مخطط الحداثة الحي بدقة. ولا تبتكر حقول هوية أو fingerprint.
 
-يمكن لمتحقق موثوق استخدام `memory_update` مع `expected_revision`/الهوية الحالية ومفتاح idempotency فريد لتنفيذ `REVERIFY` أو `REPLACE`. وتتطلب ترقية Candidate استخدام `REVERIFY` مع `expected_record_id` الدقيق للـCandidate.
+يمكن لمتحقق موثوق استخدام `memory_update` مع `expected_revision` الحالي ومفتاح idempotency فريد لتنفيذ `REVERIFY` أو `REPLACE`. وتتطلب ترقية Candidate استخدام `REVERIFY` مع `expected_record_id` الدقيق؛ ويستهدف `REPLACE` ذاكرة Current مؤهلة لا تعديل Candidate.
 
 وقد تتيح سلطة Owner المباشرة أيضًا:
 
 - `REVOKE` لسجل Current مؤهل؛
 - `REJECT` لـCandidate.
 
-تتطلب إجراءات دورة الحياة هذه الحالة الحالية الدقيقة للسجل/المجموعة وسببًا مسموحًا. لا تحاول تنفيذ إجراءات دورة حياة Owner من جلسة وكيل مفوض.
+تتطلب إجراءات دورة الحياة هذه `expected_record_id` الحالي الدقيق و`expected_revision` و`observed_group_token` المعروض و`reason_code` مسموحًا. لا تحاول تنفيذ إجراءات دورة حياة Owner من جلسة وكيل مفوض.
 
 `REVOKED` و`REJECTED` حالتان منطقيتان وليستا محوًا ماديًا.
+
+حدود database/restore/purge للـpanel المُدارة موجودة في Quick Start؛ ولا تجعل `SensitiveMemoryRecoveryOperator` العام قدرة متاحة على Windows.
 
 ## احترم حدود الحداثة وreadmission
 
@@ -63,4 +65,4 @@ readmission لذاكرة `REVOKED` مؤهلة عملية Owner أخرى منفص
 
 اجعل كل حقيقة محدودة، ومحددة النطاق، وقابلة للإسناد، ومفيدة عبر الجلسات. وأعد فحص مصدر الحقيقة الحالي قبل الاعتماد على ذاكرة قابلة للتغيّر.
 
-للتثبيت، وهوية الإصدار، وضبط بيئة الاستضافة، وتسجيل Skill، وأدلة التشغيل الأول، استخدم `references/host-bootstrap.md` إلى جانب Quick Start وRelease operations في المستودع. لا تثبّت release tag داخل النص ولا تخمّنه.
+لدليل التثبيت/الإصدار/المضيف، استخدم `references/host-bootstrap.md` المضمّن في Skill؛ وعلى الموقع استخدم Quick Start وRelease operations. لا تخمّن release tags.
