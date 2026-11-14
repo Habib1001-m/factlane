@@ -35,6 +35,8 @@ MAX_CRASH_RETRIES = 3
 READY_RESET_SECONDS = 600.0
 STATE_VERSION = 1
 _CLAIM_HOST_RE = re.compile(r"factlane-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.test")
+_LEGACY_WINDOWS_BOOT_RE = re.compile(r"windows:[0-9]{14}\.[0-9]{6}[+-][0-9]{3}")
+_WINDOWS_BOOT_COUNTER_RE = re.compile(r"windows:boot-id:(?:0|[1-9][0-9]*)")
 
 
 class ServiceStatus(str, Enum):
@@ -747,6 +749,26 @@ class WebUIServiceState:
 
     def _reconcile_boot(self) -> bool:
         current_boot = self._current_boot_id()
+        # Changing from WMI wall-clock text to the registry boot counter is
+        # not proof of a reboot. Preserve stop intent and exhausted crash
+        # incidents rather than granting a false retry/start transition.
+        if (
+            isinstance(self._state.observed_boot_id, str)
+            and _LEGACY_WINDOWS_BOOT_RE.fullmatch(self._state.observed_boot_id)
+            and _WINDOWS_BOOT_COUNTER_RE.fullmatch(current_boot)
+        ):
+            self._state.observed_boot_id = current_boot
+            self._state.next_retry_at = None
+            self._state.ready_since = None
+            self._state.ready_boot_id = None
+            if (
+                isinstance(self._state.stopped_boot_id, str)
+                and _LEGACY_WINDOWS_BOOT_RE.fullmatch(self._state.stopped_boot_id)
+            ):
+                self._state.stopped_boot_id = current_boot
+            if self._state.status == ServiceStatus.READY.value:
+                self._state.status = ServiceStatus.STARTING.value
+            return True
         changed = False
         if self._state.observed_boot_id != current_boot:
             if self._state.observed_boot_id is not None:

@@ -448,54 +448,33 @@ def windows_current_user_id() -> str:
             raise WindowsWebUIError("WINDOWS_OWNER_ACCOUNT_UNAVAILABLE", "current Windows account could not be resolved") from exc
 
 
-def windows_boot_id(*, wmi_factory: Callable[[], Any] | None = None) -> str:
+def _format_windows_boot_counter(value: Any, registry_type: int, *, dword_type: int) -> str:
+    """Validate the successful-boot counter without coercion or a clock fallback."""
+    if (
+        type(registry_type) is not int
+        or registry_type != dword_type
+        or type(value) is not int
+        or not 0 <= value <= 0xFFFFFFFF
+    ):
+        raise WindowsWebUIError("WINDOWS_BOOT_ID_UNAVAILABLE", "Windows boot identity is invalid")
+    return f"windows:boot-id:{value}"
+
+
+def windows_boot_id() -> str:
     _require_windows()
-    com_uninitialize: Callable[[], Any] | None = None
-    if wmi_factory is None:
-        try:
-            import pythoncom
-            import win32com.client
-        except ImportError as exc:  # pragma: no cover - packaging guard
-            raise WindowsWebUIError("WINDOWS_BOOT_ID_UNAVAILABLE", "Windows COM support is unavailable") from exc
-
-        try:
-            pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
-        except pythoncom.com_error as exc:
-            hresult = getattr(exc, "hresult", exc.args[0] if exc.args else None)
-            rpc_e_changed_mode = getattr(pythoncom, "RPC_E_CHANGED_MODE", -2147417850)
-            if hresult != rpc_e_changed_mode:
-                raise WindowsWebUIError(
-                    "WINDOWS_BOOT_ID_UNAVAILABLE",
-                    "Windows COM apartment could not be initialized",
-                ) from exc
-            # The caller already owns a COM apartment with a different model.
-            # WMI works in that apartment; do not balance initialization we did
-            # not successfully acquire.
-        except Exception as exc:
-            raise WindowsWebUIError("WINDOWS_BOOT_ID_UNAVAILABLE", "Windows COM apartment could not be initialized") from exc
-        else:
-            com_uninitialize = pythoncom.CoUninitialize
-
-        def wmi_factory() -> Any:
-            return win32com.client.GetObject(r"winmgmts:\\.\root\cimv2")
-
-    def read_values() -> list[str]:
-        # Keep COM proxy objects inside this frame so they are released before
-        # the caller balances CoInitialize with CoUninitialize.
-        service = wmi_factory()
-        records = service.ExecQuery("SELECT LastBootUpTime FROM Win32_OperatingSystem")
-        return [str(record.LastBootUpTime) for record in records]
-
     try:
-        values = read_values()
-    except Exception as exc:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters",
+            0,
+            winreg.KEY_READ,
+        ) as key:
+            value, registry_type = winreg.QueryValueEx(key, "BootId")
+    except (ImportError, OSError, ValueError, TypeError) as exc:
         raise WindowsWebUIError("WINDOWS_BOOT_ID_UNAVAILABLE", "Windows boot identity could not be read") from exc
-    finally:
-        if com_uninitialize is not None:
-            com_uninitialize()
-    if len(values) != 1 or not values[0].strip():
-        raise WindowsWebUIError("WINDOWS_BOOT_ID_UNAVAILABLE", "Windows boot identity is ambiguous")
-    return f"windows:{values[0].strip()}"
+    return _format_windows_boot_counter(value, registry_type, dword_type=winreg.REG_DWORD)
 
 
 def discover_windows_browser(

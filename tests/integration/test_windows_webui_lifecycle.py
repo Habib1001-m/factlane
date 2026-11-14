@@ -238,7 +238,8 @@ def test_windows_boot_identity_is_stable_and_service_state_is_owner_private(tmp_
     first = windows_boot_id()
     second = windows_boot_id()
     assert first == second
-    assert first.startswith("windows:")
+    assert first.startswith("windows:boot-id:")
+    assert first.removeprefix("windows:boot-id:").isdigit()
 
     state_path = tmp_path / "FactLane" / "state" / "webui-service.json"
     service = WebUIServiceState(state_path)

@@ -91,6 +91,73 @@ def test_stop_marker_is_owner_private_persistent_and_expires_only_on_new_boot(tm
     assert next_boot.snapshot().stopped_boot_id is None
 
 
+@pytest.mark.parametrize(
+    ("status", "stopped", "crashes", "expected_status"),
+    [
+        ("FAILED", False, 3, ServiceStatus.FAILED),
+        ("STOPPED_UNTIL_REBOOT", True, 0, ServiceStatus.STOPPED_UNTIL_REBOOT),
+        ("READY", False, 0, ServiceStatus.STARTING),
+        ("MAINTENANCE", True, 1, ServiceStatus.MAINTENANCE),
+        ("RECOVERY_REQUIRED", True, 2, ServiceStatus.RECOVERY_REQUIRED),
+    ],
+)
+def test_legacy_windows_boot_format_migrates_without_false_reboot(
+    tmp_path: Path, status: str, stopped: bool, crashes: int, expected_status: ServiceStatus
+) -> None:
+    legacy_boot = "windows:20261108144657.640405+120"
+    new_boot = "windows:boot-id:41"
+    _service(tmp_path, boot=_Boot(legacy_boot))
+    state_path = tmp_path / "owner-private" / "webui-service.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update(
+        status=status,
+        crash_attempts=crashes,
+        stopped_boot_id="windows:20261108144657.641128+120" if stopped else None,
+        ready_boot_id=legacy_boot,
+        ready_since=123.0,
+        next_retry_at=128.0,
+        intent_revision=23,
+        governance_revision=3,
+        last_intent_id="prior-intent",
+        last_intent_action="stop" if stopped else "start",
+        maintenance_operation_id="prior-maintenance" if status == "MAINTENANCE" else None,
+        maintenance_initial_status="STARTING" if status == "MAINTENANCE" else None,
+        maintenance_initial_stopped=stopped,
+        maintenance_intent_revision=23 if status == "MAINTENANCE" else None,
+    )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    controller = _Controller()
+    migrated = _service(tmp_path, boot=_Boot(new_boot), controller=controller)
+    snap = migrated.snapshot()
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert snap.status is expected_status
+    assert snap.crash_attempts == crashes
+    assert snap.stopped_boot_id == (new_boot if stopped else None)
+    assert persisted["observed_boot_id"] == new_boot
+    assert persisted["ready_boot_id"] is None
+    assert persisted["ready_since"] is None
+    assert persisted["next_retry_at"] is None
+    for field in (
+        "intent_revision", "governance_revision", "last_intent_id", "last_intent_action",
+        "maintenance_operation_id", "maintenance_initial_status",
+        "maintenance_initial_stopped", "maintenance_intent_revision",
+    ):
+        assert persisted[field] == state[field]
+    assert controller.actions == []
+    first_bytes = state_path.read_bytes()
+    assert migrated.snapshot() == snap
+    assert state_path.read_bytes() == first_bytes
+
+    next_boot = _service(tmp_path, boot=_Boot("windows:boot-id:42"), controller=controller)
+    next_snapshot = next_boot.snapshot()
+    assert next_snapshot.stopped_boot_id is None
+    if status == "FAILED":
+        assert next_snapshot.status is ServiceStatus.STARTING
+        assert next_snapshot.crash_attempts == 0
+    if status == "STOPPED_UNTIL_REBOOT":
+        assert next_snapshot.status is ServiceStatus.STARTING
+
+
 def test_first_endpoint_is_persisted_only_after_successful_bind_and_never_silently_rebound(tmp_path: Path) -> None:
     attempts: list[int] = []
 
